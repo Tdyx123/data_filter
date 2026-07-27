@@ -31,6 +31,7 @@ def apply_overrides(config: dict[str, Any], overrides: dict[str, Any]) -> dict[s
         "dataset_path": ("paths", "dataset"),
         "output_dir": ("paths", "output"),
         "gpu_count": ("train", "gpu_count"),
+        "gpu_ids": ("train", "gpu_ids"),
         "micro_batch_size": ("train", "micro_batch_size"),
         "gradient_accumulation_steps": ("train", "gradient_accumulation_steps"),
         "max_steps": ("train", "max_steps"),
@@ -81,6 +82,19 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ConfigError("state_dropout_prob must be in [0, 1]")
     if train["deepspeed_stage"] not in (2, 3):
         raise ConfigError("deepspeed_stage must be 2 or 3")
+    gpu_ids = train.get("gpu_ids")
+    if gpu_ids is not None:
+        if not isinstance(gpu_ids, list) or not all(
+            isinstance(gpu_id, int) and gpu_id >= 0 for gpu_id in gpu_ids
+        ):
+            raise ConfigError("train.gpu_ids must be a list of non-negative integers")
+        if len(gpu_ids) != len(set(gpu_ids)):
+            raise ConfigError("train.gpu_ids must not contain duplicate GPU numbers")
+        if len(gpu_ids) != int(train["gpu_count"]):
+            raise ConfigError(
+                "train.gpu_ids length must equal train.gpu_count; "
+                f"found {len(gpu_ids)} IDs for {train['gpu_count']} GPUs"
+            )
     for name in (
         "gpu_count",
         "micro_batch_size",
@@ -130,6 +144,7 @@ def resume_config_digest(config: dict[str, Any]) -> str:
         "save_every_steps",
         "validation_batches",
         "keep_last_checkpoints",
+        "gpu_ids",
     ):
         clean["train"].pop(key, None)
     payload = json.dumps(clean, sort_keys=True, separators=(",", ":")).encode()

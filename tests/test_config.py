@@ -4,6 +4,7 @@ import pytest
 
 from qwen3_vl_groot.config import (
     ConfigError,
+    apply_overrides,
     load_config,
     resume_config_digest,
     validate_config,
@@ -26,6 +27,26 @@ def test_default_config_keeps_all_qwen_layers():
     ]
 
 
+def test_four_gpu_config_preserves_effective_batch_64():
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
+    assert config["train"]["gpu_count"] == 4
+    assert config["train"]["gpu_ids"] == [0, 1, 2, 3]
+    effective_batch = (
+        config["train"]["gpu_count"]
+        * config["train"]["micro_batch_size"]
+        * config["train"]["gradient_accumulation_steps"]
+    )
+    assert effective_batch == 64
+
+
+def test_gpu_id_override_requires_matching_count():
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
+    updated = apply_overrides(config, {"gpu_ids": [2, 3, 6, 7]})
+    assert updated["train"]["gpu_ids"] == [2, 3, 6, 7]
+    with pytest.raises(ConfigError, match="length must equal"):
+        apply_overrides(config, {"gpu_ids": [0, 1]})
+
+
 def test_config_rejects_layer_truncation():
     config = load_config(PROJECT_ROOT / "configs" / "bridge_8x4090.yaml")
     config["model"]["text_layers"] = 12
@@ -38,6 +59,7 @@ def test_resume_digest_allows_extending_max_steps_but_not_model_changes():
     original = resume_config_digest(config)
     config["train"]["max_steps"] = 20_001
     config["train"]["save_every_steps"] = 1
+    config["train"]["gpu_ids"] = list(range(8))
     assert resume_config_digest(config) == original
     config["model"]["dit"]["num_layers"] = 11
     assert resume_config_digest(config) != original

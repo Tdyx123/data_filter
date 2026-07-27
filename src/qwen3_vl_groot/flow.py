@@ -160,7 +160,10 @@ class FlowMatchingActionHead(nn.Module):
                 f"Expected actions [B,{self.horizon},{self.action_dim}], "
                 f"found {tuple(noisy_actions.shape)}"
             )
-        time_condition = self.time_mlp(timestep_embedding(timestep, self.hidden_size))
+        time_features = timestep_embedding(timestep, self.hidden_size).to(
+            dtype=self.time_mlp[0].weight.dtype
+        )
+        time_condition = self.time_mlp(time_features)
         state_token = self.state_projection(state).unsqueeze(1)
         action_tokens = self.action_projection(noisy_actions)
         tokens = torch.cat([state_token, action_tokens], dim=1) + self.position_embedding

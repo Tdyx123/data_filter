@@ -319,7 +319,11 @@ def train(config: dict[str, Any], *, resume: str | None = None) -> None:
         stats=stats,
         config=config,
     )
-    policy.set_lora_trainable(False)
+    # ZeRO builds one internal bit16 group per optimizer parameter group and
+    # filters parameters with requires_grad=False. LoRA must therefore remain
+    # trainable until deepspeed.initialize() has partitioned both groups. We
+    # freeze it immediately after initialization; its scheduler LR is also zero
+    # during the configured warm-start interval.
     optimizer, scheduler = build_optimizer_and_scheduler(policy, config)
     engine, optimizer, _, scheduler = deepspeed.initialize(
         model=policy,
@@ -327,6 +331,7 @@ def train(config: dict[str, Any], *, resume: str | None = None) -> None:
         lr_scheduler=scheduler,
         config=build_deepspeed_config(config, world_size),
     )
+    policy.set_lora_trainable(False)
 
     best_validation_mae = math.inf
     global_step = 0

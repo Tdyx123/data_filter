@@ -1,0 +1,14 @@
+# One-time CPU-only dependency set for Orbax -> safetensors conversion.
+# The produced model does not require any package below this line.
+-r requirements-octo-pytorch.txt
+ml_dtypes==0.2.0
+jax==0.4.20
+jaxlib==0.4.20
+flax==0.7.5
+orbax-checkpoint==0.4.4
+chex==0.1.85
+optax==0.1.5
+scipy==1.12.0
+tensorstore==0.1.45
+etils==1.5.2
+protobuf==3.20.3

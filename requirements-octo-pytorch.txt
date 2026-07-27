@@ -1,0 +1,15 @@
+# Dedicated Python 3.10 runtime for Octo-small training and inference.
+# Install the CUDA 12.1 PyTorch wheel index as shown in README.md.
+torch==2.4.1
+transformers==4.44.2
+tokenizers==0.19.1
+safetensors==0.4.5
+sentencepiece==0.2.0
+numpy==1.24.3
+datasets==2.19.2
+pyarrow==14.0.2
+Pillow==10.4.0
+h5py==3.10.0
+PyYAML==6.0.2
+tqdm==4.66.5
+pytest==8.3.5

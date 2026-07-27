@@ -81,3 +81,23 @@ def test_tiny_two_step_training_checkpoint_and_inference(tmp_path):
     )
     assert prediction.shape == (1, 8, 7)
     assert torch.isfinite(prediction).all()
+
+
+def test_bfloat16_action_head_forward_and_backward_has_consistent_dtypes():
+    head = tiny_head().to(dtype=torch.bfloat16)
+    head.train()
+    state = torch.randn(1, 8, dtype=torch.bfloat16)
+    context = torch.randn(1, 5, 16, dtype=torch.bfloat16)
+    noisy_actions = torch.randn(1, 8, 7, dtype=torch.bfloat16)
+    # Flow time may arrive as FP32 or BF16; the head must match it to its weights.
+    timestep = torch.rand(1, dtype=torch.float32)
+    prediction = head(
+        noisy_actions,
+        state,
+        timestep,
+        context,
+        torch.ones(1, 5, dtype=torch.bool),
+    )
+    assert prediction.dtype == torch.bfloat16
+    assert torch.isfinite(prediction).all()
+    prediction.float().square().mean().backward()

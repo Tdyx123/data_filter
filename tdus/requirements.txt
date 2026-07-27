@@ -1,0 +1,15 @@
+numpy>=2.0
+pandas>=2.2
+pyarrow>=18
+av>=14
+Pillow>=11
+PyYAML>=6
+scikit-learn>=1.5
+torch>=2.5
+torchvision>=0.20
+transformers>=4.45
+matplotlib>=3.9
+seaborn>=0.13
+tqdm>=4.66
+faiss-cpu>=1.9
+pytest>=8.0

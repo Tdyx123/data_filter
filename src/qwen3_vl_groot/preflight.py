@@ -49,6 +49,7 @@ def validate_gpu_host(config: dict[str, Any]) -> dict[str, Any]:
     if available < required:
         raise PreflightError(f"Requested {required} GPUs, but torch sees {available}")
     devices = []
+    physical_ids = config["train"].get("gpu_ids")
     for index in range(required):
         properties = torch.cuda.get_device_properties(index)
         if properties.major < 8:
@@ -56,6 +57,9 @@ def validate_gpu_host(config: dict[str, Any]) -> dict[str, Any]:
         devices.append(
             {
                 "index": index,
+                "configured_physical_id": (
+                    int(physical_ids[index]) if physical_ids is not None else None
+                ),
                 "name": properties.name,
                 "memory_gib": round(properties.total_memory / 2**30, 2),
                 "compute_capability": f"{properties.major}.{properties.minor}",

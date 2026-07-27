@@ -10,11 +10,41 @@ from typing import Any
 from .config import apply_overrides, load_config, resolved_paths, save_resolved_config
 
 
+def parse_gpu_ids(value: str) -> list[int]:
+    pieces = [piece.strip() for piece in value.split(",")]
+    if not pieces or any(not piece for piece in pieces):
+        raise argparse.ArgumentTypeError("GPU IDs must look like: 0,1,2,3")
+    try:
+        gpu_ids = [int(piece) for piece in pieces]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("GPU IDs must be comma-separated integers") from error
+    if any(gpu_id < 0 for gpu_id in gpu_ids):
+        raise argparse.ArgumentTypeError("GPU IDs must be non-negative")
+    if len(gpu_ids) != len(set(gpu_ids)):
+        raise argparse.ArgumentTypeError("GPU IDs must not contain duplicates")
+    return gpu_ids
+
+
+def configure_visible_gpus(config: dict[str, Any]) -> str | None:
+    gpu_ids = config["train"].get("gpu_ids")
+    if gpu_ids is None:
+        return None
+    visible_devices = ",".join(str(gpu_id) for gpu_id in gpu_ids)
+    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+    return visible_devices
+
+
 def _add_override_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-path")
     parser.add_argument("--dataset-path")
     parser.add_argument("--output-dir")
     parser.add_argument("--gpu-count", type=int)
+    parser.add_argument(
+        "--gpu-ids",
+        type=parse_gpu_ids,
+        help="comma-separated physical GPU numbers, for example 2,3,6,7",
+    )
     parser.add_argument("--micro-batch-size", type=int)
     parser.add_argument("--gradient-accumulation-steps", type=int)
     parser.add_argument("--max-steps", type=int)
@@ -32,6 +62,7 @@ def _overrides(namespace: argparse.Namespace) -> dict[str, Any]:
         "dataset_path",
         "output_dir",
         "gpu_count",
+        "gpu_ids",
         "micro_batch_size",
         "gradient_accumulation_steps",
         "max_steps",
@@ -67,14 +98,19 @@ def _resolve_config(arguments: argparse.Namespace) -> dict[str, Any]:
 
 
 def launch(arguments: argparse.Namespace) -> None:
+    config = _resolve_config(arguments)
+    visible_devices = configure_visible_gpus(config)
+    # Importing preflight imports torch. CUDA_VISIBLE_DEVICES must be set first so
+    # both the memory probe and torchrun see the requested physical GPUs.
     from .preflight import run_preflight
 
-    config = _resolve_config(arguments)
     output = Path(config["paths"]["output"])
     output.mkdir(parents=True, exist_ok=True)
     runtime_config = output / "run_config.yaml"
     save_resolved_config(config, runtime_config)
 
+    if visible_devices is not None:
+        print(f"Using physical GPU IDs: {visible_devices}", flush=True)
     run_preflight(config, memory_probe=True)
     if arguments.preflight_only:
         return
@@ -106,12 +142,13 @@ def launch(arguments: argparse.Namespace) -> None:
 
 
 def distributed_train(arguments: argparse.Namespace) -> None:
-    from .training import train
-
     config = load_config(arguments.config)
     paths = resolved_paths(config)
     for key in ("model", "dataset", "output"):
         config["paths"][key] = str(paths[key])
+    configure_visible_gpus(config)
+    from .training import train
+
     train(config, resume=arguments.resume)
 
 
@@ -166,4 +203,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
