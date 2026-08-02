@@ -8,7 +8,7 @@ import pyarrow.parquet as pq
 import pytest
 from PIL import Image
 
-from tdus.dataset import (
+from trajectory_data import (
     DatasetValidationError,
     LeRobotDatasetAdapter,
     aligned_chunk_windows,
@@ -289,7 +289,7 @@ def test_lerobot_adapter_keeps_video_decode_path(tmp_path: Path, monkeypatch):
         decoded_paths.append(path)
         return expected
 
-    monkeypatch.setattr("tdus.dataset._decode_video", fake_decode_video)
+    monkeypatch.setattr("trajectory_data.lerobot._decode_video", fake_decode_video)
     segment = next(
         _adapter(tmp_path).iter_segments(
             ["trajectory"],

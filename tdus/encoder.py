@@ -15,7 +15,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
-from .dataset import TrajectorySegment
+from trajectory_data import TrajectorySegment
 
 
 def robust_bounds(

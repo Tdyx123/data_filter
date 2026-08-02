@@ -1,9 +1,8 @@
 """Model-free Trajectory Data Utility Score (TDUS).
 
-The package deliberately keeps dataset-specific code behind ``DatasetAdapter``.
-The scoring modules operate only on :class:`tdus.dataset.TrajectorySegment` and
-NumPy embeddings, so adding another robotics dataset does not require changing
-the TDUS algorithms.
+Dataset-specific code lives in the independent :mod:`trajectory_data` package.
+TDUS scoring modules operate only on dataset-neutral segments and NumPy
+embeddings.
 """
 
 import os as _os
@@ -40,15 +39,6 @@ def _configure_native_thread_pools() -> None:
 
 _configure_native_thread_pools()
 
-from .dataset import (  # noqa: E402 - thread limits must precede NumPy import
-    DatasetAdapter,
-    LeRobotDatasetAdapter,
-    TrajectorySegment,
-    create_dataset,
-    register_dataset_adapter,
-)
-
-
 def select_top_k(*args, **kwargs):
     """Lazily import :func:`tdus.selector.select_top_k`."""
 
@@ -65,11 +55,6 @@ def select_budget(*args, **kwargs):
     return implementation(*args, **kwargs)
 
 __all__ = [
-    "DatasetAdapter",
-    "LeRobotDatasetAdapter",
-    "TrajectorySegment",
-    "create_dataset",
-    "register_dataset_adapter",
     "select_budget",
     "select_top_k",
 ]

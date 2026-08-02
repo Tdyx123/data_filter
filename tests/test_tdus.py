@@ -13,8 +13,9 @@ import pandas as pd
 import pytest
 
 from tdus.coverage import CoverageModel, coverage, coverage_gain, mmd_squared
-from tdus.dataset import (
+from trajectory_data import (
     DatasetAdapter,
+    EpisodeData,
     EpisodeRecord,
     TrajectorySegment,
     aligned_chunk_windows,
@@ -311,36 +312,47 @@ class SyntheticAdapter(DatasetAdapter):
     def episodes(self) -> Sequence[EpisodeRecord]:
         return self._records
 
-    def iter_segments(
+    def iter_episodes(
         self,
-        modes: Sequence[str],
         *,
-        chunk_length: int,
-        stride: int,
         num_workers: int = 0,
         max_episodes: int | None = None,
         load_images: bool = True,
-    ) -> Iterator[TrajectorySegment]:
+    ) -> Iterator[EpisodeData]:
         del num_workers, load_images
         trajectories = self._segments[:max_episodes] if max_episodes else self._segments
         for trajectory in trajectories:
-            if "trajectory" in modes:
-                yield trajectory
-            if "chunk" in modes:
-                for start, end in aligned_chunk_windows(
-                    trajectory.length, chunk_length, stride
-                ):
-                    index = slice(start, end + 1)
-                    yield make_segment(
-                        trajectory.episode_id,
-                        trajectory.observations["observation.state"][index],
-                        trajectory.actions[index],
-                        kind="chunk",
-                        start=start,
-                    )
+            yield EpisodeData(
+                episode_id=trajectory.episode_id,
+                timestamps=trajectory.timestamps,
+                frame_indices=np.arange(trajectory.length, dtype=np.int64),
+                observations=trajectory.observations,
+                actions=trajectory.actions,
+            )
 
     def fingerprint(self) -> str:
         return "synthetic-v1"
+
+
+def test_dataset_adapter_builds_segments_from_public_episode_stream():
+    adapter = SyntheticAdapter({})
+
+    segments = list(
+        adapter.iter_segments(
+            ["trajectory", "chunk"],
+            chunk_length=3,
+            stride=2,
+            max_episodes=1,
+            load_images=False,
+        )
+    )
+
+    assert [segment.sample_id for segment in segments] == [
+        "ep000000_trajectory",
+        "ep000000_chunk_000000_000002",
+        "ep000000_chunk_000002_000004",
+    ]
+    assert all(segment.episode_id == 0 for segment in segments)
 
 
 def test_end_to_end_pipeline_with_registered_adapter(tmp_path: Path):

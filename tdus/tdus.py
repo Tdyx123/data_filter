@@ -16,7 +16,7 @@ import numpy as np
 import yaml
 
 from .coverage import CoverageModel
-from .dataset import DatasetAdapter, create_dataset
+from trajectory_data import DatasetAdapter, create_dataset
 from .diversity import sample_diversity
 from .encoder import (
     NumericNormalizers,

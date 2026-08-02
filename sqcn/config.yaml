@@ -1,0 +1,52 @@
+dataset:
+  type: lerobot
+  name: bridge_orig
+  path: /data/dwb/datasets/bridge_orig_1.0.0_lerobo
+  use_images: true
+  feature_keys:
+    action: action
+    timestamp: timestamp
+    frame_index: frame_index
+    episode_index: episode_index
+    vector_observations: auto
+    image_observations:
+      - observation.images.image_0
+
+encoder:
+  model: /data/dwb/models/clip-vit-base-patch32
+  local_files_only: true
+  image_batch_size: 64
+  visual_dim: 256
+  embedding_dim: 128
+  pca_fit_max_samples: null
+  device: auto
+
+quality:
+  quantile_low: 0.01
+  quantile_high: 0.99
+  epsilon: 1.0e-8
+
+coverage:
+  sigma: median
+  sigma_sample_size: 4096
+  sigma_pair_samples: 100000
+  batch_size: 2048
+  device: auto
+  quantile_low: 0.01
+  quantile_high: 0.99
+
+novelty:
+  k: 20
+  backend: auto
+  batch_size: 2048
+  quantile_low: 0.01
+  quantile_high: 0.99
+
+runtime:
+  seed: 42
+  num_workers: 4
+  max_episodes: null
+  resume: true
+
+output:
+  root: outputs/sqcn

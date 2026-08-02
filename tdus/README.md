@@ -2,7 +2,8 @@
 
 TDUS（Trajectory Data Utility Score）是一套无需策略训练、奖励模型或 rollout 的
 机器人数据评价工具。它从轨迹本身的动作、状态和图像特征计算 Quality、Coverage、
-Diversity、Novelty，并输出逐 trajectory/chunk 的可排序分数。
+Diversity、Novelty，并输出逐 trajectory/chunk 的可排序分数。数据读取接口位于
+独立的 `trajectory_data` 包；`tdus.dataset` 已删除。
 
 Bridge 只是默认配置使用的首个 LeRobot v2 数据集。核心包、API 和输出均为通用
 `tdus`，其他数据集可通过注册 `DatasetAdapter` 接入。
@@ -175,7 +176,7 @@ quality,coverage,diversity,novelty,tdus
 实现通用接口并注册工厂：
 
 ```python
-from tdus.dataset import DatasetAdapter, register_dataset_adapter
+from trajectory_data import DatasetAdapter, register_dataset_adapter
 
 class MyDatasetAdapter(DatasetAdapter):
     ...
@@ -192,7 +193,8 @@ dataset:
   path: /data/my_robot_data
 ```
 
-adapter 只负责产生 `TrajectorySegment`；encoder、四项指标、筛选和分析无需修改。
+adapter 通过公共 `iter_episodes()` 产生 `EpisodeData`，共享基类再构造
+`TrajectorySegment`；encoder、四项指标、筛选和分析无需修改。
 
 ## 测试
 

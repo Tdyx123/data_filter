@@ -1,170 +1,19 @@
-"""Dataset adapters and trajectory/chunk construction.
-
-Only this module understands the LeRobot on-disk layout.  All downstream
-modules receive the same ``TrajectorySegment`` representation and are therefore
-independent of Bridge, WidowX, or any other concrete robot dataset.
-"""
+"""LeRobot v2 dataset adapter."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import multiprocessing as mp
-from abc import ABC, abstractmethod
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import numpy as np
 
-
-class DatasetValidationError(RuntimeError):
-    """Raised when a dataset does not satisfy its adapter's contract."""
-
-
-@dataclass(frozen=True)
-class EpisodeRecord:
-    """Small, serializable episode index entry."""
-
-    episode_id: int
-    length: int
-
-
-@dataclass
-class EpisodeData:
-    """One decoded episode before it is split into segments."""
-
-    episode_id: int
-    timestamps: np.ndarray
-    frame_indices: np.ndarray
-    observations: dict[str, np.ndarray]
-    actions: np.ndarray
-
-    @property
-    def length(self) -> int:
-        return int(len(self.actions))
-
-
-@dataclass
-class TrajectorySegment:
-    """Dataset-neutral input consumed by encoders and quality metrics.
-
-    ``start_step`` and ``end_step`` are inclusive frame indices.  Observation
-    arrays always have time as their first dimension.
-    """
-
-    sample_id: str
-    episode_id: int
-    start_step: int
-    end_step: int
-    timestamps: np.ndarray
-    observations: dict[str, np.ndarray]
-    actions: np.ndarray
-    kind: str
-
-    @property
-    def length(self) -> int:
-        return int(len(self.actions))
-
-    def metadata(self) -> dict[str, Any]:
-        return {
-            "sample_id": self.sample_id,
-            "episode_id": self.episode_id,
-            "start_step": self.start_step,
-            "end_step": self.end_step,
-            "length": self.length,
-            "kind": self.kind,
-        }
-
-
-class DatasetAdapter(ABC):
-    """Abstract adapter required by the TDUS pipeline."""
-
-    @property
-    @abstractmethod
-    def vector_observation_keys(self) -> tuple[str, ...]:
-        """Return vector-valued observation fields selected for encoding."""
-
-    @property
-    @abstractmethod
-    def image_observation_keys(self) -> tuple[str, ...]:
-        """Return image/video observation fields selected for encoding."""
-
-    @abstractmethod
-    def episodes(self) -> Sequence[EpisodeRecord]:
-        """Return stable episode records."""
-
-    @abstractmethod
-    def iter_segments(
-        self,
-        modes: Sequence[str],
-        *,
-        chunk_length: int,
-        stride: int,
-        num_workers: int = 0,
-        max_episodes: int | None = None,
-        load_images: bool = True,
-    ) -> Iterator[TrajectorySegment]:
-        """Stream trajectory/chunk segments in deterministic order."""
-
-    @abstractmethod
-    def fingerprint(self) -> str:
-        """Return a stable source fingerprint used to validate caches."""
-
-
-_ADAPTERS: dict[str, Callable[[Mapping[str, Any]], DatasetAdapter]] = {}
-
-
-def register_dataset_adapter(
-    name: str,
-    factory: Callable[[Mapping[str, Any]], DatasetAdapter],
-) -> None:
-    """Register a dataset adapter factory.
-
-    Registration is intentionally tiny: a third-party dataset only needs to
-    construct a ``DatasetAdapter`` from its section of ``config.yaml``.
-    """
-
-    normalized = name.strip().lower()
-    if not normalized:
-        raise ValueError("adapter name cannot be empty")
-    _ADAPTERS[normalized] = factory
-
-
-def create_dataset(config: Mapping[str, Any]) -> DatasetAdapter:
-    """Create the adapter selected by ``dataset.type``."""
-
-    adapter_name = str(config.get("type", "")).strip().lower()
-    if adapter_name not in _ADAPTERS:
-        available = ", ".join(sorted(_ADAPTERS)) or "(none)"
-        raise ValueError(
-            f"Unknown dataset adapter {adapter_name!r}; registered adapters: {available}"
-        )
-    return _ADAPTERS[adapter_name](config)
-
-
-def aligned_chunk_windows(length: int, chunk_length: int, stride: int) -> list[tuple[int, int]]:
-    """Return inclusive windows, preserving short episodes and the final frame.
-
-    Regular stride-aligned full windows are emitted first.  If the final regular
-    window does not reach the episode end, one extra full window is aligned to
-    the end.  This avoids padding and avoids tiny tail-only chunks.
-    """
-
-    if length <= 0:
-        return []
-    if chunk_length <= 0 or stride <= 0:
-        raise ValueError("chunk_length and stride must be positive")
-    if length <= chunk_length:
-        return [(0, length - 1)]
-    starts = list(range(0, length - chunk_length + 1, stride))
-    final_start = length - chunk_length
-    if starts[-1] != final_start:
-        starts.append(final_start)
-    return [(start, start + chunk_length - 1) for start in starts]
+from .core import DatasetAdapter, DatasetValidationError, EpisodeData, EpisodeRecord
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -186,7 +35,9 @@ def _decode_video(path: Path) -> np.ndarray:
     try:
         import av
     except ImportError as error:
-        raise RuntimeError("PyAV is required to decode LeRobot video observations") from error
+        raise RuntimeError(
+            "PyAV is required to decode LeRobot video observations"
+        ) from error
     frames: list[np.ndarray] = []
     try:
         with av.open(str(path), mode="r") as container:
@@ -213,7 +64,9 @@ def _decode_embedded_images(
     try:
         from PIL import Image
     except ImportError as error:
-        raise RuntimeError("Pillow is required to decode LeRobot image observations") from error
+        raise RuntimeError(
+            "Pillow is required to decode LeRobot image observations"
+        ) from error
 
     try:
         shape = tuple(int(dimension) for dimension in expected_shape)
@@ -281,12 +134,14 @@ def _decode_embedded_images(
 
 
 def _load_lerobot_episode(payload: Mapping[str, Any]) -> EpisodeData:
-    """Process-safe LeRobot episode loader used by the multiprocessing path."""
+    """Process-safe LeRobot episode loader used by multiprocessing."""
 
     try:
         import pyarrow.parquet as pq
     except ImportError as error:
-        raise RuntimeError("pyarrow is required to read LeRobot Parquet files") from error
+        raise RuntimeError(
+            "pyarrow is required to read LeRobot Parquet files"
+        ) from error
 
     root = Path(str(payload["root"]))
     episode_id = int(payload["episode_id"])
@@ -325,7 +180,8 @@ def _load_lerobot_episode(payload: Mapping[str, Any]) -> EpisodeData:
     table = pq.read_table(parquet_path, columns=columns)
     if len(table) != expected_length:
         raise DatasetValidationError(
-            f"Episode {episode_id}: Parquet rows={len(table)}, metadata length={expected_length}"
+            f"Episode {episode_id}: Parquet rows={len(table)}, "
+            f"metadata length={expected_length}"
         )
 
     def column_array(key: str, dtype: Any) -> np.ndarray:
@@ -344,11 +200,15 @@ def _load_lerobot_episode(payload: Mapping[str, Any]) -> EpisodeData:
             f"Episode {episode_id}: action/timestamp contains NaN or infinity"
         )
     if np.any(episode_indices != episode_id):
-        raise DatasetValidationError(f"Episode {episode_id}: inconsistent episode index column")
+        raise DatasetValidationError(
+            f"Episode {episode_id}: inconsistent episode index column"
+        )
     if len(timestamps) > 1 and np.any(np.diff(timestamps) < 0):
         raise DatasetValidationError(f"Episode {episode_id}: timestamps are not monotonic")
     if len(frame_indices) > 1 and np.any(np.diff(frame_indices) <= 0):
-        raise DatasetValidationError(f"Episode {episode_id}: frame indices are not increasing")
+        raise DatasetValidationError(
+            f"Episode {episode_id}: frame indices are not increasing"
+        )
 
     observations: dict[str, np.ndarray] = {}
     for key in vector_keys:
@@ -358,6 +218,7 @@ def _load_lerobot_episode(payload: Mapping[str, Any]) -> EpisodeData:
                 f"Episode {episode_id}, {key}: invalid length or non-finite values"
             )
         observations[key] = values
+
     video_path_pattern = payload.get("video_path")
     for image_key, feature in image_features.items():
         storage = str(feature.get("dtype", ""))
@@ -411,14 +272,15 @@ class LeRobotDatasetAdapter(DatasetAdapter):
             self.info = json.load(handle)
         if not str(self.info.get("codebase_version", "")).startswith("v2"):
             raise DatasetValidationError(
-                f"LeRobot adapter currently supports v2 datasets, found "
+                "LeRobot adapter currently supports v2 datasets, found "
                 f"{self.info.get('codebase_version')!r}"
             )
         self.features: dict[str, dict[str, Any]] = dict(self.info.get("features", {}))
         self._discover_keys()
         rows = _read_jsonl(episodes_path)
         self._episodes = tuple(
-            EpisodeRecord(int(row["episode_index"]), int(row["length"])) for row in rows
+            EpisodeRecord(int(row["episode_index"]), int(row["length"]))
+            for row in rows
         )
         if any(episode.length <= 0 for episode in self._episodes):
             raise DatasetValidationError("LeRobot episodes must contain at least one frame")
@@ -450,7 +312,9 @@ class LeRobotDatasetAdapter(DatasetAdapter):
             return candidates[0]
 
         self.action_key = choose_key(
-            "action", "action", lambda key: key == "action" or key.startswith("action.")
+            "action",
+            "action",
+            lambda key: key == "action" or key.startswith("action."),
         )
         self.timestamp_key = choose_key(
             "timestamp", "timestamp", lambda key: key.endswith("timestamp")
@@ -484,9 +348,7 @@ class LeRobotDatasetAdapter(DatasetAdapter):
             if key.startswith("observation.") and feature.get("dtype") in image_dtypes
         )
         use_images = bool(self.config.get("use_images", True))
-        configured_images = overrides.get(
-            "image_observations", "auto"
-        )
+        configured_images = overrides.get("image_observations", "auto")
         if not use_images:
             selected_images: list[str] = []
         elif configured_images == "all":
@@ -499,7 +361,9 @@ class LeRobotDatasetAdapter(DatasetAdapter):
             key for key in (*self._vector_keys, *selected_images) if key not in self.features
         ]
         if unknown:
-            raise DatasetValidationError(f"Configured observation features not found: {unknown}")
+            raise DatasetValidationError(
+                f"Configured observation features not found: {unknown}"
+            )
         invalid_vectors = [
             key
             for key in self._vector_keys
@@ -545,7 +409,10 @@ class LeRobotDatasetAdapter(DatasetAdapter):
         return self._episodes
 
     def _worker_payload(
-        self, episode: EpisodeRecord, *, load_images: bool = True
+        self,
+        episode: EpisodeRecord,
+        *,
+        load_images: bool = True,
     ) -> dict[str, Any]:
         return {
             "root": str(self.root),
@@ -566,8 +433,12 @@ class LeRobotDatasetAdapter(DatasetAdapter):
             "episode_key": self.episode_key,
         }
 
-    def _iter_episodes(
-        self, *, num_workers: int, max_episodes: int | None, load_images: bool
+    def iter_episodes(
+        self,
+        *,
+        num_workers: int = 0,
+        max_episodes: int | None = None,
+        load_images: bool = True,
     ) -> Iterator[EpisodeData]:
         episodes = self._episodes[:max_episodes] if max_episodes else self._episodes
         if num_workers <= 1:
@@ -576,9 +447,7 @@ class LeRobotDatasetAdapter(DatasetAdapter):
                     self._worker_payload(episode, load_images=load_images)
                 )
             return
-        # Spawn prevents a parent CUDA context from being inherited by workers.
-        # Keep only 2x workers in flight so decoded image observations cannot
-        # accumulate for all episodes behind a slower GPU consumer.
+
         context = mp.get_context("spawn")
         with ProcessPoolExecutor(max_workers=num_workers, mp_context=context) as pool:
             episode_iterator = iter(episodes)
@@ -607,51 +476,6 @@ class LeRobotDatasetAdapter(DatasetAdapter):
                     )
                 )
 
-    @staticmethod
-    def _segment(episode: EpisodeData, start: int, end: int, kind: str) -> TrajectorySegment:
-        index = slice(start, end + 1)
-        if kind == "trajectory":
-            sample_id = f"ep{episode.episode_id:06d}_trajectory"
-        else:
-            sample_id = f"ep{episode.episode_id:06d}_chunk_{start:06d}_{end:06d}"
-        return TrajectorySegment(
-            sample_id=sample_id,
-            episode_id=episode.episode_id,
-            start_step=int(episode.frame_indices[start]),
-            end_step=int(episode.frame_indices[end]),
-            timestamps=episode.timestamps[index],
-            observations={key: value[index] for key, value in episode.observations.items()},
-            actions=episode.actions[index],
-            kind=kind,
-        )
-
-    def iter_segments(
-        self,
-        modes: Sequence[str],
-        *,
-        chunk_length: int,
-        stride: int,
-        num_workers: int = 0,
-        max_episodes: int | None = None,
-        load_images: bool = True,
-    ) -> Iterator[TrajectorySegment]:
-        normalized_modes = tuple(dict.fromkeys(str(mode).lower() for mode in modes))
-        invalid = sorted(set(normalized_modes) - {"trajectory", "chunk"})
-        if invalid:
-            raise ValueError(f"Unsupported segmentation modes: {invalid}")
-        for episode in self._iter_episodes(
-            num_workers=num_workers,
-            max_episodes=max_episodes,
-            load_images=load_images,
-        ):
-            if "trajectory" in normalized_modes:
-                yield self._segment(episode, 0, episode.length - 1, "trajectory")
-            if "chunk" in normalized_modes:
-                for start, end in aligned_chunk_windows(
-                    episode.length, chunk_length, stride
-                ):
-                    yield self._segment(episode, start, end, "chunk")
-
     def fingerprint(self) -> str:
         sha = hashlib.sha256()
         for path in (
@@ -663,6 +487,3 @@ class LeRobotDatasetAdapter(DatasetAdapter):
                     sha.update(block)
         sha.update(json.dumps(self.config, sort_keys=True).encode("utf-8"))
         return sha.hexdigest()
-
-
-register_dataset_adapter("lerobot", LeRobotDatasetAdapter)
