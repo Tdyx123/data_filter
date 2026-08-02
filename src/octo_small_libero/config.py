@@ -1,14 +1,50 @@
 from __future__ import annotations
 
 import copy
+import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import yaml
+
+from .libero10_tasks import LIBERO_10_TASK_COUNT
 
 
 class ConfigError(ValueError):
     """Raised when the independent Octo LIBERO configuration is invalid."""
+
+
+def normalized_sample_weights(weights: Sequence[float]) -> tuple[float, float]:
+    """Normalize target/prior sampling weights to probabilities."""
+    if len(weights) != 2 or any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or value <= 0
+        for value in weights
+    ):
+        raise ValueError("sample weights must contain two positive finite numbers")
+    total = sum(float(value) for value in weights)
+    return (float(weights[0]) / total, float(weights[1]) / total)
+
+
+def sample_counts_per_batch(
+    weights: Sequence[float],
+    batch_size: int,
+) -> tuple[int, int]:
+    """Resolve exact target/prior counts for one local micro-batch."""
+    normalized = normalized_sample_weights(weights)
+    raw_counts = tuple(batch_size * value for value in normalized)
+    counts = tuple(int(round(value)) for value in raw_counts)
+    if any(count <= 0 for count in counts) or any(
+        not math.isclose(value, count, rel_tol=0.0, abs_tol=1.0e-9)
+        for value, count in zip(raw_counts, counts, strict=True)
+    ):
+        raise ValueError(
+            "data.sample_weights must produce positive whole-number counts for "
+            "train.micro_batch_size_per_gpu"
+        )
+    return counts[0], counts[1]
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -54,14 +90,56 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ConfigError("data.target_dataset must be a lowercase LeRobot dataset directory name")
     if data["prior_dataset"] == data["target_dataset"]:
         raise ConfigError("The prior and target LeRobot dataset names must differ")
+    target_task_index = data.get("target_task_index")
+    target_all_tasks = data.get("target_all_tasks", False)
+    if not isinstance(target_all_tasks, bool):
+        raise ConfigError("data.target_all_tasks must be a bool")
+    if target_task_index is not None and (
+        isinstance(target_task_index, bool)
+        or not isinstance(target_task_index, int)
+        or not 0 <= target_task_index < LIBERO_10_TASK_COUNT
+    ):
+        raise ConfigError(
+            f"data.target_task_index must be null or in [0, {LIBERO_10_TASK_COUNT - 1}]"
+        )
+    if target_task_index is not None and target_all_tasks:
+        raise ConfigError(
+            "data.target_task_index and data.target_all_tasks cannot both be enabled"
+        )
+
+    selection = data.get("prior_selection")
+    if not isinstance(selection, dict):
+        raise ConfigError("data.prior_selection must be a mapping")
+    if (
+        not isinstance(selection.get("scores"), str)
+        or not selection["scores"].strip()
+    ):
+        raise ConfigError("data.prior_selection.scores must be a non-empty path")
+    top_percent = selection.get("top_percent")
+    if top_percent is not None:
+        if (
+            isinstance(top_percent, bool)
+            or not isinstance(top_percent, (int, float))
+            or not math.isfinite(float(top_percent))
+            or not 0.0 < float(top_percent) <= 100.0
+        ):
+            raise ConfigError(
+                "data.prior_selection.top_percent must be null or in (0, 100]"
+            )
 
     weights = data.get("sample_weights")
     if (
         not isinstance(weights, list)
         or len(weights) != 2
-        or any(not isinstance(value, (int, float)) or value <= 0 for value in weights)
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value <= 0
+            for value in weights
+        )
     ):
-        raise ConfigError("data.sample_weights must contain two positive numbers")
+        raise ConfigError("data.sample_weights must contain two positive finite numbers")
 
     if int(data.get("state_dim", -1)) != 8:
         raise ConfigError("LIBERO proprio must have state_dim=8")
@@ -113,6 +191,8 @@ def validate_config(config: dict[str, Any]) -> None:
         "max_steps",
         "episode_cache_size",
         "prefetch_factor",
+        "log_every_steps",
+        "save_every_steps",
     ):
         if int(train.get(name, 0)) <= 0:
             raise ConfigError(f"train.{name} must be positive")
@@ -127,8 +207,10 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ConfigError("train.gpu_ids must not contain duplicates")
     if len(gpu_ids) != int(train["gpu_count"]):
         raise ConfigError("train.gpu_ids length must equal train.gpu_count")
-    if int(train["micro_batch_size_per_gpu"]) % 2:
-        raise ConfigError("train.micro_batch_size_per_gpu must be even for 1:1 sampling")
+    try:
+        sample_counts_per_batch(weights, int(train["micro_batch_size_per_gpu"]))
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
     effective_batch_size = (
         int(train["micro_batch_size_per_gpu"])
         * int(train["gradient_accumulation_steps"])
@@ -158,6 +240,9 @@ def apply_overrides(config: dict[str, Any], **overrides: Any) -> dict[str, Any]:
         "lerobot_path": ("paths", "lerobot"),
         "output_dir": ("paths", "output"),
         "target_dataset": ("data", "target_dataset"),
+        "target_task_index": ("data", "target_task_index"),
+        "target_all_tasks": ("data", "target_all_tasks"),
+        "sample_weights": ("data", "sample_weights"),
         "gpu_ids": ("train", "gpu_ids"),
         "batch_size": ("train", "batch_size"),
         "max_steps": ("train", "max_steps"),
@@ -167,12 +252,40 @@ def apply_overrides(config: dict[str, Any], **overrides: Any) -> dict[str, Any]:
             continue
         section, key = mapping[name]
         result[section][key] = value
+    if overrides.get("target_all_tasks") is True:
+        result["data"]["target_task_index"] = None
+    elif overrides.get("target_task_index") is not None:
+        result["data"]["target_all_tasks"] = False
+    if overrides.get("prior_scores") is not None:
+        result["data"]["prior_selection"]["scores"] = overrides["prior_scores"]
+    if overrides.get("prior_top_percent") is not None:
+        result["data"]["prior_selection"]["top_percent"] = overrides[
+            "prior_top_percent"
+        ]
     if overrides.get("max_steps") is not None:
         result["train"]["learning_rate"]["decay_steps"] = max(
             int(result["train"]["learning_rate"]["decay_steps"]),
             int(overrides["max_steps"]),
         )
     validate_config(result)
+    if overrides.get("output_dir") is None:
+        output = Path(result["paths"]["output"])
+        task_index = result["data"].get("target_task_index")
+        if result["data"].get("target_all_tasks", False):
+            task_suffix = "_all-tasks"
+            if task_suffix not in output.name:
+                output = output.with_name(output.name + task_suffix)
+        elif task_index is not None:
+            task_suffix = f"_task-{task_index}"
+            if task_suffix not in output.name:
+                output = output.with_name(output.name + task_suffix)
+        top_percent = result["data"]["prior_selection"]["top_percent"]
+        if top_percent is not None:
+            tag = format(float(top_percent), ".12g").replace(".", "p")
+            top_suffix = f"_top{tag}pct"
+            if not output.name.endswith(top_suffix):
+                output = output.with_name(output.name + top_suffix)
+        result["paths"]["output"] = str(output)
     return result
 
 
@@ -196,5 +309,6 @@ def resolved_paths(config: dict[str, Any]) -> dict[str, Path]:
         "prior_dataset": prior_dataset,
         "target_dataset": target_dataset,
         "statistics": prior_dataset / "meta" / "stats.json",
+        "prior_scores": resolve(config["data"]["prior_selection"]["scores"]),
         "output": resolve(config["paths"]["output"]),
     }

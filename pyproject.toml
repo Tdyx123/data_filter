@@ -41,9 +41,10 @@ where = ["src"]
 testpaths = ["tests"]
 addopts = "-ra"
 markers = [
-  "real_data: checks the configured Bridge dataset",
+  "real_data: checks mounted real datasets",
   "gpu: requires CUDA",
   "slow: takes more than a few seconds",
+  "timeout: bounds a subprocess regression when pytest-timeout is installed",
 ]
 
 [tool.ruff]

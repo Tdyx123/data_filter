@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import csv
+import os
 from pathlib import Path
+import subprocess
+import sys
+from types import SimpleNamespace
 from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from tdus.coverage import CoverageModel, coverage, coverage_gain, mmd_squared
 from tdus.dataset import (
@@ -16,11 +21,16 @@ from tdus.dataset import (
     register_dataset_adapter,
 )
 from tdus.diversity import sample_diversity, subset_diversity
-from tdus.encoder import NumericNormalizers, PCAProjector, temporal_pool
+from tdus.encoder import (
+    NumericNormalizers,
+    PCAProjector,
+    _clip_feature_tensor,
+    temporal_pool,
+)
 from tdus.novelty import novelty_scores
-from tdus.quality import RawQuality, raw_quality, score_quality
+from tdus.quality import raw_quality, score_quality
 from tdus.selector import select_budget, select_top_k
-from tdus.tdus import compute_tdus, run_pipeline
+from tdus.tdus import compute_tdus, load_config, run_pipeline
 
 
 def make_segment(
@@ -50,6 +60,11 @@ def make_segment(
 
 def test_chunk_windows_keep_short_and_align_tail():
     assert aligned_chunk_windows(5, 8, 4) == [(0, 4)]
+    assert aligned_chunk_windows(40, 15, 15) == [
+        (0, 14),
+        (15, 29),
+        (25, 39),
+    ]
     assert aligned_chunk_windows(100, 32, 16) == [
         (0, 31),
         (16, 47),
@@ -58,6 +73,18 @@ def test_chunk_windows_keep_short_and_align_tail():
         (64, 95),
         (68, 99),
     ]
+
+
+def test_libero90_config_uses_15_step_chunks_and_trajectory_reference():
+    config = load_config(
+        Path(__file__).resolve().parents[1] / "tdus" / "config_libero90.yaml"
+    )
+
+    assert config["segmentation"]["modes"] == ["trajectory", "chunk"]
+    assert config["segmentation"]["chunk_length"] == 15
+    assert config["segmentation"]["stride"] == 15
+    assert config["dataset"]["name"] == "libero90"
+    assert config["output"]["root"] == "outputs/tdus"
 
 
 def test_pooling_and_projector_have_fixed_dimension():
@@ -70,6 +97,44 @@ def test_pooling_and_projector_have_fixed_dimension():
     embeddings = PCAProjector(output_dim=128, seed=1).fit_transform(features)
     assert embeddings.shape == (4, 128)
     assert np.all(np.isfinite(embeddings))
+
+
+def test_clip_feature_tensor_supports_transformers_4_and_5_return_types():
+    torch = pytest.importorskip("torch")
+    features = torch.randn(2, 8)
+
+    assert _clip_feature_tensor(features) is features
+    output = SimpleNamespace(pooler_output=features)
+    assert _clip_feature_tensor(output) is features
+    with pytest.raises(TypeError, match="neither a Tensor"):
+        _clip_feature_tensor(SimpleNamespace(pooler_output=None))
+
+
+def test_package_limits_native_thread_pools_before_numpy_import():
+    variables = (
+        "OPENBLAS_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    )
+    environment = os.environ.copy()
+    environment.pop("TDUS_NUM_THREADS", None)
+    for variable in variables:
+        environment.pop(variable, None)
+    code = (
+        "import os; import tdus; "
+        f"print('|'.join(os.environ[name] for name in {variables!r}))"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "1|1|1|1"
 
 
 def test_quality_components_are_bounded_and_smooth_actions_score_higher():

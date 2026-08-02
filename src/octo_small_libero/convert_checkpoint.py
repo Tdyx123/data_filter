@@ -12,6 +12,7 @@ SOURCE_PREFIX = "octo_transformer/"
 TRANSFORMER_PREFIX = (
     "octo_transformer/BlockTransformer_0/Transformer_0/"
 )
+DEFAULT_T5_SOURCE = "/data/dwb/models/t5-base"
 
 
 def _sha256(path: Path) -> str:
@@ -365,12 +366,36 @@ def _t5_mapping() -> list[tuple[str, str, str]]:
     return result
 
 
+def _ensure_sentencepiece_model(tokenizer: Any, text_root: Path) -> Path:
+    target = text_root / "spiece.model"
+    if target.is_file() and target.stat().st_size > 0:
+        return target
+    if target.exists() and not target.is_file():
+        raise RuntimeError(f"SentencePiece target is not a regular file: {target}")
+
+    source_value = getattr(tokenizer, "vocab_file", None)
+    if not source_value:
+        source_value = getattr(tokenizer, "init_kwargs", {}).get("vocab_file")
+    if not source_value:
+        raise RuntimeError(
+            "Tokenizer did not expose a vocab_file for the required spiece.model"
+        )
+    source = Path(source_value).expanduser().resolve()
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise RuntimeError(f"Tokenizer SentencePiece source is missing or empty: {source}")
+
+    shutil.copy2(source, target)
+    if not target.is_file() or target.stat().st_size <= 0:
+        raise RuntimeError(f"Failed to save tokenizer SentencePiece model: {target}")
+    return target
+
+
 def convert_checkpoint(
     source_path: str | Path,
     output_path: str | Path,
     *,
     step: int = 270000,
-    t5_source: str = "google-t5/t5-base",
+    t5_source: str = DEFAULT_T5_SOURCE,
     seed: int = 42,
     overwrite: bool = False,
     local_files_only: bool = False,
@@ -444,6 +469,7 @@ def convert_checkpoint(
     text_root = output / "text_encoder"
     text_config.save_pretrained(text_root)
     tokenizer.save_pretrained(text_root)
+    _ensure_sentencepiece_model(tokenizer, text_root)
     save_model_config(model.config, output / "model_config.json")
     weights_path = output / "model.safetensors"
     save_model(model, str(weights_path))
@@ -471,18 +497,22 @@ def convert_checkpoint(
     return manifest
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert a local Octo-small Orbax checkpoint to PyTorch safetensors"
     )
     parser.add_argument("--source", default="/data/dwb/models/octo-small")
     parser.add_argument("--output", default="/data/dwb/models/octo-small-pytorch")
     parser.add_argument("--step", type=int, default=270000)
-    parser.add_argument("--t5-source", default="google-t5/t5-base")
+    parser.add_argument("--t5-source", default=DEFAULT_T5_SOURCE)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
-    arguments = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    arguments = build_parser().parse_args()
     manifest = convert_checkpoint(
         arguments.source,
         arguments.output,

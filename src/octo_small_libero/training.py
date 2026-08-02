@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 
 from .checkpoint import inspect_octo_checkpoint, load_lerobot_statistics
+from .config import normalized_sample_weights
 from .lerobot_v2 import LeRobotV2Metadata
 
 
@@ -28,29 +29,59 @@ def _statistics_sha256(path: Path) -> str:
 def build_dataset_manifest(
     config: dict[str, Any],
     paths: dict[str, Path],
+    *,
+    target_selection: Any | None = None,
+    prior_selection: Any | None = None,
 ) -> dict[str, Any]:
+    if target_selection is None:
+        from .data import resolve_target_task_selection
+
+        target_selection = resolve_target_task_selection(config, paths)
+    if prior_selection is None and (
+        config["data"]["prior_selection"].get("top_percent") is not None
+    ):
+        from .selection import resolve_prior_selection
+
+        prior_selection = resolve_prior_selection(config, paths)
     statistics = load_lerobot_statistics(paths["prior_dataset"])
     target_name = config["data"]["target_dataset"]
     prior_name = config["data"]["prior_dataset"]
+    sample_weights = normalized_sample_weights(config["data"]["sample_weights"])
     target_metadata = LeRobotV2Metadata(paths["target_dataset"])
     prior_metadata = LeRobotV2Metadata(paths["prior_dataset"])
     conversion_manifest_path = paths["lerobot"] / "conversion_manifest.json"
+    target_conversion_manifest_path = (
+        paths["lerobot"] / f"{target_name}_conversion_manifest.json"
+    )
     return {
         "lerobot_root": str(paths["lerobot"]),
         "datasets": {
             target_name: {
-                "sample_weight": 0.5,
+                "sample_weight": sample_weights[0],
                 "path": str(target_metadata.root),
                 "metadata_sha256": target_metadata.metadata_sha256(),
                 "episodes": int(target_metadata.info["total_episodes"]),
                 "frames": int(target_metadata.info["total_frames"]),
+                "episodes_used": target_selection.episodes,
+                "frames_used": target_selection.frames,
+                "selection": target_selection.as_manifest(),
             },
             prior_name: {
-                "sample_weight": 0.5,
+                "sample_weight": sample_weights[1],
                 "path": str(prior_metadata.root),
                 "metadata_sha256": prior_metadata.metadata_sha256(),
                 "episodes": int(prior_metadata.info["total_episodes"]),
                 "frames": int(prior_metadata.info["total_frames"]),
+                "frames_used": (
+                    prior_selection.training_starts
+                    if prior_selection is not None
+                    else int(prior_metadata.info["total_frames"])
+                ),
+                "selection": (
+                    prior_selection.as_manifest()
+                    if prior_selection is not None
+                    else {"enabled": False}
+                ),
             },
         },
         "prior_statistics_path": str(paths["statistics"]),
@@ -59,6 +90,11 @@ def build_dataset_manifest(
         "normalization_transitions": int(statistics["num_transitions"]),
         "conversion_manifest": (
             str(conversion_manifest_path) if conversion_manifest_path.is_file() else None
+        ),
+        "target_conversion_manifest": (
+            str(target_conversion_manifest_path)
+            if target_conversion_manifest_path.is_file()
+            else None
         ),
     }
 
@@ -101,21 +137,87 @@ def _resolve_resume(output: Path, resume: str | None) -> Path | None:
     return Path(resume).expanduser().resolve()
 
 
+def _atomic_write_json(path: Path, value: Any) -> None:
+    temporary = path.parent / f".{path.name}.tmp"
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    temporary.replace(path)
+
+
+def _read_best_checkpoint(checkpoints: Path) -> dict[str, Any] | None:
+    path = checkpoints / "best.json"
+    if not path.is_file():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        value = json.load(handle)
+    try:
+        checkpoint = str(value["checkpoint"])
+        step = int(value["step"])
+        mean_train_loss = float(value["mean_train_loss"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(f"Invalid best checkpoint pointer at {path}") from error
+    if checkpoint != f"step-{step:08d}" or not math.isfinite(mean_train_loss):
+        raise RuntimeError(f"Invalid best checkpoint pointer at {path}")
+    if not (checkpoints / checkpoint).is_dir():
+        raise RuntimeError(
+            f"Best checkpoint pointer references a missing directory: "
+            f"{checkpoints / checkpoint}"
+        )
+    return {
+        "checkpoint": checkpoint,
+        "step": step,
+        "mean_train_loss": mean_train_loss,
+    }
+
+
+def _retain_latest_and_best_checkpoints(
+    checkpoints: Path,
+    *,
+    latest: str,
+    best: str,
+) -> None:
+    keep = {latest, best}
+    for path in checkpoints.iterdir():
+        name = path.name
+        is_step_checkpoint = (
+            path.is_dir()
+            and name.startswith("step-")
+            and len(name) == len("step-00000000")
+            and name.removeprefix("step-").isdigit()
+        )
+        if is_step_checkpoint and name not in keep:
+            shutil.rmtree(path)
+
+
+def _should_save_checkpoint(*, step: int, max_steps: int, save_every: int) -> bool:
+    return step % save_every == 0 or step == max_steps
+
+
 def _save_checkpoint(
     *,
     output: Path,
     step: int,
+    mean_train_loss: float,
     model: Any,
     optimizer: Any,
     scheduler: Any,
     sampler: Any,
     config: dict[str, Any],
+    selection_signature: str | None = None,
 ) -> Path:
     import torch
     from safetensors.torch import save_model
 
     checkpoints = output / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
+    mean_train_loss = float(mean_train_loss)
+    if not math.isfinite(mean_train_loss):
+        raise RuntimeError(
+            f"Cannot save step {step} with non-finite mean training loss: "
+            f"{mean_train_loss}"
+        )
+    previous_best = _read_best_checkpoint(checkpoints)
     name = f"step-{step:08d}"
     target = checkpoints / name
     temporary = checkpoints / f".{name}.tmp"
@@ -134,16 +236,38 @@ def _save_checkpoint(
         "torch_rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         "config": {key: value for key, value in config.items() if not key.startswith("_")},
+        "selection_signature": selection_signature,
     }
     torch.save(state, temporary / "training_state.pt")
     if target.exists():
         shutil.rmtree(target)
     temporary.rename(target)
-    latest_temporary = checkpoints / ".latest.json.tmp"
-    with latest_temporary.open("w", encoding="utf-8") as handle:
-        json.dump({"checkpoint": name, "step": step}, handle, indent=2)
-        handle.write("\n")
-    latest_temporary.replace(checkpoints / "latest.json")
+
+    improved = (
+        previous_best is None
+        or mean_train_loss < float(previous_best["mean_train_loss"])
+    )
+    best = (
+        {
+            "checkpoint": name,
+            "step": step,
+            "mean_train_loss": mean_train_loss,
+        }
+        if improved
+        else previous_best
+    )
+    assert best is not None
+    if improved:
+        _atomic_write_json(checkpoints / "best.json", best)
+    _atomic_write_json(
+        checkpoints / "latest.json",
+        {"checkpoint": name, "step": step},
+    )
+    _retain_latest_and_best_checkpoints(
+        checkpoints,
+        latest=name,
+        best=str(best["checkpoint"]),
+    )
     return target
 
 
@@ -155,18 +279,25 @@ def _load_training_state(
     scheduler: Any,
     sampler: Any,
     device: Any,
+    selection_signature: str | None = None,
 ) -> int:
     import torch
     from safetensors.torch import load_model
 
     if not checkpoint.is_dir():
         raise RuntimeError(f"Resume checkpoint does not exist: {checkpoint}")
-    load_model(model, str(checkpoint / "model.safetensors"), strict=True, device=str(device))
     state = torch.load(
         checkpoint / "training_state.pt",
         map_location="cpu",
         weights_only=False,
     )
+    saved_signature = state.get("selection_signature")
+    if saved_signature != selection_signature:
+        raise RuntimeError(
+            "Resume checkpoint data selection differs from the current target/prior "
+            "selection or sample weights"
+        )
+    load_model(model, str(checkpoint / "model.safetensors"), strict=True, device=str(device))
     optimizer.load_state_dict(state["optimizer"])
     scheduler.load_state_dict(state["scheduler"])
     sampler.load_state_dict(state["sampler"])
@@ -228,6 +359,7 @@ def train(
         rank=rank,
         world_size=world_size,
     )
+    selection_signature = train_data.selection_sha256
     if world_size > 1:
         model = DistributedDataParallel(
             model,
@@ -265,7 +397,15 @@ def train(
             key: value for key, value in config.items() if not key.startswith("_")
         }
         _write_json(output / "finetune_config.json", clean_config)
-        _write_json(output / "dataset_manifest.json", build_dataset_manifest(config, paths))
+        _write_json(
+            output / "dataset_manifest.json",
+            build_dataset_manifest(
+                config,
+                paths,
+                target_selection=train_data.target_selection,
+                prior_selection=train_data.prior_selection,
+            ),
+        )
         checkpoint_report = inspect_octo_checkpoint(paths["model"])
         model_manifest = {
             "base_model": str(paths["model"]),
@@ -291,6 +431,7 @@ def train(
             scheduler=scheduler,
             sampler=train_data.batch_sampler,
             device=device,
+            selection_signature=selection_signature,
         )
     data_iterator = iter(train_data.dataloader)
     accumulation_steps = int(config["train"]["gradient_accumulation_steps"])
@@ -300,6 +441,8 @@ def train(
     max_grad_norm = float(config["train"]["max_grad_norm"])
     metrics_path = output / "metrics.jsonl"
     optimizer.zero_grad(set_to_none=True)
+    checkpoint_loss_total = torch.zeros((), device=device)
+    checkpoint_loss_steps = 0
     progress = tqdm(
         range(start_step + 1, max_steps + 1),
         disable=rank != 0,
@@ -341,6 +484,8 @@ def train(
         if world_size > 1:
             dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
             reduced /= world_size
+        checkpoint_loss_total += reduced[0]
+        checkpoint_loss_steps += 1
         if rank == 0 and (step == 1 or step % log_every == 0):
             record = {
                 "step": step,
@@ -358,22 +503,33 @@ def train(
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             progress.set_postfix(loss=record["loss"], lr=record["learning_rate"])
 
-        should_save = step % save_every == 0 or step == max_steps
+        should_save = _should_save_checkpoint(
+            step=step,
+            max_steps=max_steps,
+            save_every=save_every,
+        )
         if should_save:
             if world_size > 1:
                 dist.barrier()
             if rank == 0:
+                mean_train_loss = float(
+                    (checkpoint_loss_total / checkpoint_loss_steps).cpu()
+                )
                 _save_checkpoint(
                     output=output,
                     step=step,
+                    mean_train_loss=mean_train_loss,
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
                     sampler=train_data.batch_sampler,
                     config=config,
+                    selection_signature=selection_signature,
                 )
             if world_size > 1:
                 dist.barrier()
+            checkpoint_loss_total.zero_()
+            checkpoint_loss_steps = 0
 
     if world_size > 1:
         dist.destroy_process_group()

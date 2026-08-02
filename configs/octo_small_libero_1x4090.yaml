@@ -1,7 +1,7 @@
 paths:
   model: /data/dwb/models/octo-small-pytorch
   lerobot: /data/dwb/datasets/LIBERO_lerobot
-  output: outputs/octo_small_libero_4gpu
+  output: outputs/octo_small_libero_1gpu
 
 data:
   prior_dataset: libero90
@@ -42,11 +42,11 @@ model:
 
 train:
   seed: 42
-  gpu_count: 4
-  gpu_ids: [0, 1, 2, 3]
+  gpu_count: 1
+  gpu_ids: [0]
   batch_size: 128
   micro_batch_size_per_gpu: 8
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 16
   max_steps: 10000
   num_workers_per_rank: 4
   prefetch_factor: 2
@@ -67,5 +67,5 @@ train:
   wandb:
     enabled: false
     project: octo_finetune
-    group: libero10_5_4x4090
+    group: libero10_all_tasks_1x4090
     entity: null

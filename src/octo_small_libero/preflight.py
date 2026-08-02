@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .checkpoint import inspect_octo_checkpoint, load_lerobot_statistics
+from .data import resolve_target_task_selection
 from .lerobot_v2 import (
     ACTION_KEY,
     PRIMARY_IMAGE_KEY,
@@ -14,6 +15,7 @@ from .lerobot_v2 import (
     LeRobotV2Metadata,
     load_episode,
 )
+from .libero10_tasks import LIBERO_10_DEMOS_PER_TASK, LIBERO_10_TASK_COUNT
 
 
 class PreflightError(RuntimeError):
@@ -143,10 +145,14 @@ def _inspect_lerobot_dataset(root: Path) -> dict[str, Any]:
 
 def run_preflight(config: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any]:
     try:
+        from .selection import resolve_prior_selection
+
         checkpoint = inspect_octo_checkpoint(paths["model"])
         statistics = load_lerobot_statistics(paths["prior_dataset"])
         prior = _inspect_lerobot_dataset(paths["prior_dataset"])
         target = _inspect_lerobot_dataset(paths["target_dataset"])
+        target_selection = resolve_target_task_selection(config, paths)
+        prior_selection = resolve_prior_selection(config, paths)
     except (OSError, RuntimeError, ValueError) as error:
         raise PreflightError(str(error)) from error
 
@@ -156,10 +162,46 @@ def run_preflight(config: dict[str, Any], paths: dict[str, Path]) -> dict[str, A
         )
     if prior["episodes"] <= 0:
         raise PreflightError("LIBERO-90 prior must contain at least one episode")
-    if target["episodes"] != 5:
-        raise PreflightError(f"Expected the DataMIL five-demo target, found {target['episodes']}")
-    if target["tasks"] != 1:
-        raise PreflightError(f"Expected one target task mapping, found {target['tasks']} tasks")
+    expected_target_episodes = LIBERO_10_TASK_COUNT * LIBERO_10_DEMOS_PER_TASK
+    if target["episodes"] != expected_target_episodes:
+        raise PreflightError(
+            f"Expected {expected_target_episodes} LIBERO-10 target episodes, "
+            f"found {target['episodes']}"
+        )
+    if target["tasks"] != LIBERO_10_TASK_COUNT:
+        raise PreflightError(
+            f"Expected {LIBERO_10_TASK_COUNT} target task mappings, "
+            f"found {target['tasks']} tasks"
+        )
+    expected_selected_episodes = (
+        len(target_selection.task_indices) * LIBERO_10_DEMOS_PER_TASK
+    )
+    if target_selection.episodes != expected_selected_episodes:
+        raise PreflightError(
+            f"Expected {expected_selected_episodes} selected target episodes, "
+            f"found {target_selection.episodes}"
+        )
+    try:
+        target_metadata = LeRobotV2Metadata(paths["target_dataset"])
+        selected_task_indices = set(target_selection.task_indices)
+        for episode_index in target_selection.episode_indices:
+            record = target_metadata.episodes[episode_index]
+            episode = load_episode(target_metadata, record)
+            expected_task_index = episode_index // LIBERO_10_DEMOS_PER_TASK
+            if expected_task_index not in selected_task_indices:
+                raise RuntimeError(
+                    f"{target_metadata.episode_path(episode_index)}: episode is outside "
+                    "the selected LIBERO-10 task set"
+                )
+            if set(int(value) for value in episode["task_index"]) != {
+                expected_task_index
+            }:
+                raise RuntimeError(
+                    f"{target_metadata.episode_path(episode_index)}: task_index column "
+                    f"does not match evaluation index {expected_task_index}"
+                )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise PreflightError(str(error)) from error
 
     try:
         import torch
@@ -198,7 +240,13 @@ def run_preflight(config: dict[str, Any], paths: dict[str, Path]) -> dict[str, A
             "root": str(paths["lerobot"]),
             "prior": prior,
             "target": target,
+            "target_selection": target_selection.as_manifest(),
             "sample_weights": list(config["data"]["sample_weights"]),
+            "prior_selection": (
+                prior_selection.as_manifest()
+                if prior_selection is not None
+                else {"enabled": False}
+            ),
             "raw_hdf5_checked": False,
         },
         "normalization": {

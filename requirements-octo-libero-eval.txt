@@ -1,0 +1,17 @@
+# Evaluation dependencies for the pinned LIBERO stack with maintained runtime upgrades.
+# Keep the environment's existing torch / transformers model stack and install
+# these instead of LIBERO's full historical training requirements.
+mujoco==3.10.0
+robosuite==1.4.0
+bddl==1.0.1
+easydict>=1.9,<2
+gymnasium==1.3.0
+cloudpickle>=2.1.0,<4
+future>=0.18.2,<2
+matplotlib>=3.5.3,<4
+termcolor>=2.4.0,<4
+packaging>=23
+imageio>=2.35.1
+imageio-ffmpeg>=0.5.1
+# The evaluator imports LIBERO from the separately pinned source checkout supplied
+# through --libero-root / LIBERO_ROOT; do not replace it with an unpinned wheel.

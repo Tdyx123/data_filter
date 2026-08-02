@@ -6,7 +6,6 @@ from qwen3_vl_groot.config import (
     ConfigError,
     apply_overrides,
     load_config,
-    resume_config_digest,
     validate_config,
 )
 from qwen3_vl_groot.modeling import inspect_qwen_config
@@ -25,6 +24,20 @@ def test_default_config_keeps_all_qwen_layers():
         "v_proj",
         "o_proj",
     ]
+    assert "keep_last_checkpoints" not in config["train"]
+
+
+@pytest.mark.parametrize("name", ["bridge_4x4090.yaml", "bridge_8x4090.yaml"])
+def test_bridge_configs_disable_checkpointing_and_enable_torch_compile(name):
+    config = load_config(PROJECT_ROOT / "configs" / name)
+    assert config["model"]["gradient_checkpointing"] is False
+    assert config["model"]["torch_compile"] == {
+        "enabled": True,
+        "backend": "inductor",
+        "mode": "default",
+        "dynamic": True,
+        "fullgraph": False,
+    }
 
 
 def test_four_gpu_config_preserves_effective_batch_64():
@@ -54,15 +67,11 @@ def test_config_rejects_layer_truncation():
         validate_config(config)
 
 
-def test_resume_digest_allows_extending_max_steps_but_not_model_changes():
+def test_config_rejects_invalid_torch_compile_mode():
     config = load_config(PROJECT_ROOT / "configs" / "bridge_8x4090.yaml")
-    original = resume_config_digest(config)
-    config["train"]["max_steps"] = 20_001
-    config["train"]["save_every_steps"] = 1
-    config["train"]["gpu_ids"] = list(range(8))
-    assert resume_config_digest(config) == original
-    config["model"]["dit"]["num_layers"] = 11
-    assert resume_config_digest(config) != original
+    config["model"]["torch_compile"]["mode"] = "fastest"
+    with pytest.raises(ConfigError, match="torch_compile.mode"):
+        validate_config(config)
 
 
 def test_local_qwen_is_36_layers():

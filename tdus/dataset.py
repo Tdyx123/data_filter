@@ -14,6 +14,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -200,6 +201,85 @@ def _decode_video(path: Path) -> np.ndarray:
     return np.stack(frames)
 
 
+def _decode_embedded_images(
+    values: Sequence[Any],
+    *,
+    episode_id: int,
+    image_key: str,
+    expected_shape: Sequence[int],
+) -> np.ndarray:
+    """Decode LeRobot ``image`` structs containing embedded image bytes."""
+
+    try:
+        from PIL import Image
+    except ImportError as error:
+        raise RuntimeError("Pillow is required to decode LeRobot image observations") from error
+
+    try:
+        shape = tuple(int(dimension) for dimension in expected_shape)
+    except (TypeError, ValueError) as error:
+        raise DatasetValidationError(
+            f"Episode {episode_id}, {image_key}: invalid declared image shape "
+            f"{expected_shape!r}"
+        ) from error
+    if len(shape) != 3 or shape[-1] != 3:
+        raise DatasetValidationError(
+            f"Episode {episode_id}, {image_key}: expected an RGB image shape, got {shape}"
+        )
+
+    frames: list[np.ndarray] = []
+    for frame_index, value in enumerate(values):
+        if not isinstance(value, Mapping):
+            raise DatasetValidationError(
+                f"Episode {episode_id}, {image_key}, frame {frame_index}: "
+                "embedded image must be a {bytes, path} mapping"
+            )
+        data = value.get("bytes")
+        path = value.get("path")
+        if path not in {None, ""}:
+            raise DatasetValidationError(
+                f"Episode {episode_id}, {image_key}, frame {frame_index}: "
+                f"embedded image path must be empty, got {path!r}"
+            )
+        if data is None:
+            raise DatasetValidationError(
+                f"Episode {episode_id}, {image_key}, frame {frame_index}: "
+                "embedded image bytes are missing"
+            )
+        try:
+            encoded = bytes(data)
+        except (TypeError, ValueError) as error:
+            raise DatasetValidationError(
+                f"Episode {episode_id}, {image_key}, frame {frame_index}: "
+                "embedded image bytes are invalid"
+            ) from error
+        if not encoded:
+            raise DatasetValidationError(
+                f"Episode {episode_id}, {image_key}, frame {frame_index}: "
+                "embedded image bytes are empty"
+            )
+        try:
+            with Image.open(BytesIO(encoded)) as image:
+                frame = np.array(image.convert("RGB"), dtype=np.uint8, copy=True)
+        except Exception as error:
+            raise DatasetValidationError(
+                f"Episode {episode_id}, {image_key}, frame {frame_index}: "
+                f"could not decode embedded image: {error}"
+            ) from error
+        if frame.shape != shape:
+            raise DatasetValidationError(
+                f"Episode {episode_id}, {image_key}, frame {frame_index}: "
+                f"decoded shape={frame.shape}, expected={shape}"
+            )
+        frames.append(frame)
+
+    if not frames:
+        raise DatasetValidationError(
+            f"Episode {episode_id}, {image_key}: embedded image sequence is empty"
+        )
+    return np.stack(frames)
+
+
 def _load_lerobot_episode(payload: Mapping[str, Any]) -> EpisodeData:
     """Process-safe LeRobot episode loader used by the multiprocessing path."""
 
@@ -223,7 +303,25 @@ def _load_lerobot_episode(payload: Mapping[str, Any]) -> EpisodeData:
     timestamp_key = str(payload["timestamp_key"])
     frame_key = str(payload["frame_key"])
     episode_key = str(payload["episode_key"])
-    columns = list(dict.fromkeys([*vector_keys, action_key, timestamp_key, frame_key, episode_key]))
+    image_features = {
+        str(key): dict(value)
+        for key, value in dict(payload.get("image_features", {})).items()
+    }
+    embedded_image_keys = tuple(
+        key for key, feature in image_features.items() if feature.get("dtype") == "image"
+    )
+    columns = list(
+        dict.fromkeys(
+            [
+                *vector_keys,
+                *embedded_image_keys,
+                action_key,
+                timestamp_key,
+                frame_key,
+                episode_key,
+            ]
+        )
+    )
     table = pq.read_table(parquet_path, columns=columns)
     if len(table) != expected_length:
         raise DatasetValidationError(
@@ -260,17 +358,34 @@ def _load_lerobot_episode(payload: Mapping[str, Any]) -> EpisodeData:
                 f"Episode {episode_id}, {key}: invalid length or non-finite values"
             )
         observations[key] = values
-    video_path_pattern = str(payload["video_path"])
-    for image_key in payload["image_keys"]:
-        video_values = {**format_values, "video_key": image_key}
-        video_path = root / video_path_pattern.format(**video_values)
-        frames = _decode_video(video_path)
+    video_path_pattern = payload.get("video_path")
+    for image_key, feature in image_features.items():
+        storage = str(feature.get("dtype", ""))
+        if storage == "image":
+            frames = _decode_embedded_images(
+                table[image_key].to_pylist(),
+                episode_id=episode_id,
+                image_key=image_key,
+                expected_shape=feature.get("shape", ()),
+            )
+        elif storage == "video":
+            if not video_path_pattern:
+                raise DatasetValidationError(
+                    f"Episode {episode_id}, {image_key}: video_path is not configured"
+                )
+            video_values = {**format_values, "video_key": image_key}
+            video_path = root / str(video_path_pattern).format(**video_values)
+            frames = _decode_video(video_path)
+        else:
+            raise DatasetValidationError(
+                f"Episode {episode_id}, {image_key}: unsupported image dtype {storage!r}"
+            )
         if len(frames) != expected_length:
             raise DatasetValidationError(
-                f"Episode {episode_id}, {image_key}: video frames={len(frames)}, "
+                f"Episode {episode_id}, {image_key}: image frames={len(frames)}, "
                 f"expected={expected_length}"
             )
-        observations[str(image_key)] = frames
+        observations[image_key] = frames
 
     return EpisodeData(
         episode_id=episode_id,
@@ -351,10 +466,11 @@ class LeRobotDatasetAdapter(DatasetAdapter):
         if missing:
             raise DatasetValidationError(f"Missing required LeRobot features: {missing}")
 
+        image_dtypes = {"image", "video"}
         discovered_vectors = [
             key
             for key, feature in self.features.items()
-            if key.startswith("observation.") and feature.get("dtype") != "video"
+            if key.startswith("observation.") and feature.get("dtype") not in image_dtypes
         ]
         configured_vectors = overrides.get("vector_observations", "auto")
         if configured_vectors == "auto":
@@ -365,7 +481,7 @@ class LeRobotDatasetAdapter(DatasetAdapter):
         discovered_images = sorted(
             key
             for key, feature in self.features.items()
-            if key.startswith("observation.") and feature.get("dtype") == "video"
+            if key.startswith("observation.") and feature.get("dtype") in image_dtypes
         )
         use_images = bool(self.config.get("use_images", True))
         configured_images = overrides.get(
@@ -384,6 +500,24 @@ class LeRobotDatasetAdapter(DatasetAdapter):
         ]
         if unknown:
             raise DatasetValidationError(f"Configured observation features not found: {unknown}")
+        invalid_vectors = [
+            key
+            for key in self._vector_keys
+            if self.features[key].get("dtype") in image_dtypes
+        ]
+        if invalid_vectors:
+            raise DatasetValidationError(
+                f"Configured vector observations are image features: {invalid_vectors}"
+            )
+        invalid_images = [
+            key
+            for key in selected_images
+            if self.features[key].get("dtype") not in image_dtypes
+        ]
+        if invalid_images:
+            raise DatasetValidationError(
+                f"Configured image observations are not image/video features: {invalid_images}"
+            )
         self._image_keys = tuple(selected_images)
         if not self._vector_keys and not self._image_keys:
             raise DatasetValidationError("No observation features were selected")
@@ -402,7 +536,8 @@ class LeRobotDatasetAdapter(DatasetAdapter):
             sorted(
                 key
                 for key, value in self.features.items()
-                if key.startswith("observation.") and value.get("dtype") == "video"
+                if key.startswith("observation.")
+                and value.get("dtype") in {"image", "video"}
             )
         )
 
@@ -420,7 +555,11 @@ class LeRobotDatasetAdapter(DatasetAdapter):
             "data_path": self.info["data_path"],
             "video_path": self.info.get("video_path", ""),
             "vector_keys": self._vector_keys,
-            "image_keys": self._image_keys if load_images else (),
+            "image_features": (
+                {key: self.features[key] for key in self._image_keys}
+                if load_images
+                else {}
+            ),
             "action_key": self.action_key,
             "timestamp_key": self.timestamp_key,
             "frame_key": self.frame_key,
@@ -438,8 +577,8 @@ class LeRobotDatasetAdapter(DatasetAdapter):
                 )
             return
         # Spawn prevents a parent CUDA context from being inherited by workers.
-        # Keep only 2x workers in flight so decoded videos cannot accumulate for
-        # all 53k episodes behind a slower GPU consumer.
+        # Keep only 2x workers in flight so decoded image observations cannot
+        # accumulate for all episodes behind a slower GPU consumer.
         context = mp.get_context("spawn")
         with ProcessPoolExecutor(max_workers=num_workers, mp_context=context) as pool:
             episode_iterator = iter(episodes)

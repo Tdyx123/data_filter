@@ -23,6 +23,23 @@ class ModelContractError(RuntimeError):
     """Raised when the local Qwen checkpoint is not the expected 36-layer model."""
 
 
+def _configure_qwen_gradient_checkpointing(
+    backbone: nn.Module,
+    *,
+    enabled: bool,
+) -> None:
+    if enabled:
+        backbone.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        # Frozen embeddings still need grad-carrying outputs so checkpointed LoRA
+        # modules receive gradients.
+        if hasattr(backbone, "enable_input_require_grads"):
+            backbone.enable_input_require_grads()
+    elif hasattr(backbone, "gradient_checkpointing_disable"):
+        backbone.gradient_checkpointing_disable()
+
+
 def _flash_attention_available() -> bool:
     try:
         from transformers.utils import is_flash_attn_2_available
@@ -86,14 +103,10 @@ def load_qwen_backbone(
     for parameter in backbone.parameters():
         parameter.requires_grad_(False)
     backbone.config.use_cache = False
-    if model_config["gradient_checkpointing"]:
-        backbone.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
-        # Frozen embeddings still need grad-carrying outputs so checkpointed LoRA
-        # modules receive gradients.
-        if hasattr(backbone, "enable_input_require_grads"):
-            backbone.enable_input_require_grads()
+    _configure_qwen_gradient_checkpointing(
+        backbone,
+        enabled=bool(model_config["gradient_checkpointing"]),
+    )
 
     lora = model_config["lora"]
     peft_config = LoraConfig(
@@ -161,6 +174,21 @@ def assert_qwen_freeze_contract(model: nn.Module) -> None:
             "Original Qwen parameters must remain frozen; trainable non-LoRA parameters: "
             + ", ".join(violations[:10])
         )
+
+
+def compile_policy_modules(policy: Any, model_config: dict[str, Any]) -> None:
+    """Compile the Qwen/PEFT backbone and DiT action head in place for training."""
+    compile_config = model_config.get("torch_compile")
+    if not compile_config or not bool(compile_config["enabled"]):
+        return
+    compile_kwargs = {
+        "backend": str(compile_config["backend"]),
+        "mode": str(compile_config["mode"]),
+        "dynamic": bool(compile_config["dynamic"]),
+        "fullgraph": bool(compile_config["fullgraph"]),
+    }
+    policy.backbone.compile(**compile_kwargs)
+    policy.action_head.compile(**compile_kwargs)
 
 
 class Qwen3VLGrootPolicy(nn.Module):

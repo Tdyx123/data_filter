@@ -1,3 +1,4 @@
+import csv
 import json
 from io import BytesIO
 from pathlib import Path
@@ -40,12 +41,15 @@ def _write_demo_file(
     demos: int = 6,
     length: int = 2,
     action_value: float | None = None,
+    language_instruction: str = "pick up the book",
 ) -> None:
     h5py = _h5py_or_skip()
     path.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(path, "w") as handle:
         data = handle.create_group("data")
-        data.attrs["problem_info"] = json.dumps({"language_instruction": "pick up the book"})
+        data.attrs["problem_info"] = json.dumps(
+            {"language_instruction": language_instruction}
+        )
         for index in range(demos):
             demo = data.create_group(f"demo_{index}")
             value = float(action_value if action_value is not None else index * 2)
@@ -93,6 +97,31 @@ def _build_synthetic_lerobot(tmp_path: Path, *, length: int = 2):
     from octo_small_libero.lerobot_builder import prepare_lerobot_v2
 
     return source, output, prepare_lerobot_v2(source, output)
+
+
+def _build_synthetic_training_lerobot(tmp_path: Path, *, length: int = 2):
+    source, output, report = _build_synthetic_lerobot(tmp_path, length=length)
+    from octo_small_libero.libero10_builder import prepare_libero10_lerobot_v2
+    from octo_small_libero.libero10_tasks import LIBERO_10_TASKS
+
+    h5py = _h5py_or_skip()
+    book_path = source / "libero_10" / f"{DEFAULT_TARGET_TASK}_demo.hdf5"
+    with h5py.File(book_path, "a") as handle:
+        handle["data"].attrs["problem_info"] = json.dumps(
+            {"language_instruction": LIBERO_10_TASKS[5].language_instruction}
+        )
+    for task_index, task in enumerate(LIBERO_10_TASKS):
+        if task_index == 5:
+            continue
+        _write_demo_file(
+            source / "libero_10" / f"{task.name}_demo.hdf5",
+            demos=6,
+            length=length,
+            action_value=float(task_index),
+            language_instruction=task.language_instruction,
+        )
+    prepare_libero10_lerobot_v2(source, output)
+    return source, output, report
 
 
 def test_hdf5_metadata_and_five_demo_target_selection(tmp_path):
@@ -191,13 +220,14 @@ def test_conversion_overwrite_is_scoped_and_fps_is_strict(tmp_path):
 
 
 def test_prior_lerobot_statistics_and_training_manifest(tmp_path):
-    _, output, _ = _build_synthetic_lerobot(tmp_path)
+    _, output, _ = _build_synthetic_training_lerobot(tmp_path)
     from octo_small_libero.config import load_config
     from octo_small_libero.training import build_dataset_manifest
 
     project_root = Path(__file__).resolve().parents[1]
     config = load_config(project_root / "configs" / "octo_small_libero_4x4090.yaml")
-    target_name = task_to_dataset_name(DEFAULT_TARGET_TASK)
+    config["data"]["target_task_index"] = 5
+    target_name = "libero10_5"
     paths = {
         "lerobot": output,
         "prior_dataset": output / "libero90",
@@ -213,7 +243,9 @@ def test_prior_lerobot_statistics_and_training_manifest(tmp_path):
     assert len(statistics["proprio"]["mean"]) == 8
     assert manifest["lerobot_root"] == str(output)
     assert manifest["datasets"]["libero90"]["episodes"] == 2
-    assert manifest["datasets"][target_name]["episodes"] == 5
+    assert manifest["datasets"][target_name]["episodes"] == 50
+    assert manifest["datasets"][target_name]["episodes_used"] == 5
+    assert manifest["datasets"][target_name]["selection"]["task_index"] == 5
     assert manifest["prior_statistics_sha256"]
     legacy_format = "rl" + "ds"
     assert legacy_format not in json.dumps(manifest).lower()
@@ -221,7 +253,7 @@ def test_prior_lerobot_statistics_and_training_manifest(tmp_path):
 def test_octo_lerobot_batch_contract_normalization_and_tail_padding(tmp_path):
     torch = pytest.importorskip("torch")
 
-    _, output, _ = _build_synthetic_lerobot(tmp_path, length=1)
+    _, output, _ = _build_synthetic_training_lerobot(tmp_path, length=1)
     from octo_small_libero.config import load_config
     from octo_small_libero.data import make_training_dataset
 
@@ -234,7 +266,8 @@ def test_octo_lerobot_batch_contract_normalization_and_tail_padding(tmp_path):
     config["train"]["gradient_accumulation_steps"] = 1
     config["train"]["max_steps"] = 1
     config["train"]["num_workers_per_rank"] = 0
-    target_name = task_to_dataset_name(DEFAULT_TARGET_TASK)
+    config["data"]["target_task_index"] = 5
+    target_name = "libero10_5"
     paths = {
         "lerobot": output,
         "prior_dataset": output / "libero90",
@@ -252,6 +285,7 @@ def test_octo_lerobot_batch_contract_normalization_and_tail_padding(tmp_path):
     training_data = make_training_dataset(config, paths, tokenizer=FakeTokenizer())
     batch = next(iter(training_data.dataloader))
 
+    assert training_data.dataset.source_sizes == (5, 2)
     assert batch["action"].shape == (8, 8, 7)
     assert batch["image_primary"].shape == (8, 1, 3, 256, 256)
     assert batch["image_wrist"].shape == (8, 1, 3, 128, 128)
@@ -279,3 +313,227 @@ def test_octo_lerobot_batch_contract_normalization_and_tail_padding(tmp_path):
                 batch["action"][index, 0, :6],
                 torch.full((6,), 19.0),
             )
+
+
+def test_all_tasks_training_uses_all_target_episodes_and_keeps_one_to_one_batch(
+    tmp_path,
+):
+    torch = pytest.importorskip("torch")
+
+    _, output, _ = _build_synthetic_training_lerobot(tmp_path, length=1)
+    from octo_small_libero.config import load_config
+    from octo_small_libero.data import make_training_dataset
+    from octo_small_libero.training import build_dataset_manifest
+
+    project_root = Path(__file__).resolve().parents[1]
+    config = load_config(project_root / "configs" / "octo_small_libero_4x4090.yaml")
+    config["train"].update(
+        {
+            "gpu_count": 1,
+            "gpu_ids": [0],
+            "batch_size": 8,
+            "micro_batch_size_per_gpu": 8,
+            "gradient_accumulation_steps": 1,
+            "max_steps": 1,
+            "num_workers_per_rank": 0,
+        }
+    )
+    config["data"]["target_task_index"] = None
+    config["data"]["target_all_tasks"] = True
+    target_name = "libero10_5"
+    paths = {
+        "lerobot": output,
+        "prior_dataset": output / "libero90",
+        "target_dataset": output / target_name,
+        "statistics": output / "libero90" / "meta" / "stats.json",
+    }
+
+    class FakeTokenizer:
+        def __call__(self, text, **kwargs):
+            del text, kwargs
+            return {
+                "input_ids": torch.arange(16, dtype=torch.long)[None],
+                "attention_mask": torch.ones(1, 16, dtype=torch.long),
+            }
+
+    training_data = make_training_dataset(config, paths, tokenizer=FakeTokenizer())
+    batch = next(iter(training_data.dataloader))
+
+    assert training_data.dataset.source_sizes == (50, 2)
+    assert training_data.target_selection.selection_mode == "all"
+    assert training_data.target_selection.task_indices == tuple(range(10))
+    assert training_data.target_selection.episode_indices == tuple(range(50))
+    assert training_data.target_selection.episodes == 50
+    assert training_data.target_selection.frames == 50
+    assert batch["dataset_name"].count(target_name) == 4
+    assert batch["dataset_name"].count("libero90") == 4
+
+    manifest = build_dataset_manifest(
+        config,
+        paths,
+        target_selection=training_data.target_selection,
+    )
+    target_manifest = manifest["datasets"][target_name]
+    assert target_manifest["episodes"] == 50
+    assert target_manifest["episodes_used"] == 50
+    assert target_manifest["frames_used"] == 50
+    assert target_manifest["selection"]["mode"] == "all"
+    assert target_manifest["selection"]["tasks"] == 10
+
+    config["data"]["sample_weights"] = [3.0, 1.0]
+    weighted_training_data = make_training_dataset(
+        config,
+        paths,
+        tokenizer=FakeTokenizer(),
+    )
+    weighted_batch = next(iter(weighted_training_data.dataloader))
+    assert weighted_batch["dataset_name"].count(target_name) == 6
+    assert weighted_batch["dataset_name"].count("libero90") == 2
+    np.testing.assert_allclose(weighted_training_data.sample_weights, [0.75, 0.25])
+
+    weighted_manifest = build_dataset_manifest(
+        config,
+        paths,
+        target_selection=weighted_training_data.target_selection,
+    )
+    assert weighted_manifest["datasets"][target_name]["sample_weight"] == 0.75
+    assert weighted_manifest["datasets"]["libero90"]["sample_weight"] == 0.25
+
+
+def test_lerobot_frame_dataset_maps_selected_global_prior_frames(tmp_path):
+    pytest.importorskip("torch")
+    _, output, _ = _build_synthetic_lerobot(tmp_path, length=10)
+    from octo_small_libero.data import LeRobotFrameDataset
+
+    statistics = load_lerobot_statistics(output / "libero90")
+    dataset = LeRobotFrameDataset(
+        output / "libero90",
+        dataset_name="libero90",
+        statistics=statistics,
+        action_horizon=8,
+        frame_indices=(1, 12),
+    )
+
+    assert len(dataset) == 2
+    first = dataset[0]
+    second = dataset[1]
+    assert (first["episode_index"], first["frame_index"]) == (0, 1)
+    assert (second["episode_index"], second["frame_index"]) == (1, 2)
+    assert first["action_pad_mask"].all()
+    assert second["action_pad_mask"].all()
+
+
+def test_training_dataset_keeps_target_prior_balance_with_tdus_subset(tmp_path):
+    torch = pytest.importorskip("torch")
+    _, output, _ = _build_synthetic_training_lerobot(tmp_path, length=10)
+    from octo_small_libero.config import load_config
+    from octo_small_libero.data import make_training_dataset
+    from octo_small_libero.training import build_dataset_manifest
+
+    project_root = Path(__file__).resolve().parents[1]
+    config = load_config(project_root / "configs" / "octo_small_libero_4x4090.yaml")
+    config["train"].update(
+        {
+            "gpu_count": 1,
+            "gpu_ids": [0],
+            "batch_size": 8,
+            "micro_batch_size_per_gpu": 8,
+            "gradient_accumulation_steps": 1,
+            "max_steps": 1,
+            "num_workers_per_rank": 0,
+        }
+    )
+    scores_root = tmp_path / "tdus" / "libero90"
+    scores = scores_root / "chunk" / "scores.csv"
+    scores.parent.mkdir(parents=True)
+    columns = [
+        "sample_id",
+        "episode_id",
+        "start_step",
+        "end_step",
+        "length",
+        "quality",
+        "coverage",
+        "diversity",
+        "novelty",
+        "tdus",
+    ]
+    with scores.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for episode_id, tdus in ((0, 0.4), (1, 0.9)):
+            writer.writerow(
+                {
+                    "sample_id": f"ep{episode_id:06d}_chunk_000000_000009",
+                    "episode_id": episode_id,
+                    "start_step": 0,
+                    "end_step": 9,
+                    "length": 10,
+                    "quality": 0.5,
+                    "coverage": 0.5,
+                    "diversity": 0.5,
+                    "novelty": 0.5,
+                    "tdus": tdus,
+                }
+            )
+    (scores_root / "run_manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset_name": "libero90",
+                "dataset_path": str((output / "libero90").resolve()),
+                "modes": ["trajectory", "chunk"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config["data"]["prior_selection"] = {
+        "scores": str(scores),
+        "top_percent": 50,
+    }
+    config["data"]["target_task_index"] = 5
+    target_name = "libero10_5"
+    paths = {
+        "lerobot": output,
+        "prior_dataset": output / "libero90",
+        "target_dataset": output / target_name,
+        "statistics": output / "libero90" / "meta" / "stats.json",
+        "prior_scores": scores,
+    }
+
+    class FakeTokenizer:
+        def __call__(self, text, **kwargs):
+            del text, kwargs
+            return {
+                "input_ids": torch.arange(16, dtype=torch.long)[None],
+                "attention_mask": torch.ones(1, 16, dtype=torch.long),
+            }
+
+    training_data = make_training_dataset(config, paths, tokenizer=FakeTokenizer())
+    batch = next(iter(training_data.dataloader))
+
+    assert training_data.dataset.source_sizes == (50, 3)
+    assert training_data.target_selection.task_index == 5
+    assert training_data.target_selection.episode_indices == (25, 26, 27, 28, 29)
+    assert training_data.prior_selection.selected_chunks == 1
+    assert training_data.prior_selection.training_starts == 3
+    assert batch["dataset_name"].count(target_name) == 4
+    assert batch["dataset_name"].count("libero90") == 4
+    for source, episode_index, frame_index in zip(
+        batch["dataset_name"],
+        batch["episode_index"].tolist(),
+        batch["frame_index"].tolist(),
+        strict=True,
+    ):
+        if source == "libero90":
+            assert episode_index == 1
+            assert 0 <= frame_index <= 2
+
+    manifest = build_dataset_manifest(
+        config,
+        paths,
+        prior_selection=training_data.prior_selection,
+    )
+    prior_manifest = manifest["datasets"]["libero90"]
+    assert prior_manifest["frames"] == 20
+    assert prior_manifest["frames_used"] == 3
+    assert prior_manifest["selection"]["top_percent"] == 50

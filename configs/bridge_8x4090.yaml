@@ -30,7 +30,13 @@ model:
   context_dim: 2560
   max_context_tokens: 512
   attn_implementation: auto
-  gradient_checkpointing: true
+  gradient_checkpointing: false
+  torch_compile:
+    enabled: true
+    backend: inductor
+    mode: default
+    dynamic: true
+    fullgraph: false
   lora:
     rank: 16
     alpha: 32
@@ -66,8 +72,6 @@ train:
   eval_every_steps: 1000
   save_every_steps: 1000
   validation_batches: 50
-  keep_last_checkpoints: 3
   bf16: true
   deepspeed_stage: 2
   cpu_optimizer_offload: false
-

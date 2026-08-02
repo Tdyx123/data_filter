@@ -1,0 +1,2 @@
+WARNING Fri Jul 31 22:11:56 2026: Linesearch objective is not convex
+

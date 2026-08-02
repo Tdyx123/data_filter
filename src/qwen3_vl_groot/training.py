@@ -13,12 +13,7 @@ import torch
 import torch.distributed as distributed
 from torch.utils.data import DataLoader
 
-from .checkpointing import (
-    export_compact_checkpoint,
-    load_training_checkpoint,
-    retain_recent_checkpoints,
-    save_training_checkpoint,
-)
+from .checkpointing import save_compact_checkpoint
 from .config import save_resolved_config
 from .data import (
     BridgeEpisodeDataset,
@@ -27,7 +22,7 @@ from .data import (
     bridge_collate,
     compute_quantile_stats,
 )
-from .modeling import Qwen3VLGrootPolicy
+from .modeling import Qwen3VLGrootPolicy, compile_policy_modules
 from .normalization import QuantileStats
 
 
@@ -45,6 +40,14 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         json.dump(value, handle, indent=2, sort_keys=True)
         handle.write("\n")
     temporary.replace(path)
+
+
+def _should_save_checkpoint(*, step: int, save_every: int, improved: bool) -> bool:
+    return improved or step % save_every == 0
+
+
+def _should_save_final_checkpoint(*, step: int, last_checkpoint_step: int) -> bool:
+    return step != last_checkpoint_step
 
 
 def _cosine_after_warmup(step: int, warmup: int, maximum: int) -> float:
@@ -285,7 +288,7 @@ def _prepare_stats(
     return QuantileStats.load(cache_path)
 
 
-def train(config: dict[str, Any], *, resume: str | None = None) -> None:
+def train(config: dict[str, Any]) -> None:
     try:
         import deepspeed
     except ImportError as error:
@@ -319,6 +322,7 @@ def train(config: dict[str, Any], *, resume: str | None = None) -> None:
         stats=stats,
         config=config,
     )
+    compile_policy_modules(policy, config["model"])
     # ZeRO builds one internal bit16 group per optimizer parameter group and
     # filters parameters with requires_grad=False. LoRA must therefore remain
     # trainable until deepspeed.initialize() has partitioned both groups. We
@@ -335,19 +339,6 @@ def train(config: dict[str, Any], *, resume: str | None = None) -> None:
 
     best_validation_mae = math.inf
     global_step = 0
-    if resume:
-        client_state = load_training_checkpoint(
-            engine,
-            output,
-            resume,
-            config=config,
-            data_fingerprint=fingerprint,
-        )
-        global_step = int(client_state["global_step"])
-        stored_best = client_state.get("best_validation_mae")
-        if stored_best is not None:
-            best_validation_mae = float(stored_best)
-    policy.set_lora_trainable(global_step >= int(config["train"]["lora_freeze_steps"]))
 
     train_loader = _make_loader(
         metadata,
@@ -371,6 +362,8 @@ def train(config: dict[str, Any], *, resume: str | None = None) -> None:
     flow_config = config["model"]["flow"]
     maximum_steps = int(train_config["max_steps"])
     previous_global_step = global_step
+    last_checkpoint_step = -1
+    validation_mae: float | None = None
 
     try:
         engine.train()
@@ -415,7 +408,7 @@ def train(config: dict[str, Any], *, resume: str | None = None) -> None:
                         }
                     )
 
-            validation_mae: float | None = None
+            validation_mae = None
             improved = False
             if global_step % int(train_config["eval_every_steps"]) == 0:
                 validation_mae = evaluate(
@@ -431,73 +424,36 @@ def train(config: dict[str, Any], *, resume: str | None = None) -> None:
                 if rank == 0:
                     logger.log({"step": global_step, "validation/action_mae": validation_mae})
 
-            should_save = global_step % int(train_config["save_every_steps"]) == 0
+            should_save = _should_save_checkpoint(
+                step=global_step,
+                save_every=int(train_config["save_every_steps"]),
+                improved=improved,
+            )
             if should_save:
-                save_training_checkpoint(
+                save_compact_checkpoint(
                     engine,
                     output,
-                    global_step=global_step,
-                    config=config,
-                    data_fingerprint=fingerprint,
-                    best_validation_mae=best_validation_mae,
-                )
-                export_compact_checkpoint(
-                    engine,
-                    output / "inference",
                     config=config,
                     model_path=config["paths"]["model"],
                     global_step=global_step,
                     validation_mae=validation_mae,
+                    is_best=improved,
                 )
-                distributed.barrier()
-                if rank == 0:
-                    retain_recent_checkpoints(
-                        output, int(train_config["keep_last_checkpoints"])
-                    )
+                last_checkpoint_step = global_step
                 distributed.barrier()
 
-            if improved:
-                save_training_checkpoint(
-                    engine,
-                    output,
-                    global_step=global_step,
-                    config=config,
-                    data_fingerprint=fingerprint,
-                    best_validation_mae=best_validation_mae,
-                    tag="best",
-                    update_latest=False,
-                )
-                export_compact_checkpoint(
-                    engine,
-                    output / "best",
-                    config=config,
-                    model_path=config["paths"]["model"],
-                    global_step=global_step,
-                    validation_mae=best_validation_mae,
-                )
-                if rank == 0:
-                    _atomic_json(
-                        output / "best_checkpoint.json",
-                        {"step": global_step, "validation_action_mae": best_validation_mae},
-                    )
-                distributed.barrier()
-
-        if global_step % int(train_config["save_every_steps"]) != 0:
-            save_training_checkpoint(
+        if _should_save_final_checkpoint(
+            step=global_step,
+            last_checkpoint_step=last_checkpoint_step,
+        ):
+            save_compact_checkpoint(
                 engine,
                 output,
-                global_step=global_step,
-                config=config,
-                data_fingerprint=fingerprint,
-                best_validation_mae=best_validation_mae,
-            )
-            export_compact_checkpoint(
-                engine,
-                output / "inference",
                 config=config,
                 model_path=config["paths"]["model"],
                 global_step=global_step,
-                validation_mae=None,
+                validation_mae=validation_mae,
             )
+            distributed.barrier()
     finally:
         logger.close()

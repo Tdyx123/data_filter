@@ -1,12 +1,21 @@
+import json
 from types import SimpleNamespace
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from octo_small_libero.data import BalancedDistributedBatchSampler  # noqa: E402
+from octo_small_libero.data import (  # noqa: E402
+    BalancedDistributedBatchSampler,
+    training_selection_sha256,
+)
 from octo_small_libero.torch_model import OctoSmallConfig, OctoSmallPolicy  # noqa: E402
-from octo_small_libero.training import _load_training_state, _save_checkpoint  # noqa: E402
+from octo_small_libero.training import (  # noqa: E402
+    _load_training_state,
+    _resolve_resume,
+    _save_checkpoint,
+    _should_save_checkpoint,
+)
 
 
 class TinyTextEncoder(torch.nn.Module):
@@ -49,6 +58,19 @@ def _tiny_batch(batch_size=2):
         "action": torch.randn(batch_size, 8, 7),
         "action_pad_mask": torch.ones(batch_size, 8, 7, dtype=torch.bool),
     }
+
+
+def _step_checkpoint_directories(checkpoints):
+    return sorted(
+        path.name
+        for path in checkpoints.iterdir()
+        if (
+            path.is_dir()
+            and path.name.startswith("step-")
+            and len(path.name) == len("step-00000000")
+            and path.name.removeprefix("step-").isdigit()
+        )
+    )
 
 
 def test_tiny_pytorch_octo_two_step_cpu_smoke_and_frozen_text_encoder():
@@ -121,6 +143,31 @@ def test_balanced_distributed_sampler_is_reproducible_disjoint_and_resumable():
     assert next(iter(restored)) == expected
 
 
+def test_weighted_distributed_sampler_uses_three_to_one_disjoint_batches():
+    samplers = [
+        BalancedDistributedBatchSampler(
+            (100, 100),
+            local_batch_size=8,
+            sample_weights=(3.0, 1.0),
+            rank=rank,
+            world_size=4,
+            seed=17,
+            num_batches=1,
+        )
+        for rank in range(4)
+    ]
+    batches = [next(iter(sampler)) for sampler in samplers]
+    for batch in batches:
+        assert [item.source for item in batch].count(0) == 6
+        assert [item.source for item in batch].count(1) == 2
+    for source, expected in ((0, 24), (1, 8)):
+        rank_values = [
+            {item.frame for item in batch if item.source == source}
+            for batch in batches
+        ]
+        assert len(set.union(*rank_values)) == expected
+
+
 def test_pytorch_training_checkpoint_round_trip(tmp_path):
     model = OctoSmallPolicy(TinyTextEncoder(16), _tiny_config())
     optimizer = torch.optim.AdamW(
@@ -135,6 +182,7 @@ def test_pytorch_training_checkpoint_round_trip(tmp_path):
     checkpoint = _save_checkpoint(
         output=tmp_path,
         step=7,
+        mean_train_loss=1.25,
         model=model,
         optimizer=optimizer,
         scheduler=scheduler,
@@ -146,8 +194,9 @@ def test_pytorch_training_checkpoint_round_trip(tmp_path):
     }
     with torch.no_grad():
         next(model.parameters()).add_(1)
+    assert _resolve_resume(tmp_path, "latest") == checkpoint
     step = _load_training_state(
-        checkpoint,
+        _resolve_resume(tmp_path, "latest"),
         model=model,
         optimizer=optimizer,
         scheduler=scheduler,
@@ -157,3 +206,137 @@ def test_pytorch_training_checkpoint_round_trip(tmp_path):
     assert step == 7
     for name, parameter in model.named_parameters():
         torch.testing.assert_close(parameter, expected[name])
+
+
+def test_checkpoint_resume_rejects_changed_target_or_prior_selection(tmp_path):
+    model = OctoSmallPolicy(TinyTextEncoder(16), _tiny_config())
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=1.0e-3,
+    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    sampler = BalancedDistributedBatchSampler(
+        (20, 20), local_batch_size=4, seed=3, num_batches=3
+    )
+    checkpoint = _save_checkpoint(
+        output=tmp_path,
+        step=1,
+        mean_train_loss=1.0,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        sampler=sampler,
+        config={"train": {"seed": 3}},
+        selection_signature="task-5-top10-selection",
+    )
+
+    with pytest.raises(RuntimeError, match="data selection differs"):
+        _load_training_state(
+            checkpoint,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            sampler=sampler,
+            device="cpu",
+            selection_signature="task-6-top10-selection",
+        )
+
+
+def test_training_selection_signature_covers_target_and_prior():
+    task_5 = SimpleNamespace(selection_sha256="task-5")
+    task_6 = SimpleNamespace(selection_sha256="task-6")
+    top_10 = SimpleNamespace(selection_sha256="top-10")
+    top_20 = SimpleNamespace(selection_sha256="top-20")
+
+    baseline = training_selection_sha256(task_5, top_10)
+    assert training_selection_sha256(task_6, top_10) != baseline
+    assert training_selection_sha256(task_5, top_20) != baseline
+    assert training_selection_sha256(task_5, None) != baseline
+    assert training_selection_sha256(task_5, top_10, [1.0, 1.0]) == baseline
+    assert training_selection_sha256(task_5, top_10, [3.0, 1.0]) != baseline
+
+
+def test_checkpoint_retention_keeps_only_latest_and_best(tmp_path):
+    model = OctoSmallPolicy(TinyTextEncoder(16), _tiny_config())
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=1.0e-3,
+    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    sampler = BalancedDistributedBatchSampler(
+        (20, 20), local_batch_size=4, seed=3, num_batches=3
+    )
+    config = {"train": {"seed": 3}}
+    checkpoints = tmp_path / "checkpoints"
+    unrelated_directory = checkpoints / "step-manual"
+    temporary_directory = checkpoints / ".step-99999999.tmp"
+    unrelated_directory.mkdir(parents=True)
+    temporary_directory.mkdir()
+
+    for step, mean_train_loss in ((1_000, 3.0), (2_000, 1.0), (3_000, 2.0)):
+        _save_checkpoint(
+            output=tmp_path,
+            step=step,
+            mean_train_loss=mean_train_loss,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            sampler=sampler,
+            config=config,
+        )
+
+    step_directories = _step_checkpoint_directories(checkpoints)
+    assert step_directories == ["step-00002000", "step-00003000"]
+    assert unrelated_directory.is_dir()
+    assert temporary_directory.is_dir()
+    assert not (tmp_path / "best").exists()
+    assert not (checkpoints / "best").exists()
+
+    latest = json.loads((checkpoints / "latest.json").read_text(encoding="utf-8"))
+    best = json.loads((checkpoints / "best.json").read_text(encoding="utf-8"))
+    assert latest == {"checkpoint": "step-00003000", "step": 3_000}
+    assert best == {
+        "checkpoint": "step-00002000",
+        "step": 2_000,
+        "mean_train_loss": 1.0,
+    }
+
+    _save_checkpoint(
+        output=tmp_path,
+        step=4_000,
+        mean_train_loss=1.0,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        sampler=sampler,
+        config=config,
+    )
+    best_after_tie = json.loads(
+        (checkpoints / "best.json").read_text(encoding="utf-8")
+    )
+    assert best_after_tie["step"] == 2_000
+    assert _step_checkpoint_directories(checkpoints) == [
+        "step-00002000",
+        "step-00004000",
+    ]
+
+    _save_checkpoint(
+        output=tmp_path,
+        step=4_500,
+        mean_train_loss=0.5,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        sampler=sampler,
+        config=config,
+    )
+    assert _step_checkpoint_directories(checkpoints) == ["step-00004500"]
+    assert json.loads(
+        (checkpoints / "best.json").read_text(encoding="utf-8")
+    )["step"] == 4_500
+
+
+def test_checkpoint_schedule_always_includes_final_step():
+    assert _should_save_checkpoint(step=1_000, max_steps=4_500, save_every=1_000)
+    assert not _should_save_checkpoint(step=4_499, max_steps=4_500, save_every=1_000)
+    assert _should_save_checkpoint(step=4_500, max_steps=4_500, save_every=1_000)

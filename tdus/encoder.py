@@ -72,6 +72,22 @@ def uniformly_sample_indices(length: int, maximum: int) -> np.ndarray:
     return np.unique(np.linspace(0, length - 1, num=count).round().astype(np.int64))
 
 
+def _clip_feature_tensor(output: Any) -> Any:
+    """Normalize Transformers 4.x/5.x CLIP image-feature return types."""
+
+    import torch
+
+    if torch.is_tensor(output):
+        return output
+    pooled = getattr(output, "pooler_output", None)
+    if torch.is_tensor(pooled):
+        return pooled
+    raise TypeError(
+        "CLIP get_image_features() returned neither a Tensor nor an output "
+        "with a Tensor pooler_output"
+    )
+
+
 @dataclass
 class NumericNormalizers:
     """Robust normalization statistics for actions and vector observations."""
@@ -215,7 +231,9 @@ class VisionFeatureExtractor:
             inputs = self.processor(images=batch, return_tensors="pt")
             inputs = {key: value.to(self.device) for key, value in inputs.items()}
             with torch.inference_mode():
-                features = self.model.get_image_features(**inputs)
+                features = _clip_feature_tensor(
+                    self.model.get_image_features(**inputs)
+                )
                 features = torch.nn.functional.normalize(features.float(), dim=-1)
             outputs.append(features.cpu().numpy().astype(np.float32))
         return np.concatenate(outputs, axis=0)

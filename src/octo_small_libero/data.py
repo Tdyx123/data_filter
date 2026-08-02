@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from bisect import bisect_right
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 import numpy as np
+
+from .config import normalized_sample_weights, sample_counts_per_batch
 
 try:
     from torch.utils.data import Dataset as _TorchDataset
@@ -284,6 +287,211 @@ class FrameIndex:
     frame: int
 
 
+@dataclass(frozen=True)
+class TargetTaskSelection:
+    dataset_name: str
+    selection_mode: str
+    task_index: int | None
+    task_name: str | None
+    language_instruction: str | None
+    task_indices: tuple[int, ...]
+    task_names: tuple[str, ...]
+    language_instructions: tuple[str, ...]
+    episode_indices: tuple[int, ...]
+    frame_indices: tuple[int, ...]
+    metadata_sha256: str
+    selection_sha256: str
+
+    @property
+    def episodes(self) -> int:
+        return len(self.episode_indices)
+
+    @property
+    def frames(self) -> int:
+        return len(self.frame_indices)
+
+    def as_manifest(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "mode": self.selection_mode,
+            "task_index": self.task_index,
+            "task_name": self.task_name,
+            "language_instruction": self.language_instruction,
+            "task_indices": list(self.task_indices),
+            "task_names": list(self.task_names),
+            "language_instructions": list(self.language_instructions),
+            "tasks": len(self.task_indices),
+            "episode_indices": list(self.episode_indices),
+            "episodes": self.episodes,
+            "frames": self.frames,
+            "metadata_sha256": self.metadata_sha256,
+            "selection_sha256": self.selection_sha256,
+        }
+
+
+def resolve_target_task_selection(
+    config: dict[str, Any],
+    paths: dict[str, Path],
+) -> TargetTaskSelection:
+    """Resolve one or all official LIBERO-10 tasks to complete target episodes."""
+    from .lerobot_v2 import LeRobotV2Metadata
+    from .libero10_tasks import (
+        LIBERO_10_DEMOS_PER_TASK,
+        LIBERO_10_TASK_COUNT,
+        LIBERO_10_TASKS,
+    )
+
+    task_index = config["data"].get("target_task_index")
+    all_tasks = bool(config["data"].get("target_all_tasks", False))
+    if task_index is None and not all_tasks:
+        raise LiberoDataError(
+            "A target selection is required; pass --task-index with an evaluation "
+            "index in [0, 9] or use --all-tasks"
+        )
+    if task_index is not None and all_tasks:
+        raise LiberoDataError("--task-index and --all-tasks cannot be used together")
+    if (
+        task_index is not None
+        and (
+            isinstance(task_index, bool)
+            or not isinstance(task_index, int)
+            or not 0 <= task_index < LIBERO_10_TASK_COUNT
+        )
+    ):
+        raise LiberoDataError(
+            f"Target task index must be in [0, {LIBERO_10_TASK_COUNT - 1}]"
+        )
+
+    metadata = LeRobotV2Metadata(paths["target_dataset"])
+    expected_tasks = {
+        index: task.language_instruction for index, task in enumerate(LIBERO_10_TASKS)
+    }
+    if metadata.tasks != expected_tasks:
+        raise LiberoDataError(
+            f"{metadata.root}: task_index mapping does not match the pinned LIBERO-10 "
+            "evaluation order; rebuild it with "
+            "scripts/prepare_libero10_lerobot_v2.sh --overwrite"
+        )
+
+    expected_episodes = LIBERO_10_TASK_COUNT * LIBERO_10_DEMOS_PER_TASK
+    if (
+        int(metadata.info["total_tasks"]) != LIBERO_10_TASK_COUNT
+        or int(metadata.info["total_episodes"]) != expected_episodes
+    ):
+        raise LiberoDataError(
+            f"{metadata.root}: expected {LIBERO_10_TASK_COUNT} tasks and "
+            f"{expected_episodes} episodes"
+        )
+    for position, episode in enumerate(metadata.episodes):
+        expected_instruction = LIBERO_10_TASKS[
+            position // LIBERO_10_DEMOS_PER_TASK
+        ].language_instruction
+        if episode.tasks != (expected_instruction,):
+            raise LiberoDataError(
+                f"{metadata.root}: episode {episode.episode_index} is not ordered by the "
+                "pinned LIBERO-10 evaluation task index; rebuild the dataset with "
+                "scripts/prepare_libero10_lerobot_v2.sh --overwrite"
+            )
+
+    if all_tasks:
+        selected_tasks = LIBERO_10_TASKS
+        selected_records = metadata.episodes
+        selection_mode = "all"
+        selected_task_index = None
+        selected_task_name = None
+        selected_language_instruction = None
+    else:
+        assert task_index is not None
+        start = task_index * LIBERO_10_DEMOS_PER_TASK
+        selected_records = metadata.episodes[start : start + LIBERO_10_DEMOS_PER_TASK]
+        selected_tasks = (LIBERO_10_TASKS[task_index],)
+        selection_mode = "single"
+        selected_task_index = task_index
+        selected_task_name = selected_tasks[0].name
+        selected_language_instruction = selected_tasks[0].language_instruction
+    episode_indices = tuple(record.episode_index for record in selected_records)
+    frame_indices = tuple(
+        frame
+        for record in selected_records
+        for frame in range(
+            metadata.global_offsets[record.episode_index],
+            metadata.global_offsets[record.episode_index] + record.length,
+        )
+    )
+    expected_selected_episodes = (
+        expected_episodes if all_tasks else LIBERO_10_DEMOS_PER_TASK
+    )
+    if len(episode_indices) != expected_selected_episodes or not frame_indices:
+        raise LiberoDataError(
+            f"{metadata.root}: target selection must contain exactly "
+            f"{expected_selected_episodes} non-empty episodes"
+        )
+
+    metadata_sha256 = metadata.metadata_sha256()
+    selected_task_indices = (
+        tuple(range(LIBERO_10_TASK_COUNT))
+        if all_tasks
+        else (selected_task_index,)
+    )
+    assert all(index is not None for index in selected_task_indices)
+    signature_payload = {
+        "dataset_name": config["data"]["target_dataset"],
+        "mode": selection_mode,
+        "task_indices": selected_task_indices,
+        "task_names": tuple(task.name for task in selected_tasks),
+        "language_instructions": tuple(
+            task.language_instruction for task in selected_tasks
+        ),
+        "episode_indices": episode_indices,
+        "frames": len(frame_indices),
+        "metadata_sha256": metadata_sha256,
+    }
+    selection_sha256 = hashlib.sha256(
+        json.dumps(signature_payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return TargetTaskSelection(
+        dataset_name=config["data"]["target_dataset"],
+        selection_mode=selection_mode,
+        task_index=selected_task_index,
+        task_name=selected_task_name,
+        language_instruction=selected_language_instruction,
+        task_indices=tuple(int(index) for index in selected_task_indices),
+        task_names=tuple(task.name for task in selected_tasks),
+        language_instructions=tuple(
+            task.language_instruction for task in selected_tasks
+        ),
+        episode_indices=episode_indices,
+        frame_indices=frame_indices,
+        metadata_sha256=metadata_sha256,
+        selection_sha256=selection_sha256,
+    )
+
+
+def training_selection_sha256(
+    target_selection: TargetTaskSelection,
+    prior_selection: Any | None,
+    sample_weights: Sequence[float] | None = None,
+) -> str:
+    payload = {
+        "target": target_selection.selection_sha256,
+        "prior": (
+            prior_selection.selection_sha256 if prior_selection is not None else None
+        ),
+    }
+    if sample_weights is not None:
+        normalized = normalized_sample_weights(sample_weights)
+        if not all(
+            math.isclose(value, 0.5, rel_tol=0.0, abs_tol=1.0e-12)
+            for value in normalized
+        ):
+            payload["sample_weights"] = normalized
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def _require_torch() -> Any:
     try:
         import torch
@@ -310,6 +518,7 @@ class LeRobotFrameDataset:
         episode_cache_size: int = 2,
         tokenizer: Any | None = None,
         max_language_length: int = 16,
+        frame_indices: Sequence[int] | None = None,
     ):
         from .lerobot_v2 import LeRobotV2Metadata
 
@@ -335,7 +544,26 @@ class LeRobotFrameDataset:
         for episode in self.metadata.episodes:
             total += episode.length
             self._episode_ends.append(total)
-        self._length = total
+        self._total_frames = total
+        if frame_indices is None:
+            self._frame_indices: tuple[int, ...] | None = None
+            self._length = total
+        else:
+            selected = tuple(int(value) for value in frame_indices)
+            if not selected:
+                raise LiberoDataError(
+                    f"{self.metadata.root}: selected frame index set is empty"
+                )
+            if any(value < 0 or value >= total for value in selected):
+                raise LiberoDataError(
+                    f"{self.metadata.root}: selected frame index is out of bounds"
+                )
+            if any(left >= right for left, right in zip(selected, selected[1:])):
+                raise LiberoDataError(
+                    f"{self.metadata.root}: selected frame indices must be unique and sorted"
+                )
+            self._frame_indices = selected
+            self._length = len(selected)
 
         action = statistics["action"]
         proprio = statistics["proprio"]
@@ -368,12 +596,21 @@ class LeRobotFrameDataset:
 
     def _locate(self, frame: int) -> tuple[int, int]:
         if frame < 0:
-            frame += self._length
-        if frame < 0 or frame >= self._length:
+            frame += self._total_frames
+        if frame < 0 or frame >= self._total_frames:
             raise IndexError(frame)
         episode_position = bisect_right(self._episode_ends, frame)
         start = 0 if episode_position == 0 else self._episode_ends[episode_position - 1]
         return episode_position, frame - start
+
+    def _global_frame(self, frame: int) -> int:
+        if self._frame_indices is None:
+            return frame
+        if frame < 0:
+            frame += self._length
+        if frame < 0 or frame >= self._length:
+            raise IndexError(frame)
+        return self._frame_indices[frame]
 
     def _episode(self, episode_position: int) -> dict[str, Any]:
         from .lerobot_v2 import load_episode
@@ -406,7 +643,8 @@ class LeRobotFrameDataset:
 
     def __getitem__(self, frame: int) -> dict[str, Any]:
         torch = _require_torch()
-        episode_position, frame_position = self._locate(int(frame))
+        global_frame = self._global_frame(int(frame))
+        episode_position, frame_position = self._locate(global_frame)
         episode = self._episode(episode_position)
         length = len(episode["action"])
         stop = min(frame_position + self.action_horizon, length)
@@ -471,13 +709,14 @@ class CombinedLeRobotDataset(_TorchDataset):
 
 
 class BalancedDistributedBatchSampler(_TorchSampler):
-    """Deterministic 1:1 target/prior batches shared consistently across DDP ranks."""
+    """Deterministic weighted target/prior batches split consistently across ranks."""
 
     def __init__(
         self,
         source_sizes: Sequence[int],
         *,
         local_batch_size: int,
+        sample_weights: Sequence[float] = (1.0, 1.0),
         rank: int = 0,
         world_size: int = 1,
         seed: int = 42,
@@ -486,12 +725,24 @@ class BalancedDistributedBatchSampler(_TorchSampler):
         torch = _require_torch()
         if len(source_sizes) != 2 or any(int(size) <= 0 for size in source_sizes):
             raise ValueError("source_sizes must contain two positive frame counts")
-        if local_batch_size <= 0 or local_batch_size % 2:
-            raise ValueError("local_batch_size must be a positive even number")
+        if local_batch_size <= 0:
+            raise ValueError("local_batch_size must be positive")
         if world_size <= 0 or not 0 <= rank < world_size:
             raise ValueError("rank must be in [0, world_size)")
         self.source_sizes = tuple(int(size) for size in source_sizes)
         self.local_batch_size = int(local_batch_size)
+        self.sample_weights = normalized_sample_weights(sample_weights)
+        self.source_batch_sizes = sample_counts_per_batch(
+            sample_weights,
+            self.local_batch_size,
+        )
+        repeats = math.gcd(*self.source_batch_sizes)
+        unit_pattern = tuple(
+            source
+            for source, count in enumerate(self.source_batch_sizes)
+            for _ in range(count // repeats)
+        )
+        self._source_pattern = unit_pattern * repeats
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.seed = int(seed)
@@ -527,15 +778,19 @@ class BalancedDistributedBatchSampler(_TorchSampler):
     def __iter__(self) -> Iterator[list[FrameIndex]]:
         produced = 0
         while self.num_batches is None or produced < self.num_batches:
-            per_source_global = self.local_batch_size // 2 * self.world_size
             global_indices = [
-                self._take(source, per_source_global) for source in range(2)
+                self._take(source, count * self.world_size)
+                for source, count in enumerate(self.source_batch_sizes)
             ]
-            start = self.rank * (self.local_batch_size // 2)
+            local_indices = []
+            for source, count in enumerate(self.source_batch_sizes):
+                start = self.rank * count
+                local_indices.append(global_indices[source][start : start + count])
+            positions = [0, 0]
             batch: list[FrameIndex] = []
-            for offset in range(self.local_batch_size // 2):
-                batch.append(FrameIndex(0, global_indices[0][start + offset]))
-                batch.append(FrameIndex(1, global_indices[1][start + offset]))
+            for source in self._source_pattern:
+                batch.append(FrameIndex(source, local_indices[source][positions[source]]))
+                positions[source] += 1
             self.step += 1
             produced += 1
             yield batch
@@ -576,6 +831,9 @@ class TorchTrainingData:
     dataset: CombinedLeRobotDataset
     batch_sampler: BalancedDistributedBatchSampler
     sample_weights: np.ndarray
+    target_selection: TargetTaskSelection
+    prior_selection: Any | None
+    selection_sha256: str
 
 
 def make_training_dataset(
@@ -591,32 +849,47 @@ def make_training_dataset(
     from torch.utils.data import DataLoader
 
     from .checkpoint import load_lerobot_statistics
+    from .selection import resolve_prior_selection
 
     data = config["data"]
     train = config["train"]
     statistics = load_lerobot_statistics(paths["prior_dataset"])
+    target_selection = resolve_target_task_selection(config, paths)
+    prior_selection = resolve_prior_selection(config, paths)
     names = [data["target_dataset"], data["prior_dataset"]]
     roots = [paths["target_dataset"], paths["prior_dataset"]]
     cache_size = int(train["episode_cache_size"])
-    sources = [
-        LeRobotFrameDataset(
-            root,
-            dataset_name=name,
-            statistics=statistics,
-            action_horizon=int(data["action_horizon"]),
-            primary_size=tuple(data["resize"]["primary"]),
-            wrist_size=tuple(data["resize"]["wrist"]),
-            episode_cache_size=cache_size,
-            tokenizer=tokenizer,
+    sources = []
+    for source, (name, root) in enumerate(zip(names, roots, strict=True)):
+        sources.append(
+            LeRobotFrameDataset(
+                root,
+                dataset_name=name,
+                statistics=statistics,
+                action_horizon=int(data["action_horizon"]),
+                primary_size=tuple(data["resize"]["primary"]),
+                wrist_size=tuple(data["resize"]["wrist"]),
+                episode_cache_size=cache_size,
+                tokenizer=tokenizer,
+                frame_indices=(
+                    target_selection.frame_indices
+                    if source == 0
+                    else (
+                        prior_selection.frame_indices
+                        if prior_selection is not None
+                        else None
+                    )
+                ),
+            )
         )
-        for name, root in zip(names, roots, strict=True)
-    ]
     dataset = CombinedLeRobotDataset(sources)
     micro_batch_size = int(train["micro_batch_size_per_gpu"])
+    sample_weights = normalized_sample_weights(data["sample_weights"])
     num_batches = int(train["max_steps"]) * int(train["gradient_accumulation_steps"])
     sampler = BalancedDistributedBatchSampler(
         dataset.source_sizes,
         local_batch_size=micro_batch_size,
+        sample_weights=sample_weights,
         rank=rank,
         world_size=world_size,
         seed=int(train["seed"]),
@@ -640,5 +913,12 @@ def make_training_dataset(
         dataloader=dataloader,
         dataset=dataset,
         batch_sampler=sampler,
-        sample_weights=np.asarray([0.5, 0.5], dtype=np.float64),
+        sample_weights=np.asarray(sample_weights, dtype=np.float64),
+        target_selection=target_selection,
+        prior_selection=prior_selection,
+        selection_sha256=training_selection_sha256(
+            target_selection,
+            prior_selection,
+            sample_weights,
+        ),
     )

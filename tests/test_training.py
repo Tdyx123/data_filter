@@ -6,7 +6,11 @@ torch = pytest.importorskip("torch")
 from torch import nn  # noqa: E402
 
 from qwen3_vl_groot.config import load_config  # noqa: E402
-from qwen3_vl_groot.training import build_optimizer_and_scheduler  # noqa: E402
+from qwen3_vl_groot.training import (  # noqa: E402
+    _should_save_checkpoint,
+    _should_save_final_checkpoint,
+    build_optimizer_and_scheduler,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -41,3 +45,10 @@ def test_optimizer_groups_are_nonempty_and_trainable_before_zero_init():
     assert optimizer.param_groups[1]["lr"] == 0.0
     assert scheduler is not None
 
+
+def test_checkpoint_schedule_saves_improvements_and_unscheduled_final_step():
+    assert _should_save_checkpoint(step=1_000, save_every=1_000, improved=False)
+    assert _should_save_checkpoint(step=750, save_every=1_000, improved=True)
+    assert not _should_save_checkpoint(step=750, save_every=1_000, improved=False)
+    assert _should_save_final_checkpoint(step=4_500, last_checkpoint_step=4_000)
+    assert not _should_save_final_checkpoint(step=4_000, last_checkpoint_step=4_000)

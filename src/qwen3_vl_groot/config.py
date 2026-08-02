@@ -76,6 +76,30 @@ def validate_config(config: dict[str, Any]) -> None:
         )
     if model["context_dim"] != 2560:
         raise ConfigError("Qwen3-VL-4B context_dim must be 2560")
+    if not isinstance(model["gradient_checkpointing"], bool):
+        raise ConfigError("model.gradient_checkpointing must be a boolean")
+    compile_config = model.get("torch_compile")
+    if compile_config is not None:
+        if not isinstance(compile_config, dict):
+            raise ConfigError("model.torch_compile must be a mapping")
+        if not isinstance(compile_config.get("enabled"), bool):
+            raise ConfigError("model.torch_compile.enabled must be a boolean")
+        if not isinstance(compile_config.get("backend"), str) or not compile_config["backend"]:
+            raise ConfigError("model.torch_compile.backend must be a non-empty string")
+        valid_compile_modes = {
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        }
+        if compile_config.get("mode") not in valid_compile_modes:
+            raise ConfigError(
+                "model.torch_compile.mode must be one of "
+                f"{sorted(valid_compile_modes)}"
+            )
+        for name in ("dynamic", "fullgraph"):
+            if not isinstance(compile_config.get(name), bool):
+                raise ConfigError(f"model.torch_compile.{name} must be a boolean")
     if model["dit"]["hidden_size"] % model["dit"]["num_heads"]:
         raise ConfigError("DiT hidden size must be divisible by the number of heads")
     if not 0.0 <= model["state_dropout_prob"] <= 1.0:
@@ -125,28 +149,6 @@ def resolved_paths(config: dict[str, Any]) -> dict[str, Path]:
 
 def config_digest(config: dict[str, Any]) -> str:
     clean = {key: value for key, value in config.items() if not key.startswith("_")}
-    payload = json.dumps(clean, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(payload).hexdigest()
-
-
-def resume_config_digest(config: dict[str, Any]) -> str:
-    """Hash state-defining fields while allowing a run to be extended safely."""
-    clean = copy.deepcopy(
-        {key: value for key, value in config.items() if not key.startswith("_")}
-    )
-    clean["paths"].pop("output", None)
-    for key in ("num_workers", "prefetch_factor", "video_cache_episodes"):
-        clean["data"].pop(key, None)
-    for key in (
-        "max_steps",
-        "log_every_steps",
-        "eval_every_steps",
-        "save_every_steps",
-        "validation_batches",
-        "keep_last_checkpoints",
-        "gpu_ids",
-    ):
-        clean["train"].pop(key, None)
     payload = json.dumps(clean, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
 

@@ -33,10 +33,34 @@ dataset:
   path: /data/dwb/datasets/bridge_orig_1.0.0_lerobo
 ```
 
-数据路径需包含 `meta/info.json`、`meta/episodes.jsonl`、Parquet episode 和可选视频。
-adapter 根据 `info.json` 自动识别维度、相机与 observation，不写死机器人类型。
-默认编码 `observation.images.image_0`；改成 `all` 可使用全部相机，将
-`dataset.use_images` 设为 `false` 可只使用向量 observation。
+数据路径需包含 `meta/info.json`、`meta/episodes.jsonl` 和 Parquet episode。
+图像既可保存为外部视频（`dtype: video`），也可作为 PNG/JPEG bytes 内嵌在
+Parquet（`dtype: image`）。adapter 根据 `info.json` 自动识别维度、相机与
+observation，不写死机器人类型。默认编码发现的第一路相机；改成 `all` 可使用
+全部相机，将 `dataset.use_images` 设为 `false` 可只使用向量 observation。
+
+### LIBERO-90
+
+仓库提供 [config_libero90.yaml](config_libero90.yaml)，用于
+`/data/dwb/datasets/LIBERO_lerobot/libero90`：
+
+```bash
+python -m tdus --config tdus/config_libero90.yaml
+```
+
+该配置使用 8 维 `observation.state`、7 维 `action` 和 agentview
+`observation.images.image`；Parquet 中内嵌的 PNG 会自动解码为 RGB。
+完整 trajectory 与 `K=15, S=15` 的 chunk 会同时评分；全量 4,500 个 episode
+预计产生 46,705 个长度 15 的 chunk，只有对齐 episode 末尾的最后一个窗口可能
+与前一窗口少量重叠。
+`/data/dwb/datasets/LIBERO_lerobot` 根目录下另一个 book-caddy target 数据集
+不参与这次评分。CLIP 模型与 processor 固定从本地
+`/data/dwb/models/clip-vit-base-patch32` 加载，运行 TDUS 不访问 Hugging Face。
+快速验证真实数据的前两个 episode：
+
+```bash
+python -m tdus --config tdus/config_libero90.yaml --max-episodes 2 --force
+```
 
 所有算法参数均位于 [config.yaml](config.yaml)，包括 chunk 的 K/S、CLIP、抽帧数、
 PCA、MMD、KNN、GPU、进程数、权重、随机种子、缓存与输出路径。
@@ -62,6 +86,37 @@ python -m tdus --config tdus/config.yaml --max-episodes 8 --force
 默认同时计算完整 trajectory 和 `K=32, S=16` chunk。CLIP 权重无法加载时会自动
 执行 resize + flatten + PCA fallback。兼容缓存会在重复运行时复用；`--force`
 强制重算。
+
+TDUS 会在导入 NumPy 前把未显式配置的 OpenBLAS、OpenMP、MKL 和 NumExpr
+线程池限制为每进程 1 线程，避免多进程数据加载在高核数服务器上过度创建线程。
+如需调整，可在启动时设置 `TDUS_NUM_THREADS`，允许范围为 1–64：
+
+```bash
+TDUS_NUM_THREADS=4 python -m tdus --config tdus/config_libero90.yaml
+```
+
+## 仅重算最终分数
+
+已有 `quality`、`coverage`、`diversity`、`novelty` 后，可以用 convert
+脚本更换四项权重，只生成新的 CSV，不重新编码轨迹或计算指标：
+
+```bash
+python -m tdus.convert \
+  --input outputs/tdus/libero90/chunk/scores.csv \
+  --output outputs/tdus/libero90/chunk/scores_custom.csv \
+  --quality-weight 0.4 \
+  --coverage-weight 0.3 \
+  --diversity-weight 0.2 \
+  --novelty-weight 0.1
+```
+
+四个权重都必须提供，取有限非负值且总和为 1。输出路径必须与输入路径不同；
+已有输出默认不会被覆盖，需要替换时显式传入 `--force`。
+
+convert 只改写每行的 `tdus`，保留其他字段、列顺序和样本行顺序，因此新 CSV
+仍与原来的 `embeddings.npy` 对齐。脚本不会修改标准 `scores.csv`、
+`tdus_scores.csv`、embedding、特征缓存或 run manifest。需要按新分数选取样本时，
+由 top-k 或训练入口在读取新 CSV 后排序。
 
 ## 数据筛选
 

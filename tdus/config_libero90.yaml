@@ -1,21 +1,22 @@
 dataset:
   type: lerobot
-  name: bridge_orig
-  path: /data/dwb/datasets/bridge_orig_1.0.0_lerobo
+  name: libero90
+  path: /data/dwb/datasets/LIBERO_lerobot/libero90
   use_images: true
   feature_keys:
     action: action
     timestamp: timestamp
     frame_index: frame_index
     episode_index: episode_index
-    vector_observations: auto
+    vector_observations:
+      - observation.state
     image_observations:
-      - observation.images.image_0
+      - observation.images.image
 
 segmentation:
   modes: [trajectory, chunk]
-  chunk_length: 32
-  stride: 16
+  chunk_length: 15
+  stride: 15
   max_episodes: null
 
 encoder:

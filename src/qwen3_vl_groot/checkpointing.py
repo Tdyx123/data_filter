@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 import json
-import random
+import re
 import shutil
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-import torch
 from safetensors.torch import load_file, save_file
 
-from .config import resume_config_digest
 from .normalization import QuantileStats
 
 
@@ -28,123 +25,34 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def capture_rng_state() -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "python": random.getstate(),
-        "numpy": np.random.get_state(),
-        "torch": torch.get_rng_state(),
+def _read_checkpoint_pointer(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        checkpoint = str(payload["checkpoint"])
+        step = int(payload["step"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise CheckpointError(f"Invalid checkpoint pointer at {path}") from error
+    if checkpoint != f"step-{step:08d}":
+        raise CheckpointError(f"Invalid checkpoint pointer at {path}")
+    return checkpoint
+
+
+def _retain_referenced_checkpoints(checkpoint_root: Path) -> None:
+    referenced = {
+        checkpoint
+        for pointer in ("latest.json", "best.json")
+        if (checkpoint := _read_checkpoint_pointer(checkpoint_root / pointer)) is not None
     }
-    if torch.cuda.is_available():
-        result["cuda"] = torch.cuda.get_rng_state_all()
-    return result
-
-
-def restore_rng_state(state: dict[str, Any]) -> None:
-    random.setstate(state["python"])
-    np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch"])
-    if torch.cuda.is_available() and "cuda" in state:
-        torch.cuda.set_rng_state_all(state["cuda"])
-
-
-def save_training_checkpoint(
-    engine: Any,
-    output_dir: str | Path,
-    *,
-    global_step: int,
-    config: dict[str, Any],
-    data_fingerprint: dict[str, Any],
-    best_validation_mae: float | None = None,
-    tag: str | None = None,
-    update_latest: bool = True,
-) -> Path:
-    output = Path(output_dir)
-    checkpoint_root = output / "checkpoints"
-    checkpoint_tag = tag or f"global_step_{global_step:08d}"
-    client_state = {
-        "global_step": global_step,
-        "config_sha256": resume_config_digest(config),
-        "data_metadata_sha256": data_fingerprint["metadata_sha256"],
-        "best_validation_mae": best_validation_mae,
-        "rng_state": capture_rng_state(),
-    }
-    success = engine.save_checkpoint(
-        str(checkpoint_root),
-        tag=checkpoint_tag,
-        client_state=client_state,
-        save_latest=False,
-    )
-    if success is False:
-        raise CheckpointError(f"DeepSpeed failed to save {checkpoint_root / checkpoint_tag}")
-    if engine.global_rank == 0 and update_latest:
-        _atomic_json(
-            checkpoint_root / "latest_train_checkpoint.json",
-            {"tag": checkpoint_tag, "global_step": global_step},
-        )
-    return checkpoint_root / checkpoint_tag
-
-
-def _resolve_resume(output_dir: Path, resume: str) -> tuple[Path, str]:
-    if resume == "latest":
-        pointer = output_dir / "checkpoints" / "latest_train_checkpoint.json"
-        if not pointer.is_file():
-            raise CheckpointError(f"No latest checkpoint pointer at {pointer}")
-        with pointer.open("r", encoding="utf-8") as handle:
-            tag = str(json.load(handle)["tag"])
-        return output_dir / "checkpoints", tag
-
-    path = Path(resume).expanduser().resolve()
-    if path.is_dir() and (path / "mp_rank_00_model_states.pt").is_file():
-        return path.parent, path.name
-    if path.is_dir() and (path / "latest_train_checkpoint.json").is_file():
-        with (path / "latest_train_checkpoint.json").open("r", encoding="utf-8") as handle:
-            tag = str(json.load(handle)["tag"])
-        return path, tag
-    raise CheckpointError(
-        f"Resume path must be a DeepSpeed tag directory or checkpoint root: {path}"
-    )
-
-
-def load_training_checkpoint(
-    engine: Any,
-    output_dir: str | Path,
-    resume: str,
-    *,
-    config: dict[str, Any],
-    data_fingerprint: dict[str, Any],
-) -> dict[str, Any]:
-    checkpoint_root, tag = _resolve_resume(Path(output_dir), resume)
-    load_path, client_state = engine.load_checkpoint(
-        str(checkpoint_root),
-        tag=tag,
-        load_module_strict=True,
-        load_optimizer_states=True,
-        load_lr_scheduler_states=True,
-    )
-    if load_path is None:
-        raise CheckpointError(f"DeepSpeed could not load {checkpoint_root / tag}")
-    expected_config = resume_config_digest(config)
-    if client_state.get("config_sha256") != expected_config:
-        raise CheckpointError(
-            "Checkpoint configuration differs from this run. Strict resume was refused."
-        )
-    if client_state.get("data_metadata_sha256") != data_fingerprint["metadata_sha256"]:
-        raise CheckpointError(
-            "Dataset metadata fingerprint differs from the checkpoint. Strict resume was refused."
-        )
-    if "rng_state" in client_state:
-        restore_rng_state(client_state["rng_state"])
-    return client_state
-
-
-def retain_recent_checkpoints(output_dir: str | Path, keep: int) -> None:
-    root = Path(output_dir) / "checkpoints"
-    checkpoints = sorted(
-        (path for path in root.glob("global_step_*") if path.is_dir()),
-        key=lambda path: path.name,
-    )
-    for path in checkpoints[:-keep]:
-        shutil.rmtree(path)
+    for path in checkpoint_root.iterdir():
+        if (
+            path.is_dir()
+            and re.fullmatch(r"step-\d{8}", path.name)
+            and path.name not in referenced
+        ):
+            shutil.rmtree(path)
 
 
 def _stats_from_policy(policy: Any) -> QuantileStats:
@@ -157,17 +65,25 @@ def _stats_from_policy(policy: Any) -> QuantileStats:
     )
 
 
-def export_compact_checkpoint(
+def save_compact_checkpoint(
     engine: Any,
-    target_dir: str | Path,
+    output_dir: str | Path,
     *,
     config: dict[str, Any],
     model_path: str | Path,
     global_step: int,
     validation_mae: float | None,
-) -> None:
-    """Export only LoRA, action-head weights, normalization, and configuration."""
-    target = Path(target_dir)
+    is_best: bool = False,
+) -> Path:
+    """Save a step containing only LoRA, action-head weights, and inference metadata."""
+    if global_step < 0:
+        raise ValueError("global_step must be non-negative")
+    if is_best and validation_mae is None:
+        raise ValueError("A best checkpoint requires validation_mae")
+
+    checkpoint_root = Path(output_dir) / "checkpoints"
+    checkpoint_name = f"step-{global_step:08d}"
+    target = checkpoint_root / checkpoint_name
     policy = engine.module
     compact_names = set(policy.compact_parameter_names())
     named_parameters = dict(policy.named_parameters())
@@ -209,6 +125,21 @@ def export_compact_checkpoint(
                     "parameter_names": sorted(compact_names),
                 },
             )
+            _atomic_json(
+                checkpoint_root / "latest.json",
+                {"checkpoint": checkpoint_name, "step": global_step},
+            )
+            if is_best:
+                _atomic_json(
+                    checkpoint_root / "best.json",
+                    {
+                        "checkpoint": checkpoint_name,
+                        "step": global_step,
+                        "validation_action_mae": validation_mae,
+                    },
+                )
+            _retain_referenced_checkpoints(checkpoint_root)
+    return target
 
 
 def load_compact_weights(policy: Any, checkpoint_dir: str | Path) -> None:

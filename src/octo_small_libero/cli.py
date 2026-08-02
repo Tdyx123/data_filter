@@ -4,6 +4,7 @@ import argparse
 import os
 
 from .config import apply_overrides, load_config, resolved_paths
+from .libero10_tasks import LIBERO_10_TASK_COUNT
 from .preflight import run_preflight
 
 
@@ -14,6 +15,18 @@ def _gpu_ids(value: str) -> list[int]:
         raise argparse.ArgumentTypeError("GPU IDs must be comma-separated integers") from error
     if not result or any(gpu_id < 0 for gpu_id in result):
         raise argparse.ArgumentTypeError("GPU IDs must be non-negative")
+    return result
+
+
+def _task_index(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("Task index must be an integer") from error
+    if not 0 <= result < LIBERO_10_TASK_COUNT:
+        raise argparse.ArgumentTypeError(
+            f"Task index must be in [0, {LIBERO_10_TASK_COUNT - 1}]"
+        )
     return result
 
 
@@ -28,10 +41,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path")
     parser.add_argument("--lerobot-path")
     parser.add_argument("--target-dataset")
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--task-index", type=_task_index)
+    target.add_argument("--all-tasks", action="store_true")
     parser.add_argument("--output-dir")
     parser.add_argument("--gpu-ids", type=_gpu_ids)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--max-steps", type=int)
+    parser.add_argument(
+        "--sample-weights",
+        type=float,
+        nargs=2,
+        metavar=("TARGET", "PRIOR"),
+    )
+    parser.add_argument("--prior-top-percent", type=float)
+    parser.add_argument("--prior-scores")
     parser.add_argument("--resume")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
@@ -49,10 +73,15 @@ def main() -> None:
         model_path=arguments.model_path,
         lerobot_path=arguments.lerobot_path,
         target_dataset=arguments.target_dataset,
+        target_task_index=arguments.task_index,
+        target_all_tasks=arguments.all_tasks,
         output_dir=arguments.output_dir,
         gpu_ids=arguments.gpu_ids,
         batch_size=arguments.batch_size,
         max_steps=max_steps,
+        sample_weights=arguments.sample_weights,
+        prior_top_percent=arguments.prior_top_percent,
+        prior_scores=arguments.prior_scores,
     )
     if arguments.smoke_test:
         config["train"]["log_every_steps"] = 1

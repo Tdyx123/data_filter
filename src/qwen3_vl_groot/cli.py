@@ -90,7 +90,6 @@ def _resolve_config(arguments: argparse.Namespace) -> dict[str, Any]:
                 "eval_every_steps": 20,
                 "save_every_steps": 20,
                 "validation_batches": 2,
-                "keep_last_checkpoints": 1,
             }
         )
         config["data"]["num_workers"] = min(int(config["data"]["num_workers"]), 1)
@@ -128,8 +127,6 @@ def launch(arguments: argparse.Namespace) -> None:
         "--config",
         str(runtime_config),
     ]
-    if arguments.resume:
-        command.extend(["--resume", arguments.resume])
     print("Launching:", " ".join(command), flush=True)
     environment = os.environ.copy()
     project_src = str(Path(__file__).resolve().parents[1])
@@ -149,7 +146,7 @@ def distributed_train(arguments: argparse.Namespace) -> None:
     configure_visible_gpus(config)
     from .training import train
 
-    train(config, resume=arguments.resume)
+    train(config)
 
 
 def inspect_data(arguments: argparse.Namespace) -> None:
@@ -175,7 +172,6 @@ def build_parser() -> argparse.ArgumentParser:
     launch_parser.add_argument("--config", required=True)
     launch_parser.add_argument("--preflight-only", action="store_true")
     launch_parser.add_argument("--smoke-test", action="store_true")
-    launch_parser.add_argument("--resume", help="latest or a DeepSpeed checkpoint path")
     _add_override_arguments(launch_parser)
     launch_parser.set_defaults(function=launch)
 
@@ -183,7 +179,6 @@ def build_parser() -> argparse.ArgumentParser:
         "train", help=argparse.SUPPRESS
     )
     train_parser.add_argument("--config", required=True)
-    train_parser.add_argument("--resume")
     train_parser.set_defaults(function=distributed_train)
 
     inspect_parser = subparsers.add_parser(
