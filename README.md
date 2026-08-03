@@ -172,14 +172,32 @@ bash scripts/train_libero_octo_small_all_tasks_4x4090.sh
 ```
 
 全任务 target 池内部按帧均匀采样；因此不同任务的抽样频率会随其轨迹总帧数
-变化。未显式指定 `--output-dir` 时，输出目录自动追加 `_all-tasks`；TDUS
-prior 筛选参数也可直接传给该脚本，例如
-`--prior-top-percent 10`，对应目录继续追加 `_top10pct`。
+变化。该脚本默认把
+`/data/dwb/libero90_sqcn/filter/top10pct/scores.csv` 作为已经筛选完成的 SQCN
+片段清单，使用文件中的全部 4671 个片段，不再按分数二次截取。每个片段只
+贡献完整落在片段范围内的 8-step action window；重叠片段去重后覆盖 2923 条
+episode，共得到 36263 个 prior 训练起点。默认输出目录为
+`outputs/octo_small_libero_4gpu_all-tasks_sqcn_top10pct`。
+
+预检会核对同目录 `filter_manifest.json`、SQCN `run_manifest.json`、数据集来源、
+文件哈希、选择摘要、连续 `filter_rank` 和片段边界。可以重复传入新参数和输出
+参数来覆盖脚本默认值，后出现的值生效：
+
+```bash
+bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
+  --prior-prefiltered-scores /path/to/filter/top10pct/scores.csv \
+  --output-dir outputs/custom_sqcn_run \
+  --preflight-only
+```
+
+`--prior-prefiltered-scores` 不能与 TDUS 的 `--prior-top-percent` 或
+`--prior-scores` 混用。需要 TDUS 排名筛选时，继续使用单任务入口，或直接调用
+`python3 -m octo_small_libero.cli --all-tasks` 并传入 TDUS 参数。
 
 训练脚本使用 `torchrun`、DDP 和 BF16；默认每卡 micro-batch 8，其中全任务
 target 6 条、prior 2 条；梯度累积 4 后，四卡有效全局 batch 为 128，其中
-target 96 条、prior 32 条。单任务脚本和独立单卡全任务脚本仍保持 1:1；权重
-sweep 单独使用 3:1。预检会验证
+target 96 条、prior 32 条。单任务脚本仍保持 1:1；权重 sweep 单独使用
+3:1。预检会验证
 v2.0 metadata、全部 Parquet
 footer/schema、评测顺序的 10-task 映射、单任务模式的 5 条或全任务模式的
 50 条 target episode、抽样 PNG、统计维度、非空 prior、PyTorch

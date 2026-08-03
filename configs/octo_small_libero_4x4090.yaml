@@ -11,6 +11,7 @@ data:
   prior_selection:
     scores: outputs/tdus/libero90/chunk/scores.csv
     top_percent: null
+    prefiltered: false
   sample_weights: [1.0, 1.0]
   image_obs_keys:
     primary: observation.images.image

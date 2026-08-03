@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Sequence
 
 from .config import apply_overrides, load_config, resolved_paths
 from .libero10_tasks import LIBERO_10_TASK_COUNT
@@ -56,15 +57,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--prior-top-percent", type=float)
     parser.add_argument("--prior-scores")
+    parser.add_argument("--prior-prefiltered-scores")
     parser.add_argument("--resume")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
     return parser
 
 
-def main() -> None:
+def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(argv)
+    if arguments.prior_prefiltered_scores is not None and (
+        arguments.prior_top_percent is not None
+        or arguments.prior_scores is not None
+    ):
+        parser.error(
+            "--prior-prefiltered-scores cannot be combined with "
+            "--prior-top-percent or --prior-scores"
+        )
+    return arguments
+
+
+def main() -> None:
+    arguments = parse_arguments()
 
     config = load_config(arguments.config)
     max_steps = 2 if arguments.smoke_test else arguments.max_steps
@@ -82,6 +97,7 @@ def main() -> None:
         sample_weights=arguments.sample_weights,
         prior_top_percent=arguments.prior_top_percent,
         prior_scores=arguments.prior_scores,
+        prior_prefiltered_scores=arguments.prior_prefiltered_scores,
     )
     if arguments.smoke_test:
         config["train"]["log_every_steps"] = 1

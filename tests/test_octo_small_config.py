@@ -38,6 +38,7 @@ def test_octo_config_is_independent_and_points_to_local_checkpoint():
     assert config["data"]["prior_selection"] == {
         "scores": "outputs/tdus/libero90/chunk/scores.csv",
         "top_percent": None,
+        "prefiltered": False,
     }
     assert config["model"]["required_observation_tokenizers"] == ["primary", "wrist"]
     assert config["train"]["gpu_ids"] == [0, 1, 2, 3]
@@ -109,6 +110,7 @@ def test_octo_cli_exposes_only_lerobot_data_override():
     assert "--smoke-test" in option_strings
     assert "--prior-top-percent" in option_strings
     assert "--prior-scores" in option_strings
+    assert "--prior-prefiltered-scores" in option_strings
     assert "--sample-weights" in option_strings
     assert "--task-index" in option_strings
     assert "--all-tasks" in option_strings
@@ -157,6 +159,67 @@ def test_octo_prior_percent_override_is_validated_and_isolates_output():
 
     with pytest.raises(ConfigError, match="in \\(0, 100\\]"):
         apply_overrides(config, prior_top_percent=0)
+
+
+def test_octo_prefiltered_scores_override_enables_all_rows_without_percent():
+    config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
+
+    updated = apply_overrides(
+        config,
+        prior_prefiltered_scores="/data/sqcn/filter/top10pct/scores.csv",
+    )
+
+    assert updated["data"]["prior_selection"] == {
+        "scores": "/data/sqcn/filter/top10pct/scores.csv",
+        "top_percent": None,
+        "prefiltered": True,
+    }
+
+
+def test_octo_config_rejects_prefiltered_scores_with_top_percent():
+    config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
+    config["data"]["prior_selection"].update(
+        {"prefiltered": True, "top_percent": 10}
+    )
+
+    with pytest.raises(ConfigError, match="prefiltered.*top_percent"):
+        validate_config(config)
+
+
+def test_octo_cli_rejects_ranked_and_prefiltered_selection_together():
+    from octo_small_libero.cli import parse_arguments
+
+    repeated = parse_arguments(
+        [
+            "--all-tasks",
+            "--prior-prefiltered-scores",
+            "/data/first.csv",
+            "--prior-prefiltered-scores",
+            "/data/second.csv",
+        ]
+    )
+    assert repeated.prior_prefiltered_scores == "/data/second.csv"
+
+    with pytest.raises(SystemExit):
+        parse_arguments(
+            [
+                "--all-tasks",
+                "--prior-prefiltered-scores",
+                "/data/sqcn.csv",
+                "--prior-top-percent",
+                "10",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        parse_arguments(
+            [
+                "--all-tasks",
+                "--prior-prefiltered-scores",
+                "/data/sqcn.csv",
+                "--prior-scores",
+                "/data/tdus.csv",
+            ]
+        )
 
 
 def test_octo_task_index_override_is_required_by_cli_and_isolates_output():

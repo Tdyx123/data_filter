@@ -115,6 +115,9 @@ def validate_config(config: dict[str, Any]) -> None:
         or not selection["scores"].strip()
     ):
         raise ConfigError("data.prior_selection.scores must be a non-empty path")
+    prefiltered = selection.get("prefiltered", False)
+    if not isinstance(prefiltered, bool):
+        raise ConfigError("data.prior_selection.prefiltered must be a bool")
     top_percent = selection.get("top_percent")
     if top_percent is not None:
         if (
@@ -126,6 +129,10 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ConfigError(
                 "data.prior_selection.top_percent must be null or in (0, 100]"
             )
+    if prefiltered and top_percent is not None:
+        raise ConfigError(
+            "data.prior_selection.prefiltered cannot be combined with top_percent"
+        )
 
     weights = data.get("sample_weights")
     if (
@@ -258,6 +265,14 @@ def apply_overrides(config: dict[str, Any], **overrides: Any) -> dict[str, Any]:
         result["data"]["target_all_tasks"] = False
     if overrides.get("prior_scores") is not None:
         result["data"]["prior_selection"]["scores"] = overrides["prior_scores"]
+    if overrides.get("prior_prefiltered_scores") is not None:
+        result["data"]["prior_selection"].update(
+            {
+                "scores": overrides["prior_prefiltered_scores"],
+                "top_percent": None,
+                "prefiltered": True,
+            }
+        )
     if overrides.get("prior_top_percent") is not None:
         result["data"]["prior_selection"]["top_percent"] = overrides[
             "prior_top_percent"

@@ -39,6 +39,7 @@ def build_dataset_manifest(
         target_selection = resolve_target_task_selection(config, paths)
     if prior_selection is None and (
         config["data"]["prior_selection"].get("top_percent") is not None
+        or config["data"]["prior_selection"].get("prefiltered", False)
     ):
         from .selection import resolve_prior_selection
 
