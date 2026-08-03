@@ -107,7 +107,7 @@ SQCN_SCORE_COLUMNS = [
     "sqcn",
     "filter_rank",
     "adjusted_score",
-    "max_penalty",
+    "knn_penalty",
 ]
 
 
@@ -138,7 +138,7 @@ def _sqcn_row(episode_id: int, start_step: int, end_step: int, rank: int):
         "sqcn": 0.75,
         "filter_rank": rank,
         "adjusted_score": 0.7,
-        "max_penalty": 0.05,
+        "knn_penalty": 0.05,
     }
 
 
@@ -313,6 +313,23 @@ def test_prefiltered_sqcn_uses_every_row_with_strict_boundaries_and_dedup(tmp_pa
     assert len(manifest["filter_manifest_sha256"]) == 64
     assert len(manifest["run_manifest_sha256"]) == 64
     assert len(selection.selection_sha256) == 64
+
+
+def test_prefiltered_sqcn_rejects_legacy_max_penalty_column(tmp_path):
+    metadata = _metadata(tmp_path)
+    scores, _, _ = _write_sqcn_selection(
+        tmp_path,
+        metadata,
+        [_sqcn_row(0, 0, 14, 1)],
+        input_fragments=10,
+    )
+    scores.write_text(
+        scores.read_text(encoding="utf-8").replace("knn_penalty", "max_penalty"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PriorSelectionError, match="knn_penalty"):
+        load_prefiltered_sqcn_selection(scores, metadata, action_horizon=8)
 
 
 def test_prefiltered_sqcn_requires_filter_manifest(tmp_path):
@@ -569,6 +586,10 @@ def test_current_sqcn_top10_scores_have_expected_training_starts():
     prior_root = Path("/data/dwb/datasets/LIBERO_lerobot/libero90")
     if not scores.is_file() or not prior_root.is_dir():
         pytest.skip("Current SQCN Top 10% scores or dataset are not mounted")
+    with scores.open(encoding="utf-8", newline="") as handle:
+        columns = set(csv.DictReader(handle).fieldnames or [])
+    if "knn_penalty" not in columns:
+        pytest.skip("Current SQCN Top 10% scores use the legacy max_penalty schema")
 
     from octo_small_libero.lerobot_v2 import LeRobotV2Metadata
 

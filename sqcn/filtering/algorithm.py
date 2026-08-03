@@ -23,6 +23,7 @@ class _AlgorithmParameters:
     random_ref_size: int = 50
     candidate_threshold: int = 50
     unseen_rank: int = 300
+    neighbor_count: int = 5
 
 
 @dataclass(frozen=True)
@@ -31,7 +32,7 @@ class SelectionResult:
 
     selected_indices: np.ndarray
     adjusted_scores: np.ndarray
-    max_penalties: np.ndarray
+    knn_penalties: np.ndarray
     sigma_raw: float
     sigma_effective: float
     seed: int
@@ -107,6 +108,15 @@ class _DiverseSelector:
         self.parameters = parameters
         self.penalties = np.zeros(len(scores), dtype=np.float64)
         self.adjusted = scores.copy()
+        self._neighbor_indices = np.full(
+            (len(scores), self.parameters.neighbor_count),
+            -1,
+            dtype=np.int64,
+        )
+        self._neighbor_similarities = np.zeros(
+            (len(scores), self.parameters.neighbor_count),
+            dtype=np.float64,
+        )
         self.refresh_round = np.full(len(scores), -1, dtype=np.int64)
         self.selected: list[int] = []
         self.candidates: set[int] = set()
@@ -114,9 +124,10 @@ class _DiverseSelector:
         self.unseen: set[int] = set(range(len(scores)))
         self._silent_heap: list[tuple[float, float, str, int, int]] = []
         self._silent_versions = np.zeros(len(scores), dtype=np.int64)
+        self._silent_heap_round = -1
         self._unseen_threshold = float("-inf")
         self._selected_adjusted: list[float] = []
-        self._selected_penalties: list[float] = []
+        self._selected_knn_penalties: list[float] = []
 
     def _rank_key(self, index: int) -> tuple[float, float, str]:
         return (
@@ -170,8 +181,53 @@ class _DiverseSelector:
         deltas = self.embeddings[target, None, :] - self.embeddings[reference, :][None, :, :]
         squared_distances = np.einsum("ijk,ijk->ij", deltas, deltas)
         similarities = np.exp(-squared_distances / (2.0 * self.sigma * self.sigma))
-        observed = np.max(similarities * self.scores[reference][None, :], axis=1)
-        self.penalties[target] = np.maximum(self.penalties[target], observed)
+        for row, index in enumerate(target):
+            retained = {
+                int(neighbor): float(similarity)
+                for neighbor, similarity in zip(
+                    self._neighbor_indices[index],
+                    self._neighbor_similarities[index],
+                    strict=True,
+                )
+                if neighbor >= 0
+            }
+            retained.update(
+                {
+                    int(neighbor): float(similarity)
+                    for neighbor, similarity in zip(
+                        reference,
+                        similarities[row],
+                        strict=True,
+                    )
+                }
+            )
+            nearest = sorted(
+                retained.items(),
+                key=lambda item: (
+                    -item[1],
+                    str(self.sample_ids[item[0]]),
+                ),
+            )[: self.parameters.neighbor_count]
+            self._neighbor_indices[index].fill(-1)
+            self._neighbor_similarities[index].fill(0.0)
+            if nearest:
+                neighbor_indices = np.fromiter(
+                    (neighbor for neighbor, _ in nearest),
+                    dtype=np.int64,
+                    count=len(nearest),
+                )
+                neighbor_similarities = np.fromiter(
+                    (similarity for _, similarity in nearest),
+                    dtype=np.float64,
+                    count=len(nearest),
+                )
+                self._neighbor_indices[index, : len(nearest)] = neighbor_indices
+                self._neighbor_similarities[index, : len(nearest)] = neighbor_similarities
+                self.penalties[index] = float(
+                    np.mean(neighbor_similarities * self.scores[neighbor_indices])
+                )
+            else:
+                self.penalties[index] = 0.0
         self.adjusted[target] = self.scores[target] - PENALTY_LAMBDA * self.penalties[target]
 
     def _push_silent(self, index: int) -> None:
@@ -196,6 +252,25 @@ class _DiverseSelector:
                 return index
             heapq.heappop(self._silent_heap)
         raise RuntimeError("silent heap is empty while silent items remain")
+
+    def _prepare_silent_round(self, round_id: int) -> None:
+        if self._silent_heap_round == round_id:
+            return
+        self._silent_heap_round = round_id
+        self._silent_heap.clear()
+        for index in self.silent:
+            self._silent_versions[index] += 1
+            version = int(self._silent_versions[index])
+            heapq.heappush(
+                self._silent_heap,
+                (
+                    -float(self.scores[index]),
+                    -float(self.scores[index]),
+                    str(self.sample_ids[index]),
+                    index,
+                    version,
+                ),
+            )
 
     def _remove_silent(self, index: int) -> None:
         self.silent.remove(index)
@@ -253,6 +328,7 @@ class _DiverseSelector:
     def _reactivate_silent(self, round_id: int) -> None:
         if not self.silent:
             return
+        self._prepare_silent_round(round_id)
         references = self._reference_set()
         count = min(self.parameters.new_batch_size, len(self.silent))
         reactivated: set[int] = set()
@@ -267,6 +343,7 @@ class _DiverseSelector:
 
     def _add_candidates(self, round_id: int) -> None:
         references = self._reference_set()
+        self._prepare_silent_round(round_id)
         newly_sampled = self._sample_unseen()
         self._refresh_unseen_threshold()
         if not newly_sampled:
@@ -274,17 +351,19 @@ class _DiverseSelector:
             return
         self.penalties[newly_sampled] = 0.0
         self.adjusted[newly_sampled] = self.scores[newly_sampled]
+        self._neighbor_indices[newly_sampled] = -1
+        self._neighbor_similarities[newly_sampled] = 0.0
         self._update(newly_sampled, references)
         self.refresh_round[newly_sampled] = round_id
         admission = set(newly_sampled)
         while self.silent and admission:
             worst = self._worst(admission)
             best_silent = self._peek_silent()
-            if self.adjusted[best_silent] <= self.adjusted[worst]:
-                break
             if self.refresh_round[best_silent] != round_id:
                 self._refresh_silent(best_silent, references, round_id)
                 continue
+            if self.adjusted[best_silent] <= self.adjusted[worst]:
+                break
             if self.adjusted[best_silent] > self.adjusted[worst]:
                 admission.remove(worst)
                 self._push_silent(worst)
@@ -298,7 +377,7 @@ class _DiverseSelector:
     def _record_selected(self, index: int) -> None:
         self.selected.append(index)
         self._selected_adjusted.append(float(self.adjusted[index]))
-        self._selected_penalties.append(float(self.penalties[index]))
+        self._selected_knn_penalties.append(float(self.penalties[index]))
 
     def select(self, target_size: int, raw_order: np.ndarray) -> tuple[np.ndarray, ...]:
         initial_count = min(
@@ -367,7 +446,7 @@ class _DiverseSelector:
         return (
             np.asarray(self.selected, dtype=np.int64),
             np.asarray(self._selected_adjusted, dtype=np.float64),
-            np.asarray(self._selected_penalties, dtype=np.float64),
+            np.asarray(self._selected_knn_penalties, dtype=np.float64),
         )
 
 
@@ -403,11 +482,11 @@ def select_diverse_fragments(
         seed=actual_seed,
         sigma_effective=sigma_effective,
     )
-    selected, adjusted_scores, max_penalties = selector.select(int(target_size), order)
+    selected, adjusted_scores, knn_penalties = selector.select(int(target_size), order)
     return SelectionResult(
         selected_indices=selected,
         adjusted_scores=adjusted_scores,
-        max_penalties=max_penalties,
+        knn_penalties=knn_penalties,
         sigma_raw=sigma_raw,
         sigma_effective=sigma_effective,
         seed=actual_seed,

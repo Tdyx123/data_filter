@@ -40,9 +40,9 @@ SQCN_SCORE_COLUMNS = {
     "sqcn",
     "filter_rank",
     "adjusted_score",
-    "max_penalty",
+    "knn_penalty",
 }
-SQCN_UNIT_COLUMNS = ("quality", "coverage", "novelty", "sqcn", "max_penalty")
+SQCN_UNIT_COLUMNS = ("quality", "coverage", "novelty", "sqcn", "knn_penalty")
 
 
 class PriorSelectionError(LiberoDataError):

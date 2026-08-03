@@ -35,6 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="exact filter output directory",
     )
     parser.add_argument(
+        "--quality-only",
+        action="store_true",
+        help="use quality instead of sqcn as the diversity reranking score",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="replace an existing filter output directory",
@@ -50,6 +55,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         output_dir=arguments.output_dir,
         seed=arguments.seed,
         force=arguments.force,
+        quality_only=arguments.quality_only,
     )
     print(f"sqcn_filter_output={root}")
 

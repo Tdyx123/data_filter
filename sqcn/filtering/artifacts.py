@@ -23,7 +23,7 @@ from .algorithm import (
 )
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 REQUIRED_SCORE_COLUMNS = (
     "sample_id",
     "episode_id",
@@ -35,7 +35,7 @@ REQUIRED_SCORE_COLUMNS = (
     "novelty",
     "sqcn",
 )
-FILTER_COLUMNS = ("filter_rank", "adjusted_score", "max_penalty")
+FILTER_COLUMNS = ("filter_rank", "adjusted_score", "knn_penalty")
 
 
 def _sha256(path: Path) -> str:
@@ -56,7 +56,10 @@ def _load_source_manifest(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _load_scores(path: Path) -> tuple[list[dict[str, str]], list[str], np.ndarray]:
+def _load_scores(
+    path: Path,
+    score_column: str,
+) -> tuple[list[dict[str, str]], list[str], np.ndarray]:
     try:
         handle = path.open("r", encoding="utf-8", newline="")
     except OSError as error:
@@ -80,27 +83,36 @@ def _load_scores(path: Path) -> tuple[list[dict[str, str]], list[str], np.ndarra
         if not sample_id:
             raise ValueError(f"Empty sample_id at scores CSV line {line_number}")
         try:
-            score = float(row["sqcn"])
+            score = float(row[score_column])
         except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(f"Invalid sqcn value at scores CSV line {line_number}") from error
+            raise ValueError(
+                f"Invalid {score_column} value at scores CSV line {line_number}"
+            ) from error
         identifiers.append(sample_id)
         scores.append(score)
     if len(set(identifiers)) != len(identifiers):
         raise ValueError("SQCN scores contain duplicate sample_id values")
     values = np.asarray(scores, dtype=np.float64)
     if not np.all(np.isfinite(values)) or np.any((values < 0.0) | (values > 1.0)):
-        raise ValueError("SQCN scores must contain finite sqcn values in [0, 1]")
+        raise ValueError(
+            f"SQCN scores must contain finite {score_column} values in [0, 1]"
+        )
     return rows, fieldnames, values
 
 
-def _load_embeddings(path: Path, row_count: int) -> np.ndarray:
+def _load_embeddings(
+    path: Path,
+    row_count: int,
+    embedding_dim: int,
+) -> np.ndarray:
     try:
         embeddings = np.load(path, allow_pickle=False)
     except (OSError, ValueError) as error:
         raise ValueError(f"Could not read SQCN embeddings {path}: {error}") from error
-    if embeddings.ndim != 2 or embeddings.shape != (row_count, 128):
+    if embeddings.ndim != 2 or embeddings.shape != (row_count, embedding_dim):
         raise ValueError(
-            f"SQCN embeddings must have shape [{row_count}, 128], got {list(embeddings.shape)}"
+            "SQCN embeddings must have shape "
+            f"[{row_count}, {embedding_dim}], got {list(embeddings.shape)}"
         )
     if not np.all(np.isfinite(embeddings)):
         raise ValueError("SQCN embeddings must contain only finite values")
@@ -137,13 +149,13 @@ def _write_scores(
     fieldnames: Sequence[str],
     selected_indices: np.ndarray,
     adjusted_scores: np.ndarray,
-    max_penalties: np.ndarray,
+    knn_penalties: np.ndarray,
 ) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=[*fieldnames, *FILTER_COLUMNS])
         writer.writeheader()
         for rank, (index, adjusted, penalty) in enumerate(
-            zip(selected_indices, adjusted_scores, max_penalties, strict=True),
+            zip(selected_indices, adjusted_scores, knn_penalties, strict=True),
             start=1,
         ):
             writer.writerow(
@@ -151,14 +163,21 @@ def _write_scores(
                     **rows[int(index)],
                     "filter_rank": rank,
                     "adjusted_score": f"{float(adjusted):.9f}",
-                    "max_penalty": f"{float(penalty):.9f}",
+                    "knn_penalty": f"{float(penalty):.9f}",
                 }
             )
 
 
-def _safe_output_root(input_root: Path, output_dir: str | Path | None, percent: float) -> Path:
+def _safe_output_root(
+    input_root: Path,
+    output_dir: str | Path | None,
+    percent: float,
+    score_column: str,
+) -> Path:
     if output_dir is None:
-        root = input_root / "filter" / f"top{_percent_tag(percent)}pct"
+        tag = f"top{_percent_tag(percent)}pct"
+        name = f"quality-{tag}" if score_column == "quality" else tag
+        root = input_root / "filter" / name
     else:
         root = Path(output_dir).expanduser().resolve()
     filter_root = input_root / "filter"
@@ -176,25 +195,37 @@ def filter_sqcn_run(
     output_dir: str | Path | None = None,
     seed: int | None = None,
     force: bool = False,
+    quality_only: bool = False,
 ) -> Path:
     """Filter one completed SQCN run and publish aligned result artifacts."""
 
     percent_value, percent_decimal = _normalize_percent(percent)
+    score_column = "quality" if quality_only else "sqcn"
     input_root = Path(input_dir).expanduser().resolve()
     source_manifest_path = input_root / "run_manifest.json"
     scores_path = input_root / "fragment" / "scores.csv"
     embeddings_path = input_root / "fragment" / "embeddings.npy"
     source_manifest = _load_source_manifest(source_manifest_path)
-    if source_manifest.get("embedding_dim", 128) != 128:
-        raise ValueError("SQCN run manifest embedding_dim must be 128")
-    rows, fieldnames, scores = _load_scores(scores_path)
-    embeddings = _load_embeddings(embeddings_path, len(rows))
+    embedding_dim = source_manifest.get("embedding_dim", 128)
+    if (
+        isinstance(embedding_dim, bool)
+        or not isinstance(embedding_dim, int)
+        or embedding_dim <= 0
+    ):
+        raise ValueError("SQCN run manifest embedding_dim must be a positive integer")
+    rows, fieldnames, scores = _load_scores(scores_path, score_column)
+    embeddings = _load_embeddings(embeddings_path, len(rows), embedding_dim)
     target_size = int(
         (Decimal(len(rows)) * percent_decimal / Decimal(100)).to_integral_value(
             rounding=ROUND_CEILING
         )
     )
-    output_root = _safe_output_root(input_root, output_dir, percent_value)
+    output_root = _safe_output_root(
+        input_root,
+        output_dir,
+        percent_value,
+        score_column,
+    )
     if output_root.exists() and not force:
         raise FileExistsError(
             f"SQCN filter output already exists: {output_root}; pass --force to replace it"
@@ -226,7 +257,14 @@ def filter_sqcn_run(
             "percent": percent_value,
             "target_size": target_size,
             "seed": result.seed,
+            "score_column": score_column,
             "lambda": PENALTY_LAMBDA,
+            "penalty": {
+                "policy": "mean_rbf_similarity_weighted_score_of_nearest_references",
+                "neighbor_count": parameters.neighbor_count,
+                "weight": "rbf_similarity",
+                "aggregation": "sum(similarity * score) / effective_neighbor_count",
+            },
             "sigma": {
                 "policy": "mean_pairwise_euclidean_distance_of_raw_top_100",
                 "top_count": min(100, len(rows)),
@@ -240,11 +278,12 @@ def filter_sqcn_run(
                 "random_ref_size": parameters.random_ref_size,
                 "candidate_threshold": parameters.candidate_threshold,
                 "unseen_rank": parameters.unseen_rank,
+                "neighbor_count": parameters.neighbor_count,
                 "weight_epsilon": WEIGHT_EPSILON,
             },
             "ordering": [
                 "adjusted_score desc",
-                "sqcn desc",
+                f"{score_column} desc",
                 "sample_id asc",
             ],
         },
@@ -272,7 +311,7 @@ def filter_sqcn_run(
             fieldnames,
             result.selected_indices,
             result.adjusted_scores,
-            result.max_penalties,
+            result.knn_penalties,
         )
         np.save(temp_root / "embeddings.npy", embeddings[result.selected_indices])
         (temp_root / "filter_manifest.json").write_text(

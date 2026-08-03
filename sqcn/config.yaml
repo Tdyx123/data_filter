@@ -16,8 +16,7 @@ encoder:
   model: /data/dwb/models/clip-vit-base-patch32
   local_files_only: true
   image_batch_size: 64
-  visual_dim: 256
-  embedding_dim: 128
+  visual_dim: 128
   pca_fit_max_samples: null
   device: auto
 

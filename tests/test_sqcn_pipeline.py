@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import pickle
 from pathlib import Path
 from typing import Iterator, Mapping, Sequence
 
@@ -10,6 +11,7 @@ import pytest
 import yaml
 
 from sqcn.cli import main
+import sqcn.pipeline as pipeline
 from sqcn.pipeline import run_pipeline
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord, register_dataset_adapter
 
@@ -108,8 +110,7 @@ def _config(tmp_path: Path) -> dict[str, object]:
             "model": "/models/local-clip-vit",
             "local_files_only": True,
             "image_batch_size": 16,
-            "visual_dim": 256,
-            "embedding_dim": 128,
+            "visual_dim": 128,
             "pca_fit_max_samples": None,
             "device": "cpu",
         },
@@ -156,8 +157,14 @@ def test_pipeline_writes_aligned_fragment_and_reference_artifacts(
     manifest = json.loads((root / "run_manifest.json").read_text(encoding="utf-8"))
 
     assert len(rows) == 5
-    assert embeddings.shape == (5, 128)
-    assert reference_embeddings.shape == (4, 128)
+    assert embeddings.shape == (5, 141)
+    assert reference_embeddings.shape == (4, 141)
+    np.testing.assert_allclose(np.linalg.norm(embeddings, axis=1), 1.0, atol=1e-6)
+    np.testing.assert_allclose(
+        np.linalg.norm(reference_embeddings, axis=1),
+        1.0,
+        atol=1e-6,
+    )
     assert set(rows[0]) == {
         "sample_id",
         "episode_id",
@@ -183,11 +190,33 @@ def test_pipeline_writes_aligned_fragment_and_reference_artifacts(
     }
     assert manifest["config"]["coverage"]["sigma"] == 1.0
     assert manifest["config"]["encoder"]["local_files_only"] is True
+    assert manifest["visual_embedding_dim"] == 128
+    assert manifest["embedding_dim"] == 141
     assert (root / "fragment" / "features.pkl").is_file()
     assert (root / "reference" / "segments.csv").is_file()
     assert (root / "encoder_artifacts" / "visual_pca.pkl").is_file()
-    assert (root / "encoder_artifacts" / "fusion_pca.pkl").is_file()
+    assert not (root / "encoder_artifacts" / "fusion_pca.pkl").exists()
     assert (root / "encoder_artifacts" / "numeric_normalizers.pkl").is_file()
+
+    with (root / "fragment" / "features.pkl").open("rb") as handle:
+        features = pickle.load(handle)
+    progress_by_fragment = {
+        (int(metadata["episode_id"]), int(metadata["start_step"])): float(row[-1])
+        for metadata, row in zip(
+            features["metadata"],
+            features["fused_raw"],
+            strict=True,
+        )
+    }
+    assert progress_by_fragment == pytest.approx(
+        {
+            (1, 0): 0.0,
+            (1, 15): 15.0 / 30.0,
+            (2, 0): 0.0,
+            (2, 15): 15.0 / 31.0,
+            (2, 16): 16.0 / 31.0,
+        }
+    )
 
     first_mtime = (root / "fragment" / "scores.csv").stat().st_mtime_ns
     cached = run_pipeline(_config(tmp_path))
@@ -214,6 +243,7 @@ def test_cli_output_dir_is_the_exact_cached_run_directory(
     assert (output_dir / "fragment" / "embeddings.npy").is_file()
     assert (output_dir / "reference" / "segments.csv").is_file()
     assert (output_dir / "encoder_artifacts" / "visual_pca.pkl").is_file()
+    assert not (output_dir / "encoder_artifacts" / "fusion_pca.pkl").exists()
     assert (output_dir / "run_manifest.json").is_file()
     assert not (output_dir / "synthetic").exists()
     assert not (Path(config["output"]["root"]) / "synthetic").exists()
@@ -279,4 +309,26 @@ def test_pipeline_requires_local_only_clip_loading(tmp_path: Path):
     config["encoder"]["local_files_only"] = False
 
     with pytest.raises(ValueError, match="local_files_only must be true"):
+        run_pipeline(config)
+
+
+def test_fusion_orders_visual_state_action_progress_then_l2_normalizes():
+    fuse = getattr(pipeline, "_fuse_fragment_features")
+    raw, normalized = fuse(
+        np.asarray([[1.0, 2.0]], dtype=np.float32),
+        np.asarray([[3.0, 4.0]], dtype=np.float32),
+        np.asarray([[5.0, 6.0]], dtype=np.float32),
+        np.asarray([0.25], dtype=np.float32),
+    )
+
+    expected = np.asarray([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.25]], dtype=np.float32)
+    np.testing.assert_allclose(raw, expected)
+    np.testing.assert_allclose(normalized, expected / np.linalg.norm(expected), atol=1e-6)
+
+
+def test_pipeline_rejects_removed_embedding_dim_config(tmp_path: Path):
+    config = _config(tmp_path)
+    config["encoder"]["embedding_dim"] = 128
+
+    with pytest.raises(ValueError, match="embedding_dim.*removed"):
         run_pipeline(config)

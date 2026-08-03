@@ -1,4 +1,4 @@
-"""SQCN temporal pooling and fixed-dimensional PCA projections."""
+"""SQCN temporal pooling, PCA projection, and row normalization."""
 
 from __future__ import annotations
 
@@ -211,8 +211,24 @@ def visual_fragment_feature(frame_features: np.ndarray) -> np.ndarray:
     )
 
 
+def l2_normalize_rows(
+    features: np.ndarray,
+    *,
+    epsilon: float = 1.0e-8,
+) -> np.ndarray:
+    """L2-normalize finite feature rows while preserving zero rows."""
+
+    values = np.asarray(features, dtype=np.float32)
+    if values.ndim != 2 or values.shape[1] == 0:
+        raise ValueError("features must have shape [samples, positive dimensions]")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("features must contain only finite values")
+    norms = np.linalg.norm(values, axis=1, keepdims=True)
+    return (values / np.maximum(norms, float(epsilon))).astype(np.float32)
+
+
 class PCAProjector:
-    """Standardize, project, zero-pad, and L2-normalize feature rows."""
+    """Standardize, project, and zero-pad feature rows."""
 
     def __init__(self, output_dim: int, seed: int = 42):
         if output_dim <= 0:
@@ -287,8 +303,7 @@ class PCAProjector:
                 projected,
                 ((0, 0), (0, self.output_dim - projected.shape[1])),
             )
-        norms = np.linalg.norm(projected, axis=1, keepdims=True)
-        return (projected / np.maximum(norms, 1.0e-8)).astype(np.float32)
+        return projected.astype(np.float32)
 
     def fit_transform(
         self,

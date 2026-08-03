@@ -23,6 +23,7 @@ from .encoding import (
     ClipVisionEncoder,
     NumericNormalizers,
     PCAProjector,
+    l2_normalize_rows,
     temporal_pool,
     visual_fragment_feature,
 )
@@ -32,7 +33,7 @@ from .sampling import candidate_windows, reference_windows
 from .scoring import compute_sqcn
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SCORE_COLUMNS = (
     "sample_id",
     "episode_id",
@@ -62,6 +63,7 @@ class _FragmentFeature:
     visual_raw: np.ndarray
     action_pooled: np.ndarray
     state_pooled: np.ndarray
+    progress: float
     raw_quality: RawQuality
 
 
@@ -79,10 +81,13 @@ def _validate_config(config: Mapping[str, Any]) -> None:
     if missing:
         raise ValueError(f"SQCN config is missing sections: {missing}")
     encoder = config["encoder"]
-    if int(encoder.get("visual_dim", -1)) != 256:
-        raise ValueError("SQCN encoder.visual_dim must be 256")
-    if int(encoder.get("embedding_dim", -1)) != 128:
-        raise ValueError("SQCN encoder.embedding_dim must be 128")
+    if "embedding_dim" in encoder:
+        raise ValueError(
+            "SQCN encoder.embedding_dim was removed; the final dimension is derived "
+            "from the fused features"
+        )
+    if int(encoder.get("visual_dim", -1)) != 128:
+        raise ValueError("SQCN encoder.visual_dim must be 128")
     if not str(encoder.get("model", "")).strip():
         raise ValueError("SQCN encoder.model must name a local CLIP ViT")
     if encoder.get("local_files_only") is not True:
@@ -117,7 +122,6 @@ def _cache_is_valid(root: Path, fingerprint: str) -> bool:
         root / "reference" / "segments.csv",
         root / "reference" / "embeddings.npy",
         root / "encoder_artifacts" / "visual_pca.pkl",
-        root / "encoder_artifacts" / "fusion_pca.pkl",
         root / "encoder_artifacts" / "numeric_normalizers.pkl",
     )
     if not manifest_path.is_file() or not all(path.is_file() for path in required):
@@ -246,12 +250,43 @@ def _build_fragment_features(
                 visual_raw=visual_fragment_feature(frame_features[index]),
                 action_pooled=temporal_pool(actions),
                 state_pooled=temporal_pool(state),
+                progress=float(start) / float(episode.length),
                 raw_quality=raw_quality(actions, state),
             )
         candidate_keys.extend(window_keys[window] for window in candidates)
         reference_keys.extend(window_keys[window] for window in references)
 
     return union, candidate_keys, reference_keys, skipped_short
+
+
+def _fuse_fragment_features(
+    visual_embeddings: np.ndarray,
+    state_pooled: np.ndarray,
+    action_pooled: np.ndarray,
+    progress: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Concatenate fragment features in contract order and L2-normalize rows."""
+
+    visual = np.asarray(visual_embeddings, dtype=np.float32)
+    states = np.asarray(state_pooled, dtype=np.float32)
+    actions = np.asarray(action_pooled, dtype=np.float32)
+    progress_values = np.asarray(progress, dtype=np.float32)
+    row_count = len(visual)
+    if (
+        visual.ndim != 2
+        or states.ndim != 2
+        or actions.ndim != 2
+        or progress_values.ndim != 1
+        or len(states) != row_count
+        or len(actions) != row_count
+        or len(progress_values) != row_count
+    ):
+        raise ValueError("fused fragment features must have aligned sample rows")
+    fused_raw = np.concatenate(
+        [visual, states, actions, progress_values[:, None]],
+        axis=1,
+    ).astype(np.float32)
+    return fused_raw, l2_normalize_rows(fused_raw)
 
 
 def _publish(temp_root: Path, root: Path, *, force: bool) -> None:
@@ -326,23 +361,17 @@ def run_pipeline(
     visual_raw = np.stack([feature.visual_raw for feature in union_features])
     encoder_config = config["encoder"]
     seed = int(config["runtime"].get("seed", 42))
-    visual_projector = PCAProjector(output_dim=256, seed=seed)
+    visual_dim = int(encoder_config["visual_dim"])
+    visual_projector = PCAProjector(output_dim=visual_dim, seed=seed)
     visual_embeddings = visual_projector.fit_transform(
         visual_raw,
         max_samples=encoder_config.get("pca_fit_max_samples"),
     )
-    fused_raw = np.concatenate(
-        [
-            visual_embeddings,
-            np.stack([feature.action_pooled for feature in union_features]),
-            np.stack([feature.state_pooled for feature in union_features]),
-        ],
-        axis=1,
-    ).astype(np.float32)
-    fusion_projector = PCAProjector(output_dim=128, seed=seed)
-    union_embeddings = fusion_projector.fit_transform(
-        fused_raw,
-        max_samples=encoder_config.get("pca_fit_max_samples"),
+    fused_raw, union_embeddings = _fuse_fragment_features(
+        visual_embeddings,
+        np.stack([feature.state_pooled for feature in union_features]),
+        np.stack([feature.action_pooled for feature in union_features]),
+        np.asarray([feature.progress for feature in union_features], dtype=np.float32),
     )
     candidate_indices = np.asarray(
         [union_index[key] for key in candidate_keys],
@@ -423,7 +452,6 @@ def run_pipeline(
             [union[key].metadata for key in reference_keys],
         )
         visual_projector.save(artifact_root / "visual_pca.pkl")
-        fusion_projector.save(artifact_root / "fusion_pca.pkl")
         artifact_root.mkdir(parents=True, exist_ok=True)
         with (artifact_root / "numeric_normalizers.pkl").open("wb") as handle:
             pickle.dump(normalizers, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -440,8 +468,8 @@ def run_pipeline(
             "clip_model": str(encoder_config["model"]),
             "fragment_length": 15,
             "candidate_stride": 15,
-            "visual_embedding_dim": 256,
-            "embedding_dim": 128,
+            "visual_embedding_dim": visual_dim,
+            "embedding_dim": int(union_embeddings.shape[1]),
             "weights": {"quality": 0.8, "coverage": 0.1, "novelty": 0.1},
             "counts": {
                 "candidate_fragments": len(candidate_keys),

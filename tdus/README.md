@@ -145,6 +145,34 @@ top = select_top_k(100, "outputs/tdus/bridge_orig/chunk/tdus_scores.csv")
 `select_budget` 还接收候选 embedding、trajectory reference embedding、coverage 配置
 和 TDUS 权重；CLI 会从 YAML 自动补齐这些参数。
 
+## 根据 LIBERO-10 结果回归 TDUS 权重
+
+权重 sweep 已产生 LIBERO-10 评测结果后，可用 `all` 目录作为未筛选基准，拟合
+可重跑的线性/二次 Ridge 响应面：
+
+```bash
+python3 scripts/analyze_libero_tdus_weights.py \
+  --results-root /data/dwb/octo_small_libero \
+  --weights-file weights.jsonl \
+  --sweep-manifest /data/dwb/checkpoints/octo_tdus_weight_sweep/sweep_manifest.json \
+  --output-dir outputs/tdus_weight_regression
+```
+
+脚本只使用 10 个任务均完成、episode 数完整且评测协议与 `all` 一致的模型；部分
+结果会列入候选状态，但不会进入回归。每个任务先计算
+`clip(model_success_rate / all_success_rate, 0, 2)`，再以相同的 1/10 权重平均，
+因此不会让 episode 池化或低基准任务的极端倍数主导目标。
+
+默认在一阶和含平方/交互项的二阶 Ridge 之间用嵌套留一验证自动选阶，并生成：
+
+- `analysis.json`：输入哈希、数据质量、原始权重方程、验证指标、稳定性与最优解；
+- `candidate_ranking.csv`：`weights.jsonl` 全部候选的状态、支持范围和预测排名；
+- `report.md`：当前实测最佳、支持范围内预测最佳、下一评测候选和连续参考解。
+
+连续解只在完整模型各权重分量的观测范围内求解。报告标为 `provisional` 时，说明
+嵌套验证没有优于均值预测，或候选对留一重拟合不稳定；任何预测权重都必须经过新
+的训练和 LIBERO-10 评测，不能当作实测性能。
+
 ## 分析图
 
 ```bash

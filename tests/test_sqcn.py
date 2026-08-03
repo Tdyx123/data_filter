@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import sqcn.encoding as encoding
 from sqcn.cli import build_parser
 from sqcn.coverage import coverage_scores, rbf_kernel
 from sqcn.encoding import (
@@ -73,7 +74,7 @@ def test_visual_fragment_feature_uses_sum_and_last_minus_first():
     np.testing.assert_allclose(encoded, [14.0, 1.0, -1.0, 1.0])
 
 
-def test_temporal_pool_and_pca_have_fixed_l2_normalized_dimensions():
+def test_temporal_pool_and_pca_have_fixed_dimensions_without_implicit_l2():
     sequence = np.asarray([[1.0, 2.0], [3.0, 6.0]], dtype=np.float32)
     np.testing.assert_allclose(
         temporal_pool(sequence),
@@ -84,13 +85,29 @@ def test_temporal_pool_and_pca_have_fixed_l2_normalized_dimensions():
         dtype=np.float32,
     )
 
-    visual = PCAProjector(output_dim=256, seed=7).fit_transform(features)
-    fused = PCAProjector(output_dim=128, seed=9).fit_transform(features)
+    visual = PCAProjector(output_dim=128, seed=7).fit_transform(features)
 
-    assert visual.shape == (4, 256)
-    assert fused.shape == (4, 128)
-    np.testing.assert_allclose(np.linalg.norm(visual, axis=1), 1.0, atol=1e-6)
-    np.testing.assert_allclose(np.linalg.norm(fused, axis=1), 1.0, atol=1e-6)
+    assert visual.shape == (4, 128)
+
+    projector = PCAProjector(output_dim=2)
+    projector.mean_ = np.zeros(2, dtype=np.float32)
+    projector.scale_ = np.ones(2, dtype=np.float32)
+    projector.components_ = np.eye(2, dtype=np.float32)
+    np.testing.assert_allclose(
+        projector.transform(np.asarray([[3.0, 4.0]], dtype=np.float32)),
+        [[3.0, 4.0]],
+    )
+
+
+def test_l2_normalize_rows_handles_regular_zero_and_non_finite_rows():
+    normalize = getattr(encoding, "l2_normalize_rows")
+
+    np.testing.assert_allclose(
+        normalize(np.asarray([[3.0, 4.0], [0.0, 0.0]], dtype=np.float32)),
+        [[0.6, 0.8], [0.0, 0.0]],
+    )
+    with pytest.raises(ValueError, match="finite"):
+        normalize(np.asarray([[np.nan, 1.0]], dtype=np.float32))
 
 
 def test_numeric_normalizers_scale_actions_and_join_vector_state():
@@ -232,8 +249,8 @@ def test_libero90_config_and_cli_keep_sqcn_dimensions_and_entrypoint():
     )
 
     assert config["dataset"]["name"] == "libero90"
-    assert config["encoder"]["visual_dim"] == 256
-    assert config["encoder"]["embedding_dim"] == 128
+    assert config["encoder"]["visual_dim"] == 128
+    assert "embedding_dim" not in config["encoder"]
     args = build_parser().parse_args(
         [
             "--config",
