@@ -325,6 +325,14 @@ def test_octo_cli_rejects_target_only_prior_options(conflicting):
         parse_arguments(["--all-tasks", "--target-only", *conflicting])
 
 
+def test_octo_cli_leaves_target_only_unset_when_flag_is_absent():
+    from octo_small_libero.cli import parse_arguments
+
+    arguments = parse_arguments(["--all-tasks"])
+
+    assert arguments.target_only is None
+
+
 def test_octo_config_rejects_invalid_target_task_index():
     config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
     for value in (-1, 10, True):

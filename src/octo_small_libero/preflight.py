@@ -144,24 +144,39 @@ def _inspect_lerobot_dataset(root: Path) -> dict[str, Any]:
 
 
 def run_preflight(config: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any]:
+    target_only = bool(config["data"].get("target_only", False))
     try:
-        from .selection import resolve_prior_selection
-
         checkpoint = inspect_octo_checkpoint(paths["model"])
-        statistics = load_lerobot_statistics(paths["prior_dataset"])
-        prior = _inspect_lerobot_dataset(paths["prior_dataset"])
+        statistics_root = (
+            paths["target_dataset"] if target_only else paths["prior_dataset"]
+        )
+        statistics = load_lerobot_statistics(statistics_root)
         target = _inspect_lerobot_dataset(paths["target_dataset"])
         target_selection = resolve_target_task_selection(config, paths)
-        prior_selection = resolve_prior_selection(config, paths)
+        if target_only:
+            prior = None
+            prior_selection = None
+        else:
+            from .selection import resolve_prior_selection
+
+            prior = _inspect_lerobot_dataset(paths["prior_dataset"])
+            prior_selection = resolve_prior_selection(config, paths)
     except (OSError, RuntimeError, ValueError) as error:
         raise PreflightError(str(error)) from error
 
-    if prior["episodes"] != int(statistics["num_trajectories"]):
-        raise PreflightError(
-            "LIBERO-90 LeRobot episode count differs from its normalization statistics"
-        )
-    if prior["episodes"] <= 0:
-        raise PreflightError("LIBERO-90 prior must contain at least one episode")
+    if target_only:
+        if target["episodes"] != int(statistics["num_trajectories"]):
+            raise PreflightError(
+                "LIBERO-10 target episode count differs from its normalization statistics"
+            )
+    else:
+        assert prior is not None
+        if prior["episodes"] != int(statistics["num_trajectories"]):
+            raise PreflightError(
+                "LIBERO-90 LeRobot episode count differs from its normalization statistics"
+            )
+        if prior["episodes"] <= 0:
+            raise PreflightError("LIBERO-90 prior must contain at least one episode")
     expected_target_episodes = LIBERO_10_TASK_COUNT * LIBERO_10_DEMOS_PER_TASK
     if target["episodes"] != expected_target_episodes:
         raise PreflightError(
@@ -227,8 +242,30 @@ def run_preflight(config: dict[str, Any], paths: dict[str, Path]) -> dict[str, A
             f"WORLD_SIZE must be 1 for preflight or {requested_devices} for training"
         )
 
+    lerobot_report = {
+        "root": str(paths["lerobot"]),
+        "target": target,
+        "target_selection": target_selection.as_manifest(),
+        "sample_weights": (
+            [1.0] if target_only else list(config["data"]["sample_weights"])
+        ),
+        "raw_hdf5_checked": False,
+    }
+    if not target_only:
+        assert prior is not None
+        lerobot_report.update(
+            {
+                "prior": prior,
+                "prior_selection": (
+                    prior_selection.as_manifest()
+                    if prior_selection is not None
+                    else {"enabled": False}
+                ),
+            }
+        )
     report = {
         "route": "octo-small-libero-pytorch",
+        "training_mode": "target_only" if target_only else "mixed",
         "independent_from": "qwen3-vl",
         "runtime": {
             "framework": "pytorch",
@@ -236,22 +273,12 @@ def run_preflight(config: dict[str, Any], paths: dict[str, Path]) -> dict[str, A
             "transformers_version": transformers.__version__,
         },
         "checkpoint": checkpoint,
-        "lerobot": {
-            "root": str(paths["lerobot"]),
-            "prior": prior,
-            "target": target,
-            "target_selection": target_selection.as_manifest(),
-            "sample_weights": list(config["data"]["sample_weights"]),
-            "prior_selection": (
-                prior_selection.as_manifest()
-                if prior_selection is not None
-                else {"enabled": False}
-            ),
-            "raw_hdf5_checked": False,
-        },
+        "lerobot": lerobot_report,
         "normalization": {
             "path": str(paths["statistics"]),
-            "source_dataset": config["data"]["prior_dataset"],
+            "source_dataset": config["data"][
+                "target_dataset" if target_only else "prior_dataset"
+            ],
             "trajectories": int(statistics["num_trajectories"]),
             "transitions": int(statistics["num_transitions"]),
             "action_mask": list(config["data"]["action_normalization_mask"]),

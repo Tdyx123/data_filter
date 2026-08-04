@@ -171,6 +171,26 @@ bash scripts/train_libero_octo_small_all_tasks_4x4090.sh --smoke-test
 bash scripts/train_libero_octo_small_all_tasks_4x4090.sh
 ```
 
+如果只使用上述 `libero10_5` 中每个任务 5 条、共 50 条示例轨迹，不采样也不读取
+LIBERO-90 prior 或 SQCN/TDUS scores，追加 `--target-only`：
+
+```bash
+bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
+  --target-only \
+  --preflight-only
+bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
+  --target-only \
+  --smoke-test
+bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
+  --target-only
+```
+
+该模式的每卡 micro-batch 8 条样本全部来自 `libero10_5`，action 与 proprio
+归一化也使用 `libero10_5/meta/stats.json`。默认输出目录为
+`outputs/octo_small_libero_4gpu_all-tasks_target-only`。`--target-only` 不能与
+`--sample-weights` 或任何 `--prior-*` 参数同时使用；不传该开关时，脚本仍保持
+下面所述的 3:1 target/prior 混合训练行为。
+
 全任务 target 池内部按帧均匀采样；因此不同任务的抽样频率会随其轨迹总帧数
 变化。该脚本默认把
 `/data/dwb/libero90_sqcn/filter/top10pct/scores.csv` 作为已经筛选完成的 SQCN
@@ -321,6 +341,16 @@ bash scripts/train_libero_octo_small_4x4090.sh --task-index 5 --resume latest
 
 完整配置见 `configs/octo_small_libero_4x4090.yaml`，默认模型路径为
 `/data/dwb/models/octo-small-pytorch`。
+
+评测 target-only checkpoint 时必须使用与训练相同的 target 统计，不能沿用评测器
+默认的 LIBERO-90 统计：
+
+```bash
+bash scripts/evaluate_libero_octo_small.sh \
+  --checkpoint /path/to/checkpoint \
+  --base-model /data/dwb/models/octo-small-pytorch \
+  --statistics /data/dwb/datasets/LIBERO_lerobot/libero10_5/meta/stats.json
+```
 
 #### LIBERO checkpoint 闭环评测
 

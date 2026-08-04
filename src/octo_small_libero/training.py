@@ -33,62 +33,78 @@ def build_dataset_manifest(
     target_selection: Any | None = None,
     prior_selection: Any | None = None,
 ) -> dict[str, Any]:
+    target_only = bool(config["data"].get("target_only", False))
     if target_selection is None:
         from .data import resolve_target_task_selection
 
         target_selection = resolve_target_task_selection(config, paths)
-    if prior_selection is None and (
+    if not target_only and prior_selection is None and (
         config["data"]["prior_selection"].get("top_percent") is not None
         or config["data"]["prior_selection"].get("prefiltered", False)
     ):
         from .selection import resolve_prior_selection
 
         prior_selection = resolve_prior_selection(config, paths)
-    statistics = load_lerobot_statistics(paths["prior_dataset"])
     target_name = config["data"]["target_dataset"]
     prior_name = config["data"]["prior_dataset"]
-    sample_weights = normalized_sample_weights(config["data"]["sample_weights"])
+    normalization_name = target_name if target_only else prior_name
+    normalization_root = (
+        paths["target_dataset"] if target_only else paths["prior_dataset"]
+    )
+    statistics = load_lerobot_statistics(normalization_root)
+    sample_weights = (
+        (1.0,)
+        if target_only
+        else normalized_sample_weights(config["data"]["sample_weights"])
+    )
     target_metadata = LeRobotV2Metadata(paths["target_dataset"])
-    prior_metadata = LeRobotV2Metadata(paths["prior_dataset"])
     conversion_manifest_path = paths["lerobot"] / "conversion_manifest.json"
     target_conversion_manifest_path = (
         paths["lerobot"] / f"{target_name}_conversion_manifest.json"
     )
-    return {
+    datasets = {
+        target_name: {
+            "sample_weight": sample_weights[0],
+            "path": str(target_metadata.root),
+            "metadata_sha256": target_metadata.metadata_sha256(),
+            "episodes": int(target_metadata.info["total_episodes"]),
+            "frames": int(target_metadata.info["total_frames"]),
+            "episodes_used": target_selection.episodes,
+            "frames_used": target_selection.frames,
+            "selection": target_selection.as_manifest(),
+        }
+    }
+    if not target_only:
+        prior_metadata = LeRobotV2Metadata(paths["prior_dataset"])
+        datasets[prior_name] = {
+            "sample_weight": sample_weights[1],
+            "path": str(prior_metadata.root),
+            "metadata_sha256": prior_metadata.metadata_sha256(),
+            "episodes": int(prior_metadata.info["total_episodes"]),
+            "frames": int(prior_metadata.info["total_frames"]),
+            "frames_used": (
+                prior_selection.training_starts
+                if prior_selection is not None
+                else int(prior_metadata.info["total_frames"])
+            ),
+            "selection": (
+                prior_selection.as_manifest()
+                if prior_selection is not None
+                else {"enabled": False}
+            ),
+        }
+    statistics_sha256 = _statistics_sha256(paths["statistics"])
+    manifest = {
+        "training_mode": "target_only" if target_only else "mixed",
         "lerobot_root": str(paths["lerobot"]),
-        "datasets": {
-            target_name: {
-                "sample_weight": sample_weights[0],
-                "path": str(target_metadata.root),
-                "metadata_sha256": target_metadata.metadata_sha256(),
-                "episodes": int(target_metadata.info["total_episodes"]),
-                "frames": int(target_metadata.info["total_frames"]),
-                "episodes_used": target_selection.episodes,
-                "frames_used": target_selection.frames,
-                "selection": target_selection.as_manifest(),
-            },
-            prior_name: {
-                "sample_weight": sample_weights[1],
-                "path": str(prior_metadata.root),
-                "metadata_sha256": prior_metadata.metadata_sha256(),
-                "episodes": int(prior_metadata.info["total_episodes"]),
-                "frames": int(prior_metadata.info["total_frames"]),
-                "frames_used": (
-                    prior_selection.training_starts
-                    if prior_selection is not None
-                    else int(prior_metadata.info["total_frames"])
-                ),
-                "selection": (
-                    prior_selection.as_manifest()
-                    if prior_selection is not None
-                    else {"enabled": False}
-                ),
-            },
+        "datasets": datasets,
+        "normalization": {
+            "source_dataset": normalization_name,
+            "path": str(paths["statistics"]),
+            "sha256": statistics_sha256,
+            "trajectories": int(statistics["num_trajectories"]),
+            "transitions": int(statistics["num_transitions"]),
         },
-        "prior_statistics_path": str(paths["statistics"]),
-        "prior_statistics_sha256": _statistics_sha256(paths["statistics"]),
-        "normalization_trajectories": int(statistics["num_trajectories"]),
-        "normalization_transitions": int(statistics["num_transitions"]),
         "conversion_manifest": (
             str(conversion_manifest_path) if conversion_manifest_path.is_file() else None
         ),
@@ -98,6 +114,16 @@ def build_dataset_manifest(
             else None
         ),
     }
+    if not target_only:
+        manifest.update(
+            {
+                "prior_statistics_path": str(paths["statistics"]),
+                "prior_statistics_sha256": statistics_sha256,
+                "normalization_trajectories": int(statistics["num_trajectories"]),
+                "normalization_transitions": int(statistics["num_transitions"]),
+            }
+        )
+    return manifest
 
 
 def _move_to_device(value: Any, device: Any) -> Any:

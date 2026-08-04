@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prior-top-percent", type=float)
     parser.add_argument("--prior-scores")
     parser.add_argument("--prior-prefiltered-scores")
-    parser.add_argument("--target-only", action="store_true")
+    parser.add_argument("--target-only", action="store_true", default=None)
     parser.add_argument("--resume")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
