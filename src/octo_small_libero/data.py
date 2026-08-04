@@ -473,6 +473,9 @@ def training_selection_sha256(
     target_selection: TargetTaskSelection,
     prior_selection: Any | None,
     sample_weights: Sequence[float] | None = None,
+    *,
+    training_mode: str | None = None,
+    normalization_sha256: str | None = None,
 ) -> str:
     payload = {
         "target": target_selection.selection_sha256,
@@ -487,6 +490,10 @@ def training_selection_sha256(
             for value in normalized
         ):
             payload["sample_weights"] = normalized
+    if training_mode is not None:
+        payload["training_mode"] = training_mode
+    if normalization_sha256 is not None:
+        payload["normalization_sha256"] = normalization_sha256
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -688,16 +695,16 @@ class LeRobotFrameDataset:
 
 
 class CombinedLeRobotDataset(_TorchDataset):
-    """Routes sampler-generated source/frame pairs to target and prior datasets."""
+    """Routes sampler-generated source/frame pairs to active datasets."""
 
     def __init__(self, sources: Sequence[LeRobotFrameDataset]):
-        if len(sources) != 2:
-            raise ValueError("DataMIL training requires exactly target and prior sources")
+        if len(sources) not in (1, 2):
+            raise ValueError("LIBERO training requires one or two data sources")
         self.sources = tuple(sources)
 
     @property
-    def source_sizes(self) -> tuple[int, int]:
-        return tuple(len(source) for source in self.sources)  # type: ignore[return-value]
+    def source_sizes(self) -> tuple[int, ...]:
+        return tuple(len(source) for source in self.sources)
 
     def __len__(self) -> int:
         return sum(self.source_sizes)
@@ -709,7 +716,7 @@ class CombinedLeRobotDataset(_TorchDataset):
 
 
 class BalancedDistributedBatchSampler(_TorchSampler):
-    """Deterministic weighted target/prior batches split consistently across ranks."""
+    """Deterministic weighted source batches split consistently across ranks."""
 
     def __init__(
         self,
@@ -723,8 +730,12 @@ class BalancedDistributedBatchSampler(_TorchSampler):
         num_batches: int | None = None,
     ):
         torch = _require_torch()
-        if len(source_sizes) != 2 or any(int(size) <= 0 for size in source_sizes):
-            raise ValueError("source_sizes must contain two positive frame counts")
+        if len(source_sizes) not in (1, 2) or any(
+            int(size) <= 0 for size in source_sizes
+        ):
+            raise ValueError("source_sizes must contain one or two positive frame counts")
+        if len(sample_weights) != len(source_sizes):
+            raise ValueError("sample_weights must contain one weight per data source")
         if local_batch_size <= 0:
             raise ValueError("local_batch_size must be positive")
         if world_size <= 0 or not 0 <= rank < world_size:
@@ -750,7 +761,7 @@ class BalancedDistributedBatchSampler(_TorchSampler):
         self.step = 0
         self._generators = []
         self._permutations = []
-        self._positions = [0, 0]
+        self._positions = [0 for _ in self.source_sizes]
         for source, size in enumerate(self.source_sizes):
             generator = torch.Generator()
             generator.manual_seed(self.seed + source * 1_000_003)
@@ -786,7 +797,7 @@ class BalancedDistributedBatchSampler(_TorchSampler):
             for source, count in enumerate(self.source_batch_sizes):
                 start = self.rank * count
                 local_indices.append(global_indices[source][start : start + count])
-            positions = [0, 0]
+            positions = [0 for _ in self.source_sizes]
             batch: list[FrameIndex] = []
             for source in self._source_pattern:
                 batch.append(FrameIndex(source, local_indices[source][positions[source]]))
@@ -809,7 +820,10 @@ class BalancedDistributedBatchSampler(_TorchSampler):
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        if len(state.get("positions", [])) != 2 or len(state.get("permutations", [])) != 2:
+        source_count = len(self.source_sizes)
+        if len(state.get("positions", [])) != source_count or len(
+            state.get("permutations", [])
+        ) != source_count:
             raise ValueError("Invalid balanced sampler state")
         self.step = int(state["step"])
         self._positions = [int(value) for value in state["positions"]]
@@ -817,7 +831,7 @@ class BalancedDistributedBatchSampler(_TorchSampler):
             [int(value) for value in values] for values in state["permutations"]
         ]
         generator_states = state.get("generator_states", [])
-        if len(generator_states) != 2:
+        if len(generator_states) != source_count:
             raise ValueError("Invalid balanced sampler generator state")
         for generator, generator_state in zip(
             self._generators, generator_states, strict=True
@@ -849,18 +863,45 @@ def make_training_dataset(
     from torch.utils.data import DataLoader
 
     from .checkpoint import load_lerobot_statistics
-    from .selection import resolve_prior_selection
-
     data = config["data"]
     train = config["train"]
-    statistics = load_lerobot_statistics(paths["prior_dataset"])
+    target_only = bool(data.get("target_only", False))
+    statistics_root = (
+        paths["target_dataset"] if target_only else paths["prior_dataset"]
+    )
+    statistics = load_lerobot_statistics(statistics_root)
     target_selection = resolve_target_task_selection(config, paths)
-    prior_selection = resolve_prior_selection(config, paths)
-    names = [data["target_dataset"], data["prior_dataset"]]
-    roots = [paths["target_dataset"], paths["prior_dataset"]]
+    if target_only:
+        prior_selection = None
+        names = [data["target_dataset"]]
+        roots = [paths["target_dataset"]]
+        frame_indices = [target_selection.frame_indices]
+        sample_weights = (1.0,)
+        normalization_sha256 = hashlib.sha256(paths["statistics"].read_bytes()).hexdigest()
+    else:
+        from .selection import resolve_prior_selection
+
+        prior_selection = resolve_prior_selection(config, paths)
+        names = [data["target_dataset"], data["prior_dataset"]]
+        roots = [paths["target_dataset"], paths["prior_dataset"]]
+        frame_indices = [
+            target_selection.frame_indices,
+            (
+                prior_selection.frame_indices
+                if prior_selection is not None
+                else None
+            ),
+        ]
+        sample_weights = normalized_sample_weights(data["sample_weights"])
+        normalization_sha256 = None
     cache_size = int(train["episode_cache_size"])
     sources = []
-    for source, (name, root) in enumerate(zip(names, roots, strict=True)):
+    for name, root, selected_frames in zip(
+        names,
+        roots,
+        frame_indices,
+        strict=True,
+    ):
         sources.append(
             LeRobotFrameDataset(
                 root,
@@ -871,20 +912,11 @@ def make_training_dataset(
                 wrist_size=tuple(data["resize"]["wrist"]),
                 episode_cache_size=cache_size,
                 tokenizer=tokenizer,
-                frame_indices=(
-                    target_selection.frame_indices
-                    if source == 0
-                    else (
-                        prior_selection.frame_indices
-                        if prior_selection is not None
-                        else None
-                    )
-                ),
+                frame_indices=selected_frames,
             )
         )
     dataset = CombinedLeRobotDataset(sources)
     micro_batch_size = int(train["micro_batch_size_per_gpu"])
-    sample_weights = normalized_sample_weights(data["sample_weights"])
     num_batches = int(train["max_steps"]) * int(train["gradient_accumulation_steps"])
     sampler = BalancedDistributedBatchSampler(
         dataset.source_sizes,
@@ -920,5 +952,7 @@ def make_training_dataset(
             target_selection,
             prior_selection,
             sample_weights,
+            training_mode="target_only" if target_only else None,
+            normalization_sha256=normalization_sha256,
         ),
     )

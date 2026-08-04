@@ -14,25 +14,25 @@ class ConfigError(ValueError):
     """Raised when the independent Octo LIBERO configuration is invalid."""
 
 
-def normalized_sample_weights(weights: Sequence[float]) -> tuple[float, float]:
-    """Normalize target/prior sampling weights to probabilities."""
-    if len(weights) != 2 or any(
+def normalized_sample_weights(weights: Sequence[float]) -> tuple[float, ...]:
+    """Normalize one or more source sampling weights to probabilities."""
+    if not weights or any(
         isinstance(value, bool)
         or not isinstance(value, (int, float))
         or not math.isfinite(float(value))
         or value <= 0
         for value in weights
     ):
-        raise ValueError("sample weights must contain two positive finite numbers")
+        raise ValueError("sample weights must contain positive finite numbers")
     total = sum(float(value) for value in weights)
-    return (float(weights[0]) / total, float(weights[1]) / total)
+    return tuple(float(value) / total for value in weights)
 
 
 def sample_counts_per_batch(
     weights: Sequence[float],
     batch_size: int,
-) -> tuple[int, int]:
-    """Resolve exact target/prior counts for one local micro-batch."""
+) -> tuple[int, ...]:
+    """Resolve exact source counts for one local micro-batch."""
     normalized = normalized_sample_weights(weights)
     raw_counts = tuple(batch_size * value for value in normalized)
     counts = tuple(int(round(value)) for value in raw_counts)
@@ -44,7 +44,7 @@ def sample_counts_per_batch(
             "data.sample_weights must produce positive whole-number counts for "
             "train.micro_batch_size_per_gpu"
         )
-    return counts[0], counts[1]
+    return counts
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
