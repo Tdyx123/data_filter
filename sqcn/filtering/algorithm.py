@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import heapq
+import math
 import secrets
 from dataclasses import dataclass
 from typing import Sequence
@@ -11,18 +12,14 @@ import numpy as np
 
 
 SIGMA_EPSILON = 1.0e-8
-WEIGHT_EPSILON = 1.0e-12
 PENALTY_LAMBDA = 1.0
+UPDATE_BATCH_SIZE = 512
 
 
 @dataclass(frozen=True)
 class _AlgorithmParameters:
     init_select_size: int = 100
-    new_batch_size: int = 100
-    high_ref_size: int = 50
-    random_ref_size: int = 50
-    candidate_threshold: int = 50
-    unseen_rank: int = 300
+    candidate_capacity: int = 100
     neighbor_count: int = 5
 
 
@@ -63,10 +60,14 @@ def _validate_inputs(
         raise ValueError("embeddings must contain only finite values")
     if len(set(identifiers.tolist())) != len(identifiers) or np.any(identifiers == ""):
         raise ValueError("sample_ids must be non-empty and unique")
+    if len(values) < 100:
+        raise ValueError("scores must contain at least 100 fragments")
     if isinstance(target_size, bool) or not isinstance(target_size, (int, np.integer)):
         raise ValueError("target_size must be an integer")
-    if not 0 < int(target_size) <= len(values):
-        raise ValueError("target_size must be in [1, sample_count]")
+    if int(target_size) < 100:
+        raise ValueError("target_size must be at least 100")
+    if int(target_size) > len(values):
+        raise ValueError("target_size must be in [100, sample_count]")
     return values, encoded.astype(np.float64, copy=False), identifiers
 
 
@@ -98,6 +99,7 @@ class _DiverseSelector:
         *,
         seed: int,
         sigma_effective: float,
+        raw_order: np.ndarray | None = None,
         parameters: _AlgorithmParameters = _AlgorithmParameters(),
     ):
         self.scores = scores
@@ -106,8 +108,17 @@ class _DiverseSelector:
         self.rng = np.random.default_rng(seed)
         self.sigma = sigma_effective
         self.parameters = parameters
+        self._raw_order = (
+            _raw_order(scores, sample_ids)
+            if raw_order is None
+            else np.asarray(raw_order, dtype=np.int64)
+        )
+        sample_id_order = np.argsort(sample_ids)
+        self._sample_id_ranks = np.empty(len(sample_ids), dtype=np.int64)
+        self._sample_id_ranks[sample_id_order] = np.arange(len(sample_ids), dtype=np.int64)
         self.penalties = np.zeros(len(scores), dtype=np.float64)
         self.adjusted = scores.copy()
+        self.update_counts = np.zeros(len(scores), dtype=np.int64)
         self._neighbor_indices = np.full(
             (len(scores), self.parameters.neighbor_count),
             -1,
@@ -117,15 +128,11 @@ class _DiverseSelector:
             (len(scores), self.parameters.neighbor_count),
             dtype=np.float64,
         )
-        self.refresh_round = np.full(len(scores), -1, dtype=np.int64)
         self.selected: list[int] = []
         self.candidates: set[int] = set()
         self.silent: set[int] = set()
-        self.unseen: set[int] = set(range(len(scores)))
         self._silent_heap: list[tuple[float, float, str, int, int]] = []
         self._silent_versions = np.zeros(len(scores), dtype=np.int64)
-        self._silent_heap_round = -1
-        self._unseen_threshold = float("-inf")
         self._selected_adjusted: list[float] = []
         self._selected_knn_penalties: list[float] = []
 
@@ -139,95 +146,70 @@ class _DiverseSelector:
     def _best(self, indices: set[int] | list[int]) -> int:
         return min(indices, key=self._rank_key)
 
-    def _worst(self, indices: set[int]) -> int:
-        return max(indices, key=self._rank_key)
-
-    def _raw_ranked(self, indices: set[int] | list[int]) -> list[int]:
-        return sorted(
-            indices,
-            key=lambda index: (
-                -float(self.scores[index]),
-                str(self.sample_ids[index]),
-            ),
-        )
-
-    def _reference_set(self) -> list[int]:
-        ranked = self._raw_ranked(self.selected)
-        high_count = min(self.parameters.high_ref_size, len(ranked))
-        high = ranked[:high_count]
-        remaining = ranked[high_count:]
-        random_count = min(self.parameters.random_ref_size, len(remaining))
-        if random_count == 0:
-            return high
-        if random_count == len(remaining):
-            sampled = remaining
-        else:
-            weights = np.maximum(self.scores[remaining], WEIGHT_EPSILON)
-            probabilities = weights / weights.sum()
-            positions = self.rng.choice(
-                len(remaining),
-                size=random_count,
-                replace=False,
-                p=probabilities,
-            )
-            sampled = [remaining[int(position)] for position in positions]
-        return high + sampled
-
     def _update(self, indices: set[int] | list[int], references: list[int]) -> None:
         if not indices or not references:
             return
-        target = np.asarray(sorted(indices), dtype=np.int64)
-        reference = np.asarray(references, dtype=np.int64)
+        targets = np.asarray(sorted(indices), dtype=np.int64)
+        reference = np.unique(np.asarray(references, dtype=np.int64))
+        for start in range(0, len(targets), UPDATE_BATCH_SIZE):
+            self._update_batch(targets[start : start + UPDATE_BATCH_SIZE], reference)
+
+    def _update_batch(self, target: np.ndarray, reference: np.ndarray) -> None:
         deltas = self.embeddings[target, None, :] - self.embeddings[reference, :][None, :, :]
         squared_distances = np.einsum("ijk,ijk->ij", deltas, deltas)
         similarities = np.exp(-squared_distances / (2.0 * self.sigma * self.sigma))
-        for row, index in enumerate(target):
-            retained = {
-                int(neighbor): float(similarity)
-                for neighbor, similarity in zip(
-                    self._neighbor_indices[index],
-                    self._neighbor_similarities[index],
-                    strict=True,
-                )
-                if neighbor >= 0
-            }
-            retained.update(
-                {
-                    int(neighbor): float(similarity)
-                    for neighbor, similarity in zip(
-                        reference,
-                        similarities[row],
-                        strict=True,
-                    )
-                }
-            )
-            nearest = sorted(
-                retained.items(),
-                key=lambda item: (
-                    -item[1],
-                    str(self.sample_ids[item[0]]),
-                ),
-            )[: self.parameters.neighbor_count]
-            self._neighbor_indices[index].fill(-1)
-            self._neighbor_similarities[index].fill(0.0)
-            if nearest:
-                neighbor_indices = np.fromiter(
-                    (neighbor for neighbor, _ in nearest),
-                    dtype=np.int64,
-                    count=len(nearest),
-                )
-                neighbor_similarities = np.fromiter(
-                    (similarity for _, similarity in nearest),
-                    dtype=np.float64,
-                    count=len(nearest),
-                )
-                self._neighbor_indices[index, : len(nearest)] = neighbor_indices
-                self._neighbor_similarities[index, : len(nearest)] = neighbor_similarities
-                self.penalties[index] = float(
-                    np.mean(neighbor_similarities * self.scores[neighbor_indices])
-                )
-            else:
-                self.penalties[index] = 0.0
+        retained_indices = self._neighbor_indices[target].copy()
+        retained_similarities = self._neighbor_similarities[target].copy()
+        duplicate_retained = np.any(
+            retained_indices[:, :, None] == reference[None, None, :],
+            axis=2,
+        )
+        retained_indices[duplicate_retained] = -1
+        retained_similarities[duplicate_retained] = 0.0
+
+        new_indices = np.broadcast_to(reference, similarities.shape)
+        combined_indices = np.concatenate((retained_indices, new_indices), axis=1)
+        combined_similarities = np.concatenate(
+            (retained_similarities, similarities),
+            axis=1,
+        )
+        valid = combined_indices >= 0
+        safe_indices = np.where(valid, combined_indices, 0)
+        id_ranks = np.where(
+            valid,
+            self._sample_id_ranks[safe_indices],
+            np.iinfo(np.int64).max,
+        )
+        nearest_positions = np.lexsort(
+            (id_ranks, -combined_similarities),
+            axis=1,
+        )[:, : self.parameters.neighbor_count]
+        nearest_indices = np.take_along_axis(combined_indices, nearest_positions, axis=1)
+        nearest_similarities = np.take_along_axis(
+            combined_similarities,
+            nearest_positions,
+            axis=1,
+        )
+        nearest_valid = nearest_indices >= 0
+        self._neighbor_indices[target] = np.where(nearest_valid, nearest_indices, -1)
+        self._neighbor_similarities[target] = np.where(
+            nearest_valid,
+            nearest_similarities,
+            0.0,
+        )
+        nearest_safe_indices = np.where(nearest_valid, nearest_indices, 0)
+        weighted_scores = np.where(
+            nearest_valid,
+            nearest_similarities * self.scores[nearest_safe_indices],
+            0.0,
+        )
+        neighbor_counts = nearest_valid.sum(axis=1)
+        self.penalties[target] = np.divide(
+            weighted_scores.sum(axis=1),
+            neighbor_counts,
+            out=np.zeros(len(target), dtype=np.float64),
+            where=neighbor_counts > 0,
+        )
         self.adjusted[target] = self.scores[target] - PENALTY_LAMBDA * self.penalties[target]
 
     def _push_silent(self, index: int) -> None:
@@ -253,156 +235,71 @@ class _DiverseSelector:
             heapq.heappop(self._silent_heap)
         raise RuntimeError("silent heap is empty while silent items remain")
 
-    def _prepare_silent_round(self, round_id: int) -> None:
-        if self._silent_heap_round == round_id:
-            return
-        self._silent_heap_round = round_id
-        self._silent_heap.clear()
-        for index in self.silent:
-            self._silent_versions[index] += 1
-            version = int(self._silent_versions[index])
-            heapq.heappush(
-                self._silent_heap,
-                (
-                    -float(self.scores[index]),
-                    -float(self.scores[index]),
-                    str(self.sample_ids[index]),
-                    index,
-                    version,
-                ),
-            )
-
     def _remove_silent(self, index: int) -> None:
         self.silent.remove(index)
 
-    def _refresh_silent(
-        self,
-        index: int,
-        references: list[int],
-        round_id: int,
-    ) -> None:
-        self._update([index], references)
-        self.refresh_round[index] = round_id
-        self._silent_versions[index] += 1
-        version = int(self._silent_versions[index])
-        heapq.heappush(
-            self._silent_heap,
-            (
-                -float(self.adjusted[index]),
-                -float(self.scores[index]),
-                str(self.sample_ids[index]),
-                index,
-                version,
-            ),
-        )
+    def _pop_silent(self) -> int:
+        index = self._peek_silent()
+        self._remove_silent(index)
+        return index
 
-    def _sample_unseen(self) -> list[int]:
-        count = min(self.parameters.new_batch_size, len(self.unseen))
+    def _fill_initial_candidates(self) -> None:
+        count = min(self.parameters.candidate_capacity, len(self.silent))
+        for _ in range(count):
+            self.candidates.add(self._pop_silent())
+
+    def _required_update_count(self, selected_count: int) -> int:
+        excess = selected_count - self.parameters.init_select_size
+        if excess < 1:
+            raise ValueError("selected_count must exceed init_select_size")
+        return math.ceil(self.parameters.init_select_size + math.log2(excess))
+
+    def _sample_catch_up_references(self, count: int) -> list[int]:
         if count == 0:
             return []
-        population = sorted(
-            self.unseen,
-            key=lambda index: str(self.sample_ids[index]),
+        positions = self.rng.choice(
+            len(self.selected),
+            size=count,
+            replace=False,
         )
-        if count == len(population):
-            sampled = population
-        else:
-            positions = self.rng.choice(len(population), size=count, replace=False)
-            sampled = [population[int(position)] for position in positions]
-        self.unseen.difference_update(sampled)
-        return sampled
+        return [self.selected[int(position)] for position in positions]
 
-    def _refresh_unseen_threshold(self) -> None:
-        rank = self.parameters.unseen_rank
-        if len(self.unseen) < rank:
-            self._unseen_threshold = float("-inf")
-            return
-        unseen_scores = np.fromiter(
-            (self.scores[index] for index in self.unseen),
-            dtype=np.float64,
-            count=len(self.unseen),
-        )
-        position = len(unseen_scores) - rank
-        self._unseen_threshold = float(np.partition(unseen_scores, position)[position])
-
-    def _reactivate_silent(self, round_id: int) -> None:
+    def _promote_one_silent(self) -> None:
         if not self.silent:
             return
-        self._prepare_silent_round(round_id)
-        references = self._reference_set()
-        count = min(self.parameters.new_batch_size, len(self.silent))
-        reactivated: set[int] = set()
-        while len(reactivated) < count and self.silent:
-            best = self._peek_silent()
-            if self.refresh_round[best] != round_id:
-                self._refresh_silent(best, references, round_id)
-                continue
-            self._remove_silent(best)
-            reactivated.add(best)
-        self.candidates.update(reactivated)
-
-    def _add_candidates(self, round_id: int) -> None:
-        references = self._reference_set()
-        self._prepare_silent_round(round_id)
-        newly_sampled = self._sample_unseen()
-        self._refresh_unseen_threshold()
-        if not newly_sampled:
-            self._reactivate_silent(round_id)
-            return
-        self.penalties[newly_sampled] = 0.0
-        self.adjusted[newly_sampled] = self.scores[newly_sampled]
-        self._neighbor_indices[newly_sampled] = -1
-        self._neighbor_similarities[newly_sampled] = 0.0
-        self._update(newly_sampled, references)
-        self.refresh_round[newly_sampled] = round_id
-        admission = set(newly_sampled)
-        while self.silent and admission:
-            worst = self._worst(admission)
-            best_silent = self._peek_silent()
-            if self.refresh_round[best_silent] != round_id:
-                self._refresh_silent(best_silent, references, round_id)
-                continue
-            if self.adjusted[best_silent] <= self.adjusted[worst]:
-                break
-            if self.adjusted[best_silent] > self.adjusted[worst]:
-                admission.remove(worst)
-                self._push_silent(worst)
-                self._remove_silent(best_silent)
-                admission.add(best_silent)
-        self.candidates.update(admission)
-        for index in newly_sampled:
-            if index not in admission and index not in self.silent:
-                self._push_silent(index)
+        index = self._pop_silent()
+        required = self._required_update_count(len(self.selected))
+        deficit = max(0, required - int(self.update_counts[index]))
+        references = self._sample_catch_up_references(deficit)
+        self._update([index], references)
+        self.update_counts[index] += deficit
+        self.candidates.add(index)
 
     def _record_selected(self, index: int) -> None:
         self.selected.append(index)
         self._selected_adjusted.append(float(self.adjusted[index]))
         self._selected_knn_penalties.append(float(self.penalties[index]))
 
-    def select(self, target_size: int, raw_order: np.ndarray) -> tuple[np.ndarray, ...]:
+    def select(self, target_size: int) -> tuple[np.ndarray, ...]:
         initial_count = min(
             self.parameters.init_select_size,
             target_size,
             len(self.scores),
         )
-        for value in raw_order[:initial_count]:
+        for value in self._raw_order[:initial_count]:
             index = int(value)
-            self.unseen.remove(index)
             self._record_selected(index)
         if len(self.selected) >= target_size:
-            return self._result_arrays()
+            return self._selection_arrays()
 
-        round_id = 0
+        remaining = [int(index) for index in self._raw_order[initial_count:]]
+        self._update(remaining, self.selected)
+        self.update_counts[remaining] = initial_count
+        for index in remaining:
+            self._push_silent(index)
+        self._fill_initial_candidates()
+
         while len(self.selected) < target_size:
-            if len(self.candidates) <= self.parameters.candidate_threshold:
-                round_id += 1
-                self._add_candidates(round_id)
-            if not self.candidates:
-                if not self.unseen and not self.silent:
-                    break
-                if not self.unseen and self.silent:
-                    round_id += 1
-                    self._reactivate_silent(round_id)
             if not self.candidates:
                 break
 
@@ -411,20 +308,16 @@ class _DiverseSelector:
             self._record_selected(chosen)
             if len(self.selected) >= target_size:
                 break
-            self._update(self.candidates, [chosen])
-            move_to_silent = [
-                index for index in self.candidates if self.adjusted[index] < self._unseen_threshold
-            ]
-            for index in move_to_silent:
-                self.candidates.remove(index)
-                self._push_silent(index)
+            candidate_indices = sorted(self.candidates)
+            self._update(candidate_indices, [chosen])
+            self.update_counts[candidate_indices] += 1
+            self._promote_one_silent()
 
         if len(self.selected) != target_size:
             raise RuntimeError(
                 "SQCN filtering stopped before target_size: "
                 f"selected={len(self.selected)}, candidates={len(self.candidates)}, "
-                f"silent={len(self.silent)}, unseen={len(self.unseen)}, "
-                f"target={target_size}"
+                f"silent={len(self.silent)}, target={target_size}"
             )
         return self._result_arrays()
 
@@ -433,7 +326,6 @@ class _DiverseSelector:
             set(self.selected),
             self.candidates,
             self.silent,
-            self.unseen,
         )
         if sum(len(group) for group in groups) != len(self.scores) or set().union(*groups) != set(
             range(len(self.scores))
@@ -441,8 +333,11 @@ class _DiverseSelector:
             raise RuntimeError(
                 "SQCN filtering state partition is inconsistent: "
                 f"selected={len(groups[0])}, candidates={len(groups[1])}, "
-                f"silent={len(groups[2])}, unseen={len(groups[3])}"
+                f"silent={len(groups[2])}"
             )
+        return self._selection_arrays()
+
+    def _selection_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         return (
             np.asarray(self.selected, dtype=np.int64),
             np.asarray(self._selected_adjusted, dtype=np.float64),
@@ -481,8 +376,9 @@ def select_diverse_fragments(
         identifiers,
         seed=actual_seed,
         sigma_effective=sigma_effective,
+        raw_order=order,
     )
-    selected, adjusted_scores, knn_penalties = selector.select(int(target_size), order)
+    selected, adjusted_scores, knn_penalties = selector.select(int(target_size))
     return SelectionResult(
         selected_indices=selected,
         adjusted_scores=adjusted_scores,

@@ -17,13 +17,12 @@ import numpy as np
 
 from .algorithm import (
     PENALTY_LAMBDA,
-    WEIGHT_EPSILON,
     _AlgorithmParameters,
     select_diverse_fragments,
 )
 
 
-VERSION = "0.2.0"
+VERSION = "0.4.0"
 REQUIRED_SCORE_COLUMNS = (
     "sample_id",
     "episode_id",
@@ -265,6 +264,19 @@ def filter_sqcn_run(
                 "weight": "rbf_similarity",
                 "aggregation": "sum(similarity * score) / effective_neighbor_count",
             },
+            "silent": {
+                "policy": "frozen_adjusted_score_heap",
+                "initial_population": "all_non_initial_fragments",
+                "initial_candidate_fill": "top_adjusted_score_up_to_candidate_capacity",
+                "steady_promotion": "one_after_each_selection",
+            },
+            "update_count": {
+                "unit": "reference_fragments",
+                "initial": parameters.init_select_size,
+                "promotion_minimum": "ceil(100 + log2(selected_count - 100))",
+                "catch_up_sampling": "uniform_without_replacement_from_selected",
+                "persisted": "internal_only",
+            },
             "sigma": {
                 "policy": "mean_pairwise_euclidean_distance_of_raw_top_100",
                 "top_count": min(100, len(rows)),
@@ -273,13 +285,8 @@ def filter_sqcn_run(
             },
             "constants": {
                 "init_select_size": parameters.init_select_size,
-                "new_batch_size": parameters.new_batch_size,
-                "high_ref_size": parameters.high_ref_size,
-                "random_ref_size": parameters.random_ref_size,
-                "candidate_threshold": parameters.candidate_threshold,
-                "unseen_rank": parameters.unseen_rank,
+                "candidate_capacity": parameters.candidate_capacity,
                 "neighbor_count": parameters.neighbor_count,
-                "weight_epsilon": WEIGHT_EPSILON,
             },
             "ordering": [
                 "adjusted_score desc",

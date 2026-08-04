@@ -94,8 +94,9 @@ Coverage 参考片段按轨迹长度确定数量，在合法起点范围内覆�
 默认分别写入 `filter/top10pct/` 和 `filter/top20pct/`。每个目录包含过滤后的
 `scores.csv`、与其行顺序严格对齐的 `embeddings.npy`，以及记录源文件哈希、
 实际随机 seed、惩罚参数和选择摘要的 `filter_manifest.json`。过滤后的 CSV
-在原字段后追加 `filter_rank`、`adjusted_score` 和 `knn_penalty`。0.2.0 版
-filter 结果不再兼容旧 `max_penalty` 字段，旧结果需要重新生成。
+在原字段后追加 `filter_rank`、`adjusted_score` 和 `knn_penalty`。0.4.0 版
+filter 结果使用固定候选池和单点 silent 晋升状态机；旧结果与当前筛选轨迹不兼容，
+需要重新生成。输入片段总数和按比例向上取整后的目标数量都必须至少为 100。
 
 传入 `--quality-only` 时，只把多样性重排使用的基础分数从 `sqcn` 切换成
 `quality`；embedding、相似性惩罚、seed 和其余产物流程保持不变：
@@ -113,8 +114,9 @@ quality 模式默认写入 `filter/quality-top10pct/`，避免覆盖相同比例
 `algorithm.score_column` 会记录本次使用的 `quality` 或 `sqcn`，ordering
 也会同步声明对应的基础分数字段。
 
-未传 `--seed` 时，每次运行都会生成新的随机 seed。需要复现某次结果时，从
-该次 `filter_manifest.json` 的 `algorithm.seed` 读取数值并显式传入：
+未传 `--seed` 时，每次运行都会生成新的随机 seed。seed 只影响 silent 片段晋升
+candidate 时用于补齐更新计数的均匀随机抽样。需要复现某次结果时，从该次
+`filter_manifest.json` 的 `algorithm.seed` 读取数值并显式传入：
 
 ```bash
 .venv/bin/python -m sqcn.filtering \
@@ -126,11 +128,19 @@ quality 模式默认写入 `filter/quality-top10pct/`，避免覆盖相同比例
 
 可以用 `--output-dir PATH` 指定精确输出目录；已有目录必须显式传 `--force`
 才能替换。Filter 固定使用 `lambda=1.0`，`sigma` 为当前基础分数 Top 100 条
-embedding 的两两欧氏距离均值。每个候选在现有批量刷新和逐点更新过程中维护
-已遇到参考点里 RBF similarity 最高的 5 个点；相似度并列时按 `sample_id`
-升序取舍。惩罚为 `sum(similarity * score) / 有效近邻数`，不足 5 个时按实际
-近邻数计算，且不会保留历史最大惩罚。若目标数量不超过 100，结果按照算法定义
-直接取当前基础分数 Top-N，不进入相似性惩罚循环。
+embedding 的两两欧氏距离均值。Filter 先按基础分数降序、`sample_id` 升序选择
+Top 100；目标恰好为 100 时直接返回。否则，所有剩余片段先对这 100 个 selected
+片段计算惩罚、记录 `update_count=100` 并进入 frozen silent heap，再取 silent
+Top 100 形成 candidate 集合。
+
+之后每轮选择 candidate Top 1，将它加入 selected 并更新其余 candidates；若尚未
+达到目标，再从 silent 晋升 Top 1。晋升片段必须满足
+`ceil(100 + log2(selected_count - 100))` 次更新，不足部分从完整 selected 集合中
+均匀、批内无放回抽样补齐。silent 片段在晋升前不实时更新；silent 耗尽后继续
+排空 candidates。每个 candidate 维护已遇到 reference 中 RBF similarity 最高的
+5 个不同片段，相似度并列时按 `sample_id` 升序取舍。惩罚为
+`sum(similarity * score) / 有效近邻数`，不足 5 个时按实际近邻数计算，且不会
+保留历史最大惩罚。
 
 LIBERO-90 的固定规模基线是 35,164 个参考片段、46,705 个候选片段、10,651
 个重合片段以及 71,218 个 PCA 去重并集片段。
