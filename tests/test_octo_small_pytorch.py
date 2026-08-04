@@ -168,6 +168,46 @@ def test_weighted_distributed_sampler_uses_three_to_one_disjoint_batches():
         assert len(set.union(*rank_values)) == expected
 
 
+def test_single_source_distributed_sampler_is_disjoint_and_resumable():
+    samplers = [
+        BalancedDistributedBatchSampler(
+            (100,),
+            local_batch_size=8,
+            sample_weights=(1.0,),
+            rank=rank,
+            world_size=4,
+            seed=17,
+            num_batches=2,
+        )
+        for rank in range(4)
+    ]
+    batches = [next(iter(sampler)) for sampler in samplers]
+    assert all({item.source for item in batch} == {0} for batch in batches)
+    rank_frames = [{item.frame for item in batch} for batch in batches]
+    assert len(set.union(*rank_frames)) == 32
+
+    original = BalancedDistributedBatchSampler(
+        (25,),
+        local_batch_size=8,
+        sample_weights=(1.0,),
+        seed=5,
+        num_batches=4,
+    )
+    iterator = iter(original)
+    next(iterator)
+    state = original.state_dict()
+    expected = next(iterator)
+    restored = BalancedDistributedBatchSampler(
+        (25,),
+        local_batch_size=8,
+        sample_weights=(1.0,),
+        seed=5,
+        num_batches=4,
+    )
+    restored.load_state_dict(state)
+    assert next(iter(restored)) == expected
+
+
 def test_pytorch_training_checkpoint_round_trip(tmp_path):
     model = OctoSmallPolicy(TinyTextEncoder(16), _tiny_config())
     optimizer = torch.optim.AdamW(
