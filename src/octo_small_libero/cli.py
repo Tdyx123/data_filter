@@ -58,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prior-top-percent", type=float)
     parser.add_argument("--prior-scores")
     parser.add_argument("--prior-prefiltered-scores")
+    parser.add_argument("--target-only", action="store_true")
     parser.add_argument("--resume")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
@@ -75,6 +76,18 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "--prior-prefiltered-scores cannot be combined with "
             "--prior-top-percent or --prior-scores"
         )
+    if arguments.target_only and any(
+        value is not None
+        for value in (
+            arguments.sample_weights,
+            arguments.prior_top_percent,
+            arguments.prior_scores,
+            arguments.prior_prefiltered_scores,
+        )
+    ):
+        parser.error(
+            "--target-only cannot be combined with --sample-weights or --prior-* options"
+        )
     return arguments
 
 
@@ -90,6 +103,7 @@ def main() -> None:
         target_dataset=arguments.target_dataset,
         target_task_index=arguments.task_index,
         target_all_tasks=arguments.all_tasks,
+        target_only=arguments.target_only,
         output_dir=arguments.output_dir,
         gpu_ids=arguments.gpu_ids,
         batch_size=arguments.batch_size,

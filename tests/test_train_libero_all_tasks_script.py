@@ -90,3 +90,60 @@ def test_single_task_script_keeps_default_sample_weights():
         PROJECT_ROOT / "scripts" / "train_libero_octo_small_4x4090.sh"
     ).read_text(encoding="utf-8")
     assert "--sample-weights" not in source
+
+
+def test_all_tasks_script_target_only_omits_prior_defaults_and_uses_isolated_output(
+    tmp_path,
+):
+    calls = tmp_path / "calls.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for executable in ("python3", "torchrun"):
+        fake = fake_bin / executable
+        fake.write_text(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$OCTO_TEST_CALLS\"\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["OCTO_TEST_CALLS"] = str(calls)
+    script = PROJECT_ROOT / "scripts" / "train_libero_octo_small_all_tasks_4x4090.sh"
+
+    subprocess.run(
+        ["bash", str(script), "--target-only", "--preflight-only"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        check=True,
+    )
+    arguments = calls.read_text(encoding="utf-8").splitlines()
+    assert "--target-only" in arguments
+    assert "--sample-weights" not in arguments
+    assert "--prior-prefiltered-scores" not in arguments
+    output_index = arguments.index("--output-dir")
+    assert arguments[output_index + 1] == (
+        "outputs/octo_small_libero_4gpu_all-tasks_target-only"
+    )
+
+    custom_output = "outputs/custom-target-only"
+    subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--target-only",
+            "--output-dir",
+            custom_output,
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        check=True,
+    )
+    training_arguments = calls.read_text(encoding="utf-8").splitlines()
+    assert "--target-only" in training_arguments
+    assert "--sample-weights" not in training_arguments
+    assert "--prior-prefiltered-scores" not in training_arguments
+    output_indexes = [
+        index for index, value in enumerate(training_arguments) if value == "--output-dir"
+    ]
+    assert training_arguments[output_indexes[-1] + 1] == custom_output

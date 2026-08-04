@@ -8,6 +8,7 @@ data:
   target_dataset: libero10_5
   target_task_index: null
   target_all_tasks: false
+  target_only: false
   prior_selection:
     scores: outputs/tdus/libero90/chunk/scores.csv
     top_percent: null

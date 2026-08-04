@@ -92,8 +92,11 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ConfigError("The prior and target LeRobot dataset names must differ")
     target_task_index = data.get("target_task_index")
     target_all_tasks = data.get("target_all_tasks", False)
+    target_only = data.get("target_only", False)
     if not isinstance(target_all_tasks, bool):
         raise ConfigError("data.target_all_tasks must be a bool")
+    if not isinstance(target_only, bool):
+        raise ConfigError("data.target_only must be a bool")
     if target_task_index is not None and (
         isinstance(target_task_index, bool)
         or not isinstance(target_task_index, int)
@@ -249,6 +252,7 @@ def apply_overrides(config: dict[str, Any], **overrides: Any) -> dict[str, Any]:
         "target_dataset": ("data", "target_dataset"),
         "target_task_index": ("data", "target_task_index"),
         "target_all_tasks": ("data", "target_all_tasks"),
+        "target_only": ("data", "target_only"),
         "sample_weights": ("data", "sample_weights"),
         "gpu_ids": ("train", "gpu_ids"),
         "batch_size": ("train", "batch_size"),
@@ -294,6 +298,10 @@ def apply_overrides(config: dict[str, Any], **overrides: Any) -> dict[str, Any]:
             task_suffix = f"_task-{task_index}"
             if task_suffix not in output.name:
                 output = output.with_name(output.name + task_suffix)
+        if result["data"].get("target_only", False):
+            target_only_suffix = "_target-only"
+            if not output.name.endswith(target_only_suffix):
+                output = output.with_name(output.name + target_only_suffix)
         top_percent = result["data"]["prior_selection"]["top_percent"]
         if top_percent is not None:
             tag = format(float(top_percent), ".12g").replace(".", "p")
@@ -317,13 +325,16 @@ def resolved_paths(config: dict[str, Any]) -> dict[str, Path]:
     lerobot = resolve(config["paths"]["lerobot"])
     prior_dataset = lerobot / config["data"]["prior_dataset"]
     target_dataset = lerobot / config["data"]["target_dataset"]
+    statistics_dataset = (
+        target_dataset if config["data"].get("target_only", False) else prior_dataset
+    )
     return {
         "project_root": project_root,
         "model": resolve(config["paths"]["model"]),
         "lerobot": lerobot,
         "prior_dataset": prior_dataset,
         "target_dataset": target_dataset,
-        "statistics": prior_dataset / "meta" / "stats.json",
+        "statistics": statistics_dataset / "meta" / "stats.json",
         "prior_scores": resolve(config["data"]["prior_selection"]["scores"]),
         "output": resolve(config["paths"]["output"]),
     }

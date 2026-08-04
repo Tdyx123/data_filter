@@ -35,6 +35,7 @@ def test_octo_config_is_independent_and_points_to_local_checkpoint():
     assert config["data"]["target_dataset"] == "libero10_5"
     assert config["data"]["target_task_index"] is None
     assert config["data"]["target_all_tasks"] is False
+    assert config["data"]["target_only"] is False
     assert config["data"]["prior_selection"] == {
         "scores": "outputs/tdus/libero90/chunk/scores.csv",
         "top_percent": None,
@@ -114,6 +115,7 @@ def test_octo_cli_exposes_only_lerobot_data_override():
     assert "--sample-weights" in option_strings
     assert "--task-index" in option_strings
     assert "--all-tasks" in option_strings
+    assert "--target-only" in option_strings
     legacy_format = "rl" + "ds"
     assert f"--{legacy_format}-path" not in option_strings
     assert "--statistics-path" not in option_strings
@@ -289,6 +291,38 @@ def test_octo_all_tasks_override_isolates_output():
     assert all_tasks_and_prior["paths"]["output"].endswith(
         "_all-tasks_top10pct"
     )
+
+
+def test_octo_target_only_override_uses_target_statistics_and_isolates_output(tmp_path):
+    config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
+
+    target_only = apply_overrides(
+        config,
+        lerobot_path=str(tmp_path / "lerobot"),
+        target_all_tasks=True,
+        target_only=True,
+    )
+    paths = resolved_paths(target_only)
+
+    assert target_only["data"]["target_only"] is True
+    assert target_only["paths"]["output"].endswith("_all-tasks_target-only")
+    assert paths["statistics"] == paths["target_dataset"] / "meta" / "stats.json"
+
+
+@pytest.mark.parametrize(
+    "conflicting",
+    [
+        ["--sample-weights", "3", "1"],
+        ["--prior-top-percent", "10"],
+        ["--prior-scores", "/data/prior.csv"],
+        ["--prior-prefiltered-scores", "/data/prefiltered.csv"],
+    ],
+)
+def test_octo_cli_rejects_target_only_prior_options(conflicting):
+    from octo_small_libero.cli import parse_arguments
+
+    with pytest.raises(SystemExit):
+        parse_arguments(["--all-tasks", "--target-only", *conflicting])
 
 
 def test_octo_config_rejects_invalid_target_task_index():
