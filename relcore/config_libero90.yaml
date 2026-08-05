@@ -1,0 +1,88 @@
+seed: 42
+
+dataset:
+  type: lerobot
+  name: libero90
+  path: /data/dwb/datasets/LIBERO_lerobot/libero90
+  use_images: true
+  feature_keys:
+    action: action
+    timestamp: timestamp
+    frame_index: frame_index
+    episode_index: episode_index
+    vector_observations: [observation.state]
+    image_observations: [observation.images.image]
+
+clip:
+  length: 15
+  stride: 15
+
+visual:
+  encoder: clip
+  model: /data/dwb/models/clip-vit-base-patch32
+  local_files_only: true
+  batch_size: 64
+  device: auto
+
+normalization:
+  epsilon: 1.0e-6
+
+relation:
+  projection_dim: 32
+  output_dim: 256
+  lags: [0, 1, 2, 4]
+
+quality:
+  knn: 10
+  gripper_progress_weight: 0.5
+  visual_progress_weight: 0.25
+  noop_threshold: 1.0e-4
+  gripper_action_index: -1
+  min_reliability: 0.05
+
+prototypes:
+  count: 64
+  batch_size: 4096
+  max_iter: 100
+  top_r: 3
+  temperature: 0.1
+
+graph:
+  knn: 32
+  similarity_threshold: 0.80
+  cooccurrence_max_gap: 4
+
+objective:
+  node_weight: 4.0
+  transition_weight: 1.2
+  cooccurrence_weight: 0.5
+  sequence_weight: 2.0
+  redundancy_weight: 2.0
+
+selection:
+  ratio: 0.10
+  budget: null
+  quota_mode: proportional
+  minimum_per_task: 1
+  engine: sparse
+  branches: 8
+  seed_candidates: 128
+  seed_similarity_threshold: 0.90
+  transition_seed_threshold: 0.0
+  seed_pairs_per_transition: 4
+  global_candidates: 256
+  residual_candidates: 128
+  random_candidates: 128
+  local_search:
+    enabled: true
+    max_selected_candidates: 128
+    max_unselected_candidates: 256
+    max_rounds: 2
+
+runtime:
+  num_workers: 4
+  max_episodes: null
+  resume: true
+
+output:
+  directory: outputs/relcore/libero90

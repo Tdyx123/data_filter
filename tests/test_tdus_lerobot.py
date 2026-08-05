@@ -10,9 +10,18 @@ from PIL import Image
 
 from trajectory_data import (
     DatasetValidationError,
+    EpisodeRecord,
     LeRobotDatasetAdapter,
     aligned_chunk_windows,
 )
+
+
+def test_episode_record_two_field_constructor_remains_compatible():
+    record = EpisodeRecord(3, 17)
+
+    assert (record.episode_id, record.length) == (3, 17)
+    assert record.task_index is None
+    assert record.task_name is None
 
 
 def _png_bytes(frame: np.ndarray) -> bytes:
@@ -26,6 +35,8 @@ def _write_embedded_image_dataset(
     image_values: list[dict[str, object]],
     *,
     declared_shape: tuple[int, int, int] = (4, 5, 3),
+    task_index_values: list[int] | None = None,
+    task_name: str | None = None,
 ) -> None:
     meta = root / "meta"
     data = root / "data" / "chunk-000"
@@ -34,25 +45,18 @@ def _write_embedded_image_dataset(
     length = len(image_values)
     states = np.arange(length * 2, dtype=np.float32).reshape(length, 2)
     actions = np.arange(length * 3, dtype=np.float32).reshape(length, 3)
-    image_type = pa.struct(
-        [pa.field("bytes", pa.binary()), pa.field("path", pa.string())]
-    )
-    table = pa.table(
-        {
-            "observation.images.image": pa.array(image_values, type=image_type),
-            "observation.state": pa.array(
-                states.tolist(), type=pa.list_(pa.float32(), list_size=2)
-            ),
-            "action": pa.array(
-                actions.tolist(), type=pa.list_(pa.float32(), list_size=3)
-            ),
-            "timestamp": pa.array(
-                np.arange(length, dtype=np.float32) / 10.0, type=pa.float32()
-            ),
-            "frame_index": pa.array(np.arange(length), type=pa.int64()),
-            "episode_index": pa.array([0] * length, type=pa.int64()),
-        }
-    )
+    image_type = pa.struct([pa.field("bytes", pa.binary()), pa.field("path", pa.string())])
+    columns = {
+        "observation.images.image": pa.array(image_values, type=image_type),
+        "observation.state": pa.array(states.tolist(), type=pa.list_(pa.float32(), list_size=2)),
+        "action": pa.array(actions.tolist(), type=pa.list_(pa.float32(), list_size=3)),
+        "timestamp": pa.array(np.arange(length, dtype=np.float32) / 10.0, type=pa.float32()),
+        "frame_index": pa.array(np.arange(length), type=pa.int64()),
+        "episode_index": pa.array([0] * length, type=pa.int64()),
+    }
+    if task_index_values is not None:
+        columns["task_index"] = pa.array(task_index_values, type=pa.int64())
+    table = pa.table(columns)
     pq.write_table(table, data / "episode_000000.parquet")
     info = {
         "codebase_version": "v2.0",
@@ -73,8 +77,15 @@ def _write_embedded_image_dataset(
         },
     }
     (meta / "info.json").write_text(json.dumps(info), encoding="utf-8")
+    episode_row: dict[str, object] = {"episode_index": 0, "length": length}
+    if task_name is not None:
+        episode_row["tasks"] = [task_name]
+        (meta / "tasks.jsonl").write_text(
+            json.dumps({"task_index": task_index_values[0], "task": task_name}) + "\n",
+            encoding="utf-8",
+        )
     (meta / "episodes.jsonl").write_text(
-        json.dumps({"episode_index": 0, "length": length}) + "\n",
+        json.dumps(episode_row) + "\n",
         encoding="utf-8",
     )
 
@@ -101,8 +112,7 @@ def test_lerobot_adapter_discovers_observations_without_robot_assumptions(tmp_pa
         "chunks_size": 1000,
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
         "video_path": (
-            "videos/chunk-{episode_chunk:03d}/{video_key}/"
-            "episode_{episode_index:06d}.mp4"
+            "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
         ),
         "features": {
             "observation.images.front": {"dtype": "video", "shape": [64, 64, 3]},
@@ -133,10 +143,7 @@ def test_lerobot_adapter_discovers_observations_without_robot_assumptions(tmp_pa
 
 def test_lerobot_adapter_decodes_embedded_png_observations(tmp_path: Path):
     values = (11, 29, 47)
-    frames = [
-        np.full((4, 5, 3), value, dtype=np.uint8)
-        for value in values
-    ]
+    frames = [np.full((4, 5, 3), value, dtype=np.uint8) for value in values]
     _write_embedded_image_dataset(
         tmp_path,
         [{"bytes": _png_bytes(frame), "path": None} for frame in frames],
@@ -163,6 +170,92 @@ def test_lerobot_adapter_decodes_embedded_png_observations(tmp_path: Path):
         chunk.observations["observation.images.image"],
         decoded[:2],
     )
+
+
+def test_lerobot_adapter_exposes_consistent_episode_task_metadata(tmp_path: Path):
+    frame = np.full((4, 5, 3), 17, dtype=np.uint8)
+    _write_embedded_image_dataset(
+        tmp_path,
+        [{"bytes": _png_bytes(frame), "path": None}] * 3,
+        task_index_values=[7, 7, 7],
+        task_name="put the bowl on the plate",
+    )
+
+    adapter = _adapter(tmp_path)
+    record = adapter.episodes()[0]
+    episode = next(adapter.iter_episodes(load_images=False))
+
+    assert (record.task_index, record.task_name) == (
+        7,
+        "put the bowl on the plate",
+    )
+    assert (episode.task_index, episode.task_name) == (
+        7,
+        "put the bowl on the plate",
+    )
+
+
+def test_lerobot_adapter_rejects_mixed_parquet_task_indices(tmp_path: Path):
+    frame = np.full((4, 5, 3), 17, dtype=np.uint8)
+    _write_embedded_image_dataset(
+        tmp_path,
+        [{"bytes": _png_bytes(frame), "path": None}] * 3,
+        task_index_values=[7, 8, 7],
+        task_name="put the bowl on the plate",
+    )
+
+    with pytest.raises(DatasetValidationError, match="inconsistent task index"):
+        next(_adapter(tmp_path).iter_episodes(load_images=False))
+
+
+@pytest.mark.parametrize(
+    ("episode_tasks", "message"),
+    [
+        (["known task", "second task"], "exactly one task"),
+        (["unknown task"], "Unknown LeRobot task"),
+    ],
+)
+def test_lerobot_adapter_rejects_ambiguous_or_unknown_episode_tasks(
+    tmp_path: Path,
+    episode_tasks: list[str],
+    message: str,
+):
+    frame = np.full((4, 5, 3), 17, dtype=np.uint8)
+    _write_embedded_image_dataset(
+        tmp_path,
+        [{"bytes": _png_bytes(frame), "path": None}] * 2,
+        task_index_values=[7, 7],
+        task_name="known task",
+    )
+    (tmp_path / "meta" / "episodes.jsonl").write_text(
+        json.dumps({"episode_index": 0, "length": 2, "tasks": episode_tasks}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DatasetValidationError, match=message):
+        _adapter(tmp_path)
+
+
+def test_lerobot_adapter_keeps_sqcn_usable_when_tasks_index_is_missing(
+    tmp_path: Path,
+):
+    frame = np.full((4, 5, 3), 17, dtype=np.uint8)
+    _write_embedded_image_dataset(
+        tmp_path,
+        [{"bytes": _png_bytes(frame), "path": None}] * 2,
+        task_index_values=[7, 7],
+        task_name="put the bowl on the plate",
+    )
+    (tmp_path / "meta" / "tasks.jsonl").unlink()
+
+    adapter = _adapter(tmp_path)
+    record = adapter.episodes()[0]
+    episode = next(adapter.iter_episodes(load_images=False))
+
+    assert record.task_index is None
+    assert record.task_name == "put the bowl on the plate"
+    assert episode.task_index is None
+    assert episode.task_name == "put the bowl on the plate"
 
 
 def test_lerobot_adapter_does_not_decode_embedded_png_when_images_are_disabled(
@@ -263,8 +356,7 @@ def test_lerobot_adapter_keeps_video_decode_path(tmp_path: Path, monkeypatch):
         "chunks_size": 1000,
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
         "video_path": (
-            "videos/chunk-{episode_chunk:03d}/{video_key}/"
-            "episode_{episode_index:06d}.mp4"
+            "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
         ),
         "features": {
             "observation.images.image": {"dtype": "video", "shape": [4, 5, 3]},
@@ -280,9 +372,7 @@ def test_lerobot_adapter_keeps_video_decode_path(tmp_path: Path, monkeypatch):
         json.dumps({"episode_index": 0, "length": length}) + "\n",
         encoding="utf-8",
     )
-    expected = np.arange(length * 4 * 5 * 3, dtype=np.uint8).reshape(
-        length, 4, 5, 3
-    )
+    expected = np.arange(length * 4 * 5 * 3, dtype=np.uint8).reshape(length, 4, 5, 3)
     decoded_paths: list[Path] = []
 
     def fake_decode_video(path: Path) -> np.ndarray:
@@ -298,12 +388,9 @@ def test_lerobot_adapter_keeps_video_decode_path(tmp_path: Path, monkeypatch):
             num_workers=0,
         )
     )
-    np.testing.assert_array_equal(
-        segment.observations["observation.images.image"], expected
-    )
+    np.testing.assert_array_equal(segment.observations["observation.images.image"], expected)
     assert decoded_paths == [
-        tmp_path
-        / "videos/chunk-000/observation.images.image/episode_000000.mp4"
+        tmp_path / "videos/chunk-000/observation.images.image/episode_000000.mp4"
     ]
 
 
@@ -314,16 +401,18 @@ def test_real_libero90_lerobot_smoke():
         pytest.skip("real LIBERO-90 LeRobot dataset is not mounted")
     adapter = _adapter(root)
     assert len(adapter.episodes()) == 4500
+    assert adapter.episodes()[0].task_index is not None
+    assert adapter.episodes()[0].task_name
     assert adapter.vector_observation_keys == ("observation.state",)
     assert adapter.image_observation_keys == ("observation.images.image",)
     assert adapter.discovered_image_keys == (
         "observation.images.image",
         "observation.images.image2",
     )
-    assert sum(
-        len(aligned_chunk_windows(episode.length, 15, 15))
-        for episode in adapter.episodes()
-    ) == 46705
+    assert (
+        sum(len(aligned_chunk_windows(episode.length, 15, 15)) for episode in adapter.episodes())
+        == 46705
+    )
     segments = adapter.iter_segments(
         ["trajectory", "chunk"],
         chunk_length=15,

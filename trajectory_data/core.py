@@ -19,6 +19,8 @@ class EpisodeRecord:
 
     episode_id: int
     length: int
+    task_index: int | None = None
+    task_name: str | None = None
 
 
 @dataclass
@@ -30,6 +32,8 @@ class EpisodeData:
     frame_indices: np.ndarray
     observations: dict[str, np.ndarray]
     actions: np.ndarray
+    task_index: int | None = None
+    task_name: str | None = None
 
     @property
     def length(self) -> int:
@@ -103,13 +107,9 @@ def segment_episode(
     if kind == "trajectory":
         sample_id = f"ep{episode.episode_id:06d}_trajectory"
     elif kind == "chunk":
-        sample_id = (
-            f"ep{episode.episode_id:06d}_chunk_{start_step:06d}_{end_step:06d}"
-        )
+        sample_id = f"ep{episode.episode_id:06d}_chunk_{start_step:06d}_{end_step:06d}"
     else:
-        sample_id = (
-            f"ep{episode.episode_id:06d}_{kind}_{start_step:06d}_{end_step:06d}"
-        )
+        sample_id = f"ep{episode.episode_id:06d}_{kind}_{start_step:06d}_{end_step:06d}"
     return TrajectorySegment(
         sample_id=sample_id,
         episode_id=episode.episode_id,

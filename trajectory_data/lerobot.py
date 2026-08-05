@@ -35,9 +35,7 @@ def _decode_video(path: Path) -> np.ndarray:
     try:
         import av
     except ImportError as error:
-        raise RuntimeError(
-            "PyAV is required to decode LeRobot video observations"
-        ) from error
+        raise RuntimeError("PyAV is required to decode LeRobot video observations") from error
     frames: list[np.ndarray] = []
     try:
         with av.open(str(path), mode="r") as container:
@@ -64,16 +62,13 @@ def _decode_embedded_images(
     try:
         from PIL import Image
     except ImportError as error:
-        raise RuntimeError(
-            "Pillow is required to decode LeRobot image observations"
-        ) from error
+        raise RuntimeError("Pillow is required to decode LeRobot image observations") from error
 
     try:
         shape = tuple(int(dimension) for dimension in expected_shape)
     except (TypeError, ValueError) as error:
         raise DatasetValidationError(
-            f"Episode {episode_id}, {image_key}: invalid declared image shape "
-            f"{expected_shape!r}"
+            f"Episode {episode_id}, {image_key}: invalid declared image shape {expected_shape!r}"
         ) from error
     if len(shape) != 3 or shape[-1] != 3:
         raise DatasetValidationError(
@@ -139,9 +134,7 @@ def _load_lerobot_episode(payload: Mapping[str, Any]) -> EpisodeData:
     try:
         import pyarrow.parquet as pq
     except ImportError as error:
-        raise RuntimeError(
-            "pyarrow is required to read LeRobot Parquet files"
-        ) from error
+        raise RuntimeError("pyarrow is required to read LeRobot Parquet files") from error
 
     root = Path(str(payload["root"]))
     episode_id = int(payload["episode_id"])
@@ -159,8 +152,7 @@ def _load_lerobot_episode(payload: Mapping[str, Any]) -> EpisodeData:
     frame_key = str(payload["frame_key"])
     episode_key = str(payload["episode_key"])
     image_features = {
-        str(key): dict(value)
-        for key, value in dict(payload.get("image_features", {})).items()
+        str(key): dict(value) for key, value in dict(payload.get("image_features", {})).items()
     }
     embedded_image_keys = tuple(
         key for key, feature in image_features.items() if feature.get("dtype") == "image"
@@ -177,11 +169,19 @@ def _load_lerobot_episode(payload: Mapping[str, Any]) -> EpisodeData:
             ]
         )
     )
-    table = pq.read_table(parquet_path, columns=columns)
+    expected_task_index = payload.get("task_index")
+    if expected_task_index is not None:
+        columns.append("task_index")
+    try:
+        table = pq.read_table(parquet_path, columns=columns)
+    except Exception as error:
+        raise DatasetValidationError(
+            f"Episode {episode_id}: could not read required columns {columns} "
+            f"from {parquet_path}: {error}"
+        ) from error
     if len(table) != expected_length:
         raise DatasetValidationError(
-            f"Episode {episode_id}: Parquet rows={len(table)}, "
-            f"metadata length={expected_length}"
+            f"Episode {episode_id}: Parquet rows={len(table)}, metadata length={expected_length}"
         )
 
     def column_array(key: str, dtype: Any) -> np.ndarray:
@@ -200,15 +200,18 @@ def _load_lerobot_episode(payload: Mapping[str, Any]) -> EpisodeData:
             f"Episode {episode_id}: action/timestamp contains NaN or infinity"
         )
     if np.any(episode_indices != episode_id):
-        raise DatasetValidationError(
-            f"Episode {episode_id}: inconsistent episode index column"
-        )
+        raise DatasetValidationError(f"Episode {episode_id}: inconsistent episode index column")
     if len(timestamps) > 1 and np.any(np.diff(timestamps) < 0):
         raise DatasetValidationError(f"Episode {episode_id}: timestamps are not monotonic")
     if len(frame_indices) > 1 and np.any(np.diff(frame_indices) <= 0):
-        raise DatasetValidationError(
-            f"Episode {episode_id}: frame indices are not increasing"
-        )
+        raise DatasetValidationError(f"Episode {episode_id}: frame indices are not increasing")
+    if expected_task_index is not None:
+        task_indices = column_array("task_index", np.int64).reshape(-1)
+        if np.any(task_indices != int(expected_task_index)):
+            raise DatasetValidationError(
+                f"Episode {episode_id}: inconsistent task index column; "
+                f"expected {int(expected_task_index)}"
+            )
 
     observations: dict[str, np.ndarray] = {}
     for key in vector_keys:
@@ -254,6 +257,8 @@ def _load_lerobot_episode(payload: Mapping[str, Any]) -> EpisodeData:
         frame_indices=frame_indices,
         observations=observations,
         actions=actions,
+        task_index=(int(expected_task_index) if expected_task_index is not None else None),
+        task_name=(str(payload["task_name"]) if payload.get("task_name") is not None else None),
     )
 
 
@@ -278,10 +283,38 @@ class LeRobotDatasetAdapter(DatasetAdapter):
         self.features: dict[str, dict[str, Any]] = dict(self.info.get("features", {}))
         self._discover_keys()
         rows = _read_jsonl(episodes_path)
-        self._episodes = tuple(
-            EpisodeRecord(int(row["episode_index"]), int(row["length"]))
-            for row in rows
-        )
+        task_by_name = self._load_task_index()
+        records: list[EpisodeRecord] = []
+        for row in rows:
+            task_names = row.get("tasks")
+            task_name: str | None = None
+            task_index: int | None = None
+            if task_names is not None:
+                if not isinstance(task_names, list) or len(task_names) != 1:
+                    raise DatasetValidationError(
+                        "LeRobot episodes must reference exactly one task when task "
+                        f"metadata is present: episode {row.get('episode_index')}"
+                    )
+                task_name = str(task_names[0])
+                if not task_name:
+                    raise DatasetValidationError(
+                        f"Empty LeRobot task name for episode {row.get('episode_index')}"
+                    )
+                if task_name in task_by_name:
+                    task_index = task_by_name[task_name]
+                elif task_by_name:
+                    raise DatasetValidationError(
+                        f"Unknown LeRobot task {task_name!r} for episode {row.get('episode_index')}"
+                    )
+            records.append(
+                EpisodeRecord(
+                    int(row["episode_index"]),
+                    int(row["length"]),
+                    task_index,
+                    task_name,
+                )
+            )
+        self._episodes = tuple(records)
         if any(episode.length <= 0 for episode in self._episodes):
             raise DatasetValidationError("LeRobot episodes must contain at least one frame")
         expected = int(self.info.get("total_episodes", len(self._episodes)))
@@ -289,6 +322,28 @@ class LeRobotDatasetAdapter(DatasetAdapter):
             raise DatasetValidationError(
                 f"episodes.jsonl has {len(self._episodes)} entries, expected {expected}"
             )
+
+    def _load_task_index(self) -> dict[str, int]:
+        path = self.root / "meta" / "tasks.jsonl"
+        if not path.is_file():
+            return {}
+        by_name: dict[str, int] = {}
+        by_index: dict[int, str] = {}
+        for row in _read_jsonl(path):
+            task_name = str(row.get("task", ""))
+            try:
+                task_index = int(row["task_index"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise DatasetValidationError(f"Invalid task_index in {path}: {row!r}") from error
+            if not task_name:
+                raise DatasetValidationError(f"Empty task name in {path}")
+            if task_name in by_name or task_index in by_index:
+                raise DatasetValidationError(
+                    f"Duplicate task name or index in {path}: {task_name!r}, {task_index}"
+                )
+            by_name[task_name] = task_index
+            by_index[task_index] = task_name
+        return by_name
 
     def _discover_keys(self) -> None:
         overrides = dict(self.config.get("feature_keys", {}))
@@ -361,22 +416,16 @@ class LeRobotDatasetAdapter(DatasetAdapter):
             key for key in (*self._vector_keys, *selected_images) if key not in self.features
         ]
         if unknown:
-            raise DatasetValidationError(
-                f"Configured observation features not found: {unknown}"
-            )
+            raise DatasetValidationError(f"Configured observation features not found: {unknown}")
         invalid_vectors = [
-            key
-            for key in self._vector_keys
-            if self.features[key].get("dtype") in image_dtypes
+            key for key in self._vector_keys if self.features[key].get("dtype") in image_dtypes
         ]
         if invalid_vectors:
             raise DatasetValidationError(
                 f"Configured vector observations are image features: {invalid_vectors}"
             )
         invalid_images = [
-            key
-            for key in selected_images
-            if self.features[key].get("dtype") not in image_dtypes
+            key for key in selected_images if self.features[key].get("dtype") not in image_dtypes
         ]
         if invalid_images:
             raise DatasetValidationError(
@@ -400,8 +449,7 @@ class LeRobotDatasetAdapter(DatasetAdapter):
             sorted(
                 key
                 for key, value in self.features.items()
-                if key.startswith("observation.")
-                and value.get("dtype") in {"image", "video"}
+                if key.startswith("observation.") and value.get("dtype") in {"image", "video"}
             )
         )
 
@@ -418,14 +466,14 @@ class LeRobotDatasetAdapter(DatasetAdapter):
             "root": str(self.root),
             "episode_id": episode.episode_id,
             "length": episode.length,
+            "task_index": episode.task_index,
+            "task_name": episode.task_name,
             "chunks_size": int(self.info["chunks_size"]),
             "data_path": self.info["data_path"],
             "video_path": self.info.get("video_path", ""),
             "vector_keys": self._vector_keys,
             "image_features": (
-                {key: self.features[key] for key in self._image_keys}
-                if load_images
-                else {}
+                {key: self.features[key] for key in self._image_keys} if load_images else {}
             ),
             "action_key": self.action_key,
             "timestamp_key": self.timestamp_key,
@@ -443,9 +491,7 @@ class LeRobotDatasetAdapter(DatasetAdapter):
         episodes = self._episodes[:max_episodes] if max_episodes else self._episodes
         if num_workers <= 1:
             for episode in episodes:
-                yield _load_lerobot_episode(
-                    self._worker_payload(episode, load_images=load_images)
-                )
+                yield _load_lerobot_episode(self._worker_payload(episode, load_images=load_images))
             return
 
         context = mp.get_context("spawn")

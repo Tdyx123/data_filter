@@ -7,7 +7,8 @@ GR00T 风格 flow-matching DiT 动作头开始训练。
 
 仓库同时包含与训练解耦的通用轨迹数据价值工具
 [TDUS](tdus/README.md)，用于直接从 LeRobot trajectory/chunk 计算 Quality、
-Coverage、Diversity 和 Novelty。
+Coverage、Diversity 和 Novelty；以及仿照 SQCN 两遍数据流、面向 LIBERO 关系图与
+集合目标筛选的 [RelCore](relcore/README.md)。
 
 它不依赖 Isaac-GR00T 源码，也不兼容 NVIDIA GR00T checkpoint 或 Policy API。
 

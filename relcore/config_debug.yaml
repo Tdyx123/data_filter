@@ -1,0 +1,28 @@
+seed: 42
+dataset:
+  type: lerobot
+  name: libero90-debug
+  path: /data/dwb/datasets/LIBERO_lerobot/libero90
+  use_images: true
+  feature_keys:
+    vector_observations: [observation.state]
+    image_observations: [observation.images.image]
+visual:
+  encoder: dummy
+relation:
+  projection_dim: 8
+  output_dim: 32
+prototypes:
+  count: 4
+  top_r: 2
+selection:
+  budget: 4
+  quota_mode: proportional
+  branches: 2
+  local_search:
+    enabled: false
+runtime:
+  max_episodes: 2
+  num_workers: 0
+output:
+  directory: outputs/relcore/debug
