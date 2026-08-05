@@ -75,9 +75,13 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ConfigError(f"Missing configuration sections: {sorted(missing)}")
 
     paths = config["paths"]
-    for name in ("model", "lerobot", "output"):
+    for name in ("model", "lerobot"):
         if not isinstance(paths.get(name), str) or not paths[name].strip():
             raise ConfigError(f"paths.{name} must be a non-empty path")
+    if "output" in paths and (
+        not isinstance(paths["output"], str) or not paths["output"].strip()
+    ):
+        raise ConfigError("paths.output must be a non-empty path when provided")
 
     data = config["data"]
     for name in ("prior_dataset", "target_dataset", "action_key"):
@@ -135,6 +139,18 @@ def validate_config(config: dict[str, Any]) -> None:
     if prefiltered and top_percent is not None:
         raise ConfigError(
             "data.prior_selection.prefiltered cannot be combined with top_percent"
+        )
+    relcore_manifest = selection.get("relcore_manifest")
+    if relcore_manifest is not None and (
+        not isinstance(relcore_manifest, str) or not relcore_manifest.strip()
+    ):
+        raise ConfigError(
+            "data.prior_selection.relcore_manifest must be null or a non-empty path"
+        )
+    if relcore_manifest is not None and (prefiltered or top_percent is not None):
+        raise ConfigError(
+            "data.prior_selection.relcore_manifest cannot be combined with "
+            "prefiltered or top_percent"
         )
 
     weights = data.get("sample_weights")
@@ -272,41 +288,30 @@ def apply_overrides(config: dict[str, Any], **overrides: Any) -> dict[str, Any]:
         result["data"]["target_all_tasks"] = False
     if overrides.get("prior_scores") is not None:
         result["data"]["prior_selection"]["scores"] = overrides["prior_scores"]
+        result["data"]["prior_selection"]["relcore_manifest"] = None
     if overrides.get("prior_prefiltered_scores") is not None:
         result["data"]["prior_selection"].update(
             {
                 "scores": overrides["prior_prefiltered_scores"],
                 "top_percent": None,
                 "prefiltered": True,
+                "relcore_manifest": None,
             }
         )
     if overrides.get("prior_top_percent") is not None:
         result["data"]["prior_selection"]["top_percent"] = overrides[
             "prior_top_percent"
         ]
+        result["data"]["prior_selection"]["relcore_manifest"] = None
+    if overrides.get("prior_relcore_manifest") is not None:
+        result["data"]["prior_selection"].update(
+            {
+                "top_percent": None,
+                "prefiltered": False,
+                "relcore_manifest": overrides["prior_relcore_manifest"],
+            }
+        )
     validate_config(result)
-    if overrides.get("output_dir") is None:
-        output = Path(result["paths"]["output"])
-        task_index = result["data"].get("target_task_index")
-        if result["data"].get("target_all_tasks", False):
-            task_suffix = "_all-tasks"
-            if task_suffix not in output.name:
-                output = output.with_name(output.name + task_suffix)
-        elif task_index is not None:
-            task_suffix = f"_task-{task_index}"
-            if task_suffix not in output.name:
-                output = output.with_name(output.name + task_suffix)
-        if result["data"].get("target_only", False):
-            target_only_suffix = "_target-only"
-            if not output.name.endswith(target_only_suffix):
-                output = output.with_name(output.name + target_only_suffix)
-        top_percent = result["data"]["prior_selection"]["top_percent"]
-        if top_percent is not None:
-            tag = format(float(top_percent), ".12g").replace(".", "p")
-            top_suffix = f"_top{tag}pct"
-            if not output.name.endswith(top_suffix):
-                output = output.with_name(output.name + top_suffix)
-        result["paths"]["output"] = str(output)
     return result
 
 
@@ -326,7 +331,10 @@ def resolved_paths(config: dict[str, Any]) -> dict[str, Path]:
     statistics_dataset = (
         target_dataset if config["data"].get("target_only", False) else prior_dataset
     )
-    return {
+    output_value = config["paths"].get("output")
+    if not isinstance(output_value, str) or not output_value.strip():
+        raise ConfigError("An explicit --output-dir is required")
+    paths = {
         "project_root": project_root,
         "model": resolve(config["paths"]["model"]),
         "lerobot": lerobot,
@@ -334,5 +342,9 @@ def resolved_paths(config: dict[str, Any]) -> dict[str, Path]:
         "target_dataset": target_dataset,
         "statistics": statistics_dataset / "meta" / "stats.json",
         "prior_scores": resolve(config["data"]["prior_selection"]["scores"]),
-        "output": resolve(config["paths"]["output"]),
+        "output": resolve(output_value),
     }
+    relcore_manifest = config["data"]["prior_selection"].get("relcore_manifest")
+    if relcore_manifest is not None:
+        paths["prior_relcore_manifest"] = resolve(relcore_manifest)
+    return paths

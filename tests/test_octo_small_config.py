@@ -27,7 +27,7 @@ def test_octo_config_is_independent_and_points_to_local_checkpoint():
     config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
     assert config["paths"]["model"] == "/data/dwb/models/octo-small-pytorch"
     assert config["paths"]["lerobot"] == "/data/dwb/datasets/LIBERO_lerobot"
-    assert config["paths"]["output"] == "outputs/octo_small_libero_4gpu"
+    assert "output" not in config["paths"]
     assert "statistics" not in config["paths"]
     assert config["model"]["pretrained_step"] == 270000
     assert config["data"]["action_horizon"] == 8
@@ -40,6 +40,7 @@ def test_octo_config_is_independent_and_points_to_local_checkpoint():
         "scores": "outputs/tdus/libero90/chunk/scores.csv",
         "top_percent": None,
         "prefiltered": False,
+        "relcore_manifest": None,
     }
     assert config["model"]["required_observation_tokenizers"] == ["primary", "wrist"]
     assert config["train"]["gpu_ids"] == [0, 1, 2, 3]
@@ -99,7 +100,11 @@ def test_octo_conversion_rejects_missing_sentencepiece_source(tmp_path):
 
 def test_octo_config_lerobot_cli_override_and_derived_prior_statistics(tmp_path):
     config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
-    config = apply_overrides(config, lerobot_path=str(tmp_path / "lerobot"))
+    config = apply_overrides(
+        config,
+        lerobot_path=str(tmp_path / "lerobot"),
+        output_dir="outputs/test",
+    )
     paths = resolved_paths(config)
 
     assert paths["lerobot"] == (tmp_path / "lerobot").resolve()
@@ -122,6 +127,7 @@ def test_octo_cli_exposes_only_lerobot_data_override():
     assert "--prior-top-percent" in option_strings
     assert "--prior-scores" in option_strings
     assert "--prior-prefiltered-scores" in option_strings
+    assert "--prior-relcore-manifest" in option_strings
     assert "--sample-weights" in option_strings
     assert "--task-index" in option_strings
     assert "--all-tasks" in option_strings
@@ -129,6 +135,49 @@ def test_octo_cli_exposes_only_lerobot_data_override():
     legacy_format = "rl" + "ds"
     assert f"--{legacy_format}-path" not in option_strings
     assert "--statistics-path" not in option_strings
+
+
+def test_octo_cli_requires_explicit_output_dir():
+    from octo_small_libero.cli import build_parser
+
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--all-tasks"])
+
+    arguments = parser.parse_args(
+        ["--all-tasks", "--output-dir", "outputs/explicit"]
+    )
+    assert arguments.output_dir == "outputs/explicit"
+
+
+def test_octo_relcore_manifest_override_selects_relcore_without_default_output():
+    config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
+
+    updated = apply_overrides(
+        config,
+        target_all_tasks=True,
+        output_dir="outputs/relcore",
+        prior_relcore_manifest="/data/relcore/selected_manifest.jsonl",
+    )
+
+    assert updated["paths"]["output"] == "outputs/relcore"
+    assert updated["data"]["prior_selection"] == {
+        "scores": "outputs/tdus/libero90/chunk/scores.csv",
+        "top_percent": None,
+        "prefiltered": False,
+        "relcore_manifest": "/data/relcore/selected_manifest.jsonl",
+    }
+    paths = resolved_paths(updated)
+    assert paths["prior_relcore_manifest"] == Path(
+        "/data/relcore/selected_manifest.jsonl"
+    )
+
+
+def test_octo_resolved_paths_rejects_missing_explicit_output():
+    config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
+
+    with pytest.raises(ConfigError, match="--output-dir"):
+        resolved_paths(config)
 
 
 @pytest.mark.parametrize("max_steps", [5_000, 12_000])
@@ -164,12 +213,12 @@ def test_octo_sample_weights_override_requires_exact_local_batch_counts():
         validate_config(invalid)
 
 
-def test_octo_prior_percent_override_is_validated_and_isolates_output():
+def test_octo_prior_percent_override_is_validated_without_deriving_output():
     config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
     updated = apply_overrides(config, prior_top_percent=12.5)
 
     assert updated["data"]["prior_selection"]["top_percent"] == 12.5
-    assert updated["paths"]["output"].endswith("_top12p5pct")
+    assert "output" not in updated["paths"]
 
     explicit = apply_overrides(
         config,
@@ -194,6 +243,7 @@ def test_octo_prefiltered_scores_override_enables_all_rows_without_percent():
         "scores": "/data/sqcn/filter/top10pct/scores.csv",
         "top_percent": None,
         "prefiltered": True,
+        "relcore_manifest": None,
     }
 
 
@@ -213,6 +263,8 @@ def test_octo_cli_rejects_ranked_and_prefiltered_selection_together():
     repeated = parse_arguments(
         [
             "--all-tasks",
+            "--output-dir",
+            "outputs/test",
             "--prior-prefiltered-scores",
             "/data/first.csv",
             "--prior-prefiltered-scores",
@@ -225,6 +277,8 @@ def test_octo_cli_rejects_ranked_and_prefiltered_selection_together():
         parse_arguments(
             [
                 "--all-tasks",
+                "--output-dir",
+                "outputs/test",
                 "--prior-prefiltered-scores",
                 "/data/sqcn.csv",
                 "--prior-top-percent",
@@ -235,12 +289,53 @@ def test_octo_cli_rejects_ranked_and_prefiltered_selection_together():
         parse_arguments(
             [
                 "--all-tasks",
+                "--output-dir",
+                "outputs/test",
                 "--prior-prefiltered-scores",
                 "/data/sqcn.csv",
                 "--prior-scores",
                 "/data/tdus.csv",
             ]
         )
+
+
+@pytest.mark.parametrize(
+    "conflicting",
+    [
+        ["--prior-top-percent", "10"],
+        ["--prior-scores", "/data/tdus.csv"],
+        ["--prior-prefiltered-scores", "/data/sqcn.csv"],
+    ],
+)
+def test_octo_cli_rejects_relcore_with_other_prior_modes(conflicting):
+    from octo_small_libero.cli import parse_arguments
+
+    with pytest.raises(SystemExit):
+        parse_arguments(
+            [
+                "--all-tasks",
+                "--output-dir",
+                "outputs/relcore",
+                "--prior-relcore-manifest",
+                "/data/selected_manifest.jsonl",
+                *conflicting,
+            ]
+        )
+
+
+def test_octo_config_rejects_relcore_with_ranked_or_prefiltered_modes():
+    config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
+    config["data"]["prior_selection"].update(
+        {"relcore_manifest": "/data/selected_manifest.jsonl", "top_percent": 10}
+    )
+    with pytest.raises(ConfigError, match="relcore_manifest"):
+        validate_config(config)
+
+    config["data"]["prior_selection"].update(
+        {"top_percent": None, "prefiltered": True}
+    )
+    with pytest.raises(ConfigError, match="relcore_manifest"):
+        validate_config(config)
 
 
 def test_octo_task_index_override_is_required_by_cli_and_isolates_output():
@@ -250,33 +345,46 @@ def test_octo_task_index_override_is_required_by_cli_and_isolates_output():
     with pytest.raises(SystemExit):
         parser.parse_args([])
     with pytest.raises(SystemExit):
-        parser.parse_args(["--task-index", "-1"])
+        parser.parse_args(["--task-index", "-1", "--output-dir", "outputs/test"])
     with pytest.raises(SystemExit):
-        parser.parse_args(["--task-index", "10"])
+        parser.parse_args(["--task-index", "10", "--output-dir", "outputs/test"])
 
-    arguments = parser.parse_args(["--task-index", "5"])
+    arguments = parser.parse_args(
+        ["--task-index", "5", "--output-dir", "outputs/task-5"]
+    )
     assert arguments.task_index == 5
     assert arguments.all_tasks is False
-    all_arguments = parser.parse_args(["--all-tasks"])
+    all_arguments = parser.parse_args(
+        ["--all-tasks", "--output-dir", "outputs/all-tasks"]
+    )
     assert all_arguments.task_index is None
     assert all_arguments.all_tasks is True
     weighted_arguments = parser.parse_args(
-        ["--all-tasks", "--sample-weights", "3", "1"]
+        [
+            "--all-tasks",
+            "--output-dir",
+            "outputs/weighted",
+            "--sample-weights",
+            "3",
+            "1",
+        ]
     )
     assert weighted_arguments.sample_weights == [3.0, 1.0]
     with pytest.raises(SystemExit):
-        parser.parse_args(["--task-index", "5", "--all-tasks"])
+        parser.parse_args(
+            ["--task-index", "5", "--all-tasks", "--output-dir", "outputs/test"]
+        )
 
     config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
     task_only = apply_overrides(config, target_task_index=5)
-    assert task_only["paths"]["output"].endswith("_task-5")
+    assert "output" not in task_only["paths"]
 
     task_and_prior = apply_overrides(
         config,
         target_task_index=5,
         prior_top_percent=10,
     )
-    assert task_and_prior["paths"]["output"].endswith("_task-5_top10pct")
+    assert "output" not in task_and_prior["paths"]
 
     explicit = apply_overrides(
         config,
@@ -286,13 +394,13 @@ def test_octo_task_index_override_is_required_by_cli_and_isolates_output():
     assert explicit["paths"]["output"] == "outputs/explicit-task"
 
 
-def test_octo_all_tasks_override_isolates_output():
+def test_octo_all_tasks_override_does_not_derive_output():
     config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
 
     all_tasks = apply_overrides(config, target_all_tasks=True)
     assert all_tasks["data"]["target_task_index"] is None
     assert all_tasks["data"]["target_all_tasks"] is True
-    assert all_tasks["paths"]["output"].endswith("_all-tasks")
+    assert "output" not in all_tasks["paths"]
 
     config_with_task = apply_overrides(config, target_task_index=5)
     all_tasks_from_task_config = apply_overrides(
@@ -307,12 +415,10 @@ def test_octo_all_tasks_override_isolates_output():
         target_all_tasks=True,
         prior_top_percent=10,
     )
-    assert all_tasks_and_prior["paths"]["output"].endswith(
-        "_all-tasks_top10pct"
-    )
+    assert "output" not in all_tasks_and_prior["paths"]
 
 
-def test_octo_target_only_override_uses_target_statistics_and_isolates_output(tmp_path):
+def test_octo_target_only_override_uses_target_statistics_with_explicit_output(tmp_path):
     config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
 
     target_only = apply_overrides(
@@ -320,11 +426,12 @@ def test_octo_target_only_override_uses_target_statistics_and_isolates_output(tm
         lerobot_path=str(tmp_path / "lerobot"),
         target_all_tasks=True,
         target_only=True,
+        output_dir="outputs/target-only",
     )
     paths = resolved_paths(target_only)
 
     assert target_only["data"]["target_only"] is True
-    assert target_only["paths"]["output"].endswith("_all-tasks_target-only")
+    assert target_only["paths"]["output"] == "outputs/target-only"
     assert paths["statistics"] == paths["target_dataset"] / "meta" / "stats.json"
 
 
@@ -335,19 +442,24 @@ def test_octo_target_only_override_uses_target_statistics_and_isolates_output(tm
         ["--prior-top-percent", "10"],
         ["--prior-scores", "/data/prior.csv"],
         ["--prior-prefiltered-scores", "/data/prefiltered.csv"],
+        ["--prior-relcore-manifest", "/data/selected_manifest.jsonl"],
     ],
 )
 def test_octo_cli_rejects_target_only_prior_options(conflicting):
     from octo_small_libero.cli import parse_arguments
 
     with pytest.raises(SystemExit):
-        parse_arguments(["--all-tasks", "--target-only", *conflicting])
+        parse_arguments(
+            ["--all-tasks", "--output-dir", "outputs/test", "--target-only", *conflicting]
+        )
 
 
 def test_octo_cli_leaves_target_only_unset_when_flag_is_absent():
     from octo_small_libero.cli import parse_arguments
 
-    arguments = parse_arguments(["--all-tasks"])
+    arguments = parse_arguments(
+        ["--all-tasks", "--output-dir", "outputs/all-tasks"]
+    )
 
     assert arguments.target_only is None
 

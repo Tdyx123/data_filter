@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--task-index", type=_task_index)
     target.add_argument("--all-tasks", action="store_true")
-    parser.add_argument("--output-dir")
+    parser.add_argument("--output-dir", required=True)
     parser.add_argument("--gpu-ids", type=_gpu_ids)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--max-steps", type=int)
@@ -58,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prior-top-percent", type=float)
     parser.add_argument("--prior-scores")
     parser.add_argument("--prior-prefiltered-scores")
+    parser.add_argument("--prior-relcore-manifest")
     parser.add_argument("--target-only", action="store_true", default=None)
     parser.add_argument("--resume")
     parser.add_argument("--preflight-only", action="store_true")
@@ -76,6 +77,18 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "--prior-prefiltered-scores cannot be combined with "
             "--prior-top-percent or --prior-scores"
         )
+    if arguments.prior_relcore_manifest is not None and any(
+        value is not None
+        for value in (
+            arguments.prior_top_percent,
+            arguments.prior_scores,
+            arguments.prior_prefiltered_scores,
+        )
+    ):
+        parser.error(
+            "--prior-relcore-manifest cannot be combined with "
+            "--prior-top-percent, --prior-scores, or --prior-prefiltered-scores"
+        )
     if arguments.target_only and any(
         value is not None
         for value in (
@@ -83,6 +96,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
             arguments.prior_top_percent,
             arguments.prior_scores,
             arguments.prior_prefiltered_scores,
+            arguments.prior_relcore_manifest,
         )
     ):
         parser.error(
@@ -112,6 +126,7 @@ def main() -> None:
         prior_top_percent=arguments.prior_top_percent,
         prior_scores=arguments.prior_scores,
         prior_prefiltered_scores=arguments.prior_prefiltered_scores,
+        prior_relcore_manifest=arguments.prior_relcore_manifest,
     )
     if arguments.smoke_test:
         config["train"]["log_every_steps"] = 1

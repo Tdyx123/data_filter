@@ -8,16 +8,28 @@ training_args=(
   --config "${PROJECT_ROOT}/configs/octo_small_libero_4x4090.yaml"
   --all-tasks
 )
-if [[ " $* " == *" --target-only "* ]]; then
-  training_args+=(
-    --output-dir outputs/octo_small_libero_4gpu_all-tasks_target-only
-  )
-else
+target_only=false
+relcore_manifest=false
+for argument in "$@"; do
+  case "${argument}" in
+    --target-only)
+      target_only=true
+      ;;
+    --prior-relcore-manifest|--prior-relcore-manifest=*)
+      relcore_manifest=true
+      ;;
+  esac
+done
+
+if [[ "${target_only}" == false ]]; then
   training_args+=(
     --sample-weights 3 1
-    --prior-prefiltered-scores /data/dwb/libero90_sqcn/filter/top10pct/scores.csv
-    --output-dir outputs/octo_small_libero_4gpu_all-tasks_sqcn_top10pct
   )
+  if [[ "${relcore_manifest}" == false ]]; then
+    training_args+=(
+      --prior-prefiltered-scores /data/dwb/libero90_sqcn/filter/top10pct/scores.csv
+    )
+  fi
 fi
 
 if [[ " $* " == *" --preflight-only "* ]]; then

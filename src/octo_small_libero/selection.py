@@ -43,10 +43,23 @@ SQCN_SCORE_COLUMNS = {
     "knn_penalty",
 }
 SQCN_UNIT_COLUMNS = ("quality", "coverage", "novelty", "sqcn", "knn_penalty")
+RELCORE_REQUIRED_FIELDS = {
+    "sample_id",
+    "dataset_name",
+    "dataset_path",
+    "episode_id",
+    "start_step",
+    "end_step",
+    "length",
+    "task_index",
+    "task_name",
+    "selected",
+    "selection_order",
+}
 
 
 class PriorSelectionError(LiberoDataError):
-    """Raised when TDUS scores cannot safely select LIBERO prior frames."""
+    """Raised when an input cannot safely select LIBERO prior frames."""
 
 
 @dataclass(frozen=True)
@@ -61,6 +74,15 @@ class _ScoreRow:
 
 @dataclass(frozen=True)
 class _PrefilteredScoreRow:
+    sample_id: str
+    episode_id: int
+    start_step: int
+    end_step: int
+    length: int
+
+
+@dataclass(frozen=True)
+class _RelCoreRow:
     sample_id: str
     episode_id: int
     start_step: int
@@ -144,6 +166,38 @@ class PrefilteredPriorSelection:
             "training_starts": self.training_starts,
             "action_horizon": self.action_horizon,
             "ordering": list(self.ordering),
+            "boundary_policy": "complete_action_window",
+            "overlap_policy": "deduplicate_episode_frame_start",
+            "selection_sha256": self.selection_sha256,
+        }
+
+
+@dataclass(frozen=True)
+class RelCorePriorSelection:
+    manifest_path: Path
+    manifest_sha256: str
+    selected_fragments: int
+    selected_sample_ids: tuple[str, ...]
+    selected_episodes: int
+    frame_indices: tuple[int, ...]
+    action_horizon: int
+    selection_sha256: str
+
+    @property
+    def training_starts(self) -> int:
+        return len(self.frame_indices)
+
+    def as_manifest(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "mode": "relcore_selected_manifest",
+            "manifest_path": str(self.manifest_path),
+            "manifest_sha256": self.manifest_sha256,
+            "selected_fragments": self.selected_fragments,
+            "selected_episodes": self.selected_episodes,
+            "training_starts": self.training_starts,
+            "action_horizon": self.action_horizon,
+            "ordering": ["selection_order asc"],
             "boundary_policy": "complete_action_window",
             "overlap_policy": "deduplicate_episode_frame_start",
             "selection_sha256": self.selection_sha256,
@@ -716,16 +770,219 @@ def load_prefiltered_sqcn_selection(
     )
 
 
+def _relcore_integer(row: Mapping[str, Any], key: str, line_number: int) -> int:
+    value = row.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PriorSelectionError(
+            f"RelCore {key} must be an integer at JSONL line {line_number}"
+        )
+    return value
+
+
+def _relcore_selection_digest(
+    *,
+    manifest_sha256: str,
+    metadata_sha256: str,
+    action_horizon: int,
+    frame_indices: tuple[int, ...],
+) -> str:
+    payload = {
+        "mode": "relcore_selected_manifest",
+        "manifest_sha256": manifest_sha256,
+        "metadata_sha256": metadata_sha256,
+        "action_horizon": action_horizon,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    digest.update(np.asarray(frame_indices, dtype="<i8").tobytes())
+    return digest.hexdigest()
+
+
+def load_relcore_prior_selection(
+    manifest_path: str | Path,
+    metadata: LeRobotV2Metadata,
+    *,
+    action_horizon: int,
+) -> RelCorePriorSelection:
+    """Load selected RelCore fragments and expand complete action windows."""
+
+    if action_horizon <= 0:
+        raise PriorSelectionError("action_horizon must be positive")
+    path = Path(manifest_path).expanduser().resolve()
+    episodes = {episode.episode_index: episode for episode in metadata.episodes}
+    rows: list[_RelCoreRow] = []
+    sample_ids: set[str] = set()
+    try:
+        handle = path.open("r", encoding="utf-8")
+    except OSError as error:
+        raise PriorSelectionError(
+            f"Could not read RelCore manifest {path}: {error}"
+        ) from error
+    with handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise PriorSelectionError(
+                    f"Invalid JSON in RelCore manifest at {path}:{line_number}: {error}"
+                ) from error
+            if not isinstance(raw, dict):
+                raise PriorSelectionError(
+                    f"RelCore manifest row must be an object at JSONL line {line_number}"
+                )
+            missing = sorted(RELCORE_REQUIRED_FIELDS - raw.keys())
+            if missing:
+                raise PriorSelectionError(
+                    f"RelCore manifest row is missing fields {missing} "
+                    f"at JSONL line {line_number}"
+                )
+
+            sample_id = raw["sample_id"]
+            if not isinstance(sample_id, str) or not sample_id.strip():
+                raise PriorSelectionError(
+                    f"RelCore sample_id must be non-empty at JSONL line {line_number}"
+                )
+            if sample_id in sample_ids:
+                raise PriorSelectionError(
+                    f"Duplicate sample_id in RelCore manifest: {sample_id}"
+                )
+            sample_ids.add(sample_id)
+            episode_id = _relcore_integer(raw, "episode_id", line_number)
+            start_step = _relcore_integer(raw, "start_step", line_number)
+            end_step = _relcore_integer(raw, "end_step", line_number)
+            length = _relcore_integer(raw, "length", line_number)
+            task_index = _relcore_integer(raw, "task_index", line_number)
+            selection_order = _relcore_integer(raw, "selection_order", line_number)
+            if selection_order != len(rows) + 1:
+                raise PriorSelectionError(
+                    "RelCore selection_order must be contiguous from 1 in JSONL row order"
+                )
+            if raw["selected"] is not True:
+                raise PriorSelectionError(
+                    f"RelCore selected must be true at JSONL line {line_number}"
+                )
+            dataset_name = raw["dataset_name"]
+            if dataset_name != metadata.root.name:
+                raise PriorSelectionError(
+                    f"RelCore dataset_name={dataset_name!r} does not match "
+                    f"training prior {metadata.root.name!r}"
+                )
+            dataset_path = raw["dataset_path"]
+            if not isinstance(dataset_path, str) or not dataset_path.strip():
+                raise PriorSelectionError(
+                    f"RelCore dataset_path must be non-empty at JSONL line {line_number}"
+                )
+            resolved_dataset_path = Path(dataset_path).expanduser().resolve()
+            if resolved_dataset_path != metadata.root:
+                raise PriorSelectionError(
+                    f"RelCore dataset_path={resolved_dataset_path} does not match "
+                    f"training prior {metadata.root}"
+                )
+            if episode_id not in episodes:
+                raise PriorSelectionError(
+                    f"Unknown episode_id={episode_id} at JSONL line {line_number}"
+                )
+            episode = episodes[episode_id]
+            if start_step < 0 or end_step < start_step:
+                raise PriorSelectionError(
+                    f"Invalid frame range [{start_step}, {end_step}] "
+                    f"at JSONL line {line_number}"
+                )
+            if end_step >= episode.length:
+                raise PriorSelectionError(
+                    f"Fragment end_step={end_step} exceeds episode {episode_id} "
+                    f"length={episode.length}"
+                )
+            if length <= 0 or length != end_step - start_step + 1:
+                raise PriorSelectionError(
+                    f"Fragment length={length} does not match inclusive frame range "
+                    f"at JSONL line {line_number}"
+                )
+            expected_id = (
+                f"ep{episode_id:06d}_fragment_{start_step:06d}_{end_step:06d}"
+            )
+            if sample_id != expected_id:
+                raise PriorSelectionError(
+                    f"sample_id={sample_id!r} does not match {expected_id!r}"
+                )
+            task_name = raw["task_name"]
+            if task_index not in metadata.tasks:
+                raise PriorSelectionError(
+                    f"Unknown task_index={task_index} at JSONL line {line_number}"
+                )
+            expected_task_name = metadata.tasks[task_index]
+            if task_name != expected_task_name or task_name not in episode.tasks:
+                raise PriorSelectionError(
+                    f"RelCore task_name={task_name!r} does not match task_index={task_index} "
+                    f"or episode {episode_id}"
+                )
+            rows.append(
+                _RelCoreRow(
+                    sample_id=sample_id,
+                    episode_id=episode_id,
+                    start_step=start_step,
+                    end_step=end_step,
+                    length=length,
+                )
+            )
+    if not rows:
+        raise PriorSelectionError(f"RelCore manifest is empty: {path}")
+
+    frame_indices: set[int] = set()
+    selected_episode_ids: set[int] = set()
+    for row in rows:
+        last_start = row.end_step - action_horizon + 1
+        if last_start < row.start_step:
+            continue
+        selected_episode_ids.add(row.episode_id)
+        global_offset = metadata.global_offsets[row.episode_id]
+        frame_indices.update(
+            global_offset + frame
+            for frame in range(row.start_step, last_start + 1)
+        )
+    ordered_indices = tuple(sorted(frame_indices))
+    if not ordered_indices:
+        raise PriorSelectionError(
+            "Selected RelCore fragments contain no complete action windows"
+        )
+    manifest_sha256 = _sha256(path)
+    return RelCorePriorSelection(
+        manifest_path=path,
+        manifest_sha256=manifest_sha256,
+        selected_fragments=len(rows),
+        selected_sample_ids=tuple(row.sample_id for row in rows),
+        selected_episodes=len(selected_episode_ids),
+        frame_indices=ordered_indices,
+        action_horizon=action_horizon,
+        selection_sha256=_relcore_selection_digest(
+            manifest_sha256=manifest_sha256,
+            metadata_sha256=metadata.metadata_sha256(),
+            action_horizon=action_horizon,
+            frame_indices=ordered_indices,
+        ),
+    )
+
+
 def resolve_prior_selection(
     config: Mapping[str, Any],
     paths: Mapping[str, Path],
-) -> PriorSelection | None:
+) -> PriorSelection | PrefilteredPriorSelection | RelCorePriorSelection | None:
     selection = config["data"]["prior_selection"]
     percent = selection.get("top_percent")
     prefiltered = selection.get("prefiltered", False)
-    if percent is None and not prefiltered:
+    relcore_manifest = selection.get("relcore_manifest")
+    if percent is None and not prefiltered and relcore_manifest is None:
         return None
     metadata = LeRobotV2Metadata(paths["prior_dataset"])
+    if relcore_manifest is not None:
+        return load_relcore_prior_selection(
+            paths["prior_relcore_manifest"],
+            metadata,
+            action_horizon=int(config["data"]["action_horizon"]),
+        )
     if prefiltered:
         return load_prefiltered_sqcn_selection(
             paths["prior_scores"],

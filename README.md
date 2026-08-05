@@ -157,9 +157,12 @@ action window。每个 worker 使用有界 episode LRU cache；确定性 DDP sam
 采样。`--task-index` 是必填的评测 index，例如 book-caddy 为 `5`：
 
 ```bash
-bash scripts/train_libero_octo_small_4x4090.sh --task-index 5 --preflight-only
-bash scripts/train_libero_octo_small_4x4090.sh --task-index 5 --smoke-test
-bash scripts/train_libero_octo_small_4x4090.sh --task-index 5
+bash scripts/train_libero_octo_small_4x4090.sh \
+  --task-index 5 --output-dir outputs/octo_small_libero_task-5 --preflight-only
+bash scripts/train_libero_octo_small_4x4090.sh \
+  --task-index 5 --output-dir outputs/octo_small_libero_task-5-smoke --smoke-test
+bash scripts/train_libero_octo_small_4x4090.sh \
+  --task-index 5 --output-dir outputs/octo_small_libero_task-5
 ```
 
 如需让 LIBERO-10 的全部 10 个任务、50 条完整 target 轨迹共同参与训练，使用
@@ -167,9 +170,12 @@ bash scripts/train_libero_octo_small_4x4090.sh --task-index 5
 target 池和 25% LIBERO-90 prior 组成：
 
 ```bash
-bash scripts/train_libero_octo_small_all_tasks_4x4090.sh --preflight-only
-bash scripts/train_libero_octo_small_all_tasks_4x4090.sh --smoke-test
-bash scripts/train_libero_octo_small_all_tasks_4x4090.sh
+bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
+  --output-dir outputs/octo_small_libero_4gpu_all-tasks_sqcn_top10pct --preflight-only
+bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
+  --output-dir outputs/octo_small_libero_4gpu_all-tasks_sqcn_top10pct-smoke --smoke-test
+bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
+  --output-dir outputs/octo_small_libero_4gpu_all-tasks_sqcn_top10pct
 ```
 
 如果只使用上述 `libero10_5` 中每个任务 5 条、共 50 条示例轨迹，不采样也不读取
@@ -178,17 +184,19 @@ LIBERO-90 prior 或 SQCN/TDUS scores，追加 `--target-only`：
 ```bash
 bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
   --target-only \
+  --output-dir outputs/octo_small_libero_4gpu_all-tasks_target-only \
   --preflight-only
 bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
   --target-only \
+  --output-dir outputs/octo_small_libero_4gpu_all-tasks_target-only-smoke \
   --smoke-test
 bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
-  --target-only
+  --target-only \
+  --output-dir outputs/octo_small_libero_4gpu_all-tasks_target-only
 ```
 
 该模式的每卡 micro-batch 8 条样本全部来自 `libero10_5`，action 与 proprio
-归一化也使用 `libero10_5/meta/stats.json`。默认输出目录为
-`outputs/octo_small_libero_4gpu_all-tasks_target-only`。`--target-only` 不能与
+归一化也使用 `libero10_5/meta/stats.json`。`--target-only` 不能与
 `--sample-weights` 或任何 `--prior-*` 参数同时使用；不传该开关时，脚本仍保持
 下面所述的 3:1 target/prior 混合训练行为。
 
@@ -197,12 +205,11 @@ bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
 `/data/dwb/libero90_sqcn/filter/top10pct/scores.csv` 作为已经筛选完成的 SQCN
 片段清单，使用文件中的全部 4671 个片段，不再按分数二次截取。每个片段只
 贡献完整落在片段范围内的 8-step action window；重叠片段去重后覆盖 2923 条
-episode，共得到 36263 个 prior 训练起点。默认输出目录为
-`outputs/octo_small_libero_4gpu_all-tasks_sqcn_top10pct`。
+episode，共得到 36263 个 prior 训练起点。
 
 预检会核对同目录 `filter_manifest.json`、SQCN `run_manifest.json`、数据集来源、
-文件哈希、选择摘要、连续 `filter_rank` 和片段边界。可以重复传入新参数和输出
-参数来覆盖脚本默认值，后出现的值生效：
+文件哈希、选择摘要、连续 `filter_rank` 和片段边界。`--output-dir` 对训练、
+smoke test 和 preflight 都是必填参数；仓库配置和 shell 脚本均不提供默认值：
 
 ```bash
 bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
@@ -213,7 +220,35 @@ bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
 
 `--prior-prefiltered-scores` 不能与 TDUS 的 `--prior-top-percent` 或
 `--prior-scores` 混用。需要 TDUS 排名筛选时，继续使用单任务入口，或直接调用
-`python3 -m octo_small_libero.cli --all-tasks` 并传入 TDUS 参数。
+`python3 -m octo_small_libero.cli --all-tasks --output-dir PATH` 并传入 TDUS 参数。
+
+#### 使用 RelCore Top20% 清单训练
+
+使用 RelCore 已选 fragment 时传入独立的 `--prior-relcore-manifest`。all-tasks
+脚本会保留 `3:1` target/prior 权重，但不会再注入默认 SQCN 参数：
+
+```bash
+bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
+  --prior-relcore-manifest /data/dwb/libero_filter/relcore_top20pct/select/selected_manifest.jsonl \
+  --output-dir outputs/octo_small_libero_4gpu_all-tasks_relcore_top20pct \
+  --preflight-only
+
+bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
+  --prior-relcore-manifest /data/dwb/libero_filter/relcore_top20pct/select/selected_manifest.jsonl \
+  --output-dir outputs/octo_small_libero_4gpu_all-tasks_relcore_top20pct-smoke \
+  --smoke-test
+
+bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
+  --prior-relcore-manifest /data/dwb/libero_filter/relcore_top20pct/select/selected_manifest.jsonl \
+  --output-dir outputs/octo_small_libero_4gpu_all-tasks_relcore_top20pct
+```
+
+当前清单包含 9,341 个 selected fragment，覆盖 1,005 条 episode。每个 inclusive
+片段只展开完整的 8-step action window，重叠起点去重后得到 74,320 个 prior
+训练起点。预检只校验 JSONL 内容与 LIBERO-90 LeRobot metadata，不依赖相邻的
+RelCore stage manifest 或 report；JSONL 中的可靠性、边际收益等额外字段不作为
+训练权重。`--prior-relcore-manifest` 不能与 TDUS/SQCN prior 参数或
+`--target-only` 混用。
 
 训练脚本使用 `torchrun`、DDP 和 BF16；默认每卡 micro-batch 8，其中全任务
 target 6 条、prior 2 条；梯度累积 4 后，四卡有效全局 batch 为 128，其中
@@ -229,6 +264,7 @@ safetensors/转换清单、CUDA 数量和 BF16 支持。
 bash scripts/train_libero_octo_small_4x4090.sh \
   --task-index 5 \
   --lerobot-path /data/dwb/datasets/LIBERO_lerobot \
+  --output-dir outputs/octo_small_libero_task-5 \
   --preflight-only
 ```
 
@@ -239,8 +275,12 @@ LIBERO-90 prior，同时保留所选任务完整的 5 条 target 轨迹，并继
 组成每个 micro-batch。Top 10% 和 Top 20% 分别运行：
 
 ```bash
-bash scripts/train_libero_octo_small_4x4090.sh --task-index 5 --prior-top-percent 10
-bash scripts/train_libero_octo_small_4x4090.sh --task-index 5 --prior-top-percent 20
+bash scripts/train_libero_octo_small_4x4090.sh \
+  --task-index 5 --prior-top-percent 10 \
+  --output-dir outputs/octo_small_libero_task-5_top10pct
+bash scripts/train_libero_octo_small_4x4090.sh \
+  --task-index 5 --prior-top-percent 20 \
+  --output-dir outputs/octo_small_libero_task-5_top20pct
 ```
 
 比例接受 `(0, 100]` 内的任意数值，选中 chunk 数按向上取整计算。排序固定为
@@ -249,9 +289,8 @@ bash scripts/train_libero_octo_small_4x4090.sh --task-index 5 --prior-top-percen
 保留一次。`--prior-top-percent 100` 仍应用这套严格片段边界；不传该参数才是
 包含 episode 尾部 padding window 的原始全帧基线。
 
-未显式传 `--output-dir` 时，输出目录会先追加 `_task-5` 等任务后缀，再追加
-`_top10pct`、`_top20pct` 等 prior 比例后缀，避免任务或比例互相覆盖。也可以
-覆盖 scores 文件和输出位置：
+输出目录必须显式指定，建议在路径中包含任务与 prior 比例，避免实验互相覆盖。
+也可以同时覆盖 scores 文件：
 
 ```bash
 bash scripts/train_libero_octo_small_4x4090.sh \
@@ -270,6 +309,7 @@ bash scripts/train_libero_octo_small_4x4090.sh \
 bash scripts/train_libero_octo_small_4x4090.sh \
   --task-index 5 \
   --prior-top-percent 10 \
+  --output-dir outputs/octo_small_libero_task-5_top10pct \
   --resume latest
 ```
 
@@ -341,7 +381,10 @@ checkpoint，并使用该保存区间内的平均训练 loss 选择 best。`chec
 sampler 和 RNG 状态。严格续训：
 
 ```bash
-bash scripts/train_libero_octo_small_4x4090.sh --task-index 5 --resume latest
+bash scripts/train_libero_octo_small_4x4090.sh \
+  --task-index 5 \
+  --output-dir outputs/octo_small_libero_task-5 \
+  --resume latest
 ```
 
 完整配置见 `configs/octo_small_libero_4x4090.yaml`，默认模型路径为

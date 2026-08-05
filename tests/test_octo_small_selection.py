@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from octo_small_libero import selection as selection_module
 from octo_small_libero.selection import (
     PriorSelectionError,
     load_prefiltered_sqcn_selection,
@@ -34,10 +35,12 @@ def _metadata(tmp_path: Path):
     return SimpleNamespace(
         root=root,
         episodes=(
-            SimpleNamespace(episode_index=0, length=40),
-            SimpleNamespace(episode_index=1, length=40),
+            SimpleNamespace(episode_index=0, length=40, tasks=("task zero",)),
+            SimpleNamespace(episode_index=1, length=40, tasks=("task one",)),
         ),
         global_offsets={0: 0, 1: 40},
+        tasks={0: "task zero", 1: "task one"},
+        metadata_sha256=lambda: "metadata-sha256",
     )
 
 
@@ -200,6 +203,43 @@ def _write_sqcn_selection(
         encoding="utf-8",
     )
     return scores, filter_manifest, run_manifest
+
+
+def _relcore_row(
+    metadata,
+    episode_id: int,
+    start_step: int,
+    end_step: int,
+    order: int,
+    *,
+    task_index: int = 0,
+):
+    return {
+        "sample_id": (
+            f"ep{episode_id:06d}_fragment_{start_step:06d}_{end_step:06d}"
+        ),
+        "dataset_name": "libero90",
+        "dataset_path": str(metadata.root),
+        "episode_id": episode_id,
+        "start_step": start_step,
+        "end_step": end_step,
+        "length": end_step - start_step + 1,
+        "task_index": task_index,
+        "task_name": metadata.tasks[task_index],
+        "selected": True,
+        "selection_order": order,
+        "reliability": 0.75,
+    }
+
+
+def _write_relcore_manifest(tmp_path: Path, rows) -> Path:
+    manifest = tmp_path / "selected_manifest.jsonl"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    return manifest
 
 
 def test_selection_uses_stable_top_percent_strict_boundaries_and_dedup(tmp_path):
@@ -463,6 +503,225 @@ def test_prefiltered_sqcn_rejects_fragments_without_complete_action_window(tmp_p
         load_prefiltered_sqcn_selection(scores, metadata, action_horizon=8)
 
 
+def test_relcore_manifest_expands_complete_windows_and_deduplicates_overlap(tmp_path):
+    metadata = _metadata(tmp_path)
+    manifest = _write_relcore_manifest(
+        tmp_path,
+        [
+            _relcore_row(metadata, 0, 0, 14, 1),
+            _relcore_row(metadata, 0, 7, 21, 2),
+        ],
+    )
+
+    selection = selection_module.load_relcore_prior_selection(
+        manifest,
+        metadata,
+        action_horizon=8,
+    )
+
+    assert selection.frame_indices == tuple(range(15))
+    assert selection.selected_fragments == 2
+    assert selection.selected_episodes == 1
+    assert selection.training_starts == 15
+    assert selection.selected_sample_ids == (
+        "ep000000_fragment_000000_000014",
+        "ep000000_fragment_000007_000021",
+    )
+    manifest_record = selection.as_manifest()
+    assert manifest_record == {
+        "enabled": True,
+        "mode": "relcore_selected_manifest",
+        "manifest_path": str(manifest.resolve()),
+        "manifest_sha256": _file_sha256(manifest),
+        "selected_fragments": 2,
+        "selected_episodes": 1,
+        "training_starts": 15,
+        "action_horizon": 8,
+        "ordering": ["selection_order asc"],
+        "boundary_policy": "complete_action_window",
+        "overlap_policy": "deduplicate_episode_frame_start",
+        "selection_sha256": selection.selection_sha256,
+    }
+
+
+def test_relcore_selection_signature_covers_manifest_and_metadata(tmp_path):
+    metadata = _metadata(tmp_path)
+    row = _relcore_row(metadata, 0, 0, 14, 1)
+    manifest = _write_relcore_manifest(tmp_path, [row])
+    original = selection_module.load_relcore_prior_selection(
+        manifest,
+        metadata,
+        action_horizon=8,
+    )
+
+    changed_manifest = _write_relcore_manifest(
+        tmp_path,
+        [dict(row, reliability=0.5)],
+    )
+    manifest_changed = selection_module.load_relcore_prior_selection(
+        changed_manifest,
+        metadata,
+        action_horizon=8,
+    )
+    metadata.metadata_sha256 = lambda: "changed-metadata-sha256"
+    metadata_changed = selection_module.load_relcore_prior_selection(
+        changed_manifest,
+        metadata,
+        action_horizon=8,
+    )
+
+    assert original.frame_indices == manifest_changed.frame_indices
+    assert original.selection_sha256 != manifest_changed.selection_sha256
+    assert manifest_changed.selection_sha256 != metadata_changed.selection_sha256
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("missing_field", "missing fields"),
+        ("duplicate_id", "Duplicate sample_id"),
+        ("selection_order", "selection_order"),
+        ("selected", "selected"),
+        ("dataset_name", "training prior"),
+        ("dataset_path", "training prior"),
+        ("sample_id", "sample_id"),
+        ("length", "length"),
+        ("unknown_episode", "Unknown episode_id"),
+        ("unknown_task", "Unknown task_index"),
+        ("task_name", "task_name"),
+        ("bounds", "exceeds episode"),
+        ("bool_integer", "episode_id"),
+    ],
+)
+def test_relcore_manifest_rejects_invalid_rows(tmp_path, case, message):
+    metadata = _metadata(tmp_path)
+    row = _relcore_row(metadata, 0, 0, 14, 1)
+    rows = [row]
+    if case == "missing_field":
+        row.pop("dataset_name")
+    elif case == "duplicate_id":
+        rows.append(dict(row, selection_order=2))
+    elif case == "selection_order":
+        row["selection_order"] = 2
+    elif case == "selected":
+        row["selected"] = False
+    elif case == "dataset_name":
+        row["dataset_name"] = "other"
+    elif case == "dataset_path":
+        row["dataset_path"] = str(tmp_path / "different")
+    elif case == "sample_id":
+        row["sample_id"] = "not-canonical"
+    elif case == "length":
+        row["length"] = 14
+    elif case == "unknown_episode":
+        row.update(
+            {
+                "sample_id": "ep000099_fragment_000000_000014",
+                "episode_id": 99,
+            }
+        )
+    elif case == "unknown_task":
+        row["task_index"] = 99
+    elif case == "task_name":
+        row["task_name"] = "wrong task"
+    elif case == "bounds":
+        row.update(
+            {
+                "sample_id": "ep000000_fragment_000030_000044",
+                "start_step": 30,
+                "end_step": 44,
+                "length": 15,
+            }
+        )
+    elif case == "bool_integer":
+        row["episode_id"] = True
+    manifest = _write_relcore_manifest(tmp_path, rows)
+
+    with pytest.raises(PriorSelectionError, match=message):
+        selection_module.load_relcore_prior_selection(
+            manifest,
+            metadata,
+            action_horizon=8,
+        )
+
+
+def test_relcore_manifest_rejects_malformed_json_and_no_complete_windows(tmp_path):
+    metadata = _metadata(tmp_path)
+    malformed = tmp_path / "malformed.jsonl"
+    malformed.write_text("{not json}\n", encoding="utf-8")
+    with pytest.raises(PriorSelectionError, match="Invalid JSON"):
+        selection_module.load_relcore_prior_selection(
+            malformed,
+            metadata,
+            action_horizon=8,
+        )
+
+    non_object = tmp_path / "non-object.jsonl"
+    non_object.write_text("[]\n", encoding="utf-8")
+    with pytest.raises(PriorSelectionError, match="must be an object"):
+        selection_module.load_relcore_prior_selection(
+            non_object,
+            metadata,
+            action_horizon=8,
+        )
+
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    with pytest.raises(PriorSelectionError, match="is empty"):
+        selection_module.load_relcore_prior_selection(
+            empty,
+            metadata,
+            action_horizon=8,
+        )
+
+    too_short = _write_relcore_manifest(
+        tmp_path / "short",
+        [_relcore_row(metadata, 0, 0, 6, 1)],
+    )
+    with pytest.raises(PriorSelectionError, match="no complete action windows"):
+        selection_module.load_relcore_prior_selection(
+            too_short,
+            metadata,
+            action_horizon=8,
+        )
+
+
+def test_resolve_prior_selection_routes_relcore_manifest(tmp_path, monkeypatch):
+    metadata = _metadata(tmp_path)
+    manifest = _write_relcore_manifest(
+        tmp_path,
+        [_relcore_row(metadata, 1, 0, 14, 1, task_index=1)],
+    )
+    monkeypatch.setattr(
+        "octo_small_libero.selection.LeRobotV2Metadata",
+        lambda root: metadata,
+    )
+    config = {
+        "data": {
+            "action_horizon": 8,
+            "prior_selection": {
+                "scores": "/unused/scores.csv",
+                "top_percent": None,
+                "prefiltered": False,
+                "relcore_manifest": str(manifest),
+            },
+        }
+    }
+
+    selection = resolve_prior_selection(
+        config,
+        {
+            "prior_dataset": metadata.root,
+            "prior_scores": Path("/unused/scores.csv"),
+            "prior_relcore_manifest": manifest,
+        },
+    )
+
+    assert selection is not None
+    assert selection.frame_indices == tuple(range(40, 48))
+    assert selection.as_manifest()["mode"] == "relcore_selected_manifest"
+
+
 def test_resolve_prior_selection_routes_prefiltered_scores(tmp_path, monkeypatch):
     metadata = _metadata(tmp_path)
     scores, _, _ = _write_sqcn_selection(
@@ -560,6 +819,99 @@ def test_dataset_manifest_resolves_prefiltered_prior_selection(tmp_path, monkeyp
         "enabled": True,
         "mode": "sqcn_prefiltered",
     }
+
+
+def test_dataset_manifest_resolves_relcore_prior_selection(tmp_path, monkeypatch):
+    from octo_small_libero import selection as selection_module
+    from octo_small_libero import training as training_module
+
+    statistics = tmp_path / "stats.json"
+    statistics.write_text("{}", encoding="utf-8")
+    selected_prior = SimpleNamespace(
+        training_starts=74_320,
+        as_manifest=lambda: {
+            "enabled": True,
+            "mode": "relcore_selected_manifest",
+        },
+    )
+    target_selection = SimpleNamespace(
+        episodes=50,
+        frames=500,
+        as_manifest=lambda: {"enabled": True},
+    )
+
+    class FakeMetadata:
+        def __init__(self, root):
+            self.root = Path(root)
+            self.info = {"total_episodes": 10, "total_frames": 100}
+
+        def metadata_sha256(self):
+            return "metadata-sha256"
+
+    monkeypatch.setattr(
+        selection_module,
+        "resolve_prior_selection",
+        lambda config, paths: selected_prior,
+    )
+    monkeypatch.setattr(training_module, "LeRobotV2Metadata", FakeMetadata)
+    monkeypatch.setattr(
+        training_module,
+        "load_lerobot_statistics",
+        lambda path: {"num_trajectories": 10, "num_transitions": 100},
+    )
+    config = {
+        "data": {
+            "target_dataset": "libero10_5",
+            "prior_dataset": "libero90",
+            "sample_weights": [3.0, 1.0],
+            "prior_selection": {
+                "scores": "/unused/scores.csv",
+                "top_percent": None,
+                "prefiltered": False,
+                "relcore_manifest": "/data/selected_manifest.jsonl",
+            },
+        }
+    }
+    paths = {
+        "lerobot": tmp_path,
+        "target_dataset": tmp_path / "libero10_5",
+        "prior_dataset": tmp_path / "libero90",
+        "statistics": statistics,
+    }
+
+    manifest = training_module.build_dataset_manifest(
+        config,
+        paths,
+        target_selection=target_selection,
+    )
+
+    assert manifest["datasets"]["libero90"]["frames_used"] == 74_320
+    assert manifest["datasets"]["libero90"]["selection"] == {
+        "enabled": True,
+        "mode": "relcore_selected_manifest",
+    }
+
+
+@pytest.mark.real_data
+def test_current_relcore_top20_manifest_has_expected_training_starts():
+    manifest = Path(
+        "/data/dwb/libero_filter/relcore_top20pct/select/selected_manifest.jsonl"
+    )
+    prior_root = Path("/data/dwb/datasets/LIBERO_lerobot/libero90")
+    if not manifest.is_file() or not prior_root.is_dir():
+        pytest.skip("Current RelCore Top 20% manifest or dataset is not mounted")
+
+    from octo_small_libero.lerobot_v2 import LeRobotV2Metadata
+
+    selection = selection_module.load_relcore_prior_selection(
+        manifest,
+        LeRobotV2Metadata(prior_root),
+        action_horizon=8,
+    )
+
+    assert selection.selected_fragments == 9_341
+    assert selection.selected_episodes == 1_005
+    assert selection.training_starts == 74_320
 
 
 @pytest.mark.real_data
