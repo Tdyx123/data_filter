@@ -18,6 +18,16 @@ from .pipeline import (
 )
 
 
+def _selection_ratio(value: str) -> float:
+    try:
+        ratio = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("selection ratio must be a number") from error
+    if not 0.0 < ratio <= 1.0:
+        raise argparse.ArgumentTypeError("selection ratio must be in (0, 1]")
+    return ratio
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="LIBERO relational coreset selection")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -28,6 +38,14 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--output-dir", default=None)
         child.add_argument("--max-episodes", type=int, default=None)
         child.add_argument("--force", action="store_true")
+        if command in {"select", "run"}:
+            child.add_argument(
+                "--selection-ratio",
+                type=_selection_ratio,
+                default=None,
+                metavar="FLOAT",
+                help="override selection ratio in (0, 1] and ignore configured budget",
+            )
     validate = subparsers.add_parser("validate")
     validate.add_argument("--output-dir", required=True)
     validate.add_argument("--config", default=None)
@@ -45,6 +63,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.max_episodes <= 0:
             raise SystemExit("--max-episodes must be positive")
         config["runtime"]["max_episodes"] = args.max_episodes
+    if args.command in {"select", "run"} and args.selection_ratio is not None:
+        config["selection"]["ratio"] = args.selection_ratio
+        config["selection"]["budget"] = None
     if args.command == "scan":
         root, _, clips, _ = scan_stage(config, output_dir=args.output_dir, force=args.force)
         print(f"relcore_output={root} clips={len(clips)}")

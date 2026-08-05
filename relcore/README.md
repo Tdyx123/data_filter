@@ -27,6 +27,18 @@ python -m relcore validate --output-dir outputs/relcore/libero90 \
   --config relcore/config_libero90.yaml
 ```
 
+`select` 和 `run` 可通过 `--selection-ratio` 在调用时设置筛选比例，取值范围为
+`(0, 1]`。例如筛选 20% 的候选片段：
+
+```bash
+python -m relcore run --config relcore/config_libero90.yaml \
+  --selection-ratio 0.20 --force
+```
+
+命令行比例会覆盖配置中的 `selection.ratio`，并忽略固定的 `selection.budget`；未传
+该参数时仍完全使用配置文件中的比例或固定预算。已有输出与新比例不兼容时需要传
+`--force`。
+
 各阶段用数据、相关配置和上游 artifact 指纹恢复；已有不兼容阶段必须显式传
 `--force`。兼容的上游阶段即使在 `--force` 下也会复用，因此只修改预算或分支参数
 不会重新运行 CLIP。快速 CPU 检查使用：
