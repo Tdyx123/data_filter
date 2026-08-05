@@ -316,8 +316,9 @@ python3 scripts/train_libero_octo_small_all_tasks_weight_sweep.py \
   --max-steps 5000
 ```
 
-`--max-steps` 会应用到每一行权重对应的模型，同时用于判断已有模型应跳过还是从
-`latest` 续训；不传时使用单卡配置中的 10,000 步。
+`--max-steps` 会应用到每一行权重对应的模型，同时作为该模型余弦学习率衰减的
+终点，并用于判断已有模型应跳过还是从 `latest` 续训；不传时使用单卡配置中的
+10,000 步。
 
 重复运行时，已达到目标步数的模型会跳过，存在完整但未完成 checkpoint 的模型
 会从 `latest` 续训。若权重、源 scores 或重新换算后的 scores 与已有 manifest
@@ -326,8 +327,11 @@ python3 scripts/train_libero_octo_small_all_tasks_weight_sweep.py \
 不会阻止其他行训练；最终 `sweep_summary.json` 会列出失败行，且批量脚本返回
 非零状态。
 
-默认训练范围是第 1–10,000 步，前 400 步 warmup，余弦学习率衰减覆盖完整
-10,000 步；`--max-steps` 可以覆盖训练上限。每 1,000 步和最终步保存候选
+默认训练范围是第 1–10,000 步，前 400 步固定为线性 warmup，随后余弦学习率
+在第 10,000 步衰减到 0。`--max-steps N` 会同时覆盖训练和余弦衰减终点，使
+余弦 progress 在第 400–N 步重新映射并在第 N 步到达 0；小于等于 400 步的
+smoke/短跑只执行 warmup。该行为由 Octo-small 的共享调度器实现，对单卡、四卡、
+target-only、mixed 和 weight sweep 均生效。每 1,000 步和最终步保存候选
 checkpoint，并使用该保存区间内的平均训练 loss 选择 best。`checkpoints/`
 最多保留 latest 与 best 对应的两个 `step-*` 目录；二者重合时只保留一个。
 `latest.json` 和 `best.json` 分别记录最新步和最佳步，不会额外创建 `best/`

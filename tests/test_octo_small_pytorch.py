@@ -11,6 +11,7 @@ from octo_small_libero.data import (  # noqa: E402
 )
 from octo_small_libero.torch_model import OctoSmallConfig, OctoSmallPolicy  # noqa: E402
 from octo_small_libero.training import (  # noqa: E402
+    _learning_rate_lambda,
     _load_training_state,
     _resolve_resume,
     _save_checkpoint,
@@ -246,6 +247,83 @@ def test_pytorch_training_checkpoint_round_trip(tmp_path):
     assert step == 7
     for name, parameter in model.named_parameters():
         torch.testing.assert_close(parameter, expected[name])
+
+
+def test_checkpoint_resume_realigns_scheduler_to_new_max_steps(tmp_path):
+    model = OctoSmallPolicy(TinyTextEncoder(16), _tiny_config())
+    peak_lr = 3.0e-4
+    resume_step = 2_700
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=peak_lr,
+    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda step: _learning_rate_lambda(
+            step,
+            warmup_steps=400,
+            max_steps=10_000,
+            end_ratio=0.0,
+        ),
+    )
+    old_learning_rate = peak_lr * _learning_rate_lambda(
+        resume_step,
+        warmup_steps=400,
+        max_steps=10_000,
+        end_ratio=0.0,
+    )
+    optimizer.param_groups[0]["lr"] = old_learning_rate
+    scheduler.last_epoch = resume_step
+    scheduler._last_lr = [old_learning_rate]
+    sampler = BalancedDistributedBatchSampler(
+        (20, 20), local_batch_size=4, seed=3, num_batches=3
+    )
+    checkpoint = _save_checkpoint(
+        output=tmp_path,
+        step=resume_step,
+        mean_train_loss=1.0,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        sampler=sampler,
+        config={"train": {"seed": 3, "max_steps": 10_000}},
+    )
+
+    resumed_optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=peak_lr,
+    )
+    resumed_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        resumed_optimizer,
+        lambda step: _learning_rate_lambda(
+            step,
+            warmup_steps=400,
+            max_steps=5_000,
+            end_ratio=0.0,
+        ),
+    )
+    resumed_sampler = BalancedDistributedBatchSampler(
+        (20, 20), local_batch_size=4, seed=3, num_batches=3
+    )
+
+    restored_step = _load_training_state(
+        checkpoint,
+        model=model,
+        optimizer=resumed_optimizer,
+        scheduler=resumed_scheduler,
+        sampler=resumed_sampler,
+        device="cpu",
+    )
+
+    expected_learning_rate = peak_lr * _learning_rate_lambda(
+        resume_step,
+        warmup_steps=400,
+        max_steps=5_000,
+        end_ratio=0.0,
+    )
+    assert restored_step == resume_step
+    assert resumed_optimizer.param_groups[0]["lr"] == pytest.approx(expected_learning_rate)
+    assert resumed_scheduler.get_last_lr() == pytest.approx([expected_learning_rate])
 
 
 def test_checkpoint_resume_rejects_changed_target_or_prior_selection(tmp_path):

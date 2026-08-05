@@ -237,10 +237,13 @@ def validate_config(config: dict[str, Any]) -> None:
     learning_rate = train.get("learning_rate", {})
     if learning_rate.get("name") != "cosine":
         raise ConfigError("Octo training currently supports the cosine learning-rate schedule")
+    if "decay_steps" in learning_rate:
+        raise ConfigError(
+            "train.learning_rate.decay_steps is no longer supported; "
+            "use train.max_steps as the cosine decay end"
+        )
     if int(learning_rate.get("warmup_steps", -1)) < 0:
         raise ConfigError("train.learning_rate.warmup_steps must be non-negative")
-    if int(learning_rate.get("decay_steps", 0)) < int(train["max_steps"]):
-        raise ConfigError("learning-rate decay_steps must cover train.max_steps")
 
 
 def apply_overrides(config: dict[str, Any], **overrides: Any) -> dict[str, Any]:
@@ -281,11 +284,6 @@ def apply_overrides(config: dict[str, Any], **overrides: Any) -> dict[str, Any]:
         result["data"]["prior_selection"]["top_percent"] = overrides[
             "prior_top_percent"
         ]
-    if overrides.get("max_steps") is not None:
-        result["train"]["learning_rate"]["decay_steps"] = max(
-            int(result["train"]["learning_rate"]["decay_steps"]),
-            int(overrides["max_steps"]),
-        )
     validate_config(result)
     if overrides.get("output_dir") is None:
         output = Path(result["paths"]["output"])

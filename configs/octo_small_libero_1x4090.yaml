@@ -58,7 +58,6 @@ train:
     init_value: 0.0
     peak_value: 3.0e-4
     warmup_steps: 400
-    decay_steps: 10000
     end_value: 0.0
   weight_decay: 0.01
   max_grad_norm: 1.0

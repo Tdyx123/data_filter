@@ -140,15 +140,34 @@ def _learning_rate_lambda(
     step: int,
     *,
     warmup_steps: int,
-    decay_steps: int,
+    max_steps: int,
     end_ratio: float,
 ) -> float:
     if warmup_steps > 0 and step < warmup_steps:
         return float(step + 1) / float(warmup_steps)
-    denominator = max(1, decay_steps - warmup_steps)
+    denominator = max(1, max_steps - warmup_steps)
     progress = min(max((step - warmup_steps) / denominator, 0.0), 1.0)
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return end_ratio + (1.0 - end_ratio) * cosine
+
+
+def _realign_scheduler_learning_rate(scheduler: Any, step: int) -> None:
+    learning_rates = [
+        float(base_lr) * float(lr_lambda(step))
+        for base_lr, lr_lambda in zip(
+            scheduler.base_lrs,
+            scheduler.lr_lambdas,
+            strict=True,
+        )
+    ]
+    for parameter_group, learning_rate in zip(
+        scheduler.optimizer.param_groups,
+        learning_rates,
+        strict=True,
+    ):
+        parameter_group["lr"] = learning_rate
+    scheduler.last_epoch = int(step)
+    scheduler._last_lr = learning_rates
 
 
 def _resolve_resume(output: Path, resume: str | None) -> Path | None:
@@ -327,13 +346,15 @@ def _load_training_state(
     load_model(model, str(checkpoint / "model.safetensors"), strict=True, device=str(device))
     optimizer.load_state_dict(state["optimizer"])
     scheduler.load_state_dict(state["scheduler"])
+    step = int(state["step"])
+    _realign_scheduler_learning_rate(scheduler, step)
     sampler.load_state_dict(state["sampler"])
     random.setstate(state["python_rng"])
     np.random.set_state(state["numpy_rng"])
     torch.set_rng_state(state["torch_rng"])
     if torch.cuda.is_available() and state["cuda_rng"] is not None:
         torch.cuda.set_rng_state_all(state["cuda_rng"])
-    return int(state["step"])
+    return step
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -412,7 +433,7 @@ def train(
         lambda step: _learning_rate_lambda(
             step,
             warmup_steps=int(learning_rate["warmup_steps"]),
-            decay_steps=int(learning_rate["decay_steps"]),
+            max_steps=int(config["train"]["max_steps"]),
             end_ratio=end_ratio,
         ),
     )

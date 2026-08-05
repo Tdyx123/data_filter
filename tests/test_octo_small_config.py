@@ -48,10 +48,20 @@ def test_octo_config_is_independent_and_points_to_local_checkpoint():
     assert config["train"]["precision"] == "bf16"
     assert config["train"]["max_steps"] == 10_000
     assert config["train"]["learning_rate"]["warmup_steps"] == 400
-    assert config["train"]["learning_rate"]["decay_steps"] == 10_000
+    assert "decay_steps" not in config["train"]["learning_rate"]
     assert config["train"]["save_every_steps"] == 1_000
     assert "lora" not in config["model"]
     assert "deepspeed_stage" not in config["train"]
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    ["octo_small_libero_1x4090.yaml", "octo_small_libero_4x4090.yaml"],
+)
+def test_octo_configs_use_max_steps_as_the_only_decay_end(config_name):
+    config = load_config(PROJECT_ROOT / "configs" / config_name)
+
+    assert "decay_steps" not in config["train"]["learning_rate"]
 
 
 def test_octo_conversion_defaults_to_local_t5_artifact():
@@ -121,12 +131,21 @@ def test_octo_cli_exposes_only_lerobot_data_override():
     assert "--statistics-path" not in option_strings
 
 
-def test_octo_max_steps_override_keeps_learning_rate_schedule_valid():
+@pytest.mark.parametrize("max_steps", [5_000, 12_000])
+def test_octo_max_steps_override_is_the_learning_rate_decay_end(max_steps):
     config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
-    config = apply_overrides(config, max_steps=12_000)
+    config = apply_overrides(config, max_steps=max_steps)
 
-    assert config["train"]["max_steps"] == 12_000
-    assert config["train"]["learning_rate"]["decay_steps"] == 12_000
+    assert config["train"]["max_steps"] == max_steps
+    assert "decay_steps" not in config["train"]["learning_rate"]
+
+
+def test_octo_config_rejects_legacy_learning_rate_decay_steps():
+    config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
+    config["train"]["learning_rate"]["decay_steps"] = config["train"]["max_steps"]
+
+    with pytest.raises(ConfigError, match=r"decay_steps.*train\.max_steps"):
+        validate_config(config)
 
 
 def test_octo_sample_weights_override_requires_exact_local_batch_counts():
