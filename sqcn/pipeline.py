@@ -18,22 +18,26 @@ import yaml
 
 from trajectory_data import DatasetAdapter, create_dataset
 
-from .coverage import coverage_scores
-from .encoding import (
+from segment_filter_core import (
     ClipVisionEncoder,
     NumericNormalizers,
     PCAProjector,
-    l2_normalize_rows,
+    RawQuality,
+    candidate_windows,
+    fuse_fragment_features as _fuse_fragment_features,
+    raw_quality,
+    reference_windows,
+    score_quality,
     temporal_pool,
     visual_fragment_feature,
 )
+
+from .coverage import coverage_scores
 from .novelty import novelty_scores
-from .quality import RawQuality, raw_quality, score_quality
-from .sampling import candidate_windows, reference_windows
 from .scoring import compute_sqcn
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SCORE_COLUMNS = (
     "sample_id",
     "episode_id",
@@ -257,36 +261,6 @@ def _build_fragment_features(
         reference_keys.extend(window_keys[window] for window in references)
 
     return union, candidate_keys, reference_keys, skipped_short
-
-
-def _fuse_fragment_features(
-    visual_embeddings: np.ndarray,
-    state_pooled: np.ndarray,
-    action_pooled: np.ndarray,
-    progress: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Concatenate fragment features in contract order and L2-normalize rows."""
-
-    visual = np.asarray(visual_embeddings, dtype=np.float32)
-    states = np.asarray(state_pooled, dtype=np.float32)
-    actions = np.asarray(action_pooled, dtype=np.float32)
-    progress_values = np.asarray(progress, dtype=np.float32)
-    row_count = len(visual)
-    if (
-        visual.ndim != 2
-        or states.ndim != 2
-        or actions.ndim != 2
-        or progress_values.ndim != 1
-        or len(states) != row_count
-        or len(actions) != row_count
-        or len(progress_values) != row_count
-    ):
-        raise ValueError("fused fragment features must have aligned sample rows")
-    fused_raw = np.concatenate(
-        [visual, states, actions, progress_values[:, None]],
-        axis=1,
-    ).astype(np.float32)
-    return fused_raw, l2_normalize_rows(fused_raw)
 
 
 def _publish(temp_root: Path, root: Path, *, force: bool) -> None:

@@ -13,6 +13,7 @@ data:
     top_percent: null
     prefiltered: false
     relcore_manifest: null
+    quality_filter_scores: null
   sample_weights: [1.0, 1.0]
   image_obs_keys:
     primary: observation.images.image

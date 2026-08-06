@@ -152,6 +152,20 @@ def validate_config(config: dict[str, Any]) -> None:
             "data.prior_selection.relcore_manifest cannot be combined with "
             "prefiltered or top_percent"
         )
+    quality_filter_scores = selection.get("quality_filter_scores")
+    if quality_filter_scores is not None and (
+        not isinstance(quality_filter_scores, str) or not quality_filter_scores.strip()
+    ):
+        raise ConfigError(
+            "data.prior_selection.quality_filter_scores must be null or a non-empty path"
+        )
+    if quality_filter_scores is not None and (
+        prefiltered or top_percent is not None or relcore_manifest is not None
+    ):
+        raise ConfigError(
+            "data.prior_selection.quality_filter_scores cannot be combined with "
+            "prefiltered, top_percent, or relcore_manifest"
+        )
 
     weights = data.get("sample_weights")
     if (
@@ -289,6 +303,7 @@ def apply_overrides(config: dict[str, Any], **overrides: Any) -> dict[str, Any]:
     if overrides.get("prior_scores") is not None:
         result["data"]["prior_selection"]["scores"] = overrides["prior_scores"]
         result["data"]["prior_selection"]["relcore_manifest"] = None
+        result["data"]["prior_selection"]["quality_filter_scores"] = None
     if overrides.get("prior_prefiltered_scores") is not None:
         result["data"]["prior_selection"].update(
             {
@@ -296,6 +311,7 @@ def apply_overrides(config: dict[str, Any], **overrides: Any) -> dict[str, Any]:
                 "top_percent": None,
                 "prefiltered": True,
                 "relcore_manifest": None,
+                "quality_filter_scores": None,
             }
         )
     if overrides.get("prior_top_percent") is not None:
@@ -303,12 +319,25 @@ def apply_overrides(config: dict[str, Any], **overrides: Any) -> dict[str, Any]:
             "prior_top_percent"
         ]
         result["data"]["prior_selection"]["relcore_manifest"] = None
+        result["data"]["prior_selection"]["quality_filter_scores"] = None
     if overrides.get("prior_relcore_manifest") is not None:
         result["data"]["prior_selection"].update(
             {
                 "top_percent": None,
                 "prefiltered": False,
                 "relcore_manifest": overrides["prior_relcore_manifest"],
+                "quality_filter_scores": None,
+            }
+        )
+    if overrides.get("prior_quality_filter_scores") is not None:
+        result["data"]["prior_selection"].update(
+            {
+                "top_percent": None,
+                "prefiltered": False,
+                "relcore_manifest": None,
+                "quality_filter_scores": overrides[
+                    "prior_quality_filter_scores"
+                ],
             }
         )
     validate_config(result)
@@ -347,4 +376,9 @@ def resolved_paths(config: dict[str, Any]) -> dict[str, Path]:
     relcore_manifest = config["data"]["prior_selection"].get("relcore_manifest")
     if relcore_manifest is not None:
         paths["prior_relcore_manifest"] = resolve(relcore_manifest)
+    quality_filter_scores = config["data"]["prior_selection"].get(
+        "quality_filter_scores"
+    )
+    if quality_filter_scores is not None:
+        paths["prior_quality_filter_scores"] = resolve(quality_filter_scores)
     return paths

@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from .scaling import robust_unit_interval
+from segment_filter_core.scaling import robust_unit_interval
 
 
 def _faiss_knn(embeddings: np.ndarray, k: int) -> np.ndarray:

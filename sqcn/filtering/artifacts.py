@@ -15,7 +15,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from .algorithm import (
+from segment_filter_core.selection import (
     PENALTY_LAMBDA,
     _AlgorithmParameters,
     select_diverse_fragments,

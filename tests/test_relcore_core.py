@@ -14,7 +14,7 @@ from trajectory_data import EpisodeRecord
 
 
 def test_candidate_windows_match_sqcn_tail_alignment_for_every_small_length():
-    from sqcn.sampling import candidate_windows as sqcn_candidate_windows
+    from segment_filter_core import candidate_windows as sqcn_candidate_windows
 
     for length in range(301):
         assert candidate_windows(length, length=15, stride=15) == (sqcn_candidate_windows(length))

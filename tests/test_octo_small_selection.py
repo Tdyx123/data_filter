@@ -9,6 +9,7 @@ import pytest
 from octo_small_libero import selection as selection_module
 from octo_small_libero.selection import (
     PriorSelectionError,
+    load_prefiltered_quality_filter_selection,
     load_prefiltered_sqcn_selection,
     load_prior_selection,
     resolve_prior_selection,
@@ -113,6 +114,21 @@ SQCN_SCORE_COLUMNS = [
     "knn_penalty",
 ]
 
+QUALITY_FILTER_SCORE_COLUMNS = [
+    "sample_id",
+    "episode_id",
+    "start_step",
+    "end_step",
+    "length",
+    "action_smooth",
+    "state_transition",
+    "motion_efficiency",
+    "quality",
+    "filter_rank",
+    "adjusted_score",
+    "knn_penalty",
+]
+
 
 def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -198,6 +214,100 @@ def _write_sqcn_selection(
                 },
                 "selection_sha256": _sample_id_sha256(rows),
                 "outputs": {"scores": str(scores)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return scores, filter_manifest, run_manifest
+
+
+def _quality_filter_row(
+    episode_id: int,
+    start_step: int,
+    end_step: int,
+    rank: int,
+):
+    return {
+        "sample_id": (
+            f"ep{episode_id:06d}_fragment_{start_step:06d}_{end_step:06d}"
+        ),
+        "episode_id": episode_id,
+        "start_step": start_step,
+        "end_step": end_step,
+        "length": end_step - start_step + 1,
+        "action_smooth": 0.9,
+        "state_transition": 0.7,
+        "motion_efficiency": 0.6,
+        "quality": 0.75,
+        "filter_rank": rank,
+        "adjusted_score": 0.7,
+        "knn_penalty": 0.05,
+    }
+
+
+def _write_quality_filter_selection(
+    tmp_path: Path,
+    metadata,
+    rows,
+    *,
+    input_fragments: int = 30,
+    percent: float = 10.0,
+):
+    root = tmp_path / "quality_filter"
+    output = root / "filter" / "top10pct"
+    output.mkdir(parents=True)
+    scores = output / "scores.csv"
+    with scores.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=QUALITY_FILTER_SCORE_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    source_scores = root / "quality" / "scores.csv"
+    source_scores.parent.mkdir(parents=True)
+    source_scores.write_text("source quality scores\n", encoding="utf-8")
+    source_embeddings = root / "encode" / "embeddings.npy"
+    source_embeddings.parent.mkdir(parents=True)
+    source_embeddings.write_bytes(b"source embeddings")
+    run_manifest = root / "run_manifest.json"
+    run_manifest.write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "dataset_name": "libero90",
+                "dataset_path": str(metadata.root),
+            }
+        ),
+        encoding="utf-8",
+    )
+    filter_manifest = output / "filter_manifest.json"
+    filter_manifest.write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "source": {
+                    "run_manifest": str(run_manifest),
+                    "run_manifest_sha256": _file_sha256(run_manifest),
+                    "scores": str(source_scores),
+                    "scores_sha256": _file_sha256(source_scores),
+                    "embeddings": str(source_embeddings),
+                    "embeddings_sha256": _file_sha256(source_embeddings),
+                },
+                "algorithm": {
+                    "percent": percent,
+                    "target_size": len(rows),
+                    "score_column": "quality",
+                    "ordering": [
+                        "adjusted_score desc",
+                        "quality desc",
+                        "sample_id asc",
+                    ],
+                },
+                "counts": {
+                    "input_fragments": input_fragments,
+                    "selected_fragments": len(rows),
+                },
+                "selection_sha256": _sample_id_sha256(rows),
+                "outputs": {"scores": str(scores)},
+                "hashes": {"scores": _file_sha256(scores)},
             }
         ),
         encoding="utf-8",
@@ -353,6 +463,88 @@ def test_prefiltered_sqcn_uses_every_row_with_strict_boundaries_and_dedup(tmp_pa
     assert len(manifest["filter_manifest_sha256"]) == 64
     assert len(manifest["run_manifest_sha256"]) == 64
     assert len(selection.selection_sha256) == 64
+
+
+def test_prefiltered_quality_filter_uses_every_row_and_reports_independent_mode(
+    tmp_path,
+):
+    metadata = _metadata(tmp_path)
+    rows = [
+        _quality_filter_row(0, 0, 14, 1),
+        _quality_filter_row(0, 7, 21, 2),
+        _quality_filter_row(1, 10, 24, 3),
+    ]
+    scores, filter_manifest, run_manifest = _write_quality_filter_selection(
+        tmp_path,
+        metadata,
+        rows,
+    )
+
+    selection = load_prefiltered_quality_filter_selection(
+        scores,
+        metadata,
+        action_horizon=8,
+    )
+
+    assert selection.total_chunks == 30
+    assert selection.selected_chunks == 3
+    assert selection.selected_episodes == 2
+    assert selection.frame_indices == (*range(15), *range(50, 58))
+    manifest = selection.as_manifest()
+    assert manifest["mode"] == "quality_filter_prefiltered"
+    assert manifest["filter_manifest_path"] == str(filter_manifest)
+    assert manifest["run_manifest_path"] == str(run_manifest)
+
+
+def test_prefiltered_quality_filter_rejects_changed_selected_scores(tmp_path):
+    metadata = _metadata(tmp_path)
+    scores, _, _ = _write_quality_filter_selection(
+        tmp_path,
+        metadata,
+        [_quality_filter_row(0, 0, 14, 1)],
+        input_fragments=10,
+    )
+    scores.write_text(scores.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    with pytest.raises(PriorSelectionError, match="scores SHA256"):
+        load_prefiltered_quality_filter_selection(
+            scores,
+            metadata,
+            action_horizon=8,
+        )
+
+
+def test_resolve_prior_selection_routes_quality_filter_scores(tmp_path, monkeypatch):
+    metadata = _metadata(tmp_path)
+    scores, _, _ = _write_quality_filter_selection(
+        tmp_path,
+        metadata,
+        [_quality_filter_row(0, 0, 14, 1)],
+        input_fragments=10,
+    )
+    monkeypatch.setattr(selection_module, "LeRobotV2Metadata", lambda _root: metadata)
+
+    selection = resolve_prior_selection(
+        {
+            "data": {
+                "action_horizon": 8,
+                "prior_selection": {
+                    "top_percent": None,
+                    "prefiltered": False,
+                    "relcore_manifest": None,
+                    "quality_filter_scores": str(scores),
+                },
+            }
+        },
+        {
+            "prior_dataset": metadata.root,
+            "prior_scores": Path("/unused/tdus.csv"),
+            "prior_quality_filter_scores": scores,
+        },
+    )
+
+    assert selection is not None
+    assert selection.as_manifest()["mode"] == "quality_filter_prefiltered"
 
 
 def test_prefiltered_sqcn_rejects_legacy_max_penalty_column(tmp_path):

@@ -10,6 +10,10 @@ GR00T 风格 flow-matching DiT 动作头开始训练。
 Coverage、Diversity 和 Novelty；以及仿照 SQCN 两遍数据流、面向 LIBERO 关系图与
 集合目标筛选的 [RelCore](relcore/README.md)。
 
+另有分阶段的 [Quality Filter](quality_filter/README.md)，只计算 SQCN Quality，
+再用相同的融合 embedding 和 0.4.0 多样化 Filter 完成片段筛选。SQCN 与
+Quality Filter 的共同算法位于 `segment_filter_core`。
+
 它不依赖 Isaac-GR00T 源码，也不兼容 NVIDIA GR00T checkpoint 或 Policy API。
 
 ## 环境

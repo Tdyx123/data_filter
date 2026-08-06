@@ -1,0 +1,42 @@
+dataset:
+  type: lerobot
+  name: libero90
+  path: /data/dwb/datasets/LIBERO_lerobot/libero90
+  use_images: true
+  feature_keys:
+    action: action
+    timestamp: timestamp
+    frame_index: frame_index
+    episode_index: episode_index
+    vector_observations: [observation.state]
+    image_observations: [observation.images.image]
+
+clip:
+  length: 15
+  stride: 15
+
+encoder:
+  model: /data/dwb/models/clip-vit-base-patch32
+  local_files_only: true
+  image_batch_size: 64
+  visual_dim: 128
+  pca_fit_max_samples: null
+  device: auto
+
+quality:
+  quantile_low: 0.01
+  quantile_high: 0.99
+  epsilon: 1.0e-8
+
+filter:
+  percent: 10.0
+  seed: null
+
+runtime:
+  seed: 42
+  num_workers: 4
+  max_episodes: null
+  resume: true
+
+output:
+  directory: outputs/quality_filter/libero90

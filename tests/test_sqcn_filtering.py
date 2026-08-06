@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from sqcn.filtering import filter_sqcn_run, select_diverse_fragments
-from sqcn.filtering.algorithm import _DiverseSelector
+from segment_filter_core.selection import _DiverseSelector
 
 
 SCORE_COLUMNS = (

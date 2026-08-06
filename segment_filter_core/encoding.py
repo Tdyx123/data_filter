@@ -227,6 +227,36 @@ def l2_normalize_rows(
     return (values / np.maximum(norms, float(epsilon))).astype(np.float32)
 
 
+def fuse_fragment_features(
+    visual_embeddings: np.ndarray,
+    state_pooled: np.ndarray,
+    action_pooled: np.ndarray,
+    progress: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Concatenate fragment features in contract order and L2-normalize rows."""
+
+    visual = np.asarray(visual_embeddings, dtype=np.float32)
+    states = np.asarray(state_pooled, dtype=np.float32)
+    actions = np.asarray(action_pooled, dtype=np.float32)
+    progress_values = np.asarray(progress, dtype=np.float32)
+    row_count = len(visual)
+    if (
+        visual.ndim != 2
+        or states.ndim != 2
+        or actions.ndim != 2
+        or progress_values.ndim != 1
+        or len(states) != row_count
+        or len(actions) != row_count
+        or len(progress_values) != row_count
+    ):
+        raise ValueError("fused fragment features must have aligned sample rows")
+    fused_raw = np.concatenate(
+        [visual, states, actions, progress_values[:, None]],
+        axis=1,
+    ).astype(np.float32)
+    return fused_raw, l2_normalize_rows(fused_raw)
+
+
 class PCAProjector:
     """Standardize, project, and zero-pad feature rows."""
 

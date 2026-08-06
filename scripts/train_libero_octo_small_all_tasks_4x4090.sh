@@ -9,14 +9,17 @@ training_args=(
   --all-tasks
 )
 target_only=false
-relcore_manifest=false
+custom_prior=false
 for argument in "$@"; do
   case "${argument}" in
     --target-only)
       target_only=true
       ;;
     --prior-relcore-manifest|--prior-relcore-manifest=*)
-      relcore_manifest=true
+      custom_prior=true
+      ;;
+    --prior-quality-filter-scores|--prior-quality-filter-scores=*)
+      custom_prior=true
       ;;
   esac
 done
@@ -25,7 +28,7 @@ if [[ "${target_only}" == false ]]; then
   training_args+=(
     --sample-weights 3 1
   )
-  if [[ "${relcore_manifest}" == false ]]; then
+  if [[ "${custom_prior}" == false ]]; then
     training_args+=(
       --prior-prefiltered-scores /data/dwb/libero90_sqcn/filter/top10pct/scores.csv
     )

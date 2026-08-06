@@ -1,5 +1,11 @@
 # SQCN：15 帧片段数据价值评价
 
+SQCN 0.3.0 起，Quality、窗口、融合编码、缩放和多样化 Filter 算法统一由
+`segment_filter_core` 提供。旧的 `sqcn.quality`、`sqcn.encoding`、
+`sqcn.scaling`、`sqcn.sampling` 和 `sqcn.filtering.algorithm` Python 导入路径
+已移除；调用公共算法时应直接导入 `segment_filter_core`。包含旧类路径的 SQCN
+pickle/cache 与 0.3.0 不兼容，需要传 `--force` 重建。SQCN 两个命令行入口保持不变。
+
 SQCN（Segment Quality-Coverage-Novelty Score）只评价完整 15 帧片段，不评价
 完整轨迹。最终分数固定为：
 

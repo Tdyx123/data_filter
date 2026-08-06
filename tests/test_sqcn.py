@@ -6,19 +6,22 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import sqcn.encoding as encoding
-from sqcn.cli import build_parser
-from sqcn.coverage import coverage_scores, rbf_kernel
-from sqcn.encoding import (
+import segment_filter_core.encoding as encoding
+from segment_filter_core import (
     ClipVisionEncoder,
     NumericNormalizers,
     PCAProjector,
+    candidate_windows,
+    raw_quality,
+    reference_sample_count,
+    reference_windows,
+    score_quality,
     temporal_pool,
     visual_fragment_feature,
 )
+from sqcn.cli import build_parser
+from sqcn.coverage import coverage_scores, rbf_kernel
 from sqcn.novelty import novelty_scores
-from sqcn.quality import raw_quality, score_quality
-from sqcn.sampling import candidate_windows, reference_sample_count, reference_windows
 from sqcn.scoring import compute_sqcn
 from sqcn.pipeline import load_config
 

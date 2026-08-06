@@ -41,6 +41,7 @@ def test_octo_config_is_independent_and_points_to_local_checkpoint():
         "top_percent": None,
         "prefiltered": False,
         "relcore_manifest": None,
+        "quality_filter_scores": None,
     }
     assert config["model"]["required_observation_tokenizers"] == ["primary", "wrist"]
     assert config["train"]["gpu_ids"] == [0, 1, 2, 3]
@@ -128,6 +129,7 @@ def test_octo_cli_exposes_only_lerobot_data_override():
     assert "--prior-scores" in option_strings
     assert "--prior-prefiltered-scores" in option_strings
     assert "--prior-relcore-manifest" in option_strings
+    assert "--prior-quality-filter-scores" in option_strings
     assert "--sample-weights" in option_strings
     assert "--task-index" in option_strings
     assert "--all-tasks" in option_strings
@@ -166,6 +168,7 @@ def test_octo_relcore_manifest_override_selects_relcore_without_default_output()
         "top_percent": None,
         "prefiltered": False,
         "relcore_manifest": "/data/relcore/selected_manifest.jsonl",
+        "quality_filter_scores": None,
     }
     paths = resolved_paths(updated)
     assert paths["prior_relcore_manifest"] == Path(
@@ -244,7 +247,34 @@ def test_octo_prefiltered_scores_override_enables_all_rows_without_percent():
         "top_percent": None,
         "prefiltered": True,
         "relcore_manifest": None,
+        "quality_filter_scores": None,
     }
+
+
+def test_octo_quality_filter_override_selects_independent_manifest_mode():
+    config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
+
+    updated = apply_overrides(
+        config,
+        target_all_tasks=True,
+        output_dir="outputs/quality-filter",
+        prior_quality_filter_scores=(
+            "/data/quality_filter/libero90/filter/top10pct/scores.csv"
+        ),
+    )
+
+    assert updated["data"]["prior_selection"] == {
+        "scores": "outputs/tdus/libero90/chunk/scores.csv",
+        "top_percent": None,
+        "prefiltered": False,
+        "relcore_manifest": None,
+        "quality_filter_scores": (
+            "/data/quality_filter/libero90/filter/top10pct/scores.csv"
+        ),
+    }
+    assert resolved_paths(updated)["prior_quality_filter_scores"] == Path(
+        "/data/quality_filter/libero90/filter/top10pct/scores.csv"
+    )
 
 
 def test_octo_config_rejects_prefiltered_scores_with_top_percent():

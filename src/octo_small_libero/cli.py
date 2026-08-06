@@ -59,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prior-scores")
     parser.add_argument("--prior-prefiltered-scores")
     parser.add_argument("--prior-relcore-manifest")
+    parser.add_argument("--prior-quality-filter-scores")
     parser.add_argument("--target-only", action="store_true", default=None)
     parser.add_argument("--resume")
     parser.add_argument("--preflight-only", action="store_true")
@@ -89,6 +90,18 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "--prior-relcore-manifest cannot be combined with "
             "--prior-top-percent, --prior-scores, or --prior-prefiltered-scores"
         )
+    if arguments.prior_quality_filter_scores is not None and any(
+        value is not None
+        for value in (
+            arguments.prior_top_percent,
+            arguments.prior_scores,
+            arguments.prior_prefiltered_scores,
+            arguments.prior_relcore_manifest,
+        )
+    ):
+        parser.error(
+            "--prior-quality-filter-scores cannot be combined with other --prior-* modes"
+        )
     if arguments.target_only and any(
         value is not None
         for value in (
@@ -97,6 +110,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
             arguments.prior_scores,
             arguments.prior_prefiltered_scores,
             arguments.prior_relcore_manifest,
+            arguments.prior_quality_filter_scores,
         )
     ):
         parser.error(
@@ -127,6 +141,7 @@ def main() -> None:
         prior_scores=arguments.prior_scores,
         prior_prefiltered_scores=arguments.prior_prefiltered_scores,
         prior_relcore_manifest=arguments.prior_relcore_manifest,
+        prior_quality_filter_scores=arguments.prior_quality_filter_scores,
     )
     if arguments.smoke_test:
         config["train"]["log_every_steps"] = 1

@@ -43,6 +43,27 @@ SQCN_SCORE_COLUMNS = {
     "knn_penalty",
 }
 SQCN_UNIT_COLUMNS = ("quality", "coverage", "novelty", "sqcn", "knn_penalty")
+QUALITY_FILTER_SCORE_COLUMNS = {
+    "sample_id",
+    "episode_id",
+    "start_step",
+    "end_step",
+    "length",
+    "action_smooth",
+    "state_transition",
+    "motion_efficiency",
+    "quality",
+    "filter_rank",
+    "adjusted_score",
+    "knn_penalty",
+}
+QUALITY_FILTER_UNIT_COLUMNS = (
+    "action_smooth",
+    "state_transition",
+    "motion_efficiency",
+    "quality",
+    "knn_penalty",
+)
 RELCORE_REQUIRED_FIELDS = {
     "sample_id",
     "dataset_name",
@@ -170,6 +191,13 @@ class PrefilteredPriorSelection:
             "overlap_policy": "deduplicate_episode_frame_start",
             "selection_sha256": self.selection_sha256,
         }
+
+
+class QualityFilteredPriorSelection(PrefilteredPriorSelection):
+    def as_manifest(self) -> dict[str, Any]:
+        value = super().as_manifest()
+        value["mode"] = "quality_filter_prefiltered"
+        return value
 
 
 @dataclass(frozen=True)
@@ -383,6 +411,92 @@ def _read_prefiltered_sqcn_scores(
     return rows
 
 
+def _read_prefiltered_quality_filter_scores(
+    scores_path: Path,
+    metadata: LeRobotV2Metadata,
+) -> list[_PrefilteredScoreRow]:
+    episode_lengths = {
+        episode.episode_index: episode.length for episode in metadata.episodes
+    }
+    rows: list[_PrefilteredScoreRow] = []
+    sample_ids: set[str] = set()
+    try:
+        handle = scores_path.open("r", encoding="utf-8", newline="")
+    except OSError as error:
+        raise PriorSelectionError(
+            f"Could not read Quality Filter scores {scores_path}: {error}"
+        ) from error
+    with handle:
+        reader = csv.DictReader(handle)
+        columns = set(reader.fieldnames or [])
+        missing = sorted(QUALITY_FILTER_SCORE_COLUMNS - columns)
+        if missing:
+            raise PriorSelectionError(
+                f"Quality Filter scores are missing columns: {missing}"
+            )
+        for line_number, raw in enumerate(reader, start=2):
+            sample_id = str(raw.get("sample_id", "")).strip()
+            if not sample_id:
+                raise PriorSelectionError(
+                    f"Empty sample_id at scores CSV line {line_number}"
+                )
+            if sample_id in sample_ids:
+                raise PriorSelectionError(
+                    f"Duplicate sample_id in Quality Filter scores: {sample_id}"
+                )
+            sample_ids.add(sample_id)
+            episode_id = _parse_int(raw, "episode_id", line_number)
+            start_step = _parse_int(raw, "start_step", line_number)
+            end_step = _parse_int(raw, "end_step", line_number)
+            length = _parse_int(raw, "length", line_number)
+            filter_rank = _parse_int(raw, "filter_rank", line_number)
+            if filter_rank != line_number - 1:
+                raise PriorSelectionError(
+                    "Quality Filter filter_rank must be contiguous from 1 in CSV row order"
+                )
+            for column in QUALITY_FILTER_UNIT_COLUMNS:
+                _parse_utility(raw, column, line_number)
+            _parse_finite(raw, "adjusted_score", line_number)
+            if episode_id not in episode_lengths:
+                raise PriorSelectionError(
+                    f"Unknown episode_id={episode_id} at scores CSV line {line_number}"
+                )
+            if start_step < 0 or end_step < start_step:
+                raise PriorSelectionError(
+                    f"Invalid frame range [{start_step}, {end_step}] "
+                    f"at scores CSV line {line_number}"
+                )
+            if end_step >= episode_lengths[episode_id]:
+                raise PriorSelectionError(
+                    f"Fragment end_step={end_step} exceeds episode {episode_id} "
+                    f"length={episode_lengths[episode_id]}"
+                )
+            if length != 15 or length != end_step - start_step + 1:
+                raise PriorSelectionError(
+                    f"Quality Filter fragment length={length} must be 15 and match "
+                    f"the inclusive frame range at scores CSV line {line_number}"
+                )
+            expected_id = (
+                f"ep{episode_id:06d}_fragment_{start_step:06d}_{end_step:06d}"
+            )
+            if sample_id != expected_id:
+                raise PriorSelectionError(
+                    f"sample_id={sample_id!r} does not match {expected_id!r}"
+                )
+            rows.append(
+                _PrefilteredScoreRow(
+                    sample_id=sample_id,
+                    episode_id=episode_id,
+                    start_step=start_step,
+                    end_step=end_step,
+                    length=length,
+                )
+            )
+    if not rows:
+        raise PriorSelectionError(f"Quality Filter scores are empty: {scores_path}")
+    return rows
+
+
 def _read_scores(scores_path: Path, metadata: LeRobotV2Metadata) -> list[_ScoreRow]:
     episode_lengths = {
         episode.episode_index: episode.length for episode in metadata.episodes
@@ -575,10 +689,11 @@ def _prefiltered_selection_digest(
     run_manifest_sha256: str,
     action_horizon: int,
     frame_indices: tuple[int, ...],
+    mode: str = "sqcn_prefiltered",
 ) -> str:
     digest = hashlib.sha256()
     identity = {
-        "mode": "sqcn_prefiltered",
+        "mode": mode,
         "scores_sha256": scores_sha256,
         "filter_manifest_sha256": filter_manifest_sha256,
         "run_manifest_sha256": run_manifest_sha256,
@@ -766,6 +881,204 @@ def load_prefiltered_sqcn_selection(
             run_manifest_sha256=run_manifest_sha256,
             action_horizon=action_horizon,
             frame_indices=ordered_indices,
+        ),
+    )
+
+
+def load_prefiltered_quality_filter_selection(
+    scores_path: str | Path,
+    metadata: LeRobotV2Metadata,
+    *,
+    action_horizon: int,
+) -> QualityFilteredPriorSelection:
+    """Load an already-filtered Quality Filter fragment list."""
+
+    if action_horizon <= 0:
+        raise PriorSelectionError("action_horizon must be positive")
+    path = Path(scores_path).expanduser().resolve()
+    filter_manifest_path = path.parent / "filter_manifest.json"
+    filter_manifest = _read_json_manifest(
+        filter_manifest_path,
+        "Quality Filter manifest",
+    )
+    if filter_manifest.get("status") != "complete":
+        raise PriorSelectionError(
+            "Quality Filter manifest must have status='complete': "
+            f"{filter_manifest_path}"
+        )
+    outputs = filter_manifest.get("outputs")
+    if not isinstance(outputs, dict):
+        raise PriorSelectionError("Quality Filter outputs must be an object")
+    declared_scores = _manifest_path(
+        outputs.get("scores"),
+        relative_to=filter_manifest_path.parent,
+        label="outputs.scores",
+    )
+    if declared_scores != path:
+        raise PriorSelectionError(
+            f"Quality Filter manifest declares scores {declared_scores}, but loaded {path}"
+        )
+    hashes = filter_manifest.get("hashes")
+    if not isinstance(hashes, dict):
+        raise PriorSelectionError("Quality Filter hashes must be an object")
+    scores_sha256 = _sha256(path)
+    if hashes.get("scores") != scores_sha256:
+        raise PriorSelectionError(
+            "Quality Filter selected scores SHA256 does not match filter manifest"
+        )
+
+    source = filter_manifest.get("source")
+    if not isinstance(source, dict):
+        raise PriorSelectionError("Quality Filter source must be an object")
+    source_paths: dict[str, Path] = {}
+    for key in ("run_manifest", "scores", "embeddings"):
+        source_path = _manifest_path(
+            source.get(key),
+            relative_to=filter_manifest_path.parent,
+            label=f"source.{key}",
+        )
+        source_paths[key] = source_path
+        try:
+            actual_sha256 = _sha256(source_path)
+        except OSError as error:
+            raise PriorSelectionError(
+                f"Could not read Quality Filter source {key} {source_path}: {error}"
+            ) from error
+        if source.get(f"{key}_sha256") != actual_sha256:
+            raise PriorSelectionError(
+                f"Quality Filter source {key} SHA256 does not match filter manifest"
+            )
+    run_manifest_path = source_paths["run_manifest"]
+    run_manifest_sha256 = _sha256(run_manifest_path)
+    run_manifest = _read_json_manifest(
+        run_manifest_path,
+        "Quality Filter run manifest",
+    )
+    if run_manifest.get("status") != "complete":
+        raise PriorSelectionError(
+            "Quality Filter run manifest must have status='complete': "
+            f"{run_manifest_path}"
+        )
+    if run_manifest.get("dataset_name") != metadata.root.name:
+        raise PriorSelectionError(
+            f"Quality Filter dataset_name={run_manifest.get('dataset_name')!r} "
+            f"does not match prior dataset {metadata.root.name!r}"
+        )
+    source_dataset = _manifest_path(
+        run_manifest.get("dataset_path"),
+        relative_to=run_manifest_path.parent,
+        label="run_manifest.dataset_path",
+    )
+    if source_dataset != metadata.root:
+        raise PriorSelectionError(
+            f"Quality Filter scores were computed from {source_dataset}, but training "
+            f"prior is {metadata.root}"
+        )
+
+    algorithm = filter_manifest.get("algorithm")
+    counts = filter_manifest.get("counts")
+    if not isinstance(algorithm, dict) or not isinstance(counts, dict):
+        raise PriorSelectionError(
+            "Quality Filter algorithm and counts must be objects"
+        )
+    if algorithm.get("score_column") != "quality":
+        raise PriorSelectionError("Quality Filter score_column must be quality")
+    try:
+        top_percent = float(algorithm["percent"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise PriorSelectionError(
+            "Quality Filter algorithm.percent must be numeric"
+        ) from error
+    if not math.isfinite(top_percent) or not 0.0 < top_percent <= 100.0:
+        raise PriorSelectionError(
+            "Quality Filter algorithm.percent must be in (0, 100]"
+        )
+    input_fragments = _manifest_positive_int(
+        counts,
+        "input_fragments",
+        label="Quality Filter counts",
+    )
+    selected_fragments = _manifest_positive_int(
+        counts,
+        "selected_fragments",
+        label="Quality Filter counts",
+    )
+    target_size = _manifest_positive_int(
+        algorithm,
+        "target_size",
+        label="Quality Filter algorithm",
+    )
+    expected_size = int(
+        (
+            Decimal(input_fragments)
+            * Decimal(str(top_percent))
+            / Decimal(100)
+        ).to_integral_value(rounding=ROUND_CEILING)
+    )
+    if selected_fragments != target_size or selected_fragments != expected_size:
+        raise PriorSelectionError(
+            "Quality Filter selected fragment counts do not match algorithm percent"
+        )
+    ordering = algorithm.get("ordering")
+    if (
+        not isinstance(ordering, list)
+        or not ordering
+        or not all(isinstance(value, str) and value for value in ordering)
+    ):
+        raise PriorSelectionError(
+            "Quality Filter algorithm.ordering must be a non-empty string list"
+        )
+
+    rows = _read_prefiltered_quality_filter_scores(path, metadata)
+    if len(rows) != selected_fragments:
+        raise PriorSelectionError(
+            f"Quality Filter scores contain {len(rows)} rows, expected "
+            f"{selected_fragments}"
+        )
+    if filter_manifest.get("selection_sha256") != _sample_ids_sha256(rows):
+        raise PriorSelectionError(
+            "Quality Filter scores do not match filter manifest selection_sha256"
+        )
+    frame_indices: set[int] = set()
+    selected_episode_ids: set[int] = set()
+    for row in rows:
+        last_start = row.end_step - action_horizon + 1
+        if last_start < row.start_step:
+            continue
+        selected_episode_ids.add(row.episode_id)
+        global_offset = metadata.global_offsets[row.episode_id]
+        frame_indices.update(
+            global_offset + frame
+            for frame in range(row.start_step, last_start + 1)
+        )
+    ordered_indices = tuple(sorted(frame_indices))
+    if not ordered_indices:
+        raise PriorSelectionError(
+            "Selected Quality Filter fragments contain no complete action windows"
+        )
+    filter_manifest_sha256 = _sha256(filter_manifest_path)
+    return QualityFilteredPriorSelection(
+        scores_path=path,
+        scores_sha256=scores_sha256,
+        filter_manifest_path=filter_manifest_path,
+        filter_manifest_sha256=filter_manifest_sha256,
+        run_manifest_path=run_manifest_path,
+        run_manifest_sha256=run_manifest_sha256,
+        top_percent=top_percent,
+        total_chunks=input_fragments,
+        selected_chunks=selected_fragments,
+        selected_sample_ids=tuple(row.sample_id for row in rows),
+        selected_episodes=len(selected_episode_ids),
+        frame_indices=ordered_indices,
+        action_horizon=action_horizon,
+        ordering=tuple(ordering),
+        selection_sha256=_prefiltered_selection_digest(
+            scores_sha256=scores_sha256,
+            filter_manifest_sha256=filter_manifest_sha256,
+            run_manifest_sha256=run_manifest_sha256,
+            action_horizon=action_horizon,
+            frame_indices=ordered_indices,
+            mode="quality_filter_prefiltered",
         ),
     )
 
@@ -969,17 +1282,35 @@ def load_relcore_prior_selection(
 def resolve_prior_selection(
     config: Mapping[str, Any],
     paths: Mapping[str, Path],
-) -> PriorSelection | PrefilteredPriorSelection | RelCorePriorSelection | None:
+) -> (
+    PriorSelection
+    | PrefilteredPriorSelection
+    | QualityFilteredPriorSelection
+    | RelCorePriorSelection
+    | None
+):
     selection = config["data"]["prior_selection"]
     percent = selection.get("top_percent")
     prefiltered = selection.get("prefiltered", False)
     relcore_manifest = selection.get("relcore_manifest")
-    if percent is None and not prefiltered and relcore_manifest is None:
+    quality_filter_scores = selection.get("quality_filter_scores")
+    if (
+        percent is None
+        and not prefiltered
+        and relcore_manifest is None
+        and quality_filter_scores is None
+    ):
         return None
     metadata = LeRobotV2Metadata(paths["prior_dataset"])
     if relcore_manifest is not None:
         return load_relcore_prior_selection(
             paths["prior_relcore_manifest"],
+            metadata,
+            action_horizon=int(config["data"]["action_horizon"]),
+        )
+    if quality_filter_scores is not None:
+        return load_prefiltered_quality_filter_selection(
+            paths["prior_quality_filter_scores"],
             metadata,
             action_horizon=int(config["data"]["action_horizon"]),
         )
