@@ -14,6 +14,7 @@ from .pipeline import (
     run_pipeline,
     scan_stage,
     select_stage,
+    selection_directory_name,
     validate_output,
 )
 
@@ -76,8 +77,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         root, _, _, graph, _ = graph_stage(config, output_dir=args.output_dir, force=args.force)
         print(f"relcore_output={root} nodes={len(graph.sample_ids)}")
     elif args.command == "select":
-        root = select_stage(config, output_dir=args.output_dir, force=args.force)
-        print(f"relcore_output={root}")
+        root = select_stage(
+            config,
+            output_dir=args.output_dir,
+            force=args.force,
+            selection_output_ratio=args.selection_ratio,
+        )
+        result = (
+            root / selection_directory_name(args.selection_ratio)
+            if args.selection_ratio is not None
+            else root
+        )
+        print(f"relcore_output={result}")
     else:
         root = run_pipeline(config, output_dir=args.output_dir, force=args.force)
         print(f"relcore_output={root}")

@@ -17,6 +17,8 @@ from relcore.pipeline import (
     _frame_cache_fingerprint,
     run_pipeline,
     scan_stage,
+    select_stage,
+    selection_directory_name,
     validate_output,
 )
 from relcore.utils.io import publish_stage, write_json
@@ -254,6 +256,118 @@ def test_force_rebuilds_only_changed_selection_stage(tmp_path: Path):
     report = json.loads((root / "selection_report.json").read_text())
     assert report["selected_clips"] == 4
     assert len(report["branches"]) == 3
+
+
+def test_ratio_scoped_selects_coexist_and_preserve_shared_outputs(tmp_path: Path):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    legacy_config = _config(tmp_path)
+    root = run_pipeline(legacy_config, visual_encoder=PipelineVisualEncoder())
+    upstream_mtimes = {
+        stage: (root / stage / "manifest.json").stat().st_mtime_ns
+        for stage in ("scan", "encode", "graph")
+    }
+    published = {
+        name: (root / name).read_bytes()
+        for name in (
+            "selected_manifest.jsonl",
+            "all_clips.parquet",
+            "selection_report.json",
+            "run_manifest.json",
+        )
+    }
+
+    half_config = _config(tmp_path)
+    half_config["selection"]["budget"] = None
+    half_config["selection"]["ratio"] = 0.5
+    full_config = _config(tmp_path)
+    full_config["selection"]["budget"] = None
+    full_config["selection"]["ratio"] = 1.0
+
+    assert select_stage(
+        half_config,
+        selection_output_ratio=0.5,
+        visual_encoder=PipelineVisualEncoder(),
+    ) == root
+    assert select_stage(
+        full_config,
+        selection_output_ratio=1.0,
+        visual_encoder=PipelineVisualEncoder(),
+    ) == root
+
+    half_root = root / "select-top50pct"
+    full_root = root / "select-top100pct"
+    assert json.loads((half_root / "manifest.json").read_text())["selected_clips"] == 3
+    assert json.loads((full_root / "manifest.json").read_text())["selected_clips"] == 6
+    for selection_root in (half_root, full_root):
+        assert {
+            "manifest.json",
+            "selected_manifest.jsonl",
+            "all_clips.parquet",
+            "selection_report.json",
+        } <= {path.name for path in selection_root.iterdir()}
+    assert {
+        stage: (root / stage / "manifest.json").stat().st_mtime_ns
+        for stage in ("scan", "encode", "graph")
+    } == upstream_mtimes
+    assert {
+        name: (root / name).read_bytes()
+        for name in published
+    } == published
+
+
+def test_ratio_scoped_select_reuses_matching_cache_and_requires_force_for_changes(
+    tmp_path: Path,
+):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    config["selection"]["budget"] = None
+    config["selection"]["ratio"] = 0.5
+    root = select_stage(
+        config,
+        selection_output_ratio=0.5,
+        visual_encoder=PipelineVisualEncoder(),
+    )
+    selection_root = root / selection_directory_name(0.5)
+    first_mtime = (selection_root / "manifest.json").stat().st_mtime_ns
+
+    select_stage(
+        config,
+        selection_output_ratio=0.5,
+        visual_encoder=PipelineVisualEncoder(),
+    )
+    assert (selection_root / "manifest.json").stat().st_mtime_ns == first_mtime
+
+    changed = _config(tmp_path)
+    changed["selection"]["budget"] = None
+    changed["selection"]["ratio"] = 0.5
+    changed["selection"]["branches"] = 3
+    with pytest.raises(FileExistsError, match="pass --force"):
+        select_stage(
+            changed,
+            selection_output_ratio=0.5,
+            visual_encoder=PipelineVisualEncoder(),
+        )
+    select_stage(
+        changed,
+        selection_output_ratio=0.5,
+        force=True,
+        visual_encoder=PipelineVisualEncoder(),
+    )
+    assert json.loads((selection_root / "manifest.json").read_text())["status"] == "complete"
+
+
+def test_ratio_scoped_select_rejects_output_ratio_that_differs_from_config(tmp_path: Path):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    config["selection"]["budget"] = None
+    config["selection"]["ratio"] = 0.5
+
+    with pytest.raises(ValueError, match="selection_output_ratio must match"):
+        select_stage(
+            config,
+            selection_output_ratio=0.25,
+            visual_encoder=PipelineVisualEncoder(),
+        )
 
 
 def test_global_selection_reports_actual_tasks_without_hard_quotas(tmp_path: Path):
