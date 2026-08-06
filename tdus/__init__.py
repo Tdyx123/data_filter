@@ -8,36 +8,26 @@ embeddings.
 import os as _os
 
 
-def _configure_native_thread_pools() -> None:
-    """Prevent each spawned data worker from creating a full CPU thread pool."""
+def _forward_legacy_thread_limit() -> None:
+    """Map the legacy TDUS override to the shared trajectory-data setting."""
 
-    variables = (
-        "OPENBLAS_NUM_THREADS",
-        "OMP_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-    )
-    configured = _os.environ.get("TDUS_NUM_THREADS")
-    if configured is not None:
-        try:
-            limit = min(max(int(configured), 1), 64)
-        except ValueError:
-            limit = 1
-        for variable in variables:
-            _os.environ[variable] = str(limit)
+    if "TRAJECTORY_DATA_NUM_THREADS" in _os.environ:
         return
-
-    for variable in variables:
-        _os.environ.setdefault(variable, "1")
+    configured = _os.environ.get("TDUS_NUM_THREADS")
+    if configured is None:
+        return
     try:
-        openblas_threads = int(_os.environ["OPENBLAS_NUM_THREADS"])
+        limit = min(max(int(configured), 1), 64)
     except ValueError:
-        openblas_threads = 1
-    if openblas_threads < 1 or openblas_threads > 64:
-        _os.environ["OPENBLAS_NUM_THREADS"] = str(min(max(openblas_threads, 1), 64))
+        limit = 1
+    _os.environ["TRAJECTORY_DATA_NUM_THREADS"] = str(limit)
 
 
-_configure_native_thread_pools()
+_forward_legacy_thread_limit()
+
+# This must follow the legacy mapping and runs the shared startup bootstrap.
+import trajectory_data as _trajectory_data  # noqa: E402, F401
+
 
 def select_top_k(*args, **kwargs):
     """Lazily import :func:`tdus.selector.select_top_k`."""

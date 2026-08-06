@@ -149,6 +149,46 @@ class DatasetAdapter(ABC):
     ) -> Iterator[EpisodeData]:
         """Stream decoded episodes in deterministic order."""
 
+    def iter_episode_subset(
+        self,
+        records: Sequence[EpisodeRecord],
+        *,
+        num_workers: int = 0,
+        load_images: bool = True,
+    ) -> Iterator[EpisodeData]:
+        """Stream a requested record subset in the caller-provided order."""
+
+        requested = list(records)
+        requested_ids = [record.episode_id for record in requested]
+        if len(set(requested_ids)) != len(requested_ids):
+            raise ValueError("episode subset contains duplicate episode ids")
+        wanted = set(requested_ids)
+        loaded = {
+            episode.episode_id: episode
+            for episode in self.iter_episodes(
+                num_workers=num_workers,
+                load_images=load_images,
+            )
+            if episode.episode_id in wanted
+        }
+        if set(loaded) != wanted:
+            missing = sorted(wanted - set(loaded))
+            raise ValueError(f"episode subset could not be loaded: {missing}")
+        for episode_id in requested_ids:
+            yield loaded[episode_id]
+
+    def dataset_summary(self) -> dict[str, int]:
+        """Return source/indexing counts suitable for stage manifests."""
+
+        count = len(self.episodes())
+        return {
+            "source_episodes": count,
+            "indexed_episodes": count,
+            "retained_episodes": count,
+            "excluded_episodes": 0,
+            "excluded_empty_task_episodes": 0,
+        }
+
     def iter_segments(
         self,
         modes: Sequence[str],

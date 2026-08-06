@@ -24,6 +24,8 @@ python -m quality_filter validate \
 `--output-dir` 是精确运行目录。`--max-episodes` 可用于 smoke test；不兼容的
 已有阶段必须显式传 `--force`。未指定 Filter seed 时，首次构建会生成随机 seed；
 兼容缓存复用 manifest 中的实际 seed，`--force` 会重新生成。
+程序会在导入 NumPy 前把原生数值库限制为每进程 1 线程；如需调整，设置
+`TRAJECTORY_DATA_NUM_THREADS=1..64`。
 
 ## 阶段与产物
 

@@ -6,7 +6,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from relcore.features.encoding import encode_dataset
+from relcore.features.encoding import (
+    encode_dataset,
+    encode_dataset_from_frame_cache,
+    fit_numeric_normalizers,
+    populate_frame_feature_cache,
+)
+from relcore.features.frame_cache import FrameFeatureCache
 from relcore.features.visual_encoder import FrozenClipEncoder
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
 
@@ -139,6 +145,49 @@ def test_encode_dataset_is_deterministic_for_same_seed(tmp_path: Path):
 
     np.testing.assert_array_equal(first.embeddings, second.embeddings)
     np.testing.assert_array_equal(first.raw_relations, second.raw_relations)
+
+
+def test_frame_cache_encoding_matches_direct_encoding(tmp_path: Path) -> None:
+    direct = encode_dataset(
+        CountingAdapter(),
+        CountingVisualEncoder(),
+        projection_dim=4,
+        output_dim=8,
+        seed=23,
+    )
+    adapter = CountingAdapter()
+    records = list(adapter.episodes())
+    action_normalizer, state_normalizer = fit_numeric_normalizers(adapter, records)
+    usable = [record for record in records if record.length >= 15]
+    cache = FrameFeatureCache(tmp_path / "cache", fingerprint="frame-v1")
+    populate_frame_feature_cache(
+        adapter,
+        usable,
+        CountingVisualEncoder(),
+        cache,
+        progress_interval=0,
+    )
+
+    cached = encode_dataset_from_frame_cache(
+        adapter,
+        records,
+        cache,
+        projection_dim=4,
+        output_dim=8,
+        seed=23,
+        action_normalizer=action_normalizer,
+        state_normalizer=state_normalizer,
+        visual_output_dim=3,
+    )
+
+    assert [clip.sample_id for clip in cached.clips] == [
+        clip.sample_id for clip in direct.clips
+    ]
+    np.testing.assert_array_equal(cached.raw_relations, direct.raw_relations)
+    np.testing.assert_array_equal(cached.embeddings, direct.embeddings)
+    np.testing.assert_array_equal(cached.state_sequences, direct.state_sequences)
+    np.testing.assert_array_equal(cached.action_sequences, direct.action_sequences)
+    np.testing.assert_array_equal(cached.visual_progress, direct.visual_progress)
 
 
 @pytest.mark.gpu

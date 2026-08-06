@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import heapq
 from collections import defaultdict
+from collections.abc import Mapping
 
 import numpy as np
 
@@ -15,7 +16,7 @@ class SparseGreedySelector:
     def __init__(
         self,
         context: ObjectiveContext,
-        task_quotas: dict[int, int],
+        task_quotas: Mapping[int, int] | None,
         *,
         seed: int = 42,
         global_candidates: int = 256,
@@ -23,18 +24,30 @@ class SparseGreedySelector:
         random_candidates: int = 128,
     ):
         self.context = context
-        self.task_quotas = {int(task): int(value) for task, value in task_quotas.items()}
+        self.task_quotas = (
+            None
+            if task_quotas is None
+            else {int(task): int(value) for task, value in task_quotas.items()}
+        )
         self.seed = int(seed)
         self.global_candidates = int(global_candidates)
         self.residual_candidates = int(residual_candidates)
         self.random_candidates = int(random_candidates)
-        self.node_task_positions = np.asarray(
-            [context.task_position[int(task)] for task in context.graph.task_indices],
-            dtype=np.int64,
+        self.node_task_positions = (
+            None
+            if self.task_quotas is None
+            else np.asarray(
+                [context.task_position[int(task)] for task in context.graph.task_indices],
+                dtype=np.int64,
+            )
         )
-        self.quota_limits = np.asarray(
-            [self.task_quotas[task] for task in context.task_labels],
-            dtype=np.int64,
+        self.quota_limits = (
+            None
+            if self.task_quotas is None
+            else np.asarray(
+                [self.task_quotas[task] for task in context.task_labels],
+                dtype=np.int64,
+            )
         )
         self.neighbors: list[set[int]] = [set() for _ in context.graph.sample_ids]
         for table in (context.graph.sequence_edges, context.graph.similarity_edges):
@@ -63,6 +76,8 @@ class SparseGreedySelector:
     def _eligible(self, state, index: int) -> bool:
         if state.selected_mask[index]:
             return False
+        if self.task_quotas is None:
+            return True
         task = int(self.context.graph.task_indices[index])
         position = self.context.task_position[task]
         return state.task_counts[position] < self.task_quotas[task]
@@ -74,8 +89,10 @@ class SparseGreedySelector:
         initial_indices: list[int] | None = None,
         branch_id: int = 0,
     ) -> SelectionResult:
-        if sum(self.task_quotas.values()) != budget:
+        if self.task_quotas is not None and sum(self.task_quotas.values()) != budget:
             raise ValueError("task quotas must sum to the selection budget")
+        if budget <= 0 or budget > len(self.context.graph.sample_ids):
+            raise ValueError("selection budget must be within candidate count")
         state = self.context.empty_state()
         selected: list[int] = []
         gains: list[float] = []
@@ -101,8 +118,14 @@ class SparseGreedySelector:
         heapq.heapify(stale_heap)
         rng = np.random.default_rng(self.seed)
         while len(selected) < budget:
-            open_tasks = state.task_counts < self.quota_limits
-            eligible = np.flatnonzero(~state.selected_mask & open_tasks[self.node_task_positions])
+            if self.task_quotas is None:
+                eligible = np.flatnonzero(~state.selected_mask)
+            else:
+                assert self.quota_limits is not None and self.node_task_positions is not None
+                open_tasks = state.task_counts < self.quota_limits
+                eligible = np.flatnonzero(
+                    ~state.selected_mask & open_tasks[self.node_task_positions]
+                )
             if not len(eligible):
                 raise ValueError("no quota-feasible candidate remains")
             candidate_pool: set[int] = set()
@@ -144,16 +167,17 @@ class SparseGreedySelector:
                     int(index)
                     for index in rng.choice(eligible, size=sample_size, replace=False, p=weights)
                 )
-            for task, quota in self.task_quotas.items():
-                position = self.context.task_position[task]
-                if state.task_counts[position] >= quota:
-                    continue
-                task_node = next(
-                    (index for index in self.task_nodes[task] if self._eligible(state, index)),
-                    None,
-                )
-                if task_node is not None:
-                    candidate_pool.add(task_node)
+            if self.task_quotas is not None:
+                for task, quota in self.task_quotas.items():
+                    position = self.context.task_position[task]
+                    if state.task_counts[position] >= quota:
+                        continue
+                    task_node = next(
+                        (index for index in self.task_nodes[task] if self._eligible(state, index)),
+                        None,
+                    )
+                    if task_node is not None:
+                        candidate_pool.add(task_node)
             evaluated = sorted(
                 (index for index in candidate_pool if self._eligible(state, index)),
                 key=lambda index: self.context.graph.sample_ids[index],

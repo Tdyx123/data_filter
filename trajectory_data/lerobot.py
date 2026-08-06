@@ -267,6 +267,9 @@ class LeRobotDatasetAdapter(DatasetAdapter):
 
     def __init__(self, config: Mapping[str, Any]):
         self.config = dict(config)
+        self.empty_task_policy = str(config.get("empty_task_policy", "error")).strip().lower()
+        if self.empty_task_policy not in {"error", "exclude"}:
+            raise DatasetValidationError("empty_task_policy must be error or exclude")
         self.root = Path(str(config["path"])).expanduser().resolve()
         info_path = self.root / "meta" / "info.json"
         episodes_path = self.root / "meta" / "episodes.jsonl"
@@ -283,29 +286,48 @@ class LeRobotDatasetAdapter(DatasetAdapter):
         self.features: dict[str, dict[str, Any]] = dict(self.info.get("features", {}))
         self._discover_keys()
         rows = _read_jsonl(episodes_path)
+        self._source_episode_count = len(rows)
+        expected = int(self.info.get("total_episodes", len(rows)))
+        if len(rows) != expected:
+            raise DatasetValidationError(
+                f"episodes.jsonl has {len(rows)} entries, expected {expected}"
+            )
         task_by_name = self._load_task_index()
+        has_task_table = (self.root / "meta" / "tasks.jsonl").is_file()
         records: list[EpisodeRecord] = []
+        excluded_empty = 0
         for row in rows:
             task_names = row.get("tasks")
-            task_name: str | None = None
+            if task_names is None and not has_task_table:
+                records.append(
+                    EpisodeRecord(
+                        int(row["episode_index"]),
+                        int(row["length"]),
+                        None,
+                        None,
+                    )
+                )
+                continue
+            if not isinstance(task_names, list) or len(task_names) != 1:
+                raise DatasetValidationError(
+                    "LeRobot episodes must reference exactly one task: "
+                    f"episode {row.get('episode_index')}"
+                )
+            task_name = str(task_names[0])
+            if not task_name.strip():
+                if self.empty_task_policy == "exclude":
+                    excluded_empty += 1
+                    continue
+                raise DatasetValidationError(
+                    f"Empty LeRobot task name for episode {row.get('episode_index')}"
+                )
             task_index: int | None = None
-            if task_names is not None:
-                if not isinstance(task_names, list) or len(task_names) != 1:
-                    raise DatasetValidationError(
-                        "LeRobot episodes must reference exactly one task when task "
-                        f"metadata is present: episode {row.get('episode_index')}"
-                    )
-                task_name = str(task_names[0])
-                if not task_name:
-                    raise DatasetValidationError(
-                        f"Empty LeRobot task name for episode {row.get('episode_index')}"
-                    )
-                if task_name in task_by_name:
-                    task_index = task_by_name[task_name]
-                elif task_by_name:
-                    raise DatasetValidationError(
-                        f"Unknown LeRobot task {task_name!r} for episode {row.get('episode_index')}"
-                    )
+            if task_name in task_by_name:
+                task_index = task_by_name[task_name]
+            elif has_task_table:
+                raise DatasetValidationError(
+                    f"Unknown LeRobot task {task_name!r} for episode {row.get('episode_index')}"
+                )
             records.append(
                 EpisodeRecord(
                     int(row["episode_index"]),
@@ -315,13 +337,9 @@ class LeRobotDatasetAdapter(DatasetAdapter):
                 )
             )
         self._episodes = tuple(records)
+        self._excluded_empty_task_episodes = excluded_empty
         if any(episode.length <= 0 for episode in self._episodes):
             raise DatasetValidationError("LeRobot episodes must contain at least one frame")
-        expected = int(self.info.get("total_episodes", len(self._episodes)))
-        if len(self._episodes) != expected:
-            raise DatasetValidationError(
-                f"episodes.jsonl has {len(self._episodes)} entries, expected {expected}"
-            )
 
     def _load_task_index(self) -> dict[str, int]:
         path = self.root / "meta" / "tasks.jsonl"
@@ -335,7 +353,7 @@ class LeRobotDatasetAdapter(DatasetAdapter):
                 task_index = int(row["task_index"])
             except (KeyError, TypeError, ValueError) as error:
                 raise DatasetValidationError(f"Invalid task_index in {path}: {row!r}") from error
-            if not task_name:
+            if not task_name.strip() and self.empty_task_policy == "error":
                 raise DatasetValidationError(f"Empty task name in {path}")
             if task_name in by_name or task_index in by_index:
                 raise DatasetValidationError(
@@ -456,6 +474,15 @@ class LeRobotDatasetAdapter(DatasetAdapter):
     def episodes(self) -> Sequence[EpisodeRecord]:
         return self._episodes
 
+    def dataset_summary(self) -> dict[str, int]:
+        return {
+            "source_episodes": self._source_episode_count,
+            "indexed_episodes": len(self._episodes),
+            "retained_episodes": len(self._episodes),
+            "excluded_episodes": self._excluded_empty_task_episodes,
+            "excluded_empty_task_episodes": self._excluded_empty_task_episodes,
+        }
+
     def _worker_payload(
         self,
         episode: EpisodeRecord,
@@ -489,6 +516,40 @@ class LeRobotDatasetAdapter(DatasetAdapter):
         load_images: bool = True,
     ) -> Iterator[EpisodeData]:
         episodes = self._episodes[:max_episodes] if max_episodes else self._episodes
+        yield from self._iter_records(
+            episodes,
+            num_workers=num_workers,
+            load_images=load_images,
+        )
+
+    def iter_episode_subset(
+        self,
+        records: Sequence[EpisodeRecord],
+        *,
+        num_workers: int = 0,
+        load_images: bool = True,
+    ) -> Iterator[EpisodeData]:
+        requested = tuple(records)
+        expected = {record.episode_id: record for record in self._episodes}
+        requested_ids = [record.episode_id for record in requested]
+        if len(set(requested_ids)) != len(requested_ids):
+            raise ValueError("episode subset contains duplicate episode ids")
+        for record in requested:
+            if expected.get(record.episode_id) != record:
+                raise ValueError(f"unknown or mismatched episode record {record.episode_id}")
+        yield from self._iter_records(
+            requested,
+            num_workers=num_workers,
+            load_images=load_images,
+        )
+
+    def _iter_records(
+        self,
+        episodes: Sequence[EpisodeRecord],
+        *,
+        num_workers: int,
+        load_images: bool,
+    ) -> Iterator[EpisodeData]:
         if num_workers <= 1:
             for episode in episodes:
                 yield _load_lerobot_episode(self._worker_payload(episode, load_images=load_images))

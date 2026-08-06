@@ -1,4 +1,7 @@
-"""LIBERO relational coreset selection."""
+"""LeRobot relational coreset selection."""
+
+# Import for its pre-NumPy native-thread bootstrap side effect.
+import trajectory_data as _trajectory_data  # noqa: F401
 
 from .schemas import ClipRecord, EdgeTable, GraphData, ObjectiveState
 

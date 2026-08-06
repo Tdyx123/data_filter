@@ -4,7 +4,8 @@ import numpy as np
 from scipy import sparse
 
 from relcore.schemas import EdgeTable, GraphData
-from relcore.selection.multibranch import MultiBranchSelector
+from relcore.selection.greedy import SelectionResult
+from relcore.selection.multibranch import MultiBranchSelector, _local_search
 from relcore.selection.objective import ObjectiveContext, ObjectiveWeights
 from relcore.selection.seeds import generate_seed_pairs
 from relcore.selection.sparse_greedy import SparseGreedySelector
@@ -36,6 +37,20 @@ def test_seed_generation_includes_high_value_real_sequence_pair():
 
     assert seeds
     assert seeds[0] == (0, 1)
+
+
+def test_global_seed_generation_allows_same_task_pair():
+    context = ObjectiveContext(_small_graph(), ObjectiveWeights(), similarity_threshold=0.8)
+
+    seeds = generate_seed_pairs(
+        context,
+        None,
+        budget=2,
+        branches=2,
+        seed_candidates=8,
+    )
+
+    assert (0, 1) in seeds
 
 
 def test_seed_generation_reserves_a_low_frequency_reliable_transition():
@@ -94,6 +109,50 @@ def test_sparse_greedy_fills_exact_budget_and_hard_quotas():
 
     assert len(result.selected_indices) == 2
     assert {int(graph.task_indices[index]) for index in result.selected_indices} == {0, 1}
+
+
+def test_sparse_greedy_global_mode_has_no_task_cap():
+    graph = _small_graph()
+    context = ObjectiveContext(graph, ObjectiveWeights(), similarity_threshold=0.8)
+
+    result = SparseGreedySelector(
+        context,
+        None,
+        seed=17,
+        global_candidates=4,
+        residual_candidates=4,
+        random_candidates=4,
+    ).select(2)
+
+    assert result.selected_indices == [0, 1]
+
+
+def test_global_local_search_can_swap_across_tasks():
+    graph = _small_graph()
+    context = ObjectiveContext(
+        graph,
+        ObjectiveWeights(
+            node=1.0,
+            transition=0.0,
+            cooccurrence=0.0,
+            sequence=0.0,
+            redundancy=0.0,
+        ),
+        similarity_threshold=0.8,
+    )
+    state = context.state_from_indices([2])
+    initial = SelectionResult([2], [float(state.objective_value)], float(state.objective_value))
+
+    refined = _local_search(
+        initial,
+        context,
+        task_quotas=None,
+        max_selected_candidates=1,
+        max_unselected_candidates=4,
+        max_rounds=1,
+    )
+
+    assert int(graph.task_indices[refined.selected_indices[0]]) == 0
 
 
 def test_multibranch_returns_at_least_the_empty_seed_sparse_objective():

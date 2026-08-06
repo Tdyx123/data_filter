@@ -17,6 +17,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "name": "libero90",
         "path": "/data/dwb/datasets/LIBERO_lerobot/libero90",
         "use_images": True,
+        "empty_task_policy": "error",
         "feature_keys": {
             "action": "action",
             "timestamp": "timestamp",
@@ -105,6 +106,8 @@ def _merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
 
 def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     resolved = _merge(DEFAULT_CONFIG, config)
+    if resolved["dataset"].get("empty_task_policy") not in {"error", "exclude"}:
+        raise ValueError("dataset.empty_task_policy must be error or exclude")
     if (int(resolved["clip"]["length"]), int(resolved["clip"]["stride"])) != (15, 15):
         raise ValueError("relcore requires SQCN-compatible 15-frame windows with stride 15")
     lags = tuple(int(lag) for lag in resolved["relation"]["lags"])
@@ -155,10 +158,13 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("objective weights cannot be negative")
     if resolved["selection"]["engine"] not in {"exact", "sparse"}:
         raise ValueError("selection.engine must be exact or sparse")
-    if resolved["selection"]["quota_mode"] != "proportional":
-        raise ValueError("selection.quota_mode must be proportional")
+    quota_mode = resolved["selection"]["quota_mode"]
+    if quota_mode not in {"proportional", "none"}:
+        raise ValueError("selection.quota_mode must be proportional or none")
     if int(resolved["selection"]["minimum_per_task"]) < 0:
         raise ValueError("selection.minimum_per_task cannot be negative")
+    if quota_mode == "none" and int(resolved["selection"]["minimum_per_task"]) != 0:
+        raise ValueError("selection.quota_mode=none requires minimum_per_task=0")
     if not 0.0 <= float(resolved["selection"]["seed_similarity_threshold"]) <= 1.0:
         raise ValueError("selection.seed_similarity_threshold must be in [0, 1]")
     if float(resolved["selection"]["transition_seed_threshold"]) < 0:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 
 import numpy as np
 
@@ -12,8 +13,10 @@ from .objective import ObjectiveContext
 def _pair_feasible(
     context: ObjectiveContext,
     pair: tuple[int, int],
-    task_quotas: dict[int, int],
+    task_quotas: Mapping[int, int] | None,
 ) -> bool:
+    if task_quotas is None:
+        return True
     counts = Counter(int(context.graph.task_indices[index]) for index in pair)
     return all(count <= task_quotas.get(task, 0) for task, count in counts.items())
 
@@ -31,7 +34,7 @@ def _episode_key(sample_id: str) -> str:
 
 def generate_seed_pairs(
     context: ObjectiveContext,
-    task_quotas: dict[int, int],
+    task_quotas: Mapping[int, int] | None,
     *,
     budget: int,
     branches: int = 8,

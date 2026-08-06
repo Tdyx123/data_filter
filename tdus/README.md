@@ -88,13 +88,15 @@ python -m tdus --config tdus/config.yaml --max-episodes 8 --force
 执行 resize + flatten + PCA fallback。兼容缓存会在重复运行时复用；`--force`
 强制重算。
 
-TDUS 会在导入 NumPy 前把未显式配置的 OpenBLAS、OpenMP、MKL 和 NumExpr
-线程池限制为每进程 1 线程，避免多进程数据加载在高核数服务器上过度创建线程。
-如需调整，可在启动时设置 `TDUS_NUM_THREADS`，允许范围为 1–64：
+TDUS 使用 `trajectory_data` 的共享启动保护，在导入 NumPy 前把 OpenBLAS、
+OpenMP、MKL 和 NumExpr 线程池限制为每进程 1 线程，避免高核数服务器上的嵌套
+并行。首选使用范围为 1–64 的共享变量 `TRAJECTORY_DATA_NUM_THREADS`：
 
 ```bash
-TDUS_NUM_THREADS=4 python -m tdus --config tdus/config_libero90.yaml
+TRAJECTORY_DATA_NUM_THREADS=4 python -m tdus --config tdus/config_libero90.yaml
 ```
+
+原有 `TDUS_NUM_THREADS` 继续兼容；两个变量同时设置时，共享变量优先。
 
 ## 仅重算最终分数
 

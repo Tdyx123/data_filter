@@ -12,7 +12,13 @@ import yaml
 
 from relcore.cli import main
 from relcore.config import load_config
-from relcore.pipeline import run_pipeline, scan_stage, validate_output
+from relcore.pipeline import (
+    _encode_fingerprint,
+    _frame_cache_fingerprint,
+    run_pipeline,
+    scan_stage,
+    validate_output,
+)
 from relcore.utils.io import publish_stage, write_json
 from trajectory_data import (
     DatasetAdapter,
@@ -88,6 +94,18 @@ class PipelineVisualEncoder:
     def encode(self, images: np.ndarray) -> np.ndarray:
         values = images[:, 0, 0, 0].astype(np.float32)
         return np.stack([values + 1.0, values + 2.0, values + 4.0], axis=1)
+
+
+class InterruptingVisualEncoder(PipelineVisualEncoder):
+    def __init__(self, fail_on_call: int | None):
+        self.fail_on_call = fail_on_call
+        self.episode_lengths: list[int] = []
+
+    def encode(self, images: np.ndarray) -> np.ndarray:
+        self.episode_lengths.append(len(images))
+        if self.fail_on_call == len(self.episode_lengths):
+            raise RuntimeError("injected CLIP interruption")
+        return super().encode(images)
 
 
 def _config(tmp_path: Path) -> dict[str, object]:
@@ -207,6 +225,16 @@ def test_scan_performs_the_numeric_pass_without_loading_images(tmp_path: Path):
     assert len(clips) == 6
     assert PipelineAdapter.load_images_calls == [False]
     assert (root / "scan" / "normalization.npz").is_file()
+    manifest = json.loads((root / "scan" / "manifest.json").read_text())
+    assert manifest["dataset_summary"] == {
+        "source_episodes": 3,
+        "indexed_episodes": 3,
+        "retained_episodes": 3,
+        "excluded_episodes": 0,
+        "excluded_empty_task_episodes": 0,
+    }
+    assert manifest["scanned_episodes"] == 3
+    assert manifest["skipped_short_episode_count"] == 1
 
 
 def test_force_rebuilds_only_changed_selection_stage(tmp_path: Path):
@@ -226,6 +254,36 @@ def test_force_rebuilds_only_changed_selection_stage(tmp_path: Path):
     report = json.loads((root / "selection_report.json").read_text())
     assert report["selected_clips"] == 4
     assert len(report["branches"]) == 3
+
+
+def test_global_selection_reports_actual_tasks_without_hard_quotas(tmp_path: Path):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    config["selection"]["quota_mode"] = "none"
+    config["selection"]["minimum_per_task"] = 0
+
+    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+
+    report = json.loads((root / "selection_report.json").read_text())
+    assert report["quota_mode"] == "none"
+    assert report["task_quotas"] is None
+    assert sum(report["task_counts"].values()) == 2
+    assert validate_output(root, config=config) == {"status": "valid", "selected_clips": 2}
+
+
+def test_global_validation_rejects_a_mismatched_recorded_budget(tmp_path: Path) -> None:
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    config["selection"]["quota_mode"] = "none"
+    config["selection"]["minimum_per_task"] = 0
+    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    manifest_path = root / "select" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["budget"] = 3
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="budget"):
+        validate_output(root)
 
 
 def test_seed_change_reuses_scan_but_rebuilds_randomized_stages(tmp_path: Path):
@@ -272,6 +330,74 @@ def test_missing_frame_feature_invalidates_encode_cache(tmp_path: Path):
 
     with pytest.raises(FileExistsError, match="pass --force"):
         run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+
+
+def test_interrupted_encode_reuses_completed_episode_frame_cache(tmp_path: Path):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    interrupted = InterruptingVisualEncoder(fail_on_call=2)
+
+    with pytest.raises(RuntimeError, match="injected CLIP interruption"):
+        run_pipeline(config, visual_encoder=interrupted)
+
+    resumed = InterruptingVisualEncoder(fail_on_call=None)
+    root = run_pipeline(config, visual_encoder=resumed)
+
+    assert interrupted.episode_lengths == [31, 31]
+    assert resumed.episode_lengths == [31]
+    assert (root / "encode" / "frame_features" / "ep000000.npy").is_file()
+    assert (root / "encode" / "frame_features" / "ep000001.npy").is_file()
+    manifest = json.loads((root / "encode" / "manifest.json").read_text())
+    assert manifest["frame_cache_reused_episodes"] == 1
+    assert manifest["frame_cache_encoded_episodes"] == 1
+
+
+def test_damaged_frame_cache_reuses_valid_prefix_and_reencodes_suffix(tmp_path: Path):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    cache_directories = list((root / ".relcore-cache" / "frame_features").iterdir())
+    assert len(cache_directories) == 1
+    with (cache_directories[0] / "ep000001.npy").open("r+b") as handle:
+        handle.seek(-1, 2)
+        handle.write(b"\x00")
+    changed = _config(tmp_path)
+    changed["relation"]["output_dim"] = 7
+    resumed = InterruptingVisualEncoder(fail_on_call=None)
+
+    run_pipeline(changed, force=True, visual_encoder=resumed)
+
+    assert resumed.episode_lengths == [31]
+    manifest = json.loads((root / "encode" / "manifest.json").read_text())
+    assert manifest["frame_cache_reused_episodes"] == 1
+    assert manifest["frame_cache_encoded_episodes"] == 1
+
+
+def test_local_model_content_invalidates_frame_cache_and_encode_fingerprints(
+    tmp_path: Path,
+) -> None:
+    adapter = PipelineAdapter({})
+    config = _config(tmp_path)
+    model = tmp_path / "clip"
+    model.mkdir()
+    weights = model / "weights.bin"
+    weights.write_bytes(b"weights-v1")
+    config["visual"] = {
+        "encoder": "clip",
+        "model": str(model),
+        "local_files_only": True,
+        "batch_size": 1,
+        "device": "cuda",
+    }
+    first_cache = _frame_cache_fingerprint(adapter, config)
+    first_encode = _encode_fingerprint(adapter, config, "scan-v1", first_cache)
+
+    weights.write_bytes(b"weights-v2")
+
+    second_cache = _frame_cache_fingerprint(adapter, config)
+    second_encode = _encode_fingerprint(adapter, config, "scan-v1", second_cache)
+    assert second_cache != first_cache
+    assert second_encode != first_encode
 
 
 def test_failed_forced_stage_build_preserves_the_previous_complete_cache(tmp_path: Path):

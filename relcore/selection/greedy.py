@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .objective import ObjectiveContext
@@ -24,9 +25,17 @@ class SelectionResult:
 
 
 class ExactGreedySelector:
-    def __init__(self, context: ObjectiveContext, task_quotas: dict[int, int]):
+    def __init__(
+        self,
+        context: ObjectiveContext,
+        task_quotas: Mapping[int, int] | None,
+    ):
         self.context = context
-        self.task_quotas = {int(task): int(value) for task, value in task_quotas.items()}
+        self.task_quotas = (
+            None
+            if task_quotas is None
+            else {int(task): int(value) for task, value in task_quotas.items()}
+        )
 
     def select(
         self,
@@ -35,16 +44,19 @@ class ExactGreedySelector:
         initial_indices: list[int] | None = None,
         branch_id: int = 0,
     ) -> SelectionResult:
-        if sum(self.task_quotas.values()) != budget:
+        if self.task_quotas is not None and sum(self.task_quotas.values()) != budget:
             raise ValueError("task quotas must sum to the selection budget")
+        if budget <= 0 or budget > len(self.context.graph.sample_ids):
+            raise ValueError("selection budget must be within candidate count")
         selected = list(initial_indices or [])
         state = self.context.empty_state()
         gains: list[float] = []
         for index in selected:
-            task = int(self.context.graph.task_indices[index])
-            position = self.context.task_position[task]
-            if state.task_counts[position] >= self.task_quotas[task]:
-                raise ValueError("initial selection exceeds a task quota")
+            if self.task_quotas is not None:
+                task = int(self.context.graph.task_indices[index])
+                position = self.context.task_position[task]
+                if state.task_counts[position] >= self.task_quotas[task]:
+                    raise ValueError("initial selection exceeds a task quota")
             gain = self.context.marginal_gain(state, index)
             self.context.add_candidate(state, index)
             gains.append(gain)
@@ -52,6 +64,9 @@ class ExactGreedySelector:
             eligible = []
             for index, sample_id in enumerate(self.context.graph.sample_ids):
                 if state.selected_mask[index]:
+                    continue
+                if self.task_quotas is None:
+                    eligible.append((sample_id, index))
                     continue
                 task = int(self.context.graph.task_indices[index])
                 position = self.context.task_position[task]

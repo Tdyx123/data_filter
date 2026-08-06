@@ -29,7 +29,7 @@ def _selection_ratio(value: str) -> float:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="LIBERO relational coreset selection")
+    parser = argparse.ArgumentParser(description="LeRobot relational coreset selection")
     subparsers = parser.add_subparsers(dest="command", required=True)
     default_config = str(Path(__file__).with_name("config_libero90.yaml"))
     for command in ("scan", "encode", "build-graph", "select", "run"):

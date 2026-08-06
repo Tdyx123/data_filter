@@ -180,6 +180,16 @@ def test_exact_greedy_fills_budget_without_exceeding_task_quotas():
     )
 
 
+def test_exact_greedy_global_mode_can_fill_budget_from_one_task():
+    graph = _small_graph()
+    result = ExactGreedySelector(
+        ObjectiveContext(graph, ObjectiveWeights(), similarity_threshold=0.8),
+        None,
+    ).select(2)
+
+    assert result.selected_indices == [0, 1]
+
+
 def test_exact_greedy_fills_budget_even_when_the_best_remaining_gain_is_negative():
     graph = GraphData(
         sample_ids=["a", "b"],

@@ -1,6 +1,10 @@
 """Shared dataset adapters for trajectory-level robotics data."""
 
-from .core import (
+from .runtime import configure_native_thread_pools as _configure_native_thread_pools
+
+_configure_native_thread_pools()
+
+from .core import (  # noqa: E402
     DatasetAdapter,
     DatasetValidationError,
     EpisodeData,
@@ -11,7 +15,7 @@ from .core import (
     register_dataset_adapter,
     segment_episode,
 )
-from .lerobot import LeRobotDatasetAdapter
+from .lerobot import LeRobotDatasetAdapter  # noqa: E402
 
 register_dataset_adapter("lerobot", LeRobotDatasetAdapter)
 

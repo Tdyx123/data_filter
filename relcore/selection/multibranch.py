@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from .greedy import LocalSwap, SelectionResult
 from .objective import ObjectiveContext
 from .seeds import generate_seed_pairs
@@ -26,6 +28,7 @@ def _local_search(
     result: SelectionResult,
     context: ObjectiveContext,
     *,
+    task_quotas: Mapping[int, int] | None,
     max_selected_candidates: int,
     max_unselected_candidates: int,
     max_rounds: int,
@@ -66,7 +69,10 @@ def _local_search(
             removed_task = int(context.graph.task_indices[removed])
             without_state = without_states[position]
             for candidate in unselected:
-                if int(context.graph.task_indices[candidate]) != removed_task:
+                if (
+                    task_quotas is not None
+                    and int(context.graph.task_indices[candidate]) != removed_task
+                ):
                     continue
                 value = without_state.objective_value + context.marginal_gain(
                     without_state, candidate
@@ -95,7 +101,7 @@ class MultiBranchSelector:
     def __init__(
         self,
         context: ObjectiveContext,
-        task_quotas: dict[int, int],
+        task_quotas: Mapping[int, int] | None,
         *,
         branches: int = 8,
         seed: int = 42,
@@ -181,6 +187,7 @@ class MultiBranchSelector:
             best = _local_search(
                 best,
                 self.context,
+                task_quotas=self.task_quotas,
                 max_selected_candidates=self.local_search_selected,
                 max_unselected_candidates=self.local_search_unselected,
                 max_rounds=self.local_search_rounds,

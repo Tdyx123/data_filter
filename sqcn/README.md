@@ -38,6 +38,8 @@ pip install -r sqcn/requirements.txt
 
 SQCN 强制使用配置中的单路相机和本地 CLIP ViT，不会访问 Hugging Face，模型
 无法加载时也不会退回像素编码。数据集必须同时包含动作和至少一路向量状态。
+程序会在导入 NumPy 前把原生数值库限制为每进程 1 线程；如需调整，设置
+`TRAJECTORY_DATA_NUM_THREADS=1..64`。
 
 ## 片段与 embedding
 

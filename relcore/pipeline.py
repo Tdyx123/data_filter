@@ -17,13 +17,20 @@ import pyarrow.parquet as pq
 import yaml
 from scipy import sparse
 
-from trajectory_data import DatasetAdapter, create_dataset
+from trajectory_data import DatasetAdapter, EpisodeRecord, create_dataset
 
 from relcore import __version__
 from relcore.config import resolve_config
 from relcore.data.index import build_clip_records
 from relcore.export import write_selection_outputs
-from relcore.features.encoding import EncodedClips, encode_dataset, fit_numeric_normalizers
+from relcore.features.encoding import (
+    EncodedClips,
+    FrameCacheSummary,
+    encode_dataset_from_frame_cache,
+    fit_numeric_normalizers,
+    populate_frame_feature_cache,
+)
+from relcore.features.frame_cache import FrameFeatureCache, directory_sha256
 from relcore.features.normalization import RobustNormalizer
 from relcore.features.visual_encoder import (
     DummyVisualEncoder,
@@ -114,6 +121,59 @@ def _manifest_fingerprint(path: Path) -> str:
     return str(json.loads(path.read_text(encoding="utf-8"))["fingerprint"])
 
 
+def _configured_records(
+    adapter: DatasetAdapter,
+    config: Mapping[str, Any],
+) -> list[EpisodeRecord]:
+    records = list(adapter.episodes())
+    max_episodes = config["runtime"].get("max_episodes")
+    return records[: int(max_episodes)] if max_episodes is not None else records
+
+
+def _frame_cache_fingerprint(
+    adapter: DatasetAdapter,
+    config: Mapping[str, Any],
+) -> str:
+    clip_length = int(config["clip"]["length"])
+    usable = [record for record in _configured_records(adapter, config) if record.length >= clip_length]
+    visual = dict(config["visual"])
+    model_sha256 = (
+        directory_sha256(str(visual["model"])) if visual["encoder"] == "clip" else None
+    )
+    return stable_hash(
+        {
+            "version": __version__,
+            "adapter": adapter.fingerprint(),
+            "tasks": _tasks_hash(config),
+            "episodes": [(record.episode_id, record.length) for record in usable],
+            "image_key": adapter.image_observation_keys[0],
+            "visual": visual,
+            "model_sha256": model_sha256,
+        }
+    )
+
+
+def _encode_fingerprint(
+    adapter: DatasetAdapter,
+    config: Mapping[str, Any],
+    scan_fingerprint: str,
+    frame_cache_fingerprint: str,
+) -> str:
+    stage_fingerprint = _fingerprint(
+        "encode",
+        adapter,
+        config,
+        ("dataset", "clip", "visual", "normalization", "relation", "runtime"),
+        scan_fingerprint,
+    )
+    return stable_hash(
+        {
+            "stage_fingerprint": stage_fingerprint,
+            "frame_cache_fingerprint": frame_cache_fingerprint,
+        }
+    )
+
+
 def _write_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(rows), path)
@@ -180,8 +240,11 @@ def scan_stage(
                 "status": "complete",
                 "fingerprint": fingerprint,
                 "episodes": len(episodes),
+                "scanned_episodes": len(episodes),
                 "clips": len(clips),
+                "dataset_summary": adapter.dataset_summary(),
                 "skipped_short_episodes": skipped_short,
+                "skipped_short_episode_count": len(skipped_short),
                 "runtime_seconds": time.perf_counter() - started,
             },
         )
@@ -211,6 +274,11 @@ def _save_encoded(
     encoded: EncodedClips,
     fingerprint: str,
     runtime_seconds: float,
+    *,
+    frame_cache: FrameFeatureCache,
+    frame_records: list[EpisodeRecord],
+    frame_cache_fingerprint: str,
+    frame_cache_summary: FrameCacheSummary,
 ) -> None:
     np.save(temporary / "embeddings.npy", encoded.embeddings)
     np.save(temporary / "raw_relations.npy", encoded.raw_relations)
@@ -234,7 +302,11 @@ def _save_encoded(
         scale=encoded.relation_projector.scale_,
         components=encoded.relation_projector.components_,
     )
-    frame_files = sorted(path.name for path in (temporary / "frame_features").glob("ep*.npy"))
+    frame_files = frame_cache.publish_features(
+        frame_records,
+        temporary / "frame_features",
+        output_dim=int(encoded.relation_encoder.projection_matrices["visual"].shape[0]),
+    )
     write_json(
         temporary / "frame_features_index.json",
         {"files": frame_files, "episodes": len(frame_files)},
@@ -247,6 +319,9 @@ def _save_encoded(
             "clips": len(encoded.clips),
             "embedding_dim": int(encoded.embeddings.shape[1]),
             "encoded_episodes": len(frame_files),
+            "frame_cache_fingerprint": frame_cache_fingerprint,
+            "frame_cache_reused_episodes": frame_cache_summary.reused_episodes,
+            "frame_cache_encoded_episodes": frame_cache_summary.encoded_episodes,
             "runtime_seconds": runtime_seconds,
         },
     )
@@ -264,12 +339,12 @@ def encode_stage(
     root, adapter, clips, scan_fingerprint = scan_stage(
         resolved, output_dir=output_dir, force=force
     )
-    fingerprint = _fingerprint(
-        "encode",
+    frame_cache_fingerprint = _frame_cache_fingerprint(adapter, resolved)
+    fingerprint = _encode_fingerprint(
         adapter,
         resolved,
-        ("dataset", "clip", "visual", "normalization", "relation", "runtime"),
         scan_fingerprint,
+        frame_cache_fingerprint,
     )
     destination = root / "encode"
     normalization = np.load(root / "scan" / "normalization.npz")
@@ -283,25 +358,49 @@ def encode_stage(
 
     def build(temporary: Path) -> None:
         started = time.perf_counter()
-        encoded = encode_dataset(
+        records = _configured_records(adapter, resolved)
+        frame_records = [
+            record for record in records if record.length >= int(resolved["clip"]["length"])
+        ]
+        encoder = visual_encoder or _make_visual_encoder(resolved)
+        frame_cache = FrameFeatureCache(
+            root / ".relcore-cache" / "frame_features" / frame_cache_fingerprint,
+            fingerprint=frame_cache_fingerprint,
+        )
+        frame_cache_summary = populate_frame_feature_cache(
             adapter,
-            visual_encoder or _make_visual_encoder(resolved),
+            frame_records,
+            encoder,
+            frame_cache,
+            num_workers=int(resolved["runtime"].get("num_workers", 0)),
+        )
+        encoded = encode_dataset_from_frame_cache(
+            adapter,
+            records,
+            frame_cache,
             clip_length=int(resolved["clip"]["length"]),
             clip_stride=int(resolved["clip"]["stride"]),
             projection_dim=int(resolved["relation"]["projection_dim"]),
             output_dim=int(resolved["relation"]["output_dim"]),
             lags=tuple(int(lag) for lag in resolved["relation"]["lags"]),
             seed=int(resolved["seed"]),
-            epsilon=float(resolved["normalization"]["epsilon"]),
             num_workers=int(resolved["runtime"].get("num_workers", 0)),
-            max_episodes=resolved["runtime"].get("max_episodes"),
-            frame_cache_dir=temporary / "frame_features",
             action_normalizer=action_normalizer,
             state_normalizer=state_normalizer,
+            visual_output_dim=int(encoder.output_dim),
         )
         if [clip.sample_id for clip in encoded.clips] != [clip.sample_id for clip in clips]:
             raise ValueError("encode clip order does not match scan clip index")
-        _save_encoded(temporary, encoded, fingerprint, time.perf_counter() - started)
+        _save_encoded(
+            temporary,
+            encoded,
+            fingerprint,
+            time.perf_counter() - started,
+            frame_cache=frame_cache,
+            frame_records=frame_records,
+            frame_cache_fingerprint=frame_cache_fingerprint,
+            frame_cache_summary=frame_cache_summary,
+        )
 
     publish_stage(
         destination,
@@ -485,13 +584,22 @@ def _selection_budget(config: Mapping[str, Any], candidate_count: int) -> int:
 def _select(
     config: Mapping[str, Any],
     graph: GraphData,
-) -> tuple[SelectionResult, list[SelectionResult], ObjectiveContext, dict[int, int]]:
+) -> tuple[
+    SelectionResult,
+    list[SelectionResult],
+    ObjectiveContext,
+    dict[int, int] | None,
+]:
     budget = _selection_budget(config, len(graph.sample_ids))
     selection = config["selection"]
-    quotas = allocate_task_quotas(
-        graph.task_indices,
-        budget=budget,
-        minimum_per_task=int(selection["minimum_per_task"]),
+    quotas = (
+        allocate_task_quotas(
+            graph.task_indices,
+            budget=budget,
+            minimum_per_task=int(selection["minimum_per_task"]),
+        )
+        if selection["quota_mode"] == "proportional"
+        else None
     )
     context = ObjectiveContext(
         graph,
@@ -617,7 +725,10 @@ def select_stage(
         started = time.perf_counter()
         result, branch_results, context, quotas = _select(resolved, graph)
         selected_rows, all_rows, report = _selection_rows(resolved, clips, graph, result, context)
-        report["task_quotas"] = {str(task): value for task, value in quotas.items()}
+        report["quota_mode"] = str(resolved["selection"]["quota_mode"])
+        report["task_quotas"] = (
+            {str(task): value for task, value in quotas.items()} if quotas is not None else None
+        )
         report["branches"] = [
             {
                 "branch_id": branch.branch_id,
@@ -805,6 +916,14 @@ def validate_output(
         raise ValueError("selected manifest contains duplicate sample ids")
     if len(selected_rows) != int(report["selected_clips"]):
         raise ValueError("selected manifest count does not match report")
+    if len(all_rows) != int(report["number_of_clips"]):
+        raise ValueError("candidate clip count does not match report")
+    select_manifest = stage_manifests["select"]
+    if (
+        len(selected_rows) != int(select_manifest.get("selected_clips", -1))
+        or len(selected_rows) != int(select_manifest.get("budget", -1))
+    ):
+        raise ValueError("selected manifest count does not match the recorded budget")
     selected_ids = {row["sample_id"] for row in selected_rows}
     parquet_selected = {row["sample_id"] for row in all_rows if row["selected"]}
     if selected_ids != parquet_selected:
@@ -845,9 +964,21 @@ def validate_output(
         counts[task] = counts.get(task, 0) + 1
     if counts != reported_counts:
         raise ValueError("selected task counts do not match report")
-    quotas = {str(key): int(value) for key, value in report["task_quotas"].items()}
-    if counts != quotas:
-        raise ValueError("selected task counts do not fill the hard quotas")
+    quota_mode = str(report.get("quota_mode", "proportional"))
+    if quota_mode == "proportional":
+        task_quotas = report.get("task_quotas")
+        if not isinstance(task_quotas, dict):
+            raise ValueError("proportional selection report has no task quotas")
+        quotas = {str(key): int(value) for key, value in task_quotas.items()}
+        if counts != quotas:
+            raise ValueError("selected task counts do not fill the hard quotas")
+    elif quota_mode == "none":
+        if report.get("task_quotas") is not None:
+            raise ValueError("global selection report must not contain task quotas")
+        if sum(counts.values()) != len(selected_rows):
+            raise ValueError("global selected task counts do not match selected clips")
+    else:
+        raise ValueError(f"unknown selection quota mode: {quota_mode}")
     if config is not None:
         resolved = resolve_config(config)
         resolved["output"]["directory"] = str(root)
@@ -858,12 +989,12 @@ def validate_output(
             resolved,
             ("dataset", "clip", "normalization", "runtime"),
         )
-        expected_encode = _fingerprint(
-            "encode",
+        expected_frame_cache = _frame_cache_fingerprint(adapter, resolved)
+        expected_encode = _encode_fingerprint(
             adapter,
             resolved,
-            ("dataset", "clip", "visual", "normalization", "relation", "runtime"),
             expected_scan,
+            expected_frame_cache,
         )
         expected_graph = _fingerprint(
             "graph",
@@ -891,6 +1022,8 @@ def validate_output(
                 raise ValueError(f"{stage} fingerprint does not match the supplied config")
         if run_manifest.get("fingerprint") != _total_fingerprint(adapter, resolved):
             raise ValueError("run fingerprint does not match the supplied config")
+        if len(selected_rows) != _selection_budget(resolved, len(all_rows)):
+            raise ValueError("selected manifest count does not match the configured budget")
         episodes = {record.episode_id: record for record in adapter.episodes()}
         for row in selected_rows:
             episode_id = int(row["episode_id"])
