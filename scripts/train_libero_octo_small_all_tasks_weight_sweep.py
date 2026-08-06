@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import math
@@ -200,6 +201,7 @@ def prepare_jobs(
     *,
     source_scores_path: str | Path,
     output_root: str | Path,
+    prior_top_percent: float,
 ) -> list[SweepJob]:
     """Generate one deterministic weighted score CSV and job descriptor per row."""
 
@@ -219,6 +221,10 @@ def prepare_jobs(
                 weighted_scores,
                 weights=weights,
                 force=True,
+            )
+            _materialize_prefiltered_scores(
+                weighted_scores,
+                top_percent=prior_top_percent,
             )
         except (OSError, ValueError) as error:
             raise SweepError(
@@ -240,6 +246,56 @@ def prepare_jobs(
     if _sha256(source) != source_sha256:
         raise SweepError(f"source scores CSV changed while jobs were prepared: {source}")
     return jobs
+
+
+def _materialize_prefiltered_scores(path: Path, *, top_percent: float) -> int:
+    """Replace a weighted TDUS CSV with its deterministically ranked top rows."""
+
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = list(reader.fieldnames or [])
+            required = {"sample_id", "length", "tdus", "episode_id", "start_step", "end_step"}
+            missing = sorted(required - set(fieldnames))
+            if missing:
+                raise SweepError(
+                    f"weighted scores are missing fields required for prefiltering: {missing}"
+                )
+            rows = list(reader)
+    except (OSError, UnicodeError, csv.Error) as error:
+        raise SweepError(f"could not read weighted scores {path}: {error}") from error
+    if not rows:
+        raise SweepError(f"weighted scores are empty: {path}")
+
+    ranked: list[tuple[float, int, str, dict[str, str]]] = []
+    for line_number, row in enumerate(rows, start=2):
+        try:
+            score = float(row["tdus"])
+            length = int(row["length"])
+            sample_id = row["sample_id"].strip()
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise SweepError(
+                f"weighted scores contain invalid ranking fields at line {line_number}"
+            ) from error
+        if not math.isfinite(score) or length <= 0 or not sample_id:
+            raise SweepError(
+                f"weighted scores contain invalid ranking fields at line {line_number}"
+            )
+        ranked.append((-score, length, sample_id, row))
+    ranked.sort(key=lambda value: value[:3])
+    selected_count = math.ceil(len(ranked) * top_percent / 100.0)
+    selected = [value[3] for value in ranked[:selected_count]]
+
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(selected)
+        os.replace(temporary, path)
+    except OSError as error:
+        raise SweepError(f"could not write prefiltered scores {path}: {error}") from error
+    return selected_count
 
 
 def _job_manifest(job: SweepJob, settings: SweepSettings) -> dict[str, Any]:
@@ -295,8 +351,7 @@ def _validate_existing_manifests(job: SweepJob, settings: SweepSettings) -> None
         prior_dataset = datasets["libero90"]
         prior_selection = prior_dataset["selection"]
         saved_prior_weight = float(prior_dataset["sample_weight"])
-        saved_scores_sha256 = prior_selection["scores_sha256"]
-        saved_top_percent = float(prior_selection["top_percent"])
+        saved_scores_sha256 = prior_selection["source_sha256"]
         target_datasets = [
             value
             for name, value in datasets.items()
@@ -309,15 +364,6 @@ def _validate_existing_manifests(job: SweepJob, settings: SweepSettings) -> None
     if saved_scores_sha256 != job.weighted_scores_sha256:
         raise SweepError(
             f"{job.model_id} existing checkpoint used different weighted scores"
-        )
-    if not math.isclose(
-        saved_top_percent,
-        settings.prior_top_percent,
-        rel_tol=0.0,
-        abs_tol=1e-12,
-    ):
-        raise SweepError(
-            f"{job.model_id} existing checkpoint used a different top percent"
         )
     if len(target_datasets) != 1 or not isinstance(target_datasets[0], dict):
         raise SweepError(
@@ -413,9 +459,7 @@ def build_training_command(
         format(settings.sample_weights[1], ".12g"),
         "--gpu-ids",
         str(gpu_id),
-        "--prior-top-percent",
-        format(settings.prior_top_percent, ".12g"),
-        "--prior-scores",
+        "--prior-prefiltered-scores",
         str(job.weighted_scores_path),
         "--output-dir",
         str(job.output_dir),
@@ -711,6 +755,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             weight_rows,
             source_scores_path=scores_path,
             output_root=output_root,
+            prior_top_percent=arguments.prior_top_percent,
         )
         output_root.mkdir(parents=True, exist_ok=True)
         _atomic_json(

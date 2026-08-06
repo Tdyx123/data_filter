@@ -49,12 +49,13 @@ all-tasks Octo 训练可直接读取筛选结果：
 
 ```bash
 bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
-  --prior-quality-filter-scores \
+  --prior-prefiltered-scores \
   outputs/quality_filter/libero90/filter/top10pct/scores.csv \
   --output-dir outputs/octo_small_libero_quality_filter_top10pct \
   --preflight-only
 ```
 
-训练预检会校验 Quality Filter 的 root/filter manifest、数据源、hash、比例、rank、
-选择摘要与片段边界。该参数不能与 TDUS、SQCN、RelCore prior 或 `--target-only`
-同时使用；训练只展开片段内的完整 action window，不按 Quality 加权采样。
+训练把 CSV 中每一行视为已选片段，只读取 `episode_id`、`start_step`、`end_step`，
+忽略 Quality、rank 和其他诊断字段，也不读取相邻的 root/filter manifest。预检会
+校验 episode、片段边界、重复项和完整 action window；该参数不能与
+`--target-only` 同时使用，训练不按 Quality 加权采样。

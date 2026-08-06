@@ -40,11 +40,7 @@ def _config(*, target_only):
             "target_dataset": "libero10_5",
             "prior_dataset": "libero90",
             "sample_weights": [3.0, 1.0],
-            "prior_selection": {
-                "scores": "/missing/prior.csv",
-                "top_percent": None,
-                "prefiltered": False,
-            },
+            "prior_selection": {"prefiltered_scores": None},
             "action_normalization_mask": [True] * 6 + [False],
             "window_size": 1,
             "action_horizon": 8,

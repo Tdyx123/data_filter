@@ -55,11 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs=2,
         metavar=("TARGET", "PRIOR"),
     )
-    parser.add_argument("--prior-top-percent", type=float)
-    parser.add_argument("--prior-scores")
     parser.add_argument("--prior-prefiltered-scores")
-    parser.add_argument("--prior-relcore-manifest")
-    parser.add_argument("--prior-quality-filter-scores")
     parser.add_argument("--target-only", action="store_true", default=None)
     parser.add_argument("--resume")
     parser.add_argument("--preflight-only", action="store_true")
@@ -70,47 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
 def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     arguments = parser.parse_args(argv)
-    if arguments.prior_prefiltered_scores is not None and (
-        arguments.prior_top_percent is not None
-        or arguments.prior_scores is not None
-    ):
-        parser.error(
-            "--prior-prefiltered-scores cannot be combined with "
-            "--prior-top-percent or --prior-scores"
-        )
-    if arguments.prior_relcore_manifest is not None and any(
-        value is not None
-        for value in (
-            arguments.prior_top_percent,
-            arguments.prior_scores,
-            arguments.prior_prefiltered_scores,
-        )
-    ):
-        parser.error(
-            "--prior-relcore-manifest cannot be combined with "
-            "--prior-top-percent, --prior-scores, or --prior-prefiltered-scores"
-        )
-    if arguments.prior_quality_filter_scores is not None and any(
-        value is not None
-        for value in (
-            arguments.prior_top_percent,
-            arguments.prior_scores,
-            arguments.prior_prefiltered_scores,
-            arguments.prior_relcore_manifest,
-        )
-    ):
-        parser.error(
-            "--prior-quality-filter-scores cannot be combined with other --prior-* modes"
-        )
     if arguments.target_only and any(
         value is not None
         for value in (
             arguments.sample_weights,
-            arguments.prior_top_percent,
-            arguments.prior_scores,
             arguments.prior_prefiltered_scores,
-            arguments.prior_relcore_manifest,
-            arguments.prior_quality_filter_scores,
         )
     ):
         parser.error(
@@ -137,11 +97,7 @@ def main() -> None:
         batch_size=arguments.batch_size,
         max_steps=max_steps,
         sample_weights=arguments.sample_weights,
-        prior_top_percent=arguments.prior_top_percent,
-        prior_scores=arguments.prior_scores,
         prior_prefiltered_scores=arguments.prior_prefiltered_scores,
-        prior_relcore_manifest=arguments.prior_relcore_manifest,
-        prior_quality_filter_scores=arguments.prior_quality_filter_scores,
     )
     if arguments.smoke_test:
         config["train"]["log_every_steps"] = 1

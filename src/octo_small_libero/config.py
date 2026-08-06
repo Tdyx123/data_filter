@@ -117,54 +117,23 @@ def validate_config(config: dict[str, Any]) -> None:
     selection = data.get("prior_selection")
     if not isinstance(selection, dict):
         raise ConfigError("data.prior_selection must be a mapping")
-    if (
-        not isinstance(selection.get("scores"), str)
-        or not selection["scores"].strip()
-    ):
-        raise ConfigError("data.prior_selection.scores must be a non-empty path")
-    prefiltered = selection.get("prefiltered", False)
-    if not isinstance(prefiltered, bool):
-        raise ConfigError("data.prior_selection.prefiltered must be a bool")
-    top_percent = selection.get("top_percent")
-    if top_percent is not None:
-        if (
-            isinstance(top_percent, bool)
-            or not isinstance(top_percent, (int, float))
-            or not math.isfinite(float(top_percent))
-            or not 0.0 < float(top_percent) <= 100.0
-        ):
-            raise ConfigError(
-                "data.prior_selection.top_percent must be null or in (0, 100]"
-            )
-    if prefiltered and top_percent is not None:
+    unexpected_selection_keys = set(selection) - {"prefiltered_scores"}
+    if unexpected_selection_keys:
         raise ConfigError(
-            "data.prior_selection.prefiltered cannot be combined with top_percent"
+            "data.prior_selection contains unsupported keys: "
+            f"{sorted(unexpected_selection_keys)}"
         )
-    relcore_manifest = selection.get("relcore_manifest")
-    if relcore_manifest is not None and (
-        not isinstance(relcore_manifest, str) or not relcore_manifest.strip()
+    prefiltered_scores = selection.get("prefiltered_scores")
+    if prefiltered_scores is not None and (
+        not isinstance(prefiltered_scores, str) or not prefiltered_scores.strip()
     ):
         raise ConfigError(
-            "data.prior_selection.relcore_manifest must be null or a non-empty path"
+            "data.prior_selection.prefiltered_scores must be null or a non-empty path"
         )
-    if relcore_manifest is not None and (prefiltered or top_percent is not None):
+    if target_only and prefiltered_scores is not None:
         raise ConfigError(
-            "data.prior_selection.relcore_manifest cannot be combined with "
-            "prefiltered or top_percent"
-        )
-    quality_filter_scores = selection.get("quality_filter_scores")
-    if quality_filter_scores is not None and (
-        not isinstance(quality_filter_scores, str) or not quality_filter_scores.strip()
-    ):
-        raise ConfigError(
-            "data.prior_selection.quality_filter_scores must be null or a non-empty path"
-        )
-    if quality_filter_scores is not None and (
-        prefiltered or top_percent is not None or relcore_manifest is not None
-    ):
-        raise ConfigError(
-            "data.prior_selection.quality_filter_scores cannot be combined with "
-            "prefiltered, top_percent, or relcore_manifest"
+            "data.target_only cannot be combined with "
+            "data.prior_selection.prefiltered_scores"
         )
 
     weights = data.get("sample_weights")
@@ -300,46 +269,10 @@ def apply_overrides(config: dict[str, Any], **overrides: Any) -> dict[str, Any]:
         result["data"]["target_task_index"] = None
     elif overrides.get("target_task_index") is not None:
         result["data"]["target_all_tasks"] = False
-    if overrides.get("prior_scores") is not None:
-        result["data"]["prior_selection"]["scores"] = overrides["prior_scores"]
-        result["data"]["prior_selection"]["relcore_manifest"] = None
-        result["data"]["prior_selection"]["quality_filter_scores"] = None
     if overrides.get("prior_prefiltered_scores") is not None:
-        result["data"]["prior_selection"].update(
-            {
-                "scores": overrides["prior_prefiltered_scores"],
-                "top_percent": None,
-                "prefiltered": True,
-                "relcore_manifest": None,
-                "quality_filter_scores": None,
-            }
-        )
-    if overrides.get("prior_top_percent") is not None:
-        result["data"]["prior_selection"]["top_percent"] = overrides[
-            "prior_top_percent"
+        result["data"]["prior_selection"]["prefiltered_scores"] = overrides[
+            "prior_prefiltered_scores"
         ]
-        result["data"]["prior_selection"]["relcore_manifest"] = None
-        result["data"]["prior_selection"]["quality_filter_scores"] = None
-    if overrides.get("prior_relcore_manifest") is not None:
-        result["data"]["prior_selection"].update(
-            {
-                "top_percent": None,
-                "prefiltered": False,
-                "relcore_manifest": overrides["prior_relcore_manifest"],
-                "quality_filter_scores": None,
-            }
-        )
-    if overrides.get("prior_quality_filter_scores") is not None:
-        result["data"]["prior_selection"].update(
-            {
-                "top_percent": None,
-                "prefiltered": False,
-                "relcore_manifest": None,
-                "quality_filter_scores": overrides[
-                    "prior_quality_filter_scores"
-                ],
-            }
-        )
     validate_config(result)
     return result
 
@@ -370,15 +303,11 @@ def resolved_paths(config: dict[str, Any]) -> dict[str, Path]:
         "prior_dataset": prior_dataset,
         "target_dataset": target_dataset,
         "statistics": statistics_dataset / "meta" / "stats.json",
-        "prior_scores": resolve(config["data"]["prior_selection"]["scores"]),
         "output": resolve(output_value),
     }
-    relcore_manifest = config["data"]["prior_selection"].get("relcore_manifest")
-    if relcore_manifest is not None:
-        paths["prior_relcore_manifest"] = resolve(relcore_manifest)
-    quality_filter_scores = config["data"]["prior_selection"].get(
-        "quality_filter_scores"
+    prefiltered_scores = config["data"]["prior_selection"].get(
+        "prefiltered_scores"
     )
-    if quality_filter_scores is not None:
-        paths["prior_quality_filter_scores"] = resolve(quality_filter_scores)
+    if prefiltered_scores is not None:
+        paths["prior_prefiltered_scores"] = resolve(prefiltered_scores)
     return paths
