@@ -17,6 +17,7 @@ import numpy as np
 
 from segment_filter_core.selection import (
     PENALTY_LAMBDA,
+    PROMOTION_MINIMUM_POLICY,
     _AlgorithmParameters,
     select_diverse_fragments,
 )
@@ -273,7 +274,7 @@ def filter_sqcn_run(
             "update_count": {
                 "unit": "reference_fragments",
                 "initial": parameters.init_select_size,
-                "promotion_minimum": "ceil(100 + log2(selected_count - 100))",
+                "promotion_minimum": PROMOTION_MINIMUM_POLICY,
                 "catch_up_sampling": "uniform_without_replacement_from_selected",
                 "persisted": "internal_only",
             },

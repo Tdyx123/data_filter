@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
@@ -16,7 +17,6 @@ from quality_filter.pipeline import (
     run_pipeline,
     validate_output,
 )
-from sqcn.filtering import filter_sqcn_run
 from trajectory_data import (
     DatasetAdapter,
     EpisodeData,
@@ -61,7 +61,7 @@ class QualityFilterAdapter(DatasetAdapter):
                 ).astype(np.float32),
             }
             if load_images:
-                pixels = np.mod(steps, 255).astype(np.uint8)
+                pixels = np.mod(steps + record.episode_id, 255).astype(np.uint8)
                 observations["observation.image"] = np.broadcast_to(
                     pixels[:, None, None, None],
                     (record.length, 2, 2, 3),
@@ -236,24 +236,35 @@ def test_filter_stage_uses_quality_and_writes_ranked_aligned_artifacts(
     config["dataset"]["type"] = "quality_filter_many"
     encode_stage(config, visual_encoder=QualityFilterVisualEncoder())
 
-    output = filter_stage(config, percent=50.0, seed=77)
+    output = filter_stage(config, percent=51.0, seed=77)
 
-    assert output == tmp_path / "quality-filter-output" / "filter" / "top50pct"
+    assert output == tmp_path / "quality-filter-output" / "filter" / "top51pct"
     with (output / "scores.csv").open(encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
     embeddings = np.load(output / "embeddings.npy", allow_pickle=False)
     manifest = json.loads((output / "filter_manifest.json").read_text())
-    assert len(rows) == 100
-    assert embeddings.shape == (100, 141)
-    assert [int(row["filter_rank"]) for row in rows] == list(range(1, 101))
+    assert len(rows) == 102
+    assert embeddings.shape == (102, 141)
+    assert [int(row["filter_rank"]) for row in rows] == list(range(1, 103))
     assert "sqcn" not in rows[0] and "coverage" not in rows[0] and "novelty" not in rows[0]
     assert manifest["status"] == "complete"
     assert manifest["algorithm"]["score_column"] == "quality"
     assert manifest["algorithm"]["seed"] == 77
-    assert manifest["algorithm"]["target_size"] == 100
+    assert manifest["algorithm"]["target_size"] == 102
+    assert manifest["algorithm"]["lambda"] == 0.5
+    assert manifest["algorithm"]["update_count"]["promotion_minimum"] == (
+        "ceil(100 + sqrt(selected_count - 100))"
+    )
+    penalties = [float(row["knn_penalty"]) for row in rows]
+    assert any(penalty > 0.0 for penalty in penalties)
+    for row in rows:
+        assert float(row["adjusted_score"]) == pytest.approx(
+            float(row["quality"]) - 0.5 * float(row["knn_penalty"]),
+            abs=2.0e-9,
+        )
     assert manifest["counts"] == {
         "input_fragments": 200,
-        "selected_fragments": 100,
+        "selected_fragments": 102,
     }
 
 
@@ -278,6 +289,26 @@ def test_run_and_validate_check_every_stage_and_selected_filter(tmp_path: Path) 
         "filters": {"top50pct": 100},
     }
 
+    filter_manifest_path = root / "filter" / "top50pct" / "filter_manifest.json"
+    filter_manifest = json.loads(filter_manifest_path.read_text())
+    filter_manifest["algorithm"]["lambda"] = 1.0
+    filter_manifest_path.write_text(json.dumps(filter_manifest))
+    with pytest.raises(ValueError, match="penalty lambda"):
+        validate_output(root, config=config, percent=50.0)
+
+    filter_manifest["algorithm"]["lambda"] = 0.5
+    filter_manifest["algorithm"]["update_count"]["promotion_minimum"] = (
+        "ceil(100 + log2(selected_count - 100))"
+    )
+    filter_manifest_path.write_text(json.dumps(filter_manifest))
+    with pytest.raises(ValueError, match="promotion minimum"):
+        validate_output(root, config=config, percent=50.0)
+
+    filter_manifest["algorithm"]["update_count"]["promotion_minimum"] = (
+        "ceil(100 + sqrt(selected_count - 100))"
+    )
+    filter_manifest_path.write_text(json.dumps(filter_manifest))
+
     embeddings_path = root / "encode" / "embeddings.npy"
     embeddings = np.load(embeddings_path, allow_pickle=False)
     np.save(embeddings_path, embeddings[:-1])
@@ -285,7 +316,7 @@ def test_run_and_validate_check_every_stage_and_selected_filter(tmp_path: Path) 
         validate_output(root, config=config, percent=50.0)
 
 
-def test_quality_filter_matches_sqcn_quality_only_embeddings_and_selection(
+def test_quality_filter_matches_sqcn_quality_only_quality_and_embeddings(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -307,13 +338,6 @@ def test_quality_filter_matches_sqcn_quality_only_embeddings_and_selection(
         visual_encoder=QualityFilterVisualEncoder(),
     )
     sqcn_root = sqcn_pipeline.run_pipeline(sqcn_values)
-    sqcn_filtered = filter_sqcn_run(
-        sqcn_root,
-        50.0,
-        seed=77,
-        quality_only=True,
-    )
-
     with (quality_root / "quality" / "scores.csv").open(
         encoding="utf-8", newline=""
     ) as handle:
@@ -338,15 +362,35 @@ def test_quality_filter_matches_sqcn_quality_only_embeddings_and_selection(
         assert quality == expected_quality
         np.testing.assert_allclose(embedding, expected_embedding, atol=1.0e-6)
 
-    with (quality_root / "filter" / "top50pct" / "scores.csv").open(
-        encoding="utf-8", newline=""
-    ) as handle:
-        quality_selected = list(csv.DictReader(handle))
-    with (sqcn_filtered / "scores.csv").open(encoding="utf-8", newline="") as handle:
-        sqcn_selected = list(csv.DictReader(handle))
-    assert [row["sample_id"] for row in quality_selected] == [
-        row["sample_id"] for row in sqcn_selected
-    ]
+
+
+def test_filter_algorithm_change_invalidates_legacy_cache(tmp_path: Path) -> None:
+    register_dataset_adapter("quality_filter_many", ManyQualityFilterAdapter)
+    config = quality_filter_config(tmp_path)
+    config["dataset"]["type"] = "quality_filter_many"
+    encode_stage(config, visual_encoder=QualityFilterVisualEncoder())
+    output = filter_stage(config, percent=50.0, seed=77)
+
+    manifest_path = output / "filter_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    legacy_payload = {
+        "version": manifest["version"],
+        "stage": "filter",
+        "source": {
+            "run_manifest": manifest["source"]["run_manifest_sha256"],
+            "scores": manifest["source"]["scores_sha256"],
+            "embeddings": manifest["source"]["embeddings_sha256"],
+        },
+        "percent": 50.0,
+        "seed": 77,
+    }
+    manifest["fingerprint"] = hashlib.sha256(
+        json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(FileExistsError, match="pass --force"):
+        filter_stage(config, percent=50.0, seed=77)
 
 
 def test_filter_rejects_a_target_smaller_than_initial_top_one_hundred(

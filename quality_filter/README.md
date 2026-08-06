@@ -41,7 +41,9 @@ python -m quality_filter validate \
   可在同一运行目录下并存。
 
 Filter 使用 Top 100 初始化、100 个 candidate、silent 晋升、5-NN RBF 惩罚和
-`lambda=1`。输入片段数与按比例向上取整后的目标数都必须至少为 100。
+`lambda=0.5`。silent 片段晋升所需的更新计数为
+`ceil(100 + sqrt(selected_count - 100))`。输入片段数与按比例向上取整后的目标数
+都必须至少为 100。
 
 ## 训练接入
 

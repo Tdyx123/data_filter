@@ -143,7 +143,7 @@ Top 100 形成 candidate 集合。
 
 之后每轮选择 candidate Top 1，将它加入 selected 并更新其余 candidates；若尚未
 达到目标，再从 silent 晋升 Top 1。晋升片段必须满足
-`ceil(100 + log2(selected_count - 100))` 次更新，不足部分从完整 selected 集合中
+`ceil(100 + sqrt(selected_count - 100))` 次更新，不足部分从完整 selected 集合中
 均匀、批内无放回抽样补齐。silent 片段在晋升前不实时更新；silent 耗尽后继续
 排空 candidates。每个 candidate 维护已遇到 reference 中 RBF similarity 最高的
 5 个不同片段，相似度并列时按 `sample_id` 升序取舍。惩罚为

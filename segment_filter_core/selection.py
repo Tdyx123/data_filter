@@ -13,6 +13,7 @@ import numpy as np
 
 SIGMA_EPSILON = 1.0e-8
 PENALTY_LAMBDA = 1.0
+PROMOTION_MINIMUM_POLICY = "ceil(100 + sqrt(selected_count - 100))"
 UPDATE_BATCH_SIZE = 512
 
 
@@ -99,6 +100,7 @@ class _DiverseSelector:
         *,
         seed: int,
         sigma_effective: float,
+        penalty_lambda: float = PENALTY_LAMBDA,
         raw_order: np.ndarray | None = None,
         parameters: _AlgorithmParameters = _AlgorithmParameters(),
     ):
@@ -107,6 +109,7 @@ class _DiverseSelector:
         self.sample_ids = sample_ids
         self.rng = np.random.default_rng(seed)
         self.sigma = sigma_effective
+        self.penalty_lambda = penalty_lambda
         self.parameters = parameters
         self._raw_order = (
             _raw_order(scores, sample_ids)
@@ -210,7 +213,9 @@ class _DiverseSelector:
             out=np.zeros(len(target), dtype=np.float64),
             where=neighbor_counts > 0,
         )
-        self.adjusted[target] = self.scores[target] - PENALTY_LAMBDA * self.penalties[target]
+        self.adjusted[target] = (
+            self.scores[target] - self.penalty_lambda * self.penalties[target]
+        )
 
     def _push_silent(self, index: int) -> None:
         self.silent.add(index)
@@ -252,7 +257,7 @@ class _DiverseSelector:
         excess = selected_count - self.parameters.init_select_size
         if excess < 1:
             raise ValueError("selected_count must exceed init_select_size")
-        return math.ceil(self.parameters.init_select_size + math.log2(excess))
+        return math.ceil(self.parameters.init_select_size + math.sqrt(excess))
 
     def _sample_catch_up_references(self, count: int) -> list[int]:
         if count == 0:
@@ -352,6 +357,7 @@ def select_diverse_fragments(
     target_size: int,
     *,
     seed: int | None = None,
+    penalty_lambda: float = PENALTY_LAMBDA,
 ) -> SelectionResult:
     """Select and order ``target_size`` fragments by score and diversity."""
 
@@ -367,6 +373,14 @@ def select_diverse_fragments(
         or not 0 <= int(seed) < 2**64
     ):
         raise ValueError("seed must be an integer in [0, 2**64)")
+    if isinstance(penalty_lambda, (bool, np.bool_)) or not isinstance(
+        penalty_lambda,
+        (int, float, np.integer, np.floating),
+    ):
+        raise ValueError("penalty_lambda must be a finite non-negative real number")
+    penalty_lambda_value = float(penalty_lambda)
+    if not np.isfinite(penalty_lambda_value) or penalty_lambda_value < 0.0:
+        raise ValueError("penalty_lambda must be a finite non-negative real number")
     actual_seed = secrets.randbits(64) if seed is None else int(seed)
     order = _raw_order(values, identifiers)
     sigma_raw, sigma_effective = _sigma_from_top_scores(encoded, order)
@@ -376,6 +390,7 @@ def select_diverse_fragments(
         identifiers,
         seed=actual_seed,
         sigma_effective=sigma_effective,
+        penalty_lambda=penalty_lambda_value,
         raw_order=order,
     )
     selected, adjusted_scores, knn_penalties = selector.select(int(target_size))
