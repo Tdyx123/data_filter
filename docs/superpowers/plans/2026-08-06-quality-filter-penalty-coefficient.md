@@ -61,6 +61,6 @@
 - Modify: `docs/superpowers/plans/2026-08-06-quality-filter-penalty-coefficient.md`
 
 - [x] README 与设计文档记录 `lambda=0.5`、SQCN 的 `lambda=1.0` 以及平方根更新阈值。
-- [ ] 运行 `pytest -q tests/test_sqcn_filtering.py tests/test_quality_filter_pipeline.py tests/test_quality_filter_cli.py tests/test_segment_filter_core.py`。
-- [ ] 检查 `git diff --check`、最终差异和工作区状态。
-- [ ] 提交文档并使用 verification-before-completion 重新运行最终验证。
+- [x] 运行 `pytest -q tests/test_sqcn_filtering.py tests/test_quality_filter_pipeline.py tests/test_quality_filter_cli.py tests/test_segment_filter_core.py`。
+- [x] 检查 `git diff --check`、最终差异和工作区状态。
+- [x] 提交文档并使用 verification-before-completion 重新运行最终验证。
