@@ -536,6 +536,15 @@ bash scripts/train_libero_qwen3_vl_4b_groot_all_tasks_4x4090.sh \
   --output-dir outputs/qwen3_vl_groot_libero
 ```
 
+默认的 `--prior-prefiltered-scores PATH` 把传入文件中的全部行视为已经完成筛选的
+片段，不在训练端重新排序或截取。文件可为 CSV 或 JSONL，只要求
+`episode_id`、`start_step`、`end_step`；其他分数、rank 和诊断字段全部忽略。
+加载与预检不读取相邻的 `filter_manifest.json` 或 `run_manifest.json`，只校验输入
+编码、必需字段、整数、episode、片段边界、重复片段和完整 action window，并把
+输入文件哈希及展开后的选择摘要写入训练 manifest。`--prior-top-percent`、
+`--prior-relcore-manifest` 和 `--prior-quality-filter-scores` 仍保留各自的严格来源与
+manifest 校验。
+
 可追加 `--preflight-only`，或用 `--smoke-test` 固定执行 20 个 optimizer step。
 只训练 LIBERO-10 时追加 `--target-only`；该模式不读取 prior 或 scores，且不能与
 `--sample-weights`/`--prior-*` 混用。LIBERO 不做离线验证，因此只写周期/最终

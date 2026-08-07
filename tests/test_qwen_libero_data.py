@@ -1,5 +1,5 @@
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 import sys
 
 import numpy as np
@@ -11,6 +11,94 @@ DATASET = Path("/data/dwb/datasets/LIBERO_lerobot/libero10_5")
 
 def _identity_transform(image, _rng):
     return image
+
+
+@pytest.mark.parametrize(
+    ("filename", "contents", "input_format"),
+    [
+        (
+            "scores.csv",
+            "episode_id,start_step,end_step\n0,0,14\n",
+            "csv",
+        ),
+        (
+            "selected.jsonl",
+            '{"episode_id": 0, "start_step": 0, "end_step": 14, '
+            '"quality": -100, "selected": false}\n',
+            "jsonl",
+        ),
+    ],
+)
+def test_qwen_prefiltered_scores_load_without_adjacent_manifests(
+    tmp_path,
+    monkeypatch,
+    filename,
+    contents,
+    input_format,
+):
+    from qwen3_vl_groot import libero_data
+
+    prior_root = (tmp_path / "lerobot" / "libero90").resolve()
+    prior_root.mkdir(parents=True)
+    scores = tmp_path / "selected" / filename
+    scores.parent.mkdir()
+    scores.write_text(contents, encoding="utf-8")
+    prior_metadata = SimpleNamespace(
+        root=prior_root,
+        episodes=(SimpleNamespace(episode_index=0, length=30),),
+        global_offsets={0: 0},
+    )
+    target_selection = SimpleNamespace(selection_sha256="target-selection")
+    monkeypatch.setattr(
+        libero_data,
+        "resolve_target_task_selection",
+        lambda _config, _paths: target_selection,
+    )
+    monkeypatch.setattr(
+        libero_data,
+        "LeRobotV2Metadata",
+        lambda root: prior_metadata if Path(root).resolve() == prior_root else None,
+    )
+
+    def reject_manifest_resolver(_config, _paths):
+        pytest.fail("Qwen prefiltered scores must not use the manifest-based resolver")
+
+    monkeypatch.setattr(libero_data, "resolve_prior_selection", reject_manifest_resolver)
+    config = {
+        "data": {
+            "target_dataset": "libero10_5",
+            "prior_dataset": "libero90",
+            "target_only": False,
+            "sample_weights": [1.0, 1.0],
+            "action_horizon": 8,
+            "prior_selection": {
+                "scores": str(scores),
+                "top_percent": None,
+                "prefiltered": True,
+                "relcore_manifest": None,
+                "quality_filter_scores": None,
+            },
+        }
+    }
+    paths = {
+        "target_dataset": tmp_path / "lerobot" / "libero10_5",
+        "prior_dataset": prior_root,
+        "prior_scores": scores,
+    }
+
+    sources = libero_data.resolve_libero_sources(config, paths)
+
+    selection = sources.prior_selection
+    assert selection is not None
+    assert selection.input_format == input_format
+    assert selection.frame_indices == tuple(range(8))
+    manifest = selection.as_manifest()
+    assert manifest["mode"] == "prefiltered_fragments"
+    assert manifest["source_path"] == str(scores.resolve())
+    assert "filter_manifest_path" not in manifest
+    assert "run_manifest_path" not in manifest
+    assert "top_percent" not in manifest
+    assert manifest["ordering"] == ["source row order"]
 
 
 def test_qwen_libero_sample_reads_only_primary_image_and_raw_action_window():

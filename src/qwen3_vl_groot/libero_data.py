@@ -12,6 +12,7 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 
 from libero_lerobot.metadata import ACTION_KEY, STATE_KEY, LeRobotV2Metadata, load_episode
+from libero_lerobot.prefiltered import load_prefiltered_selection
 from libero_lerobot.sampling import (
     FrameIndex,
     GloballyBalancedDistributedBatchSampler,
@@ -50,7 +51,15 @@ def resolve_libero_sources(
             normalization_root=Path(paths["target_dataset"]).resolve(),
             training_mode="target_only",
         )
-    prior_selection = resolve_prior_selection(config, paths)
+    prior_config = config["data"]["prior_selection"]
+    if bool(prior_config.get("prefiltered", False)):
+        prior_selection = load_prefiltered_selection(
+            paths["prior_scores"],
+            LeRobotV2Metadata(paths["prior_dataset"]),
+            action_horizon=int(config["data"]["action_horizon"]),
+        )
+    else:
+        prior_selection = resolve_prior_selection(config, paths)
     return LiberoSources(
         target_selection=target_selection,
         prior_selection=prior_selection,
