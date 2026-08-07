@@ -7,8 +7,10 @@ from typing import Any
 
 import numpy as np
 
+from libero_lerobot.sampling import sample_counts_per_batch
+
+from .config import resolved_paths
 from .data import BridgeEpisodeDataset, BridgeMetadata, validate_episode
-from .modeling import Qwen3VLGrootPolicy, inspect_qwen_config
 from .normalization import QuantileStats
 
 
@@ -16,10 +18,139 @@ class PreflightError(RuntimeError):
     """Raised when the target host cannot run the requested training configuration."""
 
 
+def _inspect_qwen_config(model_path: Path) -> dict[str, Any]:
+    from .modeling import inspect_qwen_config
+
+    return inspect_qwen_config(model_path)
+
+
+def _libero_sample_report(
+    dataset: Any,
+    *,
+    decode_samples: bool,
+) -> list[dict[str, Any]]:
+    positions = sorted({0, len(dataset) // 2, len(dataset) - 1})
+    if not decode_samples:
+        return [{"selected_position": position} for position in positions]
+    result = []
+    for position in positions:
+        sample = dataset[position]
+        image = sample["image"]
+        image_shape = (
+            list(image.shape)
+            if hasattr(image, "shape")
+            else [int(image.height), int(image.width), len(image.getbands())]
+        )
+        result.append(
+            {
+                "selected_position": position,
+                "image_shape": image_shape,
+                "state_shape": list(sample["state"].shape),
+                "action_shape": list(sample["actions"].shape),
+                "valid_action_steps": int(np.asarray(sample["action_mask"]).sum()),
+                "instruction": sample["instruction"],
+                "episode_index": sample["episode_index"],
+                "frame_index": sample["frame_index"],
+            }
+        )
+    return result
+
+
+def _validate_libero_paths_and_data(
+    config: dict[str, Any],
+    *,
+    decode_samples: bool,
+) -> dict[str, Any]:
+    from .libero_data import QwenLiberoFrameDataset, resolve_libero_sources
+
+    paths = resolved_paths(config)
+    sources = resolve_libero_sources(config, paths)
+    common = {
+        "action_horizon": int(config["data"]["action_horizon"]),
+        "train": False,
+        "seed": int(config["train"]["seed"]),
+        "episode_cache_size": 1,
+        "config": config["data"],
+        "transform": (
+            None if decode_samples else lambda image, _rng: image
+        ),
+    }
+    target_dataset = QwenLiberoFrameDataset(
+        paths["target_dataset"],
+        dataset_name=str(config["data"]["target_dataset"]),
+        frame_indices=sources.target_selection.frame_indices,
+        **common,
+    )
+    target_report = {
+        "dataset_path": str(paths["target_dataset"]),
+        "selection": sources.target_selection.as_manifest(),
+        "sampled_frames": _libero_sample_report(
+            target_dataset,
+            decode_samples=decode_samples,
+        ),
+    }
+    prior_report = None
+    if sources.training_mode == "mixed":
+        prior_dataset = QwenLiberoFrameDataset(
+            paths["prior_dataset"],
+            dataset_name=str(config["data"]["prior_dataset"]),
+            frame_indices=(
+                None
+                if sources.prior_selection is None
+                else sources.prior_selection.frame_indices
+            ),
+            **common,
+        )
+        if sources.prior_selection is None:
+            selection_report = {
+                "enabled": True,
+                "mode": "full_dataset",
+                "episodes": len(prior_dataset.metadata.episodes),
+                "frames": len(prior_dataset),
+                "metadata_sha256": prior_dataset.metadata.metadata_sha256(),
+            }
+        else:
+            selection_report = sources.prior_selection.as_manifest()
+        prior_report = {
+            "dataset_path": str(paths["prior_dataset"]),
+            "selection": selection_report,
+            "sampled_frames": _libero_sample_report(
+                prior_dataset,
+                decode_samples=decode_samples,
+            ),
+        }
+    global_micro_batch = int(config["train"]["gpu_count"]) * int(
+        config["train"]["micro_batch_size"]
+    )
+    return {
+        "dataset_type": "libero",
+        "model_path": str(paths["model"]),
+        "lerobot_path": str(paths["lerobot"]),
+        "qwen_text_layers": int(config["model"]["text_layers"]),
+        "target": target_report,
+        "prior": prior_report,
+        "sample_weights": list(sources.sample_weights),
+        "global_micro_batch_source_counts": list(
+            sample_counts_per_batch(
+                sources.sample_weights,
+                global_micro_batch,
+                scope="global micro-batch",
+            )
+        ),
+        "normalization_dataset_path": str(sources.normalization_root),
+        "offline_validation": False,
+    }
+
+
 def validate_paths_and_data(config: dict[str, Any], *, decode_samples: bool = True) -> dict[str, Any]:
     model_path = Path(config["paths"]["model"]).expanduser().resolve()
+    _inspect_qwen_config(model_path)
+    if config["data"].get("dataset_type", "bridge") == "libero":
+        return _validate_libero_paths_and_data(
+            config,
+            decode_samples=decode_samples,
+        )
     dataset_path = Path(config["paths"]["dataset"]).expanduser().resolve()
-    inspect_qwen_config(model_path)
     metadata = BridgeMetadata(dataset_path, config["data"])
     episodes = metadata.episodes
     sample_positions = sorted({0, len(episodes) // 2, len(episodes) - 1})
@@ -83,6 +214,8 @@ def probe_single_gpu_memory(config: dict[str, Any]) -> dict[str, Any]:
     """Run one real micro-batch forward/backward before distributed launch."""
     import torch
 
+    from .modeling import Qwen3VLGrootPolicy
+
     if int(config["train"]["deepspeed_stage"]) == 3:
         return {
             "skipped": True,
@@ -90,19 +223,36 @@ def probe_single_gpu_memory(config: dict[str, Any]) -> dict[str, Any]:
         }
 
     device = torch.device("cuda", 0)
-    metadata = BridgeMetadata(config["paths"]["dataset"], config["data"])
-    train_episodes, _ = metadata.split()
-    implementation = BridgeEpisodeDataset(
-        metadata,
-        [train_episodes[0]],
-        train=True,
-        rank=0,
-        world_size=1,
-        seed=int(config["train"]["seed"]),
-        action_horizon=int(config["data"]["action_horizon"]),
-        video_cache_size=1,
-    )
-    sample = next(iter(implementation))
+    if config["data"].get("dataset_type", "bridge") == "libero":
+        from .libero_data import QwenLiberoFrameDataset, resolve_libero_sources
+
+        paths = resolved_paths(config)
+        sources = resolve_libero_sources(config, paths)
+        implementation = QwenLiberoFrameDataset(
+            paths["target_dataset"],
+            dataset_name=str(config["data"]["target_dataset"]),
+            action_horizon=int(config["data"]["action_horizon"]),
+            train=True,
+            seed=int(config["train"]["seed"]),
+            episode_cache_size=1,
+            config=config["data"],
+            frame_indices=sources.target_selection.frame_indices,
+        )
+        sample = implementation[0]
+    else:
+        metadata = BridgeMetadata(config["paths"]["dataset"], config["data"])
+        train_episodes, _ = metadata.split()
+        implementation = BridgeEpisodeDataset(
+            metadata,
+            [train_episodes[0]],
+            train=True,
+            rank=0,
+            world_size=1,
+            seed=int(config["train"]["seed"]),
+            action_horizon=int(config["data"]["action_horizon"]),
+            video_cache_size=1,
+        )
+        sample = next(iter(implementation))
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
     policy = None

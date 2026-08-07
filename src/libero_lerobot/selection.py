@@ -4,15 +4,15 @@ import csv
 import hashlib
 import json
 import math
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 
-from .data import LiberoDataError
-from .lerobot_v2 import LeRobotV2Metadata
+from .errors import LiberoDataError
+from .metadata import LeRobotV2Metadata
 
 
 SCORE_COLUMNS = {
@@ -1282,40 +1282,8 @@ def load_relcore_prior_selection(
 def resolve_prior_selection(
     config: Mapping[str, Any],
     paths: Mapping[str, Path],
-) -> (
-    PriorSelection
-    | PrefilteredPriorSelection
-    | QualityFilteredPriorSelection
-    | RelCorePriorSelection
-    | None
-):
-    from libero_lerobot.selection import resolve_prior_selection as resolve_shared_prior
-
-    shared = resolve_shared_prior(
-        config,
-        paths,
-        metadata_factory=LeRobotV2Metadata,
-    )
-    if shared is None:
-        return None
-    compatibility_types = {
-        "PriorSelection": PriorSelection,
-        "PrefilteredPriorSelection": PrefilteredPriorSelection,
-        "QualityFilteredPriorSelection": QualityFilteredPriorSelection,
-        "RelCorePriorSelection": RelCorePriorSelection,
-    }
-    compatibility_type = compatibility_types[type(shared).__name__]
-    return compatibility_type(
-        **{
-            field.name: getattr(shared, field.name)
-            for field in fields(compatibility_type)
-        }
-    )
-
-
-def _legacy_resolve_prior_selection(
-    config: Mapping[str, Any],
-    paths: Mapping[str, Path],
+    *,
+    metadata_factory: Any = LeRobotV2Metadata,
 ) -> (
     PriorSelection
     | PrefilteredPriorSelection
@@ -1335,7 +1303,7 @@ def _legacy_resolve_prior_selection(
         and quality_filter_scores is None
     ):
         return None
-    metadata = LeRobotV2Metadata(paths["prior_dataset"])
+    metadata = metadata_factory(paths["prior_dataset"])
     if relcore_manifest is not None:
         return load_relcore_prior_selection(
             paths["prior_relcore_manifest"],

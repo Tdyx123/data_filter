@@ -14,7 +14,7 @@ import torch.distributed as distributed
 from torch.utils.data import DataLoader
 
 from .checkpointing import save_compact_checkpoint
-from .config import save_resolved_config
+from .config import resolved_paths, save_resolved_config
 from .data import (
     BridgeEpisodeDataset,
     BridgeMetadata,
@@ -288,6 +288,25 @@ def _prepare_stats(
     return QuantileStats.load(cache_path)
 
 
+def _prepare_libero_stats(
+    normalization_root: Path,
+    output: Path,
+    config: dict[str, Any],
+    rank: int,
+) -> tuple[QuantileStats, Path]:
+    from .libero_data import compute_libero_quantile_stats
+
+    cache_path = output / "data_cache" / "normalization.json"
+    if rank == 0:
+        compute_libero_quantile_stats(
+            normalization_root,
+            cache_path,
+            epsilon=float(config["data"]["normalization_epsilon"]),
+        )
+    distributed.barrier()
+    return QuantileStats.load(cache_path), cache_path
+
+
 def train(config: dict[str, Any]) -> None:
     try:
         import deepspeed
@@ -310,12 +329,64 @@ def train(config: dict[str, Any]) -> None:
         save_resolved_config(config, output / "run_config.yaml")
     distributed.barrier()
 
-    metadata = BridgeMetadata(config["paths"]["dataset"], config["data"])
-    train_episodes, validation_episodes = metadata.split()
-    fingerprint = metadata.fingerprint()
-    if rank == 0:
-        _atomic_json(output / "data_fingerprint.json", fingerprint)
-    stats = _prepare_stats(metadata, train_episodes, output, config, rank)
+    dataset_type = config["data"].get("dataset_type", "bridge")
+    validation_loader: DataLoader | None
+    if dataset_type == "libero":
+        from .libero_data import (
+            build_libero_dataset_manifest,
+            make_libero_training_data,
+            resolve_libero_sources,
+        )
+
+        paths = resolved_paths(config)
+        sources = resolve_libero_sources(config, paths)
+        stats, normalization_path = _prepare_libero_stats(
+            sources.normalization_root,
+            output,
+            config,
+            rank,
+        )
+        if rank == 0:
+            _atomic_json(
+                output / "dataset_manifest.json",
+                build_libero_dataset_manifest(
+                    config,
+                    paths,
+                    sources,
+                    normalization_path=normalization_path,
+                ),
+            )
+        training_data = make_libero_training_data(
+            config,
+            paths,
+            rank=rank,
+            world_size=world_size,
+        )
+        train_loader = training_data.dataloader
+        validation_loader = None
+    else:
+        metadata = BridgeMetadata(config["paths"]["dataset"], config["data"])
+        train_episodes, validation_episodes = metadata.split()
+        fingerprint = metadata.fingerprint()
+        if rank == 0:
+            _atomic_json(output / "data_fingerprint.json", fingerprint)
+        stats = _prepare_stats(metadata, train_episodes, output, config, rank)
+        train_loader = _make_loader(
+            metadata,
+            train_episodes,
+            train=True,
+            rank=rank,
+            world_size=world_size,
+            config=config,
+        )
+        validation_loader = _make_loader(
+            metadata,
+            validation_episodes,
+            train=False,
+            rank=rank,
+            world_size=world_size,
+            config=config,
+        )
 
     policy = Qwen3VLGrootPolicy.from_local_qwen(
         model_path=config["paths"]["model"],
@@ -340,32 +411,31 @@ def train(config: dict[str, Any]) -> None:
     best_validation_mae = math.inf
     global_step = 0
 
-    train_loader = _make_loader(
-        metadata,
-        train_episodes,
-        train=True,
-        rank=rank,
-        world_size=world_size,
-        config=config,
-    )
-    validation_loader = _make_loader(
-        metadata,
-        validation_episodes,
-        train=False,
-        rank=rank,
-        world_size=world_size,
-        config=config,
-    )
     train_iterator: Iterator[dict[str, Any]] = iter(train_loader)
     logger = RankZeroLogger(output, enabled=rank == 0)
     train_config = config["train"]
     flow_config = config["model"]["flow"]
+    validation_enabled = bool(train_config.get("validation_enabled", True))
+    if validation_enabled and validation_loader is None:
+        raise RuntimeError("validation is enabled but no validation loader was configured")
     maximum_steps = int(train_config["max_steps"])
     previous_global_step = global_step
     last_checkpoint_step = -1
     validation_mae: float | None = None
 
     try:
+        if rank == 0:
+            logger.log(
+                {
+                    "step": 0,
+                    "config/action_head_learning_rate": float(
+                        train_config["head_learning_rate"]
+                    ),
+                    "config/lora_learning_rate": float(
+                        train_config["lora_learning_rate"]
+                    ),
+                }
+            )
         engine.train()
         while global_step < maximum_steps:
             if (
@@ -410,7 +480,10 @@ def train(config: dict[str, Any]) -> None:
 
             validation_mae = None
             improved = False
-            if global_step % int(train_config["eval_every_steps"]) == 0:
+            if validation_enabled and global_step % int(
+                train_config["eval_every_steps"]
+            ) == 0:
+                assert validation_loader is not None
                 validation_mae = evaluate(
                     engine,
                     validation_loader,

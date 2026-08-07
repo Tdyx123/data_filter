@@ -81,14 +81,14 @@ def _write_reusable_output(
         {
             "datasets": {
                 "libero90": {
-                    "sample_weight": 0.25,
+                    "sample_weight": 0.5,
                     "selection": {
                         "scores_sha256": job.weighted_scores_sha256,
                         "top_percent": settings.prior_top_percent,
                     }
                 },
                 "libero10_5": {
-                    "sample_weight": 0.75,
+                    "sample_weight": 0.5,
                     "selection": {"mode": "all"},
                 },
             }
@@ -198,7 +198,7 @@ def test_training_command_uses_all_tasks_top10_and_one_physical_gpu(tmp_path):
     ]
     assert "--all-tasks" in command
     weight_index = command.index("--sample-weights")
-    assert command[weight_index + 1 : weight_index + 3] == ["3", "1"]
+    assert command[weight_index + 1 : weight_index + 3] == ["1", "1"]
     assert command[command.index("--gpu-ids") + 1] == "3"
     assert command[command.index("--prior-top-percent") + 1] == "10"
     assert command[command.index("--prior-scores") + 1] == str(
@@ -308,8 +308,8 @@ def test_existing_job_rejects_missing_or_changed_sample_weights(tmp_path):
     sweep._atomic_json(job_manifest_path, sweep._job_manifest(job, settings))
     dataset_manifest_path = job.output_dir / "dataset_manifest.json"
     dataset_manifest = json.loads(dataset_manifest_path.read_text(encoding="utf-8"))
-    dataset_manifest["datasets"]["libero10_5"]["sample_weight"] = 0.5
-    dataset_manifest["datasets"]["libero90"]["sample_weight"] = 0.5
+    dataset_manifest["datasets"]["libero10_5"]["sample_weight"] = 0.75
+    dataset_manifest["datasets"]["libero90"]["sample_weight"] = 0.25
     sweep._atomic_json(dataset_manifest_path, dataset_manifest)
     with pytest.raises(sweep.SweepError, match="different sample weights"):
         sweep.existing_output_action(job, settings)
@@ -340,7 +340,7 @@ def test_main_writes_failed_summary_and_returns_nonzero(tmp_path, monkeypatch):
     def fake_run_jobs(jobs, settings):
         assert [job.model_id for job in jobs] == ["model-001", "model-002"]
         assert settings.parallel == 8
-        assert settings.sample_weights == (3.0, 1.0)
+        assert settings.sample_weights == (1.0, 1.0)
         return [
             {"line_number": 1, "status": "completed"},
             {"line_number": 2, "status": "failed"},

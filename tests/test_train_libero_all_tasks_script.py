@@ -65,7 +65,7 @@ def test_all_tasks_script_injects_selection_and_forwards_preflight_arguments(
     assert output_indexes == [arguments.index("--output-dir")]
     assert arguments[output_indexes[0] + 1] == "outputs/preflight"
     weight_index = arguments.index("--sample-weights")
-    assert arguments[weight_index + 1 : weight_index + 3] == ["3", "1"]
+    assert arguments[weight_index + 1 : weight_index + 3] == ["1", "1"]
     assert "--task-index" not in arguments
     assert "--preflight-only" in arguments
     assert arguments[arguments.index("--max-steps") + 1] == "7"
@@ -94,7 +94,7 @@ def test_all_tasks_script_injects_selection_and_forwards_preflight_arguments(
     assert len(output_indexes) == 1
     assert training_arguments[output_indexes[0] + 1] == "outputs/training"
     weight_index = training_arguments.index("--sample-weights")
-    assert training_arguments[weight_index + 1 : weight_index + 3] == ["3", "1"]
+    assert training_arguments[weight_index + 1 : weight_index + 3] == ["1", "1"]
     assert training_arguments[training_arguments.index("--max-steps") + 1] == "9"
 
 
@@ -203,7 +203,7 @@ def test_all_tasks_script_relcore_manifest_suppresses_sqcn_default(tmp_path):
     assert arguments[arguments.index("--prior-relcore-manifest") + 1] == relcore_manifest
     assert "--prior-prefiltered-scores" not in arguments
     weight_index = arguments.index("--sample-weights")
-    assert arguments[weight_index + 1 : weight_index + 3] == ["3", "1"]
+    assert arguments[weight_index + 1 : weight_index + 3] == ["1", "1"]
     output_indexes = [
         index for index, value in enumerate(arguments) if value == "--output-dir"
     ]
@@ -246,4 +246,41 @@ def test_all_tasks_script_quality_filter_scores_suppress_sqcn_default(tmp_path):
     assert arguments[arguments.index("--prior-quality-filter-scores") + 1] == scores
     assert "--prior-prefiltered-scores" not in arguments
     weight_index = arguments.index("--sample-weights")
-    assert arguments[weight_index + 1 : weight_index + 3] == ["3", "1"]
+    assert arguments[weight_index + 1 : weight_index + 3] == ["1", "1"]
+
+
+def test_all_tasks_script_does_not_duplicate_explicit_sample_weights(tmp_path):
+    calls = tmp_path / "calls.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$OCTO_TEST_CALLS\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["OCTO_TEST_CALLS"] = str(calls)
+    script = PROJECT_ROOT / "scripts/train_libero_octo_small_all_tasks_4x4090.sh"
+
+    subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--sample-weights",
+            "2",
+            "1",
+            "--output-dir",
+            "outputs/custom-weights",
+            "--preflight-only",
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        check=True,
+    )
+
+    arguments = calls.read_text(encoding="utf-8").splitlines()
+    assert arguments.count("--sample-weights") == 1
+    weight_index = arguments.index("--sample-weights")
+    assert arguments[weight_index + 1 : weight_index + 3] == ["2", "1"]

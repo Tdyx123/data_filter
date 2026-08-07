@@ -73,6 +73,11 @@ def test_compact_safetensors_round_trip(tmp_path):
     assert json.loads(
         (tmp_path / "checkpoints" / "latest.json").read_text(encoding="utf-8")
     ) == {"checkpoint": "step-00000007", "step": 7}
+    checkpoint_config = json.loads(
+        (target / "policy_config.json").read_text(encoding="utf-8")
+    )["config"]
+    assert checkpoint_config["train"]["lora_learning_rate"] == pytest.approx(1e-5)
+    assert checkpoint_config["train"]["head_learning_rate"] == pytest.approx(1e-4)
 
     with torch.no_grad():
         for parameter in policy.parameters():

@@ -170,8 +170,8 @@ bash scripts/train_libero_octo_small_4x4090.sh \
 ```
 
 如需让 LIBERO-10 的全部 10 个任务、50 条完整 target 轨迹共同参与训练，使用
-独立的四卡全任务脚本。每个 micro-batch 按 `3:1` 采样，由 75% 全任务
-target 池和 25% LIBERO-90 prior 组成：
+独立的四卡全任务脚本。每个 micro-batch 按 `1:1` 采样，由 50% 全任务
+target 池和 50% LIBERO-90 prior 组成：
 
 ```bash
 bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
@@ -202,7 +202,7 @@ bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
 该模式的每卡 micro-batch 8 条样本全部来自 `libero10_5`，action 与 proprio
 归一化也使用 `libero10_5/meta/stats.json`。`--target-only` 不能与
 `--sample-weights` 或任何 `--prior-*` 参数同时使用；不传该开关时，脚本仍保持
-下面所述的 3:1 target/prior 混合训练行为。
+下面所述的 1:1 target/prior 混合训练行为。
 
 全任务 target 池内部按帧均匀采样；因此不同任务的抽样频率会随其轨迹总帧数
 变化。该脚本默认把
@@ -229,7 +229,7 @@ bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
 #### 使用 RelCore Top20% 清单训练
 
 使用 RelCore 已选 fragment 时传入独立的 `--prior-relcore-manifest`。all-tasks
-脚本会保留 `3:1` target/prior 权重，但不会再注入默认 SQCN 参数：
+脚本会保留 `1:1` target/prior 权重，但不会再注入默认 SQCN 参数：
 
 ```bash
 bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
@@ -255,9 +255,8 @@ RelCore stage manifest 或 report；JSONL 中的可靠性、边际收益等额�
 `--target-only` 混用。
 
 训练脚本使用 `torchrun`、DDP 和 BF16；默认每卡 micro-batch 8，其中全任务
-target 6 条、prior 2 条；梯度累积 4 后，四卡有效全局 batch 为 128，其中
-target 96 条、prior 32 条。单任务脚本仍保持 1:1；权重 sweep 单独使用
-3:1。预检会验证
+target 4 条、prior 4 条；梯度累积 4 后，四卡有效全局 batch 为 128，其中
+target 64 条、prior 64 条。单任务脚本与权重 sweep 也使用 1:1。预检会验证
 v2.0 metadata、全部 Parquet
 footer/schema、评测顺序的 10-task 映射、单任务模式的 5 条或全任务模式的
 50 条 target episode、抽样 PNG、统计维度、非空 prior、PyTorch
@@ -331,9 +330,9 @@ python3 scripts/train_libero_octo_small_all_tasks_weight_sweep.py
 
 默认使用 GPU `0,1,2,3`，8 个固定 worker 的绑定顺序为
 `0,1,2,3,0,1,2,3`，即每张卡同时运行 2 个模型。权重 sweep 固定按
-LIBERO-10 target 与 LIBERO-90 prior `3:1` 采样；单模型 micro-batch 8 中包含
-6 条 target 和 2 条 prior，梯度累积 16 后有效 batch 128 中包含 96 条 target
-和 32 条 prior。运行正式 sweep 前建议先确认同卡 2 个 Octo-small 模型能够
+LIBERO-10 target 与 LIBERO-90 prior `1:1` 采样；单模型 micro-batch 8 中包含
+4 条 target 和 4 条 prior，梯度累积 16 后有效 batch 128 中包含 64 条 target
+和 64 条 prior。运行正式 sweep 前建议先确认同卡 2 个 Octo-small 模型能够
 同时装入显存：
 
 ```bash
@@ -366,8 +365,8 @@ python3 scripts/train_libero_octo_small_all_tasks_weight_sweep.py \
 
 重复运行时，已达到目标步数的模型会跳过，存在完整但未完成 checkpoint 的模型
 会从 `latest` 续训。若权重、源 scores 或重新换算后的 scores 与已有 manifest
-不一致，或者旧输出不是 3:1 采样，脚本会保留现场并将该行报告为失败。首次使用
-3:1 sweep 前需要人工移动或清理同一路径下的旧 1:1 checkpoint。单个模型失败
+不一致，或者旧输出不是 1:1 采样，脚本会保留现场并将该行报告为失败。首次使用
+1:1 sweep 前需要人工移动或清理同一路径下的旧 3:1 checkpoint。单个模型失败
 不会阻止其他行训练；最终 `sweep_summary.json` 会列出失败行，且批量脚本返回
 非零状态。
 
@@ -538,6 +537,8 @@ LIBERO 仿真栈标识；每条 episode 记录包含全局 `episode_id`、`init_
 ```bash
 bash scripts/train_bridge_4x4090.sh \
   --gpu-ids 2,3,6,7 \
+  --lora-learning-rate 1e-5 \
+  --action-head-learning-rate 1e-4 \
   --model-path /data/dwb/models/Qwen3-VL-4B-Instruct \
   --dataset-path /data/dwb/datasets/bridge_orig_1.0.0_lerobo \
   --output-dir outputs/qwen3_vl_4b_groot_bridge_4gpu
@@ -550,6 +551,29 @@ bash scripts/train_bridge_4x4090.sh \
 ```bash
 bash scripts/train_bridge_4x4090.sh --gpu-ids 4,5,6,7
 ```
+
+LoRA 与 GR00T 动作头使用独立 optimizer parameter group，可分别通过
+`--lora-learning-rate` 和 `--action-head-learning-rate` 覆盖；默认分别为
+`1e-5` 与 `1e-4`。
+
+### Qwen LIBERO 全任务训练
+
+Qwen LIBERO 使用独立的 Shell/YAML 入口，不读取 Bridge 配置。默认训练
+`libero10_5` 的全部 50 条 target 轨迹，并使用 SQCN Top10% LIBERO-90 prior；
+4 卡每个全局 micro-step 按 1:1 取得 2 条 target 与 2 条 prior，梯度累积 16
+后的有效 batch 64 为 32/32。`--output-dir` 必须显式指定：
+
+```bash
+bash scripts/train_libero_qwen3_vl_4b_groot_all_tasks_4x4090.sh \
+  --lora-learning-rate 5e-6 \
+  --action-head-learning-rate 2e-4 \
+  --output-dir outputs/qwen3_vl_groot_libero
+```
+
+可追加 `--preflight-only`，或用 `--smoke-test` 固定执行 20 个 optimizer step。
+只训练 LIBERO-10 时追加 `--target-only`；该模式不读取 prior 或 scores，且不能与
+`--sample-weights`/`--prior-*` 混用。LIBERO 不做离线验证，因此只写周期/最终
+checkpoint 和 `latest.json`，不生成 `best.json`。
 
 ### 8×RTX 4090
 
@@ -598,7 +622,8 @@ python -m qwen3_vl_groot.cli launch --help
 
 ## 数据约定
 
-首版只读取 `observation.images.image_0`。数据中前六维 EEF 动作已是相对动作，
+Bridge 只读取 `observation.images.image_0`；LIBERO 只读取主视角
+`observation.images.image`。数据中前六维 EEF 动作已是相对动作，
 第七维 gripper 是绝对值；管线不会再次减去当前状态。训练/验证按 episode 的稳定
 哈希切分。q01/q99 仅从训练 episode 计算，保存在输出目录的
 `data_cache/normalization.json`，原始数据集不会被修改。
@@ -607,7 +632,8 @@ python -m qwen3_vl_groot.cli launch --help
 
 输出目录包含：
 
-- `run_config.yaml`、`data_fingerprint.json` 和归一化统计；
+- `run_config.yaml`、Bridge 的 `data_fingerprint.json` 或 LIBERO 的
+  `dataset_manifest.json`，以及归一化统计；
 - `metrics.jsonl` 与 TensorBoard event；
 - `checkpoints/step-XXXXXXXX/` 下仅含 LoRA、动作头和必要推理元数据的紧凑
   Safetensors checkpoint；

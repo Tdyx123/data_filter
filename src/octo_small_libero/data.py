@@ -12,6 +12,8 @@ from typing import Any, Iterator, Sequence
 
 import numpy as np
 
+from libero_lerobot.errors import LiberoDataError
+
 from .config import normalized_sample_weights, sample_counts_per_batch
 
 try:
@@ -29,10 +31,6 @@ DEFAULT_TARGET_TASK = (
     "STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy"
 )
 TARGET_DEMONSTRATIONS = 5
-
-
-class LiberoDataError(RuntimeError):
-    """Raised when LIBERO HDF5 or LeRobot v2 data violates the expected contract."""
 
 
 @dataclass(frozen=True)
@@ -334,6 +332,30 @@ def resolve_target_task_selection(
     paths: dict[str, Path],
 ) -> TargetTaskSelection:
     """Resolve one or all official LIBERO-10 tasks to complete target episodes."""
+    from libero_lerobot.targets import resolve_target_task_selection as resolve_shared_target
+
+    shared = resolve_shared_target(config, paths)
+    return TargetTaskSelection(
+        dataset_name=shared.dataset_name,
+        selection_mode=shared.selection_mode,
+        task_index=shared.task_index,
+        task_name=shared.task_name,
+        language_instruction=shared.language_instruction,
+        task_indices=shared.task_indices,
+        task_names=shared.task_names,
+        language_instructions=shared.language_instructions,
+        episode_indices=shared.episode_indices,
+        frame_indices=shared.frame_indices,
+        metadata_sha256=shared.metadata_sha256,
+        selection_sha256=shared.selection_sha256,
+    )
+
+
+def _legacy_resolve_target_task_selection(
+    config: dict[str, Any],
+    paths: dict[str, Path],
+) -> TargetTaskSelection:
+    """Retained implementation reference for compatibility-focused review."""
     from .lerobot_v2 import LeRobotV2Metadata
     from .libero10_tasks import (
         LIBERO_10_DEMOS_PER_TASK,

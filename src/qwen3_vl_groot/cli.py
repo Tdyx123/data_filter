@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -8,6 +9,16 @@ from pathlib import Path
 from typing import Any
 
 from .config import apply_overrides, load_config, resolved_paths, save_resolved_config
+
+
+def positive_finite_float(value: str) -> float:
+    try:
+        result = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("value must be numeric") from error
+    if not math.isfinite(result) or result <= 0.0:
+        raise argparse.ArgumentTypeError("value must be finite and positive")
+    return result
 
 
 def parse_gpu_ids(value: str) -> list[int]:
@@ -38,6 +49,7 @@ def configure_visible_gpus(config: dict[str, Any]) -> str | None:
 def _add_override_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-path")
     parser.add_argument("--dataset-path")
+    parser.add_argument("--lerobot-path")
     parser.add_argument("--output-dir")
     parser.add_argument("--gpu-count", type=int)
     parser.add_argument(
@@ -54,12 +66,28 @@ def _add_override_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dit-layers", type=int)
     parser.add_argument("--dit-hidden-size", type=int)
     parser.add_argument("--deepspeed-stage", type=int, choices=(2, 3))
+    parser.add_argument("--lora-learning-rate", type=positive_finite_float)
+    parser.add_argument("--action-head-learning-rate", type=positive_finite_float)
+    parser.add_argument("--all-tasks", action="store_true", default=None)
+    parser.add_argument("--target-only", action="store_true", default=None)
+    parser.add_argument(
+        "--sample-weights",
+        type=positive_finite_float,
+        nargs=2,
+        metavar=("TARGET", "PRIOR"),
+    )
+    parser.add_argument("--prior-top-percent", type=positive_finite_float)
+    parser.add_argument("--prior-scores")
+    parser.add_argument("--prior-prefiltered-scores")
+    parser.add_argument("--prior-relcore-manifest")
+    parser.add_argument("--prior-quality-filter-scores")
 
 
 def _overrides(namespace: argparse.Namespace) -> dict[str, Any]:
     keys = (
         "model_path",
         "dataset_path",
+        "lerobot_path",
         "output_dir",
         "gpu_count",
         "gpu_ids",
@@ -72,16 +100,51 @@ def _overrides(namespace: argparse.Namespace) -> dict[str, Any]:
         "dit_layers",
         "dit_hidden_size",
         "deepspeed_stage",
+        "lora_learning_rate",
+        "action_head_learning_rate",
+        "target_all_tasks",
+        "target_only",
+        "sample_weights",
+        "prior_top_percent",
+        "prior_scores",
+        "prior_prefiltered_scores",
+        "prior_relcore_manifest",
+        "prior_quality_filter_scores",
     )
-    return {key: getattr(namespace, key, None) for key in keys}
+    values = {key: getattr(namespace, key, None) for key in keys}
+    values["target_all_tasks"] = getattr(namespace, "all_tasks", None)
+    return values
 
 
 def _resolve_config(arguments: argparse.Namespace) -> dict[str, Any]:
+    prior_values = (
+        getattr(arguments, "prior_top_percent", None),
+        getattr(arguments, "prior_scores", None),
+        getattr(arguments, "prior_prefiltered_scores", None),
+        getattr(arguments, "prior_relcore_manifest", None),
+        getattr(arguments, "prior_quality_filter_scores", None),
+    )
+    if getattr(arguments, "target_only", False) and (
+        getattr(arguments, "sample_weights", None) is not None
+        or any(value is not None for value in prior_values)
+    ):
+        raise ValueError("--target-only cannot be combined with --sample-weights or --prior-*")
+    selected_prior_modes = sum(
+        value is not None
+        for value in (
+            getattr(arguments, "prior_top_percent", None),
+            getattr(arguments, "prior_prefiltered_scores", None),
+            getattr(arguments, "prior_relcore_manifest", None),
+            getattr(arguments, "prior_quality_filter_scores", None),
+        )
+    )
+    if selected_prior_modes > 1:
+        raise ValueError("only one --prior-* selection mode may be used")
     config = apply_overrides(load_config(arguments.config), _overrides(arguments))
     paths = resolved_paths(config)
-    config["paths"]["model"] = str(paths["model"])
-    config["paths"]["dataset"] = str(paths["dataset"])
-    config["paths"]["output"] = str(paths["output"])
+    for key in ("model", "dataset", "lerobot", "output"):
+        if key in paths:
+            config["paths"][key] = str(paths[key])
     if getattr(arguments, "smoke_test", False):
         config["train"].update(
             {
@@ -141,8 +204,9 @@ def launch(arguments: argparse.Namespace) -> None:
 def distributed_train(arguments: argparse.Namespace) -> None:
     config = load_config(arguments.config)
     paths = resolved_paths(config)
-    for key in ("model", "dataset", "output"):
-        config["paths"][key] = str(paths[key])
+    for key in ("model", "dataset", "lerobot", "output"):
+        if key in paths:
+            config["paths"][key] = str(paths[key])
     configure_visible_gpus(config)
     from .training import train
 

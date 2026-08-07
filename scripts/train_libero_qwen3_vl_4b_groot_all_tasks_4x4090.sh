@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 training_args=(
-  --config "${PROJECT_ROOT}/configs/octo_small_libero_4x4090.yaml"
+  --config "${PROJECT_ROOT}/configs/qwen3_vl_4b_groot_libero_4x4090.yaml"
   --all-tasks
 )
 target_only=false
-custom_prior=false
 custom_weights=false
+custom_prior=false
 for argument in "$@"; do
   case "${argument}" in
     --target-only)
@@ -27,9 +28,7 @@ done
 
 if [[ "${target_only}" == false ]]; then
   if [[ "${custom_weights}" == false ]]; then
-    training_args+=(
-      --sample-weights 1 1
-    )
+    training_args+=(--sample-weights 1 1)
   fi
   if [[ "${custom_prior}" == false ]]; then
     training_args+=(
@@ -38,14 +37,6 @@ if [[ "${target_only}" == false ]]; then
   fi
 fi
 
-if [[ " $* " == *" --preflight-only "* ]]; then
-  exec python3 -m octo_small_libero.cli \
-    "${training_args[@]}" \
-    "$@"
-fi
-
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
-exec torchrun --standalone --nproc_per_node=4 \
-  -m octo_small_libero.cli \
+exec python -m qwen3_vl_groot.cli launch \
   "${training_args[@]}" \
   "$@"

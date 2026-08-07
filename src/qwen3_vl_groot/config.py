@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ def apply_overrides(config: dict[str, Any], overrides: dict[str, Any]) -> dict[s
     mapping = {
         "model_path": ("paths", "model"),
         "dataset_path": ("paths", "dataset"),
+        "lerobot_path": ("paths", "lerobot"),
         "output_dir": ("paths", "output"),
         "gpu_count": ("train", "gpu_count"),
         "gpu_ids": ("train", "gpu_ids"),
@@ -41,6 +43,11 @@ def apply_overrides(config: dict[str, Any], overrides: dict[str, Any]) -> dict[s
         "dit_layers": ("model", "dit", "num_layers"),
         "dit_hidden_size": ("model", "dit", "hidden_size"),
         "deepspeed_stage": ("train", "deepspeed_stage"),
+        "lora_learning_rate": ("train", "lora_learning_rate"),
+        "action_head_learning_rate": ("train", "head_learning_rate"),
+        "target_all_tasks": ("data", "target_all_tasks"),
+        "target_only": ("data", "target_only"),
+        "sample_weights": ("data", "sample_weights"),
     }
     for key, value in overrides.items():
         if value is None or key not in mapping:
@@ -50,6 +57,46 @@ def apply_overrides(config: dict[str, Any], overrides: dict[str, Any]) -> dict[s
         for part in keys[:-1]:
             target = target[part]
         target[keys[-1]] = value
+
+    if overrides.get("prior_scores") is not None:
+        result["data"]["prior_selection"]["scores"] = overrides["prior_scores"]
+    if overrides.get("prior_prefiltered_scores") is not None:
+        result["data"]["prior_selection"].update(
+            {
+                "scores": overrides["prior_prefiltered_scores"],
+                "top_percent": None,
+                "prefiltered": True,
+                "relcore_manifest": None,
+                "quality_filter_scores": None,
+            }
+        )
+    if overrides.get("prior_top_percent") is not None:
+        result["data"]["prior_selection"].update(
+            {
+                "top_percent": overrides["prior_top_percent"],
+                "prefiltered": False,
+                "relcore_manifest": None,
+                "quality_filter_scores": None,
+            }
+        )
+    if overrides.get("prior_relcore_manifest") is not None:
+        result["data"]["prior_selection"].update(
+            {
+                "top_percent": None,
+                "prefiltered": False,
+                "relcore_manifest": overrides["prior_relcore_manifest"],
+                "quality_filter_scores": None,
+            }
+        )
+    if overrides.get("prior_quality_filter_scores") is not None:
+        result["data"]["prior_selection"].update(
+            {
+                "top_percent": None,
+                "prefiltered": False,
+                "relcore_manifest": None,
+                "quality_filter_scores": overrides["prior_quality_filter_scores"],
+            }
+        )
 
     if result["train"]["deepspeed_stage"] == 3:
         result["train"]["cpu_optimizer_offload"] = True
@@ -66,8 +113,11 @@ def validate_config(config: dict[str, Any]) -> None:
     data = config["data"]
     model = config["model"]
     train = config["train"]
+    dataset_type = data.get("dataset_type", "bridge")
+    if dataset_type not in {"bridge", "libero"}:
+        raise ConfigError("data.dataset_type must be bridge or libero")
     if data["state_dim"] != 8 or data["action_dim"] != 7:
-        raise ConfigError("Bridge WidowX requires state_dim=8 and action_dim=7")
+        raise ConfigError(f"{dataset_type} requires state_dim=8 and action_dim=7")
     if data["action_horizon"] <= 0:
         raise ConfigError("action_horizon must be positive")
     if model["text_layers"] != 36:
@@ -127,6 +177,54 @@ def validate_config(config: dict[str, Any]) -> None:
     ):
         if int(train[name]) <= 0:
             raise ConfigError(f"train.{name} must be positive")
+    for name in ("lora_learning_rate", "head_learning_rate"):
+        value = train.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+        ):
+            raise ConfigError(f"train.{name} must be finite and positive")
+    if dataset_type == "libero":
+        if not isinstance(config["paths"].get("lerobot"), str):
+            raise ConfigError("paths.lerobot must be set for LIBERO")
+        if data.get("prior_dataset") != "libero90" or data.get("target_dataset") != "libero10_5":
+            raise ConfigError("LIBERO requires prior=libero90 and target=libero10_5")
+        weights = data.get("sample_weights")
+        if not isinstance(weights, list) or len(weights) != 2:
+            raise ConfigError("data.sample_weights must contain target and prior weights")
+        prior = data.get("prior_selection")
+        if not isinstance(prior, dict):
+            raise ConfigError("data.prior_selection must be a mapping")
+        top_percent = prior.get("top_percent")
+        active_prior_modes = sum(
+            (
+                top_percent is not None,
+                bool(prior.get("prefiltered", False)),
+                prior.get("relcore_manifest") is not None,
+                prior.get("quality_filter_scores") is not None,
+            )
+        )
+        if active_prior_modes > 1:
+            raise ConfigError("only one LIBERO prior selection mode may be configured")
+        if top_percent is not None and (
+            isinstance(top_percent, bool)
+            or not isinstance(top_percent, (int, float))
+            or not math.isfinite(float(top_percent))
+            or not 0.0 < float(top_percent) <= 100.0
+        ):
+            raise ConfigError("data.prior_selection.top_percent must be in (0, 100]")
+        from libero_lerobot.sampling import sample_counts_per_batch
+
+        try:
+            sample_counts_per_batch(
+                (1.0,) if bool(data.get("target_only", False)) else weights,
+                int(train["gpu_count"]) * int(train["micro_batch_size"]),
+                scope="global micro-batch",
+            )
+        except ValueError as error:
+            raise ConfigError(str(error)) from error
 
 
 def resolved_paths(config: dict[str, Any]) -> dict[str, Path]:
@@ -139,12 +237,33 @@ def resolved_paths(config: dict[str, Any]) -> dict[str, Path]:
             candidate = project_root / candidate
         return candidate.resolve()
 
-    return {
+    output_value = config["paths"].get("output")
+    if not isinstance(output_value, str) or not output_value.strip():
+        raise ConfigError("an explicit --output-dir is required")
+    result = {
         "project_root": project_root,
         "model": resolve(config["paths"]["model"]),
-        "dataset": resolve(config["paths"]["dataset"]),
-        "output": resolve(config["paths"]["output"]),
+        "output": resolve(output_value),
     }
+    if config["data"].get("dataset_type", "bridge") == "bridge":
+        result["dataset"] = resolve(config["paths"]["dataset"])
+        return result
+    lerobot = resolve(config["paths"]["lerobot"])
+    result.update(
+        {
+            "lerobot": lerobot,
+            "target_dataset": lerobot / config["data"]["target_dataset"],
+            "prior_dataset": lerobot / config["data"]["prior_dataset"],
+            "prior_scores": resolve(config["data"]["prior_selection"]["scores"]),
+        }
+    )
+    relcore = config["data"]["prior_selection"].get("relcore_manifest")
+    if relcore is not None:
+        result["prior_relcore_manifest"] = resolve(relcore)
+    quality = config["data"]["prior_selection"].get("quality_filter_scores")
+    if quality is not None:
+        result["prior_quality_filter_scores"] = resolve(quality)
+    return result
 
 
 def config_digest(config: dict[str, Any]) -> str:
