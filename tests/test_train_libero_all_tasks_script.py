@@ -4,12 +4,12 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SQCN_SCORES = "/data/dwb/libero90_sqcn/filter/top10pct/scores.csv"
+PREFILTERED_SCORES = "/data/dwb/libero_filter/quality/filter/top10pct/scores.csv"
 
 
-def _assert_sqcn_defaults(arguments):
+def _assert_prefiltered_defaults(arguments):
     scores_index = arguments.index("--prior-prefiltered-scores")
-    assert arguments[scores_index + 1] == SQCN_SCORES
+    assert arguments[scores_index + 1] == PREFILTERED_SCORES
 
 
 def test_all_tasks_script_injects_selection_and_forwards_preflight_arguments(
@@ -58,7 +58,7 @@ def test_all_tasks_script_injects_selection_and_forwards_preflight_arguments(
     arguments = calls.read_text(encoding="utf-8").splitlines()
     assert arguments[:2] == ["-m", "octo_small_libero.cli"]
     assert "--all-tasks" in arguments
-    _assert_sqcn_defaults(arguments)
+    _assert_prefiltered_defaults(arguments)
     output_indexes = [
         index for index, value in enumerate(arguments) if value == "--output-dir"
     ]
@@ -85,7 +85,7 @@ def test_all_tasks_script_injects_selection_and_forwards_preflight_arguments(
     )
     training_arguments = calls.read_text(encoding="utf-8").splitlines()
     assert "--all-tasks" in training_arguments
-    _assert_sqcn_defaults(training_arguments)
+    _assert_prefiltered_defaults(training_arguments)
     output_indexes = [
         index
         for index, value in enumerate(training_arguments)
@@ -167,51 +167,7 @@ def test_all_tasks_script_target_only_omits_prior_defaults_and_uses_isolated_out
     assert training_arguments[output_indexes[-1] + 1] == custom_output
 
 
-def test_all_tasks_script_relcore_manifest_suppresses_sqcn_default(tmp_path):
-    calls = tmp_path / "calls.txt"
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    fake_python = fake_bin / "python3"
-    fake_python.write_text(
-        "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$OCTO_TEST_CALLS\"\n",
-        encoding="utf-8",
-    )
-    fake_python.chmod(0o755)
-
-    environment = os.environ.copy()
-    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
-    environment["OCTO_TEST_CALLS"] = str(calls)
-    script = PROJECT_ROOT / "scripts" / "train_libero_octo_small_all_tasks_4x4090.sh"
-    relcore_manifest = "/data/relcore/select/selected_manifest.jsonl"
-
-    subprocess.run(
-        [
-            "bash",
-            str(script),
-            "--prior-relcore-manifest",
-            relcore_manifest,
-            "--output-dir",
-            "outputs/relcore",
-            "--preflight-only",
-        ],
-        cwd=PROJECT_ROOT,
-        env=environment,
-        check=True,
-    )
-
-    arguments = calls.read_text(encoding="utf-8").splitlines()
-    assert arguments[arguments.index("--prior-relcore-manifest") + 1] == relcore_manifest
-    assert "--prior-prefiltered-scores" not in arguments
-    weight_index = arguments.index("--sample-weights")
-    assert arguments[weight_index + 1 : weight_index + 3] == ["1", "1"]
-    output_indexes = [
-        index for index, value in enumerate(arguments) if value == "--output-dir"
-    ]
-    assert len(output_indexes) == 1
-    assert arguments[output_indexes[0] + 1] == "outputs/relcore"
-
-
-def test_all_tasks_script_quality_filter_scores_suppress_sqcn_default(tmp_path):
+def test_all_tasks_script_explicit_prefiltered_scores_override_default(tmp_path):
     calls = tmp_path / "calls.txt"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -225,13 +181,13 @@ def test_all_tasks_script_quality_filter_scores_suppress_sqcn_default(tmp_path):
     environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
     environment["OCTO_TEST_CALLS"] = str(calls)
     script = PROJECT_ROOT / "scripts" / "train_libero_octo_small_all_tasks_4x4090.sh"
-    scores = "/data/quality_filter/libero90/filter/top10pct/scores.csv"
+    scores = "/data/custom/selected.csv"
 
     subprocess.run(
         [
             "bash",
             str(script),
-            "--prior-quality-filter-scores",
+            "--prior-prefiltered-scores",
             scores,
             "--output-dir",
             "outputs/quality-filter",
@@ -243,10 +199,29 @@ def test_all_tasks_script_quality_filter_scores_suppress_sqcn_default(tmp_path):
     )
 
     arguments = calls.read_text(encoding="utf-8").splitlines()
-    assert arguments[arguments.index("--prior-quality-filter-scores") + 1] == scores
-    assert "--prior-prefiltered-scores" not in arguments
+    scores_index = arguments.index("--prior-prefiltered-scores")
+    assert arguments[scores_index + 1] == scores
+    assert PREFILTERED_SCORES not in arguments
     weight_index = arguments.index("--sample-weights")
     assert arguments[weight_index + 1 : weight_index + 3] == ["1", "1"]
+
+    subprocess.run(
+        [
+            "bash",
+            str(script),
+            f"--prior-prefiltered-scores={scores}",
+            "--output-dir",
+            "outputs/custom-equals",
+            "--preflight-only",
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        check=True,
+    )
+
+    equals_arguments = calls.read_text(encoding="utf-8").splitlines()
+    assert f"--prior-prefiltered-scores={scores}" in equals_arguments
+    assert PREFILTERED_SCORES not in equals_arguments
 
 
 def test_all_tasks_script_does_not_duplicate_explicit_sample_weights(tmp_path):

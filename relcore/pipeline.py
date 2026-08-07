@@ -73,6 +73,11 @@ def _output_root(config: Mapping[str, Any], output_dir: str | Path | None) -> Pa
     ).expanduser()
 
 
+def selection_directory_name(ratio: float) -> str:
+    percent_tag = format(float(ratio) * 100.0, ".12g").replace(".", "p")
+    return f"select-top{percent_tag}pct"
+
+
 def _tasks_hash(config: Mapping[str, Any]) -> str:
     return file_sha256(Path(str(config["dataset"].get("path", ""))) / "meta/tasks.jsonl")
 
@@ -702,8 +707,14 @@ def select_stage(
     output_dir: str | Path | None = None,
     force: bool = False,
     visual_encoder: VisualEncoder | None = None,
+    selection_output_ratio: float | None = None,
 ) -> Path:
     resolved = resolve_config(config)
+    scoped_ratio = (
+        float(selection_output_ratio) if selection_output_ratio is not None else None
+    )
+    if scoped_ratio is not None and scoped_ratio != float(resolved["selection"]["ratio"]):
+        raise ValueError("selection_output_ratio must match selection.ratio")
     seed_everything(int(resolved["seed"]))
     root, adapter, clips, graph, graph_fingerprint = graph_stage(
         resolved,
@@ -719,7 +730,9 @@ def select_stage(
         ("objective", "selection", "seed"),
         graph_fingerprint,
     )
-    destination = root / "select"
+    destination = root / (
+        selection_directory_name(scoped_ratio) if scoped_ratio is not None else "select"
+    )
 
     def build(temporary: Path) -> None:
         started = time.perf_counter()
@@ -790,22 +803,23 @@ def select_stage(
         resume=bool(resolved["runtime"].get("resume", True)),
         build=build,
     )
-    for name in ("selected_manifest.jsonl", "all_clips.parquet", "selection_report.json"):
-        target = root / name
-        source = destination / name
-        if built or not target.is_file() or file_sha256(target) != file_sha256(source):
-            shutil.copy2(destination / name, target)
-    write_json(
-        root / "run_manifest.json",
-        {
-            "status": "complete",
-            "fingerprint": _total_fingerprint(adapter, resolved),
-            "stage_fingerprints": {
-                stage: _manifest_fingerprint(root / stage / "manifest.json")
-                for stage in ("scan", "encode", "graph", "select")
+    if scoped_ratio is None:
+        for name in ("selected_manifest.jsonl", "all_clips.parquet", "selection_report.json"):
+            target = root / name
+            source = destination / name
+            if built or not target.is_file() or file_sha256(target) != file_sha256(source):
+                shutil.copy2(destination / name, target)
+        write_json(
+            root / "run_manifest.json",
+            {
+                "status": "complete",
+                "fingerprint": _total_fingerprint(adapter, resolved),
+                "stage_fingerprints": {
+                    stage: _manifest_fingerprint(root / stage / "manifest.json")
+                    for stage in ("scan", "encode", "graph", "select")
+                },
             },
-        },
-    )
+        )
     return root
 
 

@@ -423,7 +423,7 @@ def test_lerobot_frame_dataset_maps_selected_global_prior_frames(tmp_path):
     assert second["action_pad_mask"].all()
 
 
-def test_training_dataset_keeps_target_prior_balance_with_tdus_subset(tmp_path):
+def test_training_dataset_keeps_target_prior_balance_with_prefiltered_subset(tmp_path):
     torch = pytest.importorskip("torch")
     _, output, _ = _build_synthetic_training_lerobot(tmp_path, length=10)
     from octo_small_libero.config import load_config
@@ -461,7 +461,7 @@ def test_training_dataset_keeps_target_prior_balance_with_tdus_subset(tmp_path):
     with scores.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
-        for episode_id, tdus in ((0, 0.4), (1, 0.9)):
+        for episode_id, tdus in ((1, 0.9),):
             writer.writerow(
                 {
                     "sample_id": f"ep{episode_id:06d}_chunk_000000_000009",
@@ -476,19 +476,8 @@ def test_training_dataset_keeps_target_prior_balance_with_tdus_subset(tmp_path):
                     "tdus": tdus,
                 }
             )
-    (scores_root / "run_manifest.json").write_text(
-        json.dumps(
-            {
-                "dataset_name": "libero90",
-                "dataset_path": str((output / "libero90").resolve()),
-                "modes": ["trajectory", "chunk"],
-            }
-        ),
-        encoding="utf-8",
-    )
     config["data"]["prior_selection"] = {
-        "scores": str(scores),
-        "top_percent": 50,
+        "prefiltered_scores": str(scores),
     }
     config["data"]["target_task_index"] = 5
     target_name = "libero10_5"
@@ -497,7 +486,7 @@ def test_training_dataset_keeps_target_prior_balance_with_tdus_subset(tmp_path):
         "prior_dataset": output / "libero90",
         "target_dataset": output / target_name,
         "statistics": output / "libero90" / "meta" / "stats.json",
-        "prior_scores": scores,
+        "prior_prefiltered_scores": scores,
     }
 
     class FakeTokenizer:
@@ -514,7 +503,7 @@ def test_training_dataset_keeps_target_prior_balance_with_tdus_subset(tmp_path):
     assert training_data.dataset.source_sizes == (50, 3)
     assert training_data.target_selection.task_index == 5
     assert training_data.target_selection.episode_indices == (25, 26, 27, 28, 29)
-    assert training_data.prior_selection.selected_chunks == 1
+    assert training_data.prior_selection.selected_fragments == 1
     assert training_data.prior_selection.training_starts == 3
     assert batch["dataset_name"].count(target_name) == 4
     assert batch["dataset_name"].count("libero90") == 4
@@ -536,4 +525,5 @@ def test_training_dataset_keeps_target_prior_balance_with_tdus_subset(tmp_path):
     prior_manifest = manifest["datasets"]["libero90"]
     assert prior_manifest["frames"] == 20
     assert prior_manifest["frames_used"] == 3
-    assert prior_manifest["selection"]["top_percent"] == 50
+    assert prior_manifest["selection"]["mode"] == "prefiltered_fragments"
+    assert prior_manifest["selection"]["selected_fragments"] == 1

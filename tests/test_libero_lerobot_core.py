@@ -133,35 +133,18 @@ def test_octo_target_resolver_preserves_compatibility_result_type():
     assert isinstance(selection, TargetTaskSelection)
 
 
-def test_octo_prior_resolver_preserves_compatibility_result_type(tmp_path, monkeypatch):
-    import libero_lerobot.selection as shared_selection
+def test_octo_prefiltered_prior_import_path_uses_shared_result_type():
+    import libero_lerobot.prefiltered as shared_selection
     import octo_small_libero.selection as octo_selection
 
-    shared = shared_selection.PriorSelection(
-        scores_path=tmp_path / "scores.csv",
-        scores_sha256="scores-sha",
-        run_manifest_path=tmp_path / "run_manifest.json",
-        top_percent=10.0,
-        total_chunks=10,
-        selected_chunks=1,
-        selected_sample_ids=("sample",),
-        selected_episodes=1,
-        frame_indices=(0,),
-        action_horizon=8,
-        selection_sha256="selection-sha",
+    assert (
+        octo_selection.PrefilteredPriorSelection
+        is shared_selection.PrefilteredPriorSelection
     )
-    monkeypatch.setattr(
-        shared_selection,
-        "resolve_prior_selection",
-        lambda *_args, **_kwargs: shared,
+    assert (
+        octo_selection.load_prefiltered_selection
+        is shared_selection.load_prefiltered_selection
     )
-
-    selection = octo_selection.resolve_prior_selection(
-        {"data": {"prior_selection": {}}},
-        {},
-    )
-
-    assert isinstance(selection, octo_selection.PriorSelection)
 
 
 def test_global_sampler_balances_one_to_one_across_four_single_sample_ranks():

@@ -175,15 +175,15 @@ target 池和 50% LIBERO-90 prior 组成：
 
 ```bash
 bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
-  --output-dir outputs/octo_small_libero_4gpu_all-tasks_sqcn_top10pct --preflight-only
+  --output-dir outputs/octo_small_libero_4gpu_all-tasks_quality_top10pct --preflight-only
 bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
-  --output-dir outputs/octo_small_libero_4gpu_all-tasks_sqcn_top10pct-smoke --smoke-test
+  --output-dir outputs/octo_small_libero_4gpu_all-tasks_quality_top10pct-smoke --smoke-test
 bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
-  --output-dir outputs/octo_small_libero_4gpu_all-tasks_sqcn_top10pct
+  --output-dir outputs/octo_small_libero_4gpu_all-tasks_quality_top10pct
 ```
 
 如果只使用上述 `libero10_5` 中每个任务 5 条、共 50 条示例轨迹，不采样也不读取
-LIBERO-90 prior 或 SQCN/TDUS scores，追加 `--target-only`：
+LIBERO-90 prior 或预筛选片段文件，追加 `--target-only`：
 
 ```bash
 bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
@@ -206,53 +206,39 @@ bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
 
 全任务 target 池内部按帧均匀采样；因此不同任务的抽样频率会随其轨迹总帧数
 变化。该脚本默认把
-`/data/dwb/libero90_sqcn/filter/top10pct/scores.csv` 作为已经筛选完成的 SQCN
-片段清单，使用文件中的全部 4671 个片段，不再按分数二次截取。每个片段只
-贡献完整落在片段范围内的 8-step action window；重叠片段去重后覆盖 2923 条
-episode，共得到 36263 个 prior 训练起点。
+`/data/dwb/libero_filter/quality/filter/top10pct/scores.csv` 作为已经筛选完成的
+片段清单。文件中的 4,671 行全部入选，不按 Quality 或其他分数二次排序；每个
+片段只贡献完整落在范围内的 8-step action window，重叠片段去重后覆盖 2,935
+条 episode，共得到 35,913 个 prior 训练起点。
 
-预检会核对同目录 `filter_manifest.json`、SQCN `run_manifest.json`、数据集来源、
-文件哈希、选择摘要、连续 `filter_rank` 和片段边界。`--output-dir` 对训练、
-smoke test 和 preflight 都是必填参数；仓库配置和 shell 脚本均不提供默认值：
+训练入口只接受 `--prior-prefiltered-scores PATH`。文件可为 CSV 或 JSONL：首个
+非空内容以 `{` 开头时按 JSONL 读取，否则按 CSV 读取。两种格式都只要求
+`episode_id`、`start_step`、`end_step`，其他分数、rank、`sample_id`、`length`
+和诊断字段全部忽略。预检不读取相邻的 filter/run manifest，也不校验算法来源；
+它只校验 UTF-8、必需字段、整数、episode、边界、重复片段和完整 action window，
+并把输入文件 SHA256 与展开后的选择摘要写入训练 manifest。`--output-dir` 对训练、
+smoke test 和 preflight 都是必填参数：
 
 ```bash
 bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
-  --prior-prefiltered-scores /path/to/filter/top10pct/scores.csv \
-  --output-dir outputs/custom_sqcn_run \
+  --prior-prefiltered-scores /path/to/selected.csv \
+  --output-dir outputs/custom_prefiltered_run \
   --preflight-only
 ```
 
-`--prior-prefiltered-scores` 不能与 TDUS 的 `--prior-top-percent` 或
-`--prior-scores` 混用。需要 TDUS 排名筛选时，继续使用单任务入口，或直接调用
-`python3 -m octo_small_libero.cli --all-tasks --output-dir PATH` 并传入 TDUS 参数。
-
-#### 使用 RelCore Top20% 清单训练
-
-使用 RelCore 已选 fragment 时传入独立的 `--prior-relcore-manifest`。all-tasks
-脚本会保留 `1:1` target/prior 权重，但不会再注入默认 SQCN 参数：
+RelCore 的 `selected_manifest.jsonl` 也通过同一参数传入；文件中的每个 JSON
+对象都视为已选片段，`selected` 等额外字段不参与训练：
 
 ```bash
 bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
-  --prior-relcore-manifest /data/dwb/libero_filter/relcore_top20pct/select/selected_manifest.jsonl \
+  --prior-prefiltered-scores /data/dwb/libero_filter/relcore_top20pct/select/selected_manifest.jsonl \
   --output-dir outputs/octo_small_libero_4gpu_all-tasks_relcore_top20pct \
   --preflight-only
-
-bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
-  --prior-relcore-manifest /data/dwb/libero_filter/relcore_top20pct/select/selected_manifest.jsonl \
-  --output-dir outputs/octo_small_libero_4gpu_all-tasks_relcore_top20pct-smoke \
-  --smoke-test
-
-bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
-  --prior-relcore-manifest /data/dwb/libero_filter/relcore_top20pct/select/selected_manifest.jsonl \
-  --output-dir outputs/octo_small_libero_4gpu_all-tasks_relcore_top20pct
 ```
 
-当前清单包含 9,341 个 selected fragment，覆盖 1,005 条 episode。每个 inclusive
-片段只展开完整的 8-step action window，重叠起点去重后得到 74,320 个 prior
-训练起点。预检只校验 JSONL 内容与 LIBERO-90 LeRobot metadata，不依赖相邻的
-RelCore stage manifest 或 report；JSONL 中的可靠性、边际收益等额外字段不作为
-训练权重。`--prior-relcore-manifest` 不能与 TDUS/SQCN prior 参数或
-`--target-only` 混用。
+已删除训练入口中的 TDUS 排序、SQCN、RelCore 和 Quality 专用参数。需要按某个
+分数或算法选择 Top N% 时，必须先由相应离线工具生成只包含已选行的 CSV/JSONL，
+再传给统一参数。`--prior-prefiltered-scores` 不能与 `--target-only` 混用。
 
 训练脚本使用 `torchrun`、DDP 和 BF16；默认每卡 micro-batch 8，其中全任务
 target 4 条、prior 4 条；梯度累积 4 后，四卡有效全局 batch 为 128，其中
@@ -271,48 +257,27 @@ bash scripts/train_libero_octo_small_4x4090.sh \
   --preflight-only
 ```
 
-#### 使用 TDUS Top 片段训练
+#### 使用自定义预筛选片段训练
 
-训练入口可根据 `outputs/tdus/libero90/chunk/scores.csv` 的 `tdus` 分数筛选
-LIBERO-90 prior，同时保留所选任务完整的 5 条 target 轨迹，并继续按 1:1
-组成每个 micro-batch。Top 10% 和 Top 20% 分别运行：
-
-```bash
-bash scripts/train_libero_octo_small_4x4090.sh \
-  --task-index 5 --prior-top-percent 10 \
-  --output-dir outputs/octo_small_libero_task-5_top10pct
-bash scripts/train_libero_octo_small_4x4090.sh \
-  --task-index 5 --prior-top-percent 20 \
-  --output-dir outputs/octo_small_libero_task-5_top20pct
-```
-
-比例接受 `(0, 100]` 内的任意数值，选中 chunk 数按向上取整计算。排序固定为
-`tdus` 降序、`length` 升序、`sample_id` 升序。一个选中 chunk 只贡献完整落在
-片段内的 8-step action window 起点，重叠 chunk 的相同 episode/frame 起点只
-保留一次。`--prior-top-percent 100` 仍应用这套严格片段边界；不传该参数才是
-包含 episode 尾部 padding window 的原始全帧基线。
-
-输出目录必须显式指定，建议在路径中包含任务与 prior 比例，避免实验互相覆盖。
-也可以同时覆盖 scores 文件：
+单任务入口使用相同的预筛选文件契约，并继续按 1:1 组成 prior/target
+micro-batch。TDUS、SQCN、Quality Filter 或其他算法必须先在训练外完成排序和
+截取；训练端使用输入文件中的全部行：
 
 ```bash
 bash scripts/train_libero_octo_small_4x4090.sh \
   --task-index 5 \
-  --prior-top-percent 12.5 \
-  --prior-scores /path/to/libero90/chunk/scores.csv \
-  --output-dir outputs/octo_small_libero_top12p5
+  --prior-prefiltered-scores /path/to/selected.csv \
+  --output-dir outputs/octo_small_libero_prefiltered
 ```
 
-`--preflight-only` 和 `--smoke-test` 支持相同参数。预检会核对 TDUS
-`run_manifest.json` 中的数据源，并报告选中的 chunk、episode 和去重后的训练
-起点数。训练 manifest 会记录 scores SHA256 与选择摘要；续训必须使用完全相同
-的比例和 scores 内容：
+`--preflight-only` 和 `--smoke-test` 支持相同参数。续训必须使用内容完全相同的
+预筛选文件，否则输入文件 SHA256 和选择摘要会发生变化：
 
 ```bash
 bash scripts/train_libero_octo_small_4x4090.sh \
   --task-index 5 \
-  --prior-top-percent 10 \
-  --output-dir outputs/octo_small_libero_task-5_top10pct \
+  --prior-prefiltered-scores /path/to/selected.csv \
+  --output-dir outputs/octo_small_libero_prefiltered \
   --resume latest
 ```
 
@@ -343,8 +308,9 @@ python3 scripts/train_libero_octo_small_all_tasks_weight_sweep.py \
   --smoke-test
 ```
 
-第 1 行权重生成 `scores_weights_001.csv` 和 `model-001/`，依此类推。
-重新换算的 CSV 保存在原 `chunk/` 目录中，原始 `scores.csv` 不会被修改。
+第 1 行权重生成 `scores_weights_001.csv` 和 `model-001/`，依此类推。sweep 会先按
+新的 TDUS 分数排序并将 Top N% 物化到该 CSV，再通过统一的
+`--prior-prefiltered-scores` 启动训练；原始 `scores.csv` 不会被修改。
 模型、日志、批次 manifest 和最终汇总默认写入
 `outputs/octo_small_libero_all_tasks_weight_sweep_top10pct/`。可覆盖常用参数：
 

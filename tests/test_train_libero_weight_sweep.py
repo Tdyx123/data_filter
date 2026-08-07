@@ -20,8 +20,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def _write_source_scores(path: Path) -> bytes:
     path.parent.mkdir(parents=True)
     path.write_text(
-        "sample_id,quality,coverage,diversity,novelty,tdus\n"
-        "sample-1,1.0,0.5,0.25,0.0,0.0\n",
+        "sample_id,episode_id,start_step,end_step,length,quality,coverage,diversity,novelty,tdus\n"
+        "sample-1,0,0,14,15,1.0,0.5,0.25,0.0,0.0\n"
+        "sample-2,0,15,29,15,0.2,1.0,0.5,0.1,0.0\n"
+        "sample-3,1,0,14,15,0.5,0.5,0.5,0.5,0.0\n",
         encoding="utf-8",
     )
     return path.read_bytes()
@@ -83,8 +85,7 @@ def _write_reusable_output(
                 "libero90": {
                     "sample_weight": 0.5,
                     "selection": {
-                        "scores_sha256": job.weighted_scores_sha256,
-                        "top_percent": settings.prior_top_percent,
+                        "source_sha256": job.weighted_scores_sha256,
                     }
                 },
                 "libero10_5": {
@@ -165,6 +166,7 @@ def test_prepare_jobs_reweights_tdus_to_nine_decimals_without_changing_source(
         ],
         source_scores_path=source,
         output_root=tmp_path / "models",
+        prior_top_percent=50,
     )
 
     assert source.read_bytes() == original
@@ -172,9 +174,11 @@ def test_prepare_jobs_reweights_tdus_to_nine_decimals_without_changing_source(
     assert jobs[0].model_id == "model-001"
     assert jobs[0].weighted_scores_path == source.parent / "scores_weights_001.csv"
     with jobs[0].weighted_scores_path.open(encoding="utf-8", newline="") as handle:
-        row = next(csv.DictReader(handle))
-    assert row["tdus"].partition(".")[2] and len(row["tdus"].partition(".")[2]) == 9
-    assert float(row["tdus"]) == pytest.approx(0.65, abs=1e-7)
+        rows = list(csv.DictReader(handle))
+    assert [row["sample_id"] for row in rows] == ["sample-1", "sample-3"]
+    assert rows[0]["tdus"].partition(".")[2]
+    assert len(rows[0]["tdus"].partition(".")[2]) == 9
+    assert float(rows[0]["tdus"]) == pytest.approx(0.65, abs=1e-7)
 
 
 def test_training_command_uses_all_tasks_top10_and_one_physical_gpu(tmp_path):
@@ -200,10 +204,11 @@ def test_training_command_uses_all_tasks_top10_and_one_physical_gpu(tmp_path):
     weight_index = command.index("--sample-weights")
     assert command[weight_index + 1 : weight_index + 3] == ["1", "1"]
     assert command[command.index("--gpu-ids") + 1] == "3"
-    assert command[command.index("--prior-top-percent") + 1] == "10"
-    assert command[command.index("--prior-scores") + 1] == str(
+    assert command[command.index("--prior-prefiltered-scores") + 1] == str(
         job.weighted_scores_path
     )
+    assert "--prior-top-percent" not in command
+    assert "--prior-scores" not in command
     assert command[command.index("--max-steps") + 1] == "7500"
     assert command[-2:] == ["--resume", "latest"]
 

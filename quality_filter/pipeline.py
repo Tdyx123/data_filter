@@ -29,7 +29,7 @@ from segment_filter_core import (
     visual_fragment_feature,
 )
 from segment_filter_core.selection import (
-    PENALTY_LAMBDA,
+    PROMOTION_MINIMUM_POLICY,
     _AlgorithmParameters,
     select_diverse_fragments,
 )
@@ -49,6 +49,7 @@ QUALITY_COLUMNS = (
     "motion_efficiency",
     "quality",
 )
+QUALITY_FILTER_PENALTY_LAMBDA = 0.5
 
 
 def _stable_hash(value: Any) -> str:
@@ -663,6 +664,8 @@ def filter_stage(
             "source": source_hashes,
             "percent": percent_value,
             "seed": requested_seed,
+            "penalty_lambda": QUALITY_FILTER_PENALTY_LAMBDA,
+            "promotion_minimum": PROMOTION_MINIMUM_POLICY,
         }
     )
 
@@ -674,6 +677,7 @@ def filter_stage(
             sample_ids,
             target_size,
             seed=requested_seed,
+            penalty_lambda=QUALITY_FILTER_PENALTY_LAMBDA,
         )
         selected_ids = [sample_ids[int(index)] for index in result.selected_indices]
         filter_columns = ("filter_rank", "adjusted_score", "knn_penalty")
@@ -722,7 +726,7 @@ def filter_stage(
                     "target_size": target_size,
                     "seed": result.seed,
                     "score_column": "quality",
-                    "lambda": PENALTY_LAMBDA,
+                    "lambda": QUALITY_FILTER_PENALTY_LAMBDA,
                     "penalty": {
                         "policy": "mean_rbf_similarity_weighted_score_of_nearest_references",
                         "neighbor_count": parameters.neighbor_count,
@@ -742,9 +746,7 @@ def filter_stage(
                     "update_count": {
                         "unit": "reference_fragments",
                         "initial": parameters.init_select_size,
-                        "promotion_minimum": (
-                            "ceil(100 + log2(selected_count - 100))"
-                        ),
+                        "promotion_minimum": PROMOTION_MINIMUM_POLICY,
                         "catch_up_sampling": (
                             "uniform_without_replacement_from_selected"
                         ),
@@ -864,6 +866,14 @@ def _validate_filter_output(
         raise ValueError("quality filter source must be an object")
     if algorithm.get("score_column") != "quality":
         raise ValueError("quality filter score_column must be quality")
+    if algorithm.get("lambda") != QUALITY_FILTER_PENALTY_LAMBDA:
+        raise ValueError("quality filter penalty lambda must be 0.5")
+    update_count = algorithm.get("update_count")
+    if (
+        not isinstance(update_count, dict)
+        or update_count.get("promotion_minimum") != PROMOTION_MINIMUM_POLICY
+    ):
+        raise ValueError("quality filter promotion minimum must use sqrt")
     percent, percent_decimal = _normalize_percent(algorithm.get("percent"))
     if expected_percent is not None and percent != expected_percent:
         raise ValueError("quality filter percent does not match requested validation")

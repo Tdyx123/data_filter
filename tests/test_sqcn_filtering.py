@@ -137,7 +137,7 @@ def test_selector_initializes_all_remaining_fragments_before_filling_candidates(
     np.testing.assert_array_equal(selector.update_counts[100:], 100)
 
 
-def test_promotion_update_count_uses_ceiling_of_logarithmic_threshold():
+def test_promotion_update_count_uses_ceiling_of_square_root_threshold():
     selector = _DiverseSelector(
         np.linspace(1.0, 0.0, 103, dtype=np.float64),
         np.zeros((103, 2), dtype=np.float64),
@@ -146,8 +146,8 @@ def test_promotion_update_count_uses_ceiling_of_logarithmic_threshold():
         sigma_effective=1.0,
     )
 
-    assert selector._required_update_count(101) == 100
-    assert selector._required_update_count(102) == 101
+    assert selector._required_update_count(101) == 101
+    assert selector._required_update_count(102) == 102
     assert selector._required_update_count(103) == 102
 
 
@@ -183,8 +183,8 @@ def test_selection_promotes_one_silent_fragment_after_each_candidate_selection()
     assert selector.selected == list(range(104))
     assert selector.candidates == {*range(104, 200), 200, 201, 202}
     assert selector.silent == {203, 204}
-    assert selector.update_counts[200] == 102
-    assert selector.update_counts[201] == 102
+    assert selector.update_counts[200] == 103
+    assert selector.update_counts[201] == 103
     assert selector.update_counts[202] == 102
     assert selector.update_counts[203] == 100
     assert selector._neighbor_indices[203].tolist() == [0, 1, 2, 3, 4]
@@ -251,6 +251,55 @@ def test_selected_diagnostic_uses_knn_penalty_and_unit_lambda():
     assert result.selected_indices[-2:].tolist() == [101, 100]
     assert result.knn_penalties[-1] == pytest.approx(0.998)
     assert result.adjusted_scores[-1] == pytest.approx(-0.098)
+
+
+def test_penalty_lambda_scales_adjusted_score():
+    scores = np.concatenate(
+        [
+            np.linspace(1.0, 0.901, 100, dtype=np.float64),
+            np.asarray([0.9, 0.8], dtype=np.float64),
+        ]
+    )
+    embeddings = np.concatenate(
+        [
+            np.tile(np.asarray([[1.0, 0.0]], dtype=np.float32), (101, 1)),
+            np.asarray([[-1.0, 0.0]], dtype=np.float32),
+        ],
+        axis=0,
+    )
+    sample_ids = tuple(f"sample-{index:03d}" for index in range(len(scores)))
+
+    result = select_diverse_fragments(
+        scores,
+        embeddings,
+        sample_ids,
+        target_size=102,
+        seed=23,
+        penalty_lambda=0.5,
+    )
+
+    assert result.selected_indices[-2:].tolist() == [101, 100]
+    assert result.knn_penalties[-1] == pytest.approx(0.998)
+    assert result.adjusted_scores[-1] == pytest.approx(0.401)
+
+
+@pytest.mark.parametrize(
+    "penalty_lambda",
+    [-0.1, float("nan"), float("inf"), True, "0.5"],
+)
+def test_penalty_lambda_rejects_invalid_values(penalty_lambda: object):
+    scores = np.linspace(1.0, 0.0, 100, dtype=np.float64)
+    embeddings = np.eye(100, dtype=np.float32)
+    sample_ids = tuple(f"sample-{index:03d}" for index in range(len(scores)))
+
+    with pytest.raises(ValueError, match="penalty_lambda"):
+        select_diverse_fragments(
+            scores,
+            embeddings,
+            sample_ids,
+            target_size=100,
+            penalty_lambda=penalty_lambda,
+        )
 
 
 def test_knn_penalty_uses_actual_neighbor_count_and_can_decrease():
@@ -429,7 +478,7 @@ def test_filter_run_writes_ceil_percent_aligned_artifacts_and_manifest(tmp_path:
     assert manifest["algorithm"]["update_count"] == {
         "unit": "reference_fragments",
         "initial": 100,
-        "promotion_minimum": "ceil(100 + log2(selected_count - 100))",
+        "promotion_minimum": "ceil(100 + sqrt(selected_count - 100))",
         "catch_up_sampling": "uniform_without_replacement_from_selected",
         "persisted": "internal_only",
     }

@@ -36,13 +36,7 @@ def test_octo_config_is_independent_and_points_to_local_checkpoint():
     assert config["data"]["target_task_index"] is None
     assert config["data"]["target_all_tasks"] is False
     assert config["data"]["target_only"] is False
-    assert config["data"]["prior_selection"] == {
-        "scores": "outputs/tdus/libero90/chunk/scores.csv",
-        "top_percent": None,
-        "prefiltered": False,
-        "relcore_manifest": None,
-        "quality_filter_scores": None,
-    }
+    assert config["data"]["prior_selection"] == {"prefiltered_scores": None}
     assert config["model"]["required_observation_tokenizers"] == ["primary", "wrist"]
     assert config["train"]["gpu_ids"] == [0, 1, 2, 3]
     assert config["train"]["micro_batch_size_per_gpu"] == 8
@@ -125,11 +119,7 @@ def test_octo_cli_exposes_only_lerobot_data_override():
     assert "--lerobot-path" in option_strings
     assert "--max-steps" in option_strings
     assert "--smoke-test" in option_strings
-    assert "--prior-top-percent" in option_strings
-    assert "--prior-scores" in option_strings
     assert "--prior-prefiltered-scores" in option_strings
-    assert "--prior-relcore-manifest" in option_strings
-    assert "--prior-quality-filter-scores" in option_strings
     assert "--sample-weights" in option_strings
     assert "--task-index" in option_strings
     assert "--all-tasks" in option_strings
@@ -150,30 +140,6 @@ def test_octo_cli_requires_explicit_output_dir():
         ["--all-tasks", "--output-dir", "outputs/explicit"]
     )
     assert arguments.output_dir == "outputs/explicit"
-
-
-def test_octo_relcore_manifest_override_selects_relcore_without_default_output():
-    config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
-
-    updated = apply_overrides(
-        config,
-        target_all_tasks=True,
-        output_dir="outputs/relcore",
-        prior_relcore_manifest="/data/relcore/selected_manifest.jsonl",
-    )
-
-    assert updated["paths"]["output"] == "outputs/relcore"
-    assert updated["data"]["prior_selection"] == {
-        "scores": "outputs/tdus/libero90/chunk/scores.csv",
-        "top_percent": None,
-        "prefiltered": False,
-        "relcore_manifest": "/data/relcore/selected_manifest.jsonl",
-        "quality_filter_scores": None,
-    }
-    paths = resolved_paths(updated)
-    assert paths["prior_relcore_manifest"] == Path(
-        "/data/relcore/selected_manifest.jsonl"
-    )
 
 
 def test_octo_resolved_paths_rejects_missing_explicit_output():
@@ -216,25 +182,7 @@ def test_octo_sample_weights_override_requires_exact_local_batch_counts():
         validate_config(invalid)
 
 
-def test_octo_prior_percent_override_is_validated_without_deriving_output():
-    config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
-    updated = apply_overrides(config, prior_top_percent=12.5)
-
-    assert updated["data"]["prior_selection"]["top_percent"] == 12.5
-    assert "output" not in updated["paths"]
-
-    explicit = apply_overrides(
-        config,
-        prior_top_percent=10,
-        output_dir="outputs/explicit",
-    )
-    assert explicit["paths"]["output"] == "outputs/explicit"
-
-    with pytest.raises(ConfigError, match="in \\(0, 100\\]"):
-        apply_overrides(config, prior_top_percent=0)
-
-
-def test_octo_prefiltered_scores_override_enables_all_rows_without_percent():
+def test_octo_prefiltered_scores_override_enables_all_rows():
     config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
 
     updated = apply_overrides(
@@ -243,128 +191,15 @@ def test_octo_prefiltered_scores_override_enables_all_rows_without_percent():
     )
 
     assert updated["data"]["prior_selection"] == {
-        "scores": "/data/sqcn/filter/top10pct/scores.csv",
-        "top_percent": None,
-        "prefiltered": True,
-        "relcore_manifest": None,
-        "quality_filter_scores": None,
+        "prefiltered_scores": "/data/sqcn/filter/top10pct/scores.csv"
     }
 
 
-def test_octo_quality_filter_override_selects_independent_manifest_mode():
+def test_octo_config_rejects_removed_prior_selection_keys():
     config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
+    config["data"]["prior_selection"]["top_percent"] = 10
 
-    updated = apply_overrides(
-        config,
-        target_all_tasks=True,
-        output_dir="outputs/quality-filter",
-        prior_quality_filter_scores=(
-            "/data/quality_filter/libero90/filter/top10pct/scores.csv"
-        ),
-    )
-
-    assert updated["data"]["prior_selection"] == {
-        "scores": "outputs/tdus/libero90/chunk/scores.csv",
-        "top_percent": None,
-        "prefiltered": False,
-        "relcore_manifest": None,
-        "quality_filter_scores": (
-            "/data/quality_filter/libero90/filter/top10pct/scores.csv"
-        ),
-    }
-    assert resolved_paths(updated)["prior_quality_filter_scores"] == Path(
-        "/data/quality_filter/libero90/filter/top10pct/scores.csv"
-    )
-
-
-def test_octo_config_rejects_prefiltered_scores_with_top_percent():
-    config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
-    config["data"]["prior_selection"].update(
-        {"prefiltered": True, "top_percent": 10}
-    )
-
-    with pytest.raises(ConfigError, match="prefiltered.*top_percent"):
-        validate_config(config)
-
-
-def test_octo_cli_rejects_ranked_and_prefiltered_selection_together():
-    from octo_small_libero.cli import parse_arguments
-
-    repeated = parse_arguments(
-        [
-            "--all-tasks",
-            "--output-dir",
-            "outputs/test",
-            "--prior-prefiltered-scores",
-            "/data/first.csv",
-            "--prior-prefiltered-scores",
-            "/data/second.csv",
-        ]
-    )
-    assert repeated.prior_prefiltered_scores == "/data/second.csv"
-
-    with pytest.raises(SystemExit):
-        parse_arguments(
-            [
-                "--all-tasks",
-                "--output-dir",
-                "outputs/test",
-                "--prior-prefiltered-scores",
-                "/data/sqcn.csv",
-                "--prior-top-percent",
-                "10",
-            ]
-        )
-    with pytest.raises(SystemExit):
-        parse_arguments(
-            [
-                "--all-tasks",
-                "--output-dir",
-                "outputs/test",
-                "--prior-prefiltered-scores",
-                "/data/sqcn.csv",
-                "--prior-scores",
-                "/data/tdus.csv",
-            ]
-        )
-
-
-@pytest.mark.parametrize(
-    "conflicting",
-    [
-        ["--prior-top-percent", "10"],
-        ["--prior-scores", "/data/tdus.csv"],
-        ["--prior-prefiltered-scores", "/data/sqcn.csv"],
-    ],
-)
-def test_octo_cli_rejects_relcore_with_other_prior_modes(conflicting):
-    from octo_small_libero.cli import parse_arguments
-
-    with pytest.raises(SystemExit):
-        parse_arguments(
-            [
-                "--all-tasks",
-                "--output-dir",
-                "outputs/relcore",
-                "--prior-relcore-manifest",
-                "/data/selected_manifest.jsonl",
-                *conflicting,
-            ]
-        )
-
-
-def test_octo_config_rejects_relcore_with_ranked_or_prefiltered_modes():
-    config = load_config(PROJECT_ROOT / "configs" / "octo_small_libero_4x4090.yaml")
-    config["data"]["prior_selection"].update(
-        {"relcore_manifest": "/data/selected_manifest.jsonl", "top_percent": 10}
-    )
-    with pytest.raises(ConfigError, match="relcore_manifest"):
-        validate_config(config)
-
-    config["data"]["prior_selection"].update(
-        {"top_percent": None, "prefiltered": True}
-    )
-    with pytest.raises(ConfigError, match="relcore_manifest"):
+    with pytest.raises(ConfigError, match="unsupported keys.*top_percent"):
         validate_config(config)
 
 
@@ -469,10 +304,7 @@ def test_octo_target_only_override_uses_target_statistics_with_explicit_output(t
     "conflicting",
     [
         ["--sample-weights", "3", "1"],
-        ["--prior-top-percent", "10"],
-        ["--prior-scores", "/data/prior.csv"],
         ["--prior-prefiltered-scores", "/data/prefiltered.csv"],
-        ["--prior-relcore-manifest", "/data/selected_manifest.jsonl"],
     ],
 )
 def test_octo_cli_rejects_target_only_prior_options(conflicting):

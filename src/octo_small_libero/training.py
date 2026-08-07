@@ -39,9 +39,7 @@ def build_dataset_manifest(
 
         target_selection = resolve_target_task_selection(config, paths)
     if not target_only and prior_selection is None and (
-        config["data"]["prior_selection"].get("top_percent") is not None
-        or config["data"]["prior_selection"].get("prefiltered", False)
-        or config["data"]["prior_selection"].get("relcore_manifest") is not None
+        config["data"]["prior_selection"].get("prefiltered_scores") is not None
     ):
         from .selection import resolve_prior_selection
 

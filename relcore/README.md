@@ -28,16 +28,35 @@ python -m relcore validate --output-dir outputs/relcore/libero90 \
 ```
 
 `select` 和 `run` 可通过 `--selection-ratio` 在调用时设置筛选比例，取值范围为
-`(0, 1]`。例如筛选 20% 的候选片段：
+`(0, 1]`。命令行比例会覆盖配置中的 `selection.ratio`，并忽略固定的
+`selection.budget`；未传该参数时仍完全使用配置文件中的比例或固定预算。
+
+显式设置比例的 `select` 会把结果写入共享输出根目录下的比例目录，因此可复用同一份
+scan、encode 和 graph，且不同筛选比例不需要 `--force` 即可并存。例如：
+
+```bash
+python -m relcore select --config relcore/config_libero90.yaml \
+  --selection-ratio 0.10
+python -m relcore select --config relcore/config_libero90.yaml \
+  --selection-ratio 0.20
+```
+
+上述结果分别位于 `outputs/relcore/libero90/select-top10pct/` 和
+`outputs/relcore/libero90/select-top20pct/`；12.5% 使用 `select-top12p5pct/`。
+比例目录包含 `manifest.json`、`selected_manifest.jsonl`、`all_clips.parquet` 和
+`selection_report.json`。此模式不会更新输出根目录的同名结果文件或
+`run_manifest.json`，命令打印的 `relcore_output=` 直接指向本次比例目录。同一比例
+目录的配置发生不兼容变化时仍需传 `--force`。
+
+`run --selection-ratio` 保持原有的单结果根目录布局。例如筛选 20% 的候选片段：
 
 ```bash
 python -m relcore run --config relcore/config_libero90.yaml \
   --selection-ratio 0.20 --force
 ```
 
-命令行比例会覆盖配置中的 `selection.ratio`，并忽略固定的 `selection.budget`；未传
-该参数时仍完全使用配置文件中的比例或固定预算。已有输出与新比例不兼容时需要传
-`--force`。
+`validate` 当前只验证未使用比例后缀的传统根目录结果，不接受
+`select-topXpct/` 比例目录。
 
 各阶段用数据、相关配置和上游 artifact 指纹恢复；已有不兼容阶段必须显式传
 `--force`。兼容的上游阶段即使在 `--force` 下也会复用，因此只修改预算或分支参数
@@ -103,8 +122,10 @@ OpenBLAS、OpenMP、MKL 和 NumExpr 统一限制为每进程 1 个线程。这�
 TRAJECTORY_DATA_NUM_THREADS=4 python -m relcore select \
   --config relcore/config_libero90.yaml \
   --selection-ratio 0.30 \
-  --output-dir /data/dwb/libero_filter/relcore_top30pct
+  --output-dir /data/dwb/libero_filter/relcore
 ```
+
+该命令的筛选结果位于 `/data/dwb/libero_filter/relcore/select-top30pct/`。
 
 在尚未包含该启动保护的旧版本上，可用下面的等价命令临时规避；四个变量必须在
 启动 Python 前设置：
@@ -114,7 +135,7 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 NUMEXPR_NUM_THREADS=1 python -m relcore select \
   --config relcore/config_libero90.yaml \
   --selection-ratio 0.30 \
-  --output-dir /data/dwb/libero_filter/relcore_top30pct
+  --output-dir /data/dwb/libero_filter/relcore
 ```
 
 ## 数据与输出
@@ -122,7 +143,8 @@ NUMEXPR_NUM_THREADS=1 python -m relcore select \
 窗口固定长度 15、stride 15，并与 SQCN 一样追加末尾对齐窗口；不足 15 帧的 episode
 跳过。只有边界严格相邻的窗口才建立时序边，重叠的尾部窗口不会伪造时序关系。
 
-最终输出位于配置的 `output.directory`：
+未显式传入 `select --selection-ratio` 时，最终输出位于配置的
+`output.directory`：
 
 - `selected_manifest.jsonl`：按选择顺序记录 LeRobot `episode_id` 与 inclusive
   `start_step/end_step`；
@@ -131,6 +153,9 @@ NUMEXPR_NUM_THREADS=1 python -m relcore select \
 - `run_manifest.json`：数据、任务元数据、完整配置和阶段指纹；
 - `scan/ encode/ graph/ select/`：可检查、可恢复的阶段 artifact，其中逐 episode
   CLIP 帧特征保存在 `encode/frame_features/`。
+
+显式传入 `select --selection-ratio` 时，scan、encode 和 graph 仍位于同一输出根目录，
+selection artifact 与三份结果文件改为位于对应的 `select-topXpct/`，不再发布到根目录。
 
 `selected_manifest.jsonl` 使用 `sample_id`、`episode_id`、`task_index`、`task_name`、
 inclusive `start_step/end_step` 定位原始 LeRobot 数据。`all_clips.parquet` 区分插入
