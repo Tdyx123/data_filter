@@ -1,5 +1,15 @@
 """Clip reliability scoring."""
 
-from .reliability import ReliabilityResult, compute_reliability
+from .reliability import (
+    RELIABILITY_METRICS,
+    ReliabilityResult,
+    compute_reliability,
+    normalize_reliability_metrics,
+)
 
-__all__ = ["ReliabilityResult", "compute_reliability"]
+__all__ = [
+    "RELIABILITY_METRICS",
+    "ReliabilityResult",
+    "compute_reliability",
+    "normalize_reliability_metrics",
+]

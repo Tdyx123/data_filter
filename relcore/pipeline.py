@@ -39,7 +39,7 @@ from relcore.features.visual_encoder import (
 )
 from relcore.graph import build_graph, discover_prototypes
 from relcore.schemas import ClipRecord, EdgeTable, GraphData
-from relcore.scoring import compute_reliability
+from relcore.scoring import compute_reliability, normalize_reliability_metrics
 from relcore.selection.greedy import ExactGreedySelector, SelectionResult
 from relcore.selection.multibranch import MultiBranchSelector
 from relcore.selection.objective import (
@@ -483,6 +483,7 @@ def graph_stage(
             noop_threshold=float(quality_config["noop_threshold"]),
             gripper_action_index=int(quality_config["gripper_action_index"]),
             min_reliability=float(quality_config["min_reliability"]),
+            reliability_metrics=quality_config["reliability_metrics"],
         )
         prototype_config = resolved["prototypes"]
         prototypes = discover_prototypes(
@@ -692,6 +693,7 @@ def _selection_rows(
         "number_of_clips": len(clips),
         "selected_clips": len(result.selected_indices),
         "selection_ratio": len(result.selected_indices) / len(clips),
+        "reliability_metrics": list(config["quality"]["reliability_metrics"]),
         "objective": asdict(breakdown),
         "prototype_coverage": {
             str(index): float(value) for index, value in enumerate(final_state.prototype_coverage)
@@ -924,6 +926,13 @@ def validate_output(
     ]
     all_rows = pq.read_table(required[1]).to_pylist()
     report = json.loads(required[2].read_text(encoding="utf-8"))
+    reported_metrics = report.get("reliability_metrics")
+    try:
+        normalized_reported_metrics = list(normalize_reliability_metrics(reported_metrics))
+    except ValueError as error:
+        raise ValueError(f"selection report reliability_metrics {error}") from error
+    if reported_metrics != normalized_reported_metrics:
+        raise ValueError("selection report reliability_metrics are not in canonical order")
     if [row["sample_id"] for row in all_rows] != sorted(row["sample_id"] for row in all_rows):
         raise ValueError("all_clips.parquet is not sorted by sample_id")
     if len({row["sample_id"] for row in selected_rows}) != len(selected_rows):
@@ -995,6 +1004,10 @@ def validate_output(
         raise ValueError(f"unknown selection quota mode: {quota_mode}")
     if config is not None:
         resolved = resolve_config(config)
+        if normalized_reported_metrics != resolved["quality"]["reliability_metrics"]:
+            raise ValueError(
+                "selection report reliability_metrics do not match the supplied config"
+            )
         resolved["output"]["directory"] = str(root)
         adapter = create_dataset(resolved["dataset"])
         expected_scan = _fingerprint(

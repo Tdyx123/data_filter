@@ -39,6 +39,7 @@ quality:
   noop_threshold: 1.0e-4
   gripper_action_index: -1
   min_reliability: 0.05
+  reliability_metrics: [support, progress, smoothness, non_noop]
 
 prototypes:
   count: 64

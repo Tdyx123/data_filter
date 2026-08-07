@@ -58,6 +58,36 @@ python -m relcore run --config relcore/config_libero90.yaml \
 `validate` 当前只验证未使用比例后缀的传统根目录结果，不接受
 `select-topXpct/` 比例目录。
 
+## 可靠性指标
+
+`quality.reliability_metrics` 控制合成可靠性使用哪些组成指标。默认配置显式启用
+全部四项：
+
+```yaml
+quality:
+  reliability_metrics: [support, progress, smoothness, non_noop]
+```
+
+- `support`：关系嵌入的 KNN 邻域支持度；
+- `progress`：末端状态、夹爪状态和视觉变化组成的进展分数；
+- `smoothness`：根据动作 jerk 得到的平滑度；
+- `non_noop`：有效动作比例，即 `1 - noop_ratio`。
+
+列表必须非空、不能重复且只能包含上述名称；书写顺序不会影响结果，解析后的配置按
+上述固定顺序保存。每项沿用固定指数：`support`、`progress`、`non_noop` 为 `0.5`，
+`smoothness` 为 `0.25`。禁用某项时直接省略对应因子，不重新归一化剩余指数，因此
+启用项较少时合成可靠性可能整体升高。例如只使用任务进展和有效动作：
+
+```yaml
+quality:
+  reliability_metrics: [progress, non_noop]
+```
+
+四个原始分量始终计算并保存在 `graph/nodes.npz`，但只有配置子集合成的单一
+`reliability` 用于建图、目标函数、种子和候选选择。实际生效列表写入
+`selection_report.json`。修改列表会使 graph 和 select 阶段指纹失效；对已有输出重跑
+时需要 `--force`，scan、encode 和 CLIP 帧特征缓存仍可复用。
+
 各阶段用数据、相关配置和上游 artifact 指纹恢复；已有不兼容阶段必须显式传
 `--force`。兼容的上游阶段即使在 `--force` 下也会复用，因此只修改预算或分支参数
 不会重新运行 CLIP。快速 CPU 检查使用：

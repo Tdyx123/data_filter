@@ -2,9 +2,36 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
+
+
+_RELIABILITY_METRIC_EXPONENTS = {
+    "support": 0.5,
+    "progress": 0.5,
+    "smoothness": 0.25,
+    "non_noop": 0.5,
+}
+RELIABILITY_METRICS = tuple(_RELIABILITY_METRIC_EXPONENTS)
+
+
+def normalize_reliability_metrics(metrics: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(metrics, (str, bytes)) or not isinstance(metrics, Sequence):
+        raise ValueError("must be a sequence of metric names")
+    values = tuple(metrics)
+    if not values:
+        raise ValueError("cannot be empty")
+    if any(not isinstance(metric, str) for metric in values):
+        raise ValueError("must contain only metric names")
+    if len(set(values)) != len(values):
+        raise ValueError("cannot contain duplicates")
+    unknown = sorted(set(values) - set(RELIABILITY_METRICS))
+    if unknown:
+        raise ValueError(f"contains unknown metrics: {unknown}")
+    selected = set(values)
+    return tuple(metric for metric in RELIABILITY_METRICS if metric in selected)
 
 
 @dataclass(frozen=True)
@@ -35,8 +62,10 @@ def compute_reliability(
     noop_threshold: float = 1.0e-4,
     gripper_action_index: int = -1,
     min_reliability: float = 0.05,
+    reliability_metrics: Sequence[str] = RELIABILITY_METRICS,
     epsilon: float = 1.0e-8,
 ) -> ReliabilityResult:
+    enabled_metrics = normalize_reliability_metrics(reliability_metrics)
     values = np.asarray(embeddings, dtype=np.float32)
     states = np.asarray(state_sequences, dtype=np.float32)
     actions = np.asarray(action_sequences, dtype=np.float32)
@@ -93,8 +122,14 @@ def compute_reliability(
     noop_ratio = np.mean(motion_small & (gripper_change < noop_threshold), axis=1).astype(
         np.float32
     )
-    reliability = (
-        support**0.5 * progress**0.5 * smoothness**0.25 * np.maximum(1.0 - noop_ratio, 0.0) ** 0.5
-    )
+    metric_values = {
+        "support": support,
+        "progress": progress,
+        "smoothness": smoothness,
+        "non_noop": np.maximum(1.0 - noop_ratio, 0.0),
+    }
+    reliability = np.ones(count, dtype=np.float32)
+    for metric in enabled_metrics:
+        reliability *= metric_values[metric] ** _RELIABILITY_METRIC_EXPONENTS[metric]
     reliability = np.clip(reliability, min_reliability, 1.0).astype(np.float32)
     return ReliabilityResult(reliability, support, progress, smoothness, noop_ratio)

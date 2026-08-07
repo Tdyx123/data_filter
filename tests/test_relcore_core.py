@@ -90,6 +90,33 @@ def test_config_locks_sqcn_windows_and_local_production_clip():
         resolve_config({"visual": {"model": "/tmp/another-clip"}})
 
 
+def test_config_defaults_and_canonicalizes_reliability_metrics():
+    expected = ["support", "progress", "smoothness", "non_noop"]
+
+    assert resolve_config({})["quality"]["reliability_metrics"] == expected
+    assert resolve_config(
+        {
+            "quality": {
+                "reliability_metrics": ["non_noop", "support", "smoothness"],
+            }
+        }
+    )["quality"]["reliability_metrics"] == ["support", "smoothness", "non_noop"]
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        [],
+        ["support", "support"],
+        ["support", "unknown"],
+        "support",
+    ],
+)
+def test_config_rejects_invalid_reliability_metrics(metrics):
+    with pytest.raises(ValueError, match="quality.reliability_metrics"):
+        resolve_config({"quality": {"reliability_metrics": metrics}})
+
+
 def test_seed_everything_resets_python_and_numpy_generators():
     seed_everything(91)
     first = (random.random(), np.random.random())

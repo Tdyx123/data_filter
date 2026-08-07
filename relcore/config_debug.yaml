@@ -12,6 +12,8 @@ visual:
 relation:
   projection_dim: 8
   output_dim: 32
+quality:
+  reliability_metrics: [support, progress, smoothness, non_noop]
 prototypes:
   count: 4
   top_r: 2

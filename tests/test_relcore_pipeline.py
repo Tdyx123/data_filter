@@ -198,6 +198,12 @@ def test_run_pipeline_publishes_aligned_outputs_and_reuses_complete_cache(
     assert {row["task_index"] for row in manifest_rows} == {0, 1}
     assert all("hdf5_path" not in row and "demo_key" not in row for row in manifest_rows)
     assert report["selected_clips"] == 2
+    assert report["reliability_metrics"] == [
+        "support",
+        "progress",
+        "smoothness",
+        "non_noop",
+    ]
     assert report["task_quotas"] == {"0": 1, "1": 1}
     assert set(report["runtime_seconds"]) == {"scan", "encode", "graph", "select"}
     assert "prototype_coverage" in report
@@ -256,6 +262,33 @@ def test_force_rebuilds_only_changed_selection_stage(tmp_path: Path):
     report = json.loads((root / "selection_report.json").read_text())
     assert report["selected_clips"] == 4
     assert len(report["branches"]) == 3
+
+
+def test_reliability_metric_change_reuses_encode_and_rebuilds_graph_and_select(
+    tmp_path: Path,
+):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    baseline_reliability = np.load(root / "graph" / "nodes.npz")["reliability"].copy()
+    mtimes = {
+        stage: (root / stage / "manifest.json").stat().st_mtime_ns
+        for stage in ("scan", "encode", "graph", "select")
+    }
+
+    changed = _config(tmp_path)
+    changed["quality"]["reliability_metrics"] = ["progress"]
+    run_pipeline(changed, force=True, visual_encoder=PipelineVisualEncoder())
+
+    assert (root / "scan" / "manifest.json").stat().st_mtime_ns == mtimes["scan"]
+    assert (root / "encode" / "manifest.json").stat().st_mtime_ns == mtimes["encode"]
+    assert (root / "graph" / "manifest.json").stat().st_mtime_ns != mtimes["graph"]
+    assert (root / "select" / "manifest.json").stat().st_mtime_ns != mtimes["select"]
+    nodes = np.load(root / "graph" / "nodes.npz")
+    assert not np.array_equal(nodes["reliability"], baseline_reliability)
+    np.testing.assert_allclose(nodes["reliability"], nodes["progress"] ** 0.5, rtol=1.0e-6)
+    report = json.loads((root / "selection_report.json").read_text())
+    assert report["reliability_metrics"] == ["progress"]
 
 
 def test_ratio_scoped_selects_coexist_and_preserve_shared_outputs(tmp_path: Path):
@@ -424,6 +457,40 @@ def test_validate_rejects_a_config_with_different_selection_fingerprint(tmp_path
 
     with pytest.raises(ValueError, match="fingerprint"):
         validate_output(root, config=changed)
+
+
+def test_validate_rejects_noncanonical_reported_reliability_metrics(tmp_path: Path):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    for report_path in (
+        root / "selection_report.json",
+        root / "select" / "selection_report.json",
+    ):
+        report = json.loads(report_path.read_text())
+        report["reliability_metrics"] = ["progress", "support"]
+        write_json(report_path, report)
+
+    with pytest.raises(ValueError, match="reliability_metrics"):
+        validate_output(root)
+
+
+def test_validate_rejects_reported_reliability_metrics_that_differ_from_config(
+    tmp_path: Path,
+):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    for report_path in (
+        root / "selection_report.json",
+        root / "select" / "selection_report.json",
+    ):
+        report = json.loads(report_path.read_text())
+        report["reliability_metrics"] = ["progress"]
+        write_json(report_path, report)
+
+    with pytest.raises(ValueError, match="reliability_metrics.*config"):
+        validate_output(root, config=config)
 
 
 def test_validate_rejects_missing_stage_artifact(tmp_path: Path):

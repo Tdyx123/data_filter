@@ -8,6 +8,52 @@ from relcore.scoring.reliability import compute_reliability
 from relcore.schemas import ClipRecord
 
 
+def _reliability_inputs() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    embeddings = np.asarray([[1.0, 0.0]], dtype=np.float32)
+    states = np.zeros((1, 15, 2), dtype=np.float32)
+    actions = np.zeros((1, 15, 2), dtype=np.float32)
+    actions[0, :5, 0] = 1.0
+    visual_progress = np.asarray([2.0], dtype=np.float32)
+    return embeddings, states, actions, visual_progress
+
+
+def test_explicit_all_reliability_metrics_match_default():
+    inputs = _reliability_inputs()
+
+    default = compute_reliability(*inputs)
+    explicit = compute_reliability(
+        *inputs,
+        reliability_metrics=["support", "progress", "smoothness", "non_noop"],
+    )
+
+    np.testing.assert_array_equal(explicit.reliability, default.reliability)
+
+
+def test_reliability_metric_subset_uses_fixed_exponents_without_renormalizing():
+    inputs = _reliability_inputs()
+
+    progress_only = compute_reliability(*inputs, reliability_metrics=["progress"])
+    progress_and_non_noop = compute_reliability(
+        *inputs,
+        reliability_metrics=["non_noop", "progress"],
+    )
+
+    np.testing.assert_allclose(progress_only.reliability, [0.8347063], rtol=1.0e-6)
+    np.testing.assert_allclose(progress_and_non_noop.reliability, [0.4819179], rtol=1.0e-6)
+
+
+def test_reliability_metric_subset_keeps_all_diagnostic_components():
+    inputs = _reliability_inputs()
+
+    default = compute_reliability(*inputs)
+    progress_only = compute_reliability(*inputs, reliability_metrics=["progress"])
+
+    np.testing.assert_array_equal(progress_only.support, default.support)
+    np.testing.assert_array_equal(progress_only.progress, default.progress)
+    np.testing.assert_array_equal(progress_only.smoothness, default.smoothness)
+    np.testing.assert_array_equal(progress_only.noop_ratio, default.noop_ratio)
+
+
 def test_noop_clip_has_lower_reliability_than_supported_smooth_motion():
     embeddings = np.asarray([[1.0, 0.0], [0.99, 0.01], [0.0, 1.0]], dtype=np.float32)
     states = np.zeros((3, 15, 3), dtype=np.float32)
