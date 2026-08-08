@@ -51,6 +51,34 @@ frequent = filter_frequent_primitives(statistics, min_frequency=0.001)
 `filter_frequent_primitives` 只用于数据分布分析。它不会参与标签生成，也不会删除
 低频标签或低频样本。
 
+## 汇总完整 LeRobot 数据集
+
+从仓库根目录运行以下脚本，可以逐 episode 读取完整的 LeRobot v2 数据集，并把
+整个数据集的运动原语类别、数量和占比写入 CSV：
+
+```bash
+.venv/bin/python scripts/generate_libero_motion_primitive_distribution.py \
+  --dataset-root /data/dwb/datasets/LIBERO_lerobot/libero10_5 \
+  --output-dir outputs/libero_motion_primitives \
+  --horizon 4 \
+  --threshold 0.03 \
+  --tail-strategy truncate
+```
+
+输出文件为
+`outputs/libero_motion_primitives/motion_primitive_distribution.csv`，格式如下：
+
+```csv
+primitive,count,proportion
+stop,1000,0.5
+move forward,600,0.3
+move right,400,0.2
+```
+
+脚本不会加载图像，也不会跨 episode 比较状态。CSV 按数量降序、类别名称升序
+排列；占比的分母是所选尾部策略实际生成的全部标签数。`--horizon` 支持 3 到 8，
+`--tail-strategy` 支持 `truncate`、`clip` 和 `pad_last`。
+
 ## 自定义坐标和夹爪符号
 
 所有状态索引和正负方向都由配置指定，不在分类算法中硬编码：
