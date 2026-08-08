@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import platform
-import shutil
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -39,7 +39,12 @@ from relcore.features.visual_encoder import (
 )
 from relcore.graph import build_graph, discover_prototypes
 from relcore.schemas import ClipRecord, EdgeTable, GraphData
-from relcore.scoring import compute_reliability, normalize_reliability_metrics
+from relcore.scoring import (
+    RELIABILITY_METRICS,
+    compute_reliability,
+    normalize_reliability_metrics,
+    reliability_metric_mask,
+)
 from relcore.selection.greedy import ExactGreedySelector, SelectionResult
 from relcore.selection.multibranch import MultiBranchSelector
 from relcore.selection.objective import (
@@ -73,9 +78,19 @@ def _output_root(config: Mapping[str, Any], output_dir: str | Path | None) -> Pa
     ).expanduser()
 
 
-def selection_directory_name(ratio: float) -> str:
+def graph_directory_name(reliability_metrics: Sequence[str]) -> str:
+    return f"graph-{reliability_metric_mask(reliability_metrics)}"
+
+
+def selection_directory_name(
+    reliability_metrics: Sequence[str],
+    ratio: float | None = None,
+) -> str:
+    prefix = f"select-{reliability_metric_mask(reliability_metrics)}"
+    if ratio is None:
+        return prefix
     percent_tag = format(float(ratio) * 100.0, ".12g").replace(".", "p")
-    return f"select-top{percent_tag}pct"
+    return f"{prefix}-top{percent_tag}pct"
 
 
 def _tasks_hash(config: Mapping[str, Any]) -> str:
@@ -88,6 +103,7 @@ def _fingerprint(
     config: Mapping[str, Any],
     sections: tuple[str, ...],
     upstream: str = "",
+    parameters: Mapping[str, Any] | None = None,
 ) -> str:
     stage_config = {
         section: (
@@ -99,25 +115,31 @@ def _fingerprint(
     }
     if stage in {"encode", "graph", "select"}:
         stage_config["seed"] = config["seed"]
-    return stable_hash(
-        {
-            "version": __version__,
-            "stage": stage,
-            "adapter": adapter.fingerprint(),
-            "tasks": _tasks_hash(config),
-            "config": stage_config,
-            "upstream": upstream,
-        }
-    )
+    payload = {
+        "version": __version__,
+        "stage": stage,
+        "adapter": adapter.fingerprint(),
+        "tasks": _tasks_hash(config),
+        "config": stage_config,
+        "upstream": upstream,
+    }
+    if parameters:
+        payload["parameters"] = dict(parameters)
+    return stable_hash(payload)
 
 
-def _total_fingerprint(adapter: DatasetAdapter, config: Mapping[str, Any]) -> str:
+def _total_fingerprint(
+    adapter: DatasetAdapter,
+    config: Mapping[str, Any],
+    reliability_metrics: Sequence[str],
+) -> str:
     return stable_hash(
         {
             "version": __version__,
             "adapter": adapter.fingerprint(),
             "tasks": _tasks_hash(config),
             "config": config,
+            "reliability_metrics": list(normalize_reliability_metrics(reliability_metrics)),
         }
     )
 
@@ -451,8 +473,11 @@ def graph_stage(
     output_dir: str | Path | None = None,
     force: bool = False,
     visual_encoder: VisualEncoder | None = None,
+    reliability_metrics: Sequence[str] = RELIABILITY_METRICS,
 ) -> tuple[Path, DatasetAdapter, list[ClipRecord], GraphData, str]:
     resolved = resolve_config(config)
+    metrics = normalize_reliability_metrics(reliability_metrics)
+    metric_mask = reliability_metric_mask(metrics)
     seed_everything(int(resolved["seed"]))
     root, adapter, encoded = encode_stage(
         resolved,
@@ -466,8 +491,9 @@ def graph_stage(
         resolved,
         ("quality", "prototypes", "graph"),
         encoded.fingerprint,
+        parameters={"reliability_metrics": metrics},
     )
-    destination = root / "graph"
+    destination = root / graph_directory_name(metrics)
 
     def build(temporary: Path) -> None:
         started = time.perf_counter()
@@ -483,7 +509,7 @@ def graph_stage(
             noop_threshold=float(quality_config["noop_threshold"]),
             gripper_action_index=int(quality_config["gripper_action_index"]),
             min_reliability=float(quality_config["min_reliability"]),
-            reliability_metrics=quality_config["reliability_metrics"],
+            reliability_metrics=metrics,
         )
         prototype_config = resolved["prototypes"]
         prototypes = discover_prototypes(
@@ -526,6 +552,10 @@ def graph_stage(
             {
                 "status": "complete",
                 "fingerprint": fingerprint,
+                "upstream_fingerprint": encoded.fingerprint,
+                "stage_directory": destination.name,
+                "reliability_metrics": list(metrics),
+                "reliability_mask": metric_mask,
                 "nodes": len(graph.sample_ids),
                 "sequence_edges": len(graph.sequence_edges.source),
                 "similarity_edges": len(graph.similarity_edges.source),
@@ -643,6 +673,7 @@ def _selection_rows(
     graph: GraphData,
     result: SelectionResult,
     context: ObjectiveContext,
+    reliability_metrics: Sequence[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     final_state = context.state_from_indices(result.selected_indices)
     selected_position = {index: position for position, index in enumerate(result.selected_indices)}
@@ -693,7 +724,7 @@ def _selection_rows(
         "number_of_clips": len(clips),
         "selected_clips": len(result.selected_indices),
         "selection_ratio": len(result.selected_indices) / len(clips),
-        "reliability_metrics": list(config["quality"]["reliability_metrics"]),
+        "reliability_metrics": list(normalize_reliability_metrics(reliability_metrics)),
         "objective": asdict(breakdown),
         "prototype_coverage": {
             str(index): float(value) for index, value in enumerate(final_state.prototype_coverage)
@@ -710,8 +741,11 @@ def select_stage(
     force: bool = False,
     visual_encoder: VisualEncoder | None = None,
     selection_output_ratio: float | None = None,
+    reliability_metrics: Sequence[str] = RELIABILITY_METRICS,
 ) -> Path:
     resolved = resolve_config(config)
+    metrics = normalize_reliability_metrics(reliability_metrics)
+    metric_mask = reliability_metric_mask(metrics)
     scoped_ratio = (
         float(selection_output_ratio) if selection_output_ratio is not None else None
     )
@@ -723,6 +757,7 @@ def select_stage(
         output_dir=output_dir,
         force=force,
         visual_encoder=visual_encoder,
+        reliability_metrics=metrics,
     )
     resolved["output"]["directory"] = str(root)
     fingerprint = _fingerprint(
@@ -732,14 +767,27 @@ def select_stage(
         ("objective", "selection", "seed"),
         graph_fingerprint,
     )
-    destination = root / (
-        selection_directory_name(scoped_ratio) if scoped_ratio is not None else "select"
-    )
+    graph_directory = graph_directory_name(metrics)
+    selection_directory = selection_directory_name(metrics, scoped_ratio)
+    destination = root / selection_directory
+    stage_directories = {
+        "scan": "scan",
+        "encode": "encode",
+        "graph": graph_directory,
+        "select": selection_directory,
+    }
 
     def build(temporary: Path) -> None:
         started = time.perf_counter()
         result, branch_results, context, quotas = _select(resolved, graph)
-        selected_rows, all_rows, report = _selection_rows(resolved, clips, graph, result, context)
+        selected_rows, all_rows, report = _selection_rows(
+            resolved,
+            clips,
+            graph,
+            result,
+            context,
+            metrics,
+        )
         report["quota_mode"] = str(resolved["selection"]["quota_mode"])
         report["task_quotas"] = (
             {str(task): value for task, value in quotas.items()} if quotas is not None else None
@@ -768,14 +816,14 @@ def select_stage(
         scan_manifest = json.loads((root / "scan" / "manifest.json").read_text(encoding="utf-8"))
         report["number_of_episodes"] = int(scan_manifest["episodes"])
         report["skipped_short_episodes"] = scan_manifest.get("skipped_short_episodes", [])
-        report["runtime_seconds"] = {
-            stage: float(
-                json.loads((root / stage / "manifest.json").read_text(encoding="utf-8")).get(
+        report["runtime_seconds"] = {}
+        for stage in ("scan", "encode", "graph"):
+            stage_manifest = root / stage_directories[stage] / "manifest.json"
+            report["runtime_seconds"][stage] = float(
+                json.loads(stage_manifest.read_text(encoding="utf-8")).get(
                     "runtime_seconds", 0.0
                 )
             )
-            for stage in ("scan", "encode", "graph")
-        }
         report["runtime_seconds"]["select"] = time.perf_counter() - started
         write_selection_outputs(
             temporary,
@@ -788,12 +836,16 @@ def select_stage(
             {
                 "status": "complete",
                 "fingerprint": fingerprint,
+                "upstream_fingerprint": graph_fingerprint,
+                "stage_directory": selection_directory,
+                "reliability_metrics": list(metrics),
+                "reliability_mask": metric_mask,
                 "selected_clips": len(result.selected_indices),
                 "budget": len(result.selected_indices),
             },
         )
 
-    built = publish_stage(
+    publish_stage(
         destination,
         fingerprint=fingerprint,
         required=(
@@ -805,24 +857,22 @@ def select_stage(
         resume=bool(resolved["runtime"].get("resume", True)),
         build=build,
     )
-    if scoped_ratio is None:
-        for name in ("selected_manifest.jsonl", "all_clips.parquet", "selection_report.json"):
-            target = root / name
-            source = destination / name
-            if built or not target.is_file() or file_sha256(target) != file_sha256(source):
-                shutil.copy2(destination / name, target)
-        write_json(
-            root / "run_manifest.json",
-            {
-                "status": "complete",
-                "fingerprint": _total_fingerprint(adapter, resolved),
-                "stage_fingerprints": {
-                    stage: _manifest_fingerprint(root / stage / "manifest.json")
-                    for stage in ("scan", "encode", "graph", "select")
-                },
+    write_json(
+        destination / "run_manifest.json",
+        {
+            "status": "complete",
+            "fingerprint": _total_fingerprint(adapter, resolved, metrics),
+            "reliability_metrics": list(metrics),
+            "reliability_mask": metric_mask,
+            "selection_output_ratio": scoped_ratio,
+            "stage_directories": stage_directories,
+            "stage_fingerprints": {
+                stage: _manifest_fingerprint(root / directory / "manifest.json")
+                for stage, directory in stage_directories.items()
             },
-        )
-    return root
+        },
+    )
+    return destination
 
 
 def run_pipeline(
@@ -831,6 +881,8 @@ def run_pipeline(
     output_dir: str | Path | None = None,
     force: bool = False,
     visual_encoder: VisualEncoder | None = None,
+    selection_output_ratio: float | None = None,
+    reliability_metrics: Sequence[str] = RELIABILITY_METRICS,
 ) -> Path:
     resolved = resolve_config(config)
     root = _output_root(resolved, output_dir)
@@ -840,6 +892,8 @@ def run_pipeline(
         output_dir=root,
         force=force,
         visual_encoder=visual_encoder,
+        selection_output_ratio=selection_output_ratio,
+        reliability_metrics=reliability_metrics,
     )
     result.mkdir(parents=True, exist_ok=True)
     (result / "resolved_config.yaml").write_text(
@@ -861,12 +915,13 @@ def validate_output(
     *,
     config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    root = Path(output_dir).expanduser()
+    result = Path(output_dir).expanduser()
+    root = result.parent
     required = (
-        root / "selected_manifest.jsonl",
-        root / "all_clips.parquet",
-        root / "selection_report.json",
-        root / "run_manifest.json",
+        result / "selected_manifest.jsonl",
+        result / "all_clips.parquet",
+        result / "selection_report.json",
+        result / "run_manifest.json",
     )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
@@ -874,9 +929,37 @@ def validate_output(
     run_manifest = json.loads(required[3].read_text(encoding="utf-8"))
     if run_manifest.get("status") != "complete":
         raise ValueError("run is not complete")
+    recorded_metrics = run_manifest.get("reliability_metrics")
+    try:
+        metrics = normalize_reliability_metrics(recorded_metrics)
+    except ValueError as error:
+        raise ValueError(f"run manifest reliability_metrics {error}") from error
+    if list(metrics) != recorded_metrics:
+        raise ValueError("run manifest reliability_metrics are not in canonical order")
+    metric_mask = reliability_metric_mask(metrics)
+    if int(run_manifest.get("reliability_mask", -1)) != metric_mask:
+        raise ValueError("run manifest reliability_mask does not match reliability_metrics")
+    scoped_ratio = run_manifest.get("selection_output_ratio")
+    if scoped_ratio is not None:
+        try:
+            scoped_ratio = float(scoped_ratio)
+        except (TypeError, ValueError) as error:
+            raise ValueError("run manifest selection_output_ratio is invalid") from error
+    expected_directories = {
+        "scan": "scan",
+        "encode": "encode",
+        "graph": graph_directory_name(metrics),
+        "select": selection_directory_name(metrics, scoped_ratio),
+    }
+    stage_directories = run_manifest.get("stage_directories")
+    if stage_directories != expected_directories:
+        raise ValueError("run manifest stage_directories do not match reliability parameters")
+    if result.name != expected_directories["select"]:
+        raise ValueError("selection output directory does not match reliability parameters")
+    stage_paths = {stage: root / directory for stage, directory in expected_directories.items()}
     stage_manifests: dict[str, dict[str, Any]] = {}
     for stage in ("scan", "encode", "graph", "select"):
-        manifest_path = root / stage / "manifest.json"
+        manifest_path = stage_paths[stage] / "manifest.json"
         if not manifest_path.is_file():
             raise ValueError(f"missing stage manifest: {manifest_path}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -911,14 +994,30 @@ def validate_output(
         ),
     }
     for stage, names in stage_required.items():
-        if not cache_is_valid(root / stage, str(stage_manifests[stage]["fingerprint"]), names):
+        if not cache_is_valid(
+            stage_paths[stage],
+            str(stage_manifests[stage]["fingerprint"]),
+            names,
+        ):
             raise ValueError(f"missing stage artifact or invalid cache index: {stage}")
         recorded = run_manifest.get("stage_fingerprints", {}).get(stage)
         if recorded != stage_manifests[stage]["fingerprint"]:
             raise ValueError(f"run/stage fingerprint mismatch: {stage}")
-    for name in ("selected_manifest.jsonl", "all_clips.parquet", "selection_report.json"):
-        if file_sha256(root / name) != file_sha256(root / "select" / name):
-            raise ValueError(f"published output does not match select artifact: {name}")
+    expected_upstreams = {
+        "graph": stage_manifests["encode"]["fingerprint"],
+        "select": stage_manifests["graph"]["fingerprint"],
+    }
+    for stage, expected_upstream in expected_upstreams.items():
+        if stage_manifests[stage].get("upstream_fingerprint") != expected_upstream:
+            raise ValueError(f"{stage} manifest upstream_fingerprint mismatch")
+    for stage in ("graph", "select"):
+        manifest = stage_manifests[stage]
+        if manifest.get("reliability_metrics") != list(metrics):
+            raise ValueError(f"{stage} manifest reliability_metrics mismatch")
+        if int(manifest.get("reliability_mask", -1)) != metric_mask:
+            raise ValueError(f"{stage} manifest reliability_mask mismatch")
+        if manifest.get("stage_directory") != expected_directories[stage]:
+            raise ValueError(f"{stage} manifest stage_directory mismatch")
     selected_rows = [
         json.loads(line)
         for line in required[0].read_text(encoding="utf-8").splitlines()
@@ -933,6 +1032,8 @@ def validate_output(
         raise ValueError(f"selection report reliability_metrics {error}") from error
     if reported_metrics != normalized_reported_metrics:
         raise ValueError("selection report reliability_metrics are not in canonical order")
+    if tuple(normalized_reported_metrics) != metrics:
+        raise ValueError("selection report reliability_metrics do not match the run manifest")
     if [row["sample_id"] for row in all_rows] != sorted(row["sample_id"] for row in all_rows):
         raise ValueError("all_clips.parquet is not sorted by sample_id")
     if len({row["sample_id"] for row in selected_rows}) != len(selected_rows):
@@ -1004,10 +1105,6 @@ def validate_output(
         raise ValueError(f"unknown selection quota mode: {quota_mode}")
     if config is not None:
         resolved = resolve_config(config)
-        if normalized_reported_metrics != resolved["quality"]["reliability_metrics"]:
-            raise ValueError(
-                "selection report reliability_metrics do not match the supplied config"
-            )
         resolved["output"]["directory"] = str(root)
         adapter = create_dataset(resolved["dataset"])
         expected_scan = _fingerprint(
@@ -1029,6 +1126,7 @@ def validate_output(
             resolved,
             ("quality", "prototypes", "graph"),
             expected_encode,
+            parameters={"reliability_metrics": metrics},
         )
         expected_select = _fingerprint(
             "select",
@@ -1044,10 +1142,10 @@ def validate_output(
             "select": expected_select,
         }
         for stage, expected in expected_stages.items():
-            actual = _manifest_fingerprint(root / stage / "manifest.json")
+            actual = _manifest_fingerprint(stage_paths[stage] / "manifest.json")
             if actual != expected:
                 raise ValueError(f"{stage} fingerprint does not match the supplied config")
-        if run_manifest.get("fingerprint") != _total_fingerprint(adapter, resolved):
+        if run_manifest.get("fingerprint") != _total_fingerprint(adapter, resolved, metrics):
             raise ValueError("run fingerprint does not match the supplied config")
         if len(selected_rows) != _selection_budget(resolved, len(all_rows)):
             raise ValueError("selected manifest count does not match the configured budget")

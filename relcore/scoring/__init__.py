@@ -5,6 +5,7 @@ from .reliability import (
     ReliabilityResult,
     compute_reliability,
     normalize_reliability_metrics,
+    reliability_metric_mask,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "ReliabilityResult",
     "compute_reliability",
     "normalize_reliability_metrics",
+    "reliability_metric_mask",
 ]

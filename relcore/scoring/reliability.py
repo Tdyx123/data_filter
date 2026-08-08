@@ -34,6 +34,16 @@ def normalize_reliability_metrics(metrics: Sequence[str]) -> tuple[str, ...]:
     return tuple(metric for metric in RELIABILITY_METRICS if metric in selected)
 
 
+def reliability_metric_mask(metrics: Sequence[str]) -> int:
+    """Encode enabled metrics using the canonical [8, 4, 2, 1] bit order."""
+    enabled = set(normalize_reliability_metrics(metrics))
+    return sum(
+        1 << (len(RELIABILITY_METRICS) - index - 1)
+        for index, metric in enumerate(RELIABILITY_METRICS)
+        if metric in enabled
+    )
+
+
 @dataclass(frozen=True)
 class ReliabilityResult:
     reliability: np.ndarray

@@ -10,13 +10,14 @@ from typing import Sequence
 from .config import load_config
 from .pipeline import (
     encode_stage,
+    graph_directory_name,
     graph_stage,
     run_pipeline,
     scan_stage,
     select_stage,
-    selection_directory_name,
     validate_output,
 )
+from .scoring import RELIABILITY_METRICS, normalize_reliability_metrics
 
 
 def _selection_ratio(value: str) -> float:
@@ -29,6 +30,18 @@ def _selection_ratio(value: str) -> float:
     return ratio
 
 
+def _reliability_metrics(value: str) -> tuple[str, ...]:
+    parts = value.split(",")
+    if any(not part.strip() for part in parts):
+        raise argparse.ArgumentTypeError(
+            "reliability metrics must be a comma-separated list of metric names"
+        )
+    try:
+        return normalize_reliability_metrics(tuple(part.strip() for part in parts))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"reliability metrics {error}") from error
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="LeRobot relational coreset selection")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -39,6 +52,14 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--output-dir", default=None)
         child.add_argument("--max-episodes", type=int, default=None)
         child.add_argument("--force", action="store_true")
+        if command in {"build-graph", "select", "run"}:
+            child.add_argument(
+                "--reliability-metrics",
+                type=_reliability_metrics,
+                default=RELIABILITY_METRICS,
+                metavar="NAMES",
+                help="comma-separated subset of support,progress,smoothness,non_noop",
+            )
         if command in {"select", "run"}:
             child.add_argument(
                 "--selection-ratio",
@@ -74,24 +95,34 @@ def main(argv: Sequence[str] | None = None) -> None:
         root, _, artifact = encode_stage(config, output_dir=args.output_dir, force=args.force)
         print(f"relcore_output={root} clips={len(artifact.clips)}")
     elif args.command == "build-graph":
-        root, _, _, graph, _ = graph_stage(config, output_dir=args.output_dir, force=args.force)
-        print(f"relcore_output={root} nodes={len(graph.sample_ids)}")
+        root, _, _, graph, _ = graph_stage(
+            config,
+            output_dir=args.output_dir,
+            force=args.force,
+            reliability_metrics=args.reliability_metrics,
+        )
+        print(
+            f"relcore_output={root / graph_directory_name(args.reliability_metrics)} "
+            f"nodes={len(graph.sample_ids)}"
+        )
     elif args.command == "select":
-        root = select_stage(
+        result = select_stage(
             config,
             output_dir=args.output_dir,
             force=args.force,
             selection_output_ratio=args.selection_ratio,
-        )
-        result = (
-            root / selection_directory_name(args.selection_ratio)
-            if args.selection_ratio is not None
-            else root
+            reliability_metrics=args.reliability_metrics,
         )
         print(f"relcore_output={result}")
     else:
-        root = run_pipeline(config, output_dir=args.output_dir, force=args.force)
-        print(f"relcore_output={root}")
+        result = run_pipeline(
+            config,
+            output_dir=args.output_dir,
+            force=args.force,
+            selection_output_ratio=args.selection_ratio,
+            reliability_metrics=args.reliability_metrics,
+        )
+        print(f"relcore_output={result}")
 
 
 if __name__ == "__main__":

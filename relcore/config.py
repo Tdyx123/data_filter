@@ -9,9 +9,6 @@ from typing import Any
 
 import yaml
 
-from relcore.scoring import RELIABILITY_METRICS, normalize_reliability_metrics
-
-
 DEFAULT_CONFIG: dict[str, Any] = {
     "seed": 42,
     "dataset": {
@@ -50,7 +47,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "noop_threshold": 1.0e-4,
         "gripper_action_index": -1,
         "min_reliability": 0.05,
-        "reliability_metrics": list(RELIABILITY_METRICS),
     },
     "prototypes": {
         "count": 64,
@@ -108,6 +104,11 @@ def _merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    configured_quality = config.get("quality")
+    if isinstance(configured_quality, Mapping) and "reliability_metrics" in configured_quality:
+        raise ValueError(
+            "quality.reliability_metrics was removed; use --reliability-metrics instead"
+        )
     resolved = _merge(DEFAULT_CONFIG, config)
     if resolved["dataset"].get("empty_task_policy") not in {"error", "exclude"}:
         raise ValueError("dataset.empty_task_policy must be error or exclude")
@@ -132,12 +133,6 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if int(resolved["visual"].get("batch_size", 1)) <= 0:
         raise ValueError("visual.batch_size must be positive")
     quality = resolved["quality"]
-    try:
-        quality["reliability_metrics"] = list(
-            normalize_reliability_metrics(quality["reliability_metrics"])
-        )
-    except ValueError as error:
-        raise ValueError(f"quality.reliability_metrics {error}") from error
     if int(quality["knn"]) <= 0 or float(quality["noop_threshold"]) < 0:
         raise ValueError("quality knn/noop_threshold configuration is invalid")
     if (

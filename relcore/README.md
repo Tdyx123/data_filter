@@ -23,16 +23,27 @@ python -m relcore encode --config relcore/config_libero90.yaml
 python -m relcore build-graph --config relcore/config_libero90.yaml
 python -m relcore select --config relcore/config_libero90.yaml
 python -m relcore run --config relcore/config_libero90.yaml
-python -m relcore validate --output-dir outputs/relcore/libero90 \
+python -m relcore validate --output-dir outputs/relcore/libero90/select-15 \
   --config relcore/config_libero90.yaml
 ```
+
+默认启用全部四项可靠性指标，因此 graph 和最终结果分别位于 `graph-15/` 与
+`select-15/`。`build-graph`、`select` 和 `run` 可通过逗号分隔参数选择指标：
+
+```bash
+python -m relcore run --config relcore/config_libero90.yaml \
+  --reliability-metrics progress,non_noop
+```
+
+上述结果使用掩码 5，位于 `graph-5/` 和 `select-5/`，并与默认结果共享同一份
+`scan/`、`encode/` 和逐 episode CLIP 帧特征缓存。
 
 `select` 和 `run` 可通过 `--selection-ratio` 在调用时设置筛选比例，取值范围为
 `(0, 1]`。命令行比例会覆盖配置中的 `selection.ratio`，并忽略固定的
 `selection.budget`；未传该参数时仍完全使用配置文件中的比例或固定预算。
 
-显式设置比例的 `select` 会把结果写入共享输出根目录下的比例目录，因此可复用同一份
-scan、encode 和 graph，且不同筛选比例不需要 `--force` 即可并存。例如：
+显式设置比例会在指标掩码后追加比例，因此不同指标和筛选比例无需 `--force` 即可并存。
+例如默认四项指标下：
 
 ```bash
 python -m relcore select --config relcore/config_libero90.yaml \
@@ -41,52 +52,52 @@ python -m relcore select --config relcore/config_libero90.yaml \
   --selection-ratio 0.20
 ```
 
-上述结果分别位于 `outputs/relcore/libero90/select-top10pct/` 和
-`outputs/relcore/libero90/select-top20pct/`；12.5% 使用 `select-top12p5pct/`。
+上述结果分别位于 `outputs/relcore/libero90/select-15-top10pct/` 和
+`outputs/relcore/libero90/select-15-top20pct/`；12.5% 使用
+`select-15-top12p5pct/`。
 比例目录包含 `manifest.json`、`selected_manifest.jsonl`、`all_clips.parquet` 和
-`selection_report.json`。此模式不会更新输出根目录的同名结果文件或
-`run_manifest.json`，命令打印的 `relcore_output=` 直接指向本次比例目录。同一比例
-目录的配置发生不兼容变化时仍需传 `--force`。
+`selection_report.json`，同时保存 `run_manifest.json`。命令打印的
+`relcore_output=` 直接指向本次选择目录。同一指标掩码和比例目录的其他配置发生
+不兼容变化时仍需传 `--force`。
 
-`run --selection-ratio` 保持原有的单结果根目录布局。例如筛选 20% 的候选片段：
+`run --selection-ratio` 使用相同的隔离布局。例如筛选 20% 的候选片段：
 
 ```bash
 python -m relcore run --config relcore/config_libero90.yaml \
   --selection-ratio 0.20 --force
 ```
 
-`validate` 当前只验证未使用比例后缀的传统根目录结果，不接受
-`select-topXpct/` 比例目录。
+`validate` 接受具体的 `select-<mask>/` 或 `select-<mask>-topXpct/` 目录，并从其中的
+manifest 定位共享输出根目录下的 scan、encode 和匹配的 graph。
 
 ## 可靠性指标
 
-`quality.reliability_metrics` 控制合成可靠性使用哪些组成指标。默认配置显式启用
-全部四项：
-
-```yaml
-quality:
-  reliability_metrics: [support, progress, smoothness, non_noop]
-```
+可靠性指标是独立的 CLI/Python API 参数，不属于 YAML quality 配置。未传
+`--reliability-metrics` 时默认启用全部四项：
 
 - `support`：关系嵌入的 KNN 邻域支持度；
 - `progress`：末端状态、夹爪状态和视觉变化组成的进展分数；
 - `smoothness`：根据动作 jerk 得到的平滑度；
 - `non_noop`：有效动作比例，即 `1 - noop_ratio`。
 
-列表必须非空、不能重复且只能包含上述名称；书写顺序不会影响结果，解析后的配置按
-上述固定顺序保存。每项沿用固定指数：`support`、`progress`、`non_noop` 为 `0.5`，
+列表必须非空、不能重复且只能包含上述名称；书写顺序不会影响结果，解析后按上述固定
+顺序保存。每项沿用固定指数：`support`、`progress`、`non_noop` 为 `0.5`，
 `smoothness` 为 `0.25`。禁用某项时直接省略对应因子，不重新归一化剩余指数，因此
 启用项较少时合成可靠性可能整体升高。例如只使用任务进展和有效动作：
 
-```yaml
-quality:
-  reliability_metrics: [progress, non_noop]
+```bash
+python -m relcore run --config relcore/config_libero90.yaml \
+  --reliability-metrics progress,non_noop
 ```
 
-四个原始分量始终计算并保存在 `graph/nodes.npz`，但只有配置子集合成的单一
+固定位序为 `[support, progress, smoothness, non_noop]`，对应二进制权重
+`[8, 4, 2, 1]`。例如仅 `non_noop` 的后缀为 1，`progress,non_noop` 为 5，全部启用为
+15。旧配置若仍包含 `quality.reliability_metrics` 会明确报错并提示迁移到 CLI 参数。
+
+四个原始分量始终计算并保存在 `graph-<mask>/nodes.npz`，但只有参数子集合成的单一
 `reliability` 用于建图、目标函数、种子和候选选择。实际生效列表写入
-`selection_report.json`。修改列表会使 graph 和 select 阶段指纹失效；对已有输出重跑
-时需要 `--force`，scan、encode 和 CLIP 帧特征缓存仍可复用。
+`selection_report.json`。不同指标集合写入不同 graph/select 目录，无需 `--force`；
+scan、encode 和 CLIP 帧特征缓存仍可复用。
 
 各阶段用数据、相关配置和上游 artifact 指纹恢复；已有不兼容阶段必须显式传
 `--force`。兼容的上游阶段即使在 `--force` 下也会复用，因此只修改预算或分支参数
@@ -119,7 +130,7 @@ python -m relcore scan --config relcore/config_bridge.yaml
 CUDA_VISIBLE_DEVICES=0 python -m relcore encode --config relcore/config_bridge.yaml
 CUDA_VISIBLE_DEVICES=0 python -m relcore run --config relcore/config_bridge.yaml
 python -m relcore validate \
-  --output-dir outputs/relcore/bridge_orig_1.0.0_top10pct \
+  --output-dir outputs/relcore/bridge_orig_1.0.0_top10pct/select-15 \
   --config relcore/config_bridge.yaml
 ```
 
@@ -155,7 +166,7 @@ TRAJECTORY_DATA_NUM_THREADS=4 python -m relcore select \
   --output-dir /data/dwb/libero_filter/relcore
 ```
 
-该命令的筛选结果位于 `/data/dwb/libero_filter/relcore/select-top30pct/`。
+该命令的筛选结果位于 `/data/dwb/libero_filter/relcore/select-15-top30pct/`。
 
 在尚未包含该启动保护的旧版本上，可用下面的等价命令临时规避；四个变量必须在
 启动 Python 前设置：
@@ -173,19 +184,19 @@ NUMEXPR_NUM_THREADS=1 python -m relcore select \
 窗口固定长度 15、stride 15，并与 SQCN 一样追加末尾对齐窗口；不足 15 帧的 episode
 跳过。只有边界严格相邻的窗口才建立时序边，重叠的尾部窗口不会伪造时序关系。
 
-未显式传入 `select --selection-ratio` 时，最终输出位于配置的
-`output.directory`：
+共享输出根目录始终保留 `scan/`、`encode/` 和一个或多个 `graph-<mask>/`。最终结果
+位于 `select-<mask>/`；显式传入 `--selection-ratio` 时位于
+`select-<mask>-topXpct/`。每个选择目录包含：
 
 - `selected_manifest.jsonl`：按选择顺序记录 LeRobot `episode_id` 与 inclusive
   `start_step/end_step`；
 - `all_clips.parquet`：全部候选、可靠性、原型、选择状态和最终边际；
 - `selection_report.json`：目标分解、实际任务计数、可选任务额度和分支结果；
-- `run_manifest.json`：数据、任务元数据、完整配置和阶段指纹；
-- `scan/ encode/ graph/ select/`：可检查、可恢复的阶段 artifact，其中逐 episode
-  CLIP 帧特征保存在 `encode/frame_features/`。
+- `run_manifest.json`：可靠性指标、掩码、阶段目录和阶段指纹；
+- `resolved_config.yaml`、`environment.json`：`run` 写入的配置与运行环境。
 
-显式传入 `select --selection-ratio` 时，scan、encode 和 graph 仍位于同一输出根目录，
-selection artifact 与三份结果文件改为位于对应的 `select-topXpct/`，不再发布到根目录。
+逐 episode CLIP 帧特征保存在共享的 `encode/frame_features/`。输出根目录不再发布
+`selected_manifest.jsonl` 等“最后一次运行”副本，因此不同指标组合不会互相覆盖。
 
 `selected_manifest.jsonl` 使用 `sample_id`、`episode_id`、`task_index`、`task_name`、
 inclusive `start_step/end_step` 定位原始 LeRobot 数据。`all_clips.parquet` 区分插入

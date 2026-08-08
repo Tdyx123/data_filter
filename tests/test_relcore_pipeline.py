@@ -18,7 +18,6 @@ from relcore.pipeline import (
     run_pipeline,
     scan_stage,
     select_stage,
-    selection_directory_name,
     validate_output,
 )
 from relcore.utils.io import publish_stage, write_json
@@ -180,19 +179,22 @@ def test_run_pipeline_publishes_aligned_outputs_and_reuses_complete_cache(
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     config = _config(tmp_path)
 
-    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    root = Path(config["output"]["directory"])
 
-    assert root == Path(config["output"]["directory"])
+    assert result == root / "select-15"
     assert (root / "scan" / "manifest.json").is_file()
     assert (root / "encode" / "manifest.json").is_file()
-    assert (root / "graph" / "manifest.json").is_file()
-    assert (root / "select" / "manifest.json").is_file()
-    assert (root / "run_manifest.json").is_file()
+    assert (root / "graph-15" / "manifest.json").is_file()
+    assert (result / "manifest.json").is_file()
+    assert (result / "run_manifest.json").is_file()
+    assert (result / "resolved_config.yaml").is_file()
+    assert (result / "environment.json").is_file()
     manifest_rows = [
-        json.loads(line) for line in (root / "selected_manifest.jsonl").read_text().splitlines()
+        json.loads(line) for line in (result / "selected_manifest.jsonl").read_text().splitlines()
     ]
-    all_clips = pq.read_table(root / "all_clips.parquet").to_pylist()
-    report = json.loads((root / "selection_report.json").read_text())
+    all_clips = pq.read_table(result / "all_clips.parquet").to_pylist()
+    report = json.loads((result / "selection_report.json").read_text())
     assert len(manifest_rows) == 2
     assert len(all_clips) == 6
     assert {row["task_index"] for row in manifest_rows} == {0, 1}
@@ -213,12 +215,21 @@ def test_run_pipeline_publishes_aligned_outputs_and_reuses_complete_cache(
     assert report["local_search"]["accepted_swaps"] == 0
     assert all("marginal_gain" in row for row in manifest_rows)
 
-    first_mtime = (root / "selected_manifest.jsonl").stat().st_mtime_ns
-    cached = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
-    assert cached == root
-    assert (root / "selected_manifest.jsonl").stat().st_mtime_ns == first_mtime
+    run_manifest = json.loads((result / "run_manifest.json").read_text())
+    assert run_manifest["reliability_mask"] == 15
+    assert run_manifest["stage_directories"] == {
+        "scan": "scan",
+        "encode": "encode",
+        "graph": "graph-15",
+        "select": "select-15",
+    }
 
-    validation = validate_output(root, config=config)
+    first_mtime = (result / "selected_manifest.jsonl").stat().st_mtime_ns
+    cached = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    assert cached == result
+    assert (result / "selected_manifest.jsonl").stat().st_mtime_ns == first_mtime
+
+    validation = validate_output(result, config=config)
     assert validation["status"] == "valid"
     assert validation["selected_clips"] == 2
 
@@ -248,9 +259,10 @@ def test_scan_performs_the_numeric_pass_without_loading_images(tmp_path: Path):
 def test_force_rebuilds_only_changed_selection_stage(tmp_path: Path):
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     config = _config(tmp_path)
-    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    root = result.parent
     encode_mtime = (root / "encode" / "manifest.json").stat().st_mtime_ns
-    graph_mtime = (root / "graph" / "manifest.json").stat().st_mtime_ns
+    graph_mtime = (root / "graph-15" / "manifest.json").stat().st_mtime_ns
 
     changed = _config(tmp_path)
     changed["selection"]["budget"] = 4
@@ -258,49 +270,67 @@ def test_force_rebuilds_only_changed_selection_stage(tmp_path: Path):
     run_pipeline(changed, force=True, visual_encoder=PipelineVisualEncoder())
 
     assert (root / "encode" / "manifest.json").stat().st_mtime_ns == encode_mtime
-    assert (root / "graph" / "manifest.json").stat().st_mtime_ns == graph_mtime
-    report = json.loads((root / "selection_report.json").read_text())
+    assert (root / "graph-15" / "manifest.json").stat().st_mtime_ns == graph_mtime
+    report = json.loads((result / "selection_report.json").read_text())
     assert report["selected_clips"] == 4
     assert len(report["branches"]) == 3
 
 
-def test_reliability_metric_change_reuses_encode_and_rebuilds_graph_and_select(
+def test_reliability_metric_variants_share_encode_and_keep_graphs_and_selects(
     tmp_path: Path,
 ):
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     config = _config(tmp_path)
-    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
-    baseline_reliability = np.load(root / "graph" / "nodes.npz")["reliability"].copy()
-    mtimes = {
-        stage: (root / stage / "manifest.json").stat().st_mtime_ns
-        for stage in ("scan", "encode", "graph", "select")
-    }
+    root = Path(config["output"]["directory"])
+    all_metrics = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    encode_mtime = (root / "encode" / "manifest.json").stat().st_mtime_ns
+    baseline_reliability = np.load(root / "graph-15" / "nodes.npz")["reliability"].copy()
 
-    changed = _config(tmp_path)
-    changed["quality"]["reliability_metrics"] = ["progress"]
-    run_pipeline(changed, force=True, visual_encoder=PipelineVisualEncoder())
+    selected = run_pipeline(
+        config,
+        reliability_metrics=["non_noop", "progress"],
+        visual_encoder=PipelineVisualEncoder(),
+    )
 
-    assert (root / "scan" / "manifest.json").stat().st_mtime_ns == mtimes["scan"]
-    assert (root / "encode" / "manifest.json").stat().st_mtime_ns == mtimes["encode"]
-    assert (root / "graph" / "manifest.json").stat().st_mtime_ns != mtimes["graph"]
-    assert (root / "select" / "manifest.json").stat().st_mtime_ns != mtimes["select"]
-    nodes = np.load(root / "graph" / "nodes.npz")
+    assert all_metrics == root / "select-15"
+    assert selected == root / "select-5"
+    assert (root / "encode" / "manifest.json").stat().st_mtime_ns == encode_mtime
+    assert (root / "graph-15" / "manifest.json").is_file()
+    assert (root / "graph-5" / "manifest.json").is_file()
+    assert (root / "select-15" / "manifest.json").is_file()
+    assert (root / "select-5" / "manifest.json").is_file()
+    nodes = np.load(root / "graph-5" / "nodes.npz")
     assert not np.array_equal(nodes["reliability"], baseline_reliability)
-    np.testing.assert_allclose(nodes["reliability"], nodes["progress"] ** 0.5, rtol=1.0e-6)
-    report = json.loads((root / "selection_report.json").read_text())
-    assert report["reliability_metrics"] == ["progress"]
+    np.testing.assert_allclose(
+        nodes["reliability"],
+        nodes["progress"] ** 0.5 * np.maximum(1.0 - nodes["noop_ratio"], 0.0) ** 0.5,
+        rtol=1.0e-6,
+    )
+    graph_manifest = json.loads((root / "graph-5" / "manifest.json").read_text())
+    encode_manifest = json.loads((root / "encode" / "manifest.json").read_text())
+    assert graph_manifest["reliability_metrics"] == ["progress", "non_noop"]
+    assert graph_manifest["reliability_mask"] == 5
+    assert graph_manifest["upstream_fingerprint"] == encode_manifest["fingerprint"]
+    report = json.loads((selected / "selection_report.json").read_text())
+    assert report["reliability_metrics"] == ["progress", "non_noop"]
+    assert validate_output(selected, config=config)["status"] == "valid"
 
 
 def test_ratio_scoped_selects_coexist_and_preserve_shared_outputs(tmp_path: Path):
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     legacy_config = _config(tmp_path)
-    root = run_pipeline(legacy_config, visual_encoder=PipelineVisualEncoder())
+    default_result = run_pipeline(legacy_config, visual_encoder=PipelineVisualEncoder())
+    root = default_result.parent
     upstream_mtimes = {
-        stage: (root / stage / "manifest.json").stat().st_mtime_ns
-        for stage in ("scan", "encode", "graph")
+        stage: (root / directory / "manifest.json").stat().st_mtime_ns
+        for stage, directory in {
+            "scan": "scan",
+            "encode": "encode",
+            "graph": "graph-15",
+        }.items()
     }
     published = {
-        name: (root / name).read_bytes()
+        name: (default_result / name).read_bytes()
         for name in (
             "selected_manifest.jsonl",
             "all_clips.parquet",
@@ -320,15 +350,15 @@ def test_ratio_scoped_selects_coexist_and_preserve_shared_outputs(tmp_path: Path
         half_config,
         selection_output_ratio=0.5,
         visual_encoder=PipelineVisualEncoder(),
-    ) == root
+    ) == root / "select-15-top50pct"
     assert select_stage(
         full_config,
         selection_output_ratio=1.0,
         visual_encoder=PipelineVisualEncoder(),
-    ) == root
+    ) == root / "select-15-top100pct"
 
-    half_root = root / "select-top50pct"
-    full_root = root / "select-top100pct"
+    half_root = root / "select-15-top50pct"
+    full_root = root / "select-15-top100pct"
     assert json.loads((half_root / "manifest.json").read_text())["selected_clips"] == 3
     assert json.loads((full_root / "manifest.json").read_text())["selected_clips"] == 6
     for selection_root in (half_root, full_root):
@@ -339,11 +369,15 @@ def test_ratio_scoped_selects_coexist_and_preserve_shared_outputs(tmp_path: Path
             "selection_report.json",
         } <= {path.name for path in selection_root.iterdir()}
     assert {
-        stage: (root / stage / "manifest.json").stat().st_mtime_ns
-        for stage in ("scan", "encode", "graph")
+        stage: (root / directory / "manifest.json").stat().st_mtime_ns
+        for stage, directory in {
+            "scan": "scan",
+            "encode": "encode",
+            "graph": "graph-15",
+        }.items()
     } == upstream_mtimes
     assert {
-        name: (root / name).read_bytes()
+        name: (default_result / name).read_bytes()
         for name in published
     } == published
 
@@ -355,12 +389,11 @@ def test_ratio_scoped_select_reuses_matching_cache_and_requires_force_for_change
     config = _config(tmp_path)
     config["selection"]["budget"] = None
     config["selection"]["ratio"] = 0.5
-    root = select_stage(
+    selection_root = select_stage(
         config,
         selection_output_ratio=0.5,
         visual_encoder=PipelineVisualEncoder(),
     )
-    selection_root = root / selection_directory_name(0.5)
     first_mtime = (selection_root / "manifest.json").stat().st_mtime_ns
 
     select_stage(
@@ -423,20 +456,21 @@ def test_global_validation_rejects_a_mismatched_recorded_budget(tmp_path: Path) 
     config = _config(tmp_path)
     config["selection"]["quota_mode"] = "none"
     config["selection"]["minimum_per_task"] = 0
-    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
-    manifest_path = root / "select" / "manifest.json"
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    manifest_path = result / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["budget"] = 3
     write_json(manifest_path, manifest)
 
     with pytest.raises(ValueError, match="budget"):
-        validate_output(root)
+        validate_output(result)
 
 
 def test_seed_change_reuses_scan_but_rebuilds_randomized_stages(tmp_path: Path):
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     config = _config(tmp_path)
-    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    root = result.parent
     scan_mtime = (root / "scan" / "manifest.json").stat().st_mtime_ns
     encode_mtime = (root / "encode" / "manifest.json").stat().st_mtime_ns
 
@@ -462,51 +496,91 @@ def test_validate_rejects_a_config_with_different_selection_fingerprint(tmp_path
 def test_validate_rejects_noncanonical_reported_reliability_metrics(tmp_path: Path):
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     config = _config(tmp_path)
-    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
-    for report_path in (
-        root / "selection_report.json",
-        root / "select" / "selection_report.json",
-    ):
-        report = json.loads(report_path.read_text())
-        report["reliability_metrics"] = ["progress", "support"]
-        write_json(report_path, report)
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    report_path = result / "selection_report.json"
+    report = json.loads(report_path.read_text())
+    report["reliability_metrics"] = ["progress", "support"]
+    write_json(report_path, report)
 
     with pytest.raises(ValueError, match="reliability_metrics"):
-        validate_output(root)
+        validate_output(result)
 
 
-def test_validate_rejects_reported_reliability_metrics_that_differ_from_config(
+def test_validate_rejects_reliability_mask_that_differs_from_metrics(tmp_path: Path):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    manifest_path = result / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["reliability_mask"] = 5
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="reliability_mask"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_tampered_stage_directory(tmp_path: Path):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    manifest_path = result / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["stage_directories"]["graph"] = "graph-5"
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="stage_directories"):
+        validate_output(result)
+
+
+def test_validate_rejects_tampered_graph_metrics(tmp_path: Path):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    manifest_path = result.parent / "graph-15" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["reliability_metrics"] = ["progress"]
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="graph.*reliability_metrics"):
+        validate_output(result)
+
+
+@pytest.mark.parametrize(
+    ("stage", "directory"),
+    [("graph", "graph-15"), ("select", "select-15")],
+)
+def test_validate_rejects_tampered_upstream_fingerprint(
     tmp_path: Path,
+    stage: str,
+    directory: str,
 ):
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     config = _config(tmp_path)
-    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
-    for report_path in (
-        root / "selection_report.json",
-        root / "select" / "selection_report.json",
-    ):
-        report = json.loads(report_path.read_text())
-        report["reliability_metrics"] = ["progress"]
-        write_json(report_path, report)
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    manifest_path = result.parent / directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["upstream_fingerprint"] = "tampered"
+    write_json(manifest_path, manifest)
 
-    with pytest.raises(ValueError, match="reliability_metrics.*config"):
-        validate_output(root, config=config)
+    with pytest.raises(ValueError, match=f"{stage}.*upstream"):
+        validate_output(result)
 
 
 def test_validate_rejects_missing_stage_artifact(tmp_path: Path):
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     config = _config(tmp_path)
-    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
-    (root / "graph" / "sequence_edges.npz").unlink()
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    (result.parent / "graph-15" / "sequence_edges.npz").unlink()
 
     with pytest.raises(ValueError, match="missing stage artifact"):
-        validate_output(root, config=config)
+        validate_output(result, config=config)
 
 
 def test_missing_frame_feature_invalidates_encode_cache(tmp_path: Path):
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     config = _config(tmp_path)
-    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    root = result.parent
     (root / "encode" / "frame_features" / "ep000000.npy").unlink()
 
     with pytest.raises(FileExistsError, match="pass --force"):
@@ -522,7 +596,8 @@ def test_interrupted_encode_reuses_completed_episode_frame_cache(tmp_path: Path)
         run_pipeline(config, visual_encoder=interrupted)
 
     resumed = InterruptingVisualEncoder(fail_on_call=None)
-    root = run_pipeline(config, visual_encoder=resumed)
+    result = run_pipeline(config, visual_encoder=resumed)
+    root = result.parent
 
     assert interrupted.episode_lengths == [31, 31]
     assert resumed.episode_lengths == [31]
@@ -536,7 +611,8 @@ def test_interrupted_encode_reuses_completed_episode_frame_cache(tmp_path: Path)
 def test_damaged_frame_cache_reuses_valid_prefix_and_reencodes_suffix(tmp_path: Path):
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     config = _config(tmp_path)
-    root = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    root = result.parent
     cache_directories = list((root / ".relcore-cache" / "frame_features").iterdir())
     assert len(cache_directories) == 1
     with (cache_directories[0] / "ep000001.npy").open("r+b") as handle:
@@ -629,17 +705,18 @@ def test_cli_run_and_validate_use_exact_output_directory(tmp_path: Path, capsys)
             str(output),
         ]
     )
+    result = output / "select-15"
     main(
         [
             "validate",
             "--config",
             str(config_path),
             "--output-dir",
-            str(output),
+            str(result),
         ]
     )
 
-    assert (output / "selected_manifest.jsonl").is_file()
+    assert (result / "selected_manifest.jsonl").is_file()
     assert '"status": "valid"' in capsys.readouterr().out
 
 

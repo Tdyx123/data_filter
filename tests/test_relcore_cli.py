@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from relcore import cli
-from relcore.pipeline import selection_directory_name
+from relcore import pipeline
 
 
 @pytest.mark.parametrize("command", ["select", "run"])
@@ -30,19 +30,51 @@ def test_selection_ratio_rejects_invalid_values(value: str) -> None:
         cli.build_parser().parse_args(["run", "--selection-ratio", value])
 
 
+@pytest.mark.parametrize("command", ["build-graph", "select", "run"])
+def test_graph_commands_accept_reliability_metric_names(command: str) -> None:
+    arguments = cli.build_parser().parse_args(
+        [command, "--reliability-metrics", "non_noop,progress"]
+    )
+
+    assert arguments.reliability_metrics == ("progress", "non_noop")
+
+
+@pytest.mark.parametrize("command", ["scan", "encode"])
+def test_pregraph_commands_reject_reliability_metrics(command: str) -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            [command, "--reliability-metrics", "progress"]
+        )
+
+
 @pytest.mark.parametrize(
-    ("ratio", "expected"),
+    "value",
+    ["", "support,support", "support,unknown"],
+)
+def test_reliability_metrics_reject_invalid_values(value: str) -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["run", "--reliability-metrics", value])
+
+
+def test_graph_directory_name_uses_reliability_mask() -> None:
+    assert pipeline.graph_directory_name(["progress", "non_noop"]) == "graph-5"
+
+
+@pytest.mark.parametrize(
+    ("metrics", "ratio", "expected"),
     [
-        (0.20, "select-top20pct"),
-        (0.125, "select-top12p5pct"),
-        (1.0, "select-top100pct"),
+        (["support", "progress", "smoothness", "non_noop"], None, "select-15"),
+        (["progress", "non_noop"], 0.20, "select-5-top20pct"),
+        (["non_noop"], 0.125, "select-1-top12p5pct"),
+        (["support"], 1.0, "select-8-top100pct"),
     ],
 )
 def test_selection_directory_name_uses_canonical_percent_tag(
-    ratio: float,
+    metrics: list[str],
+    ratio: float | None,
     expected: str,
 ) -> None:
-    assert selection_directory_name(ratio) == expected
+    assert pipeline.selection_directory_name(metrics, ratio) == expected
 
 
 def test_main_select_ratio_scopes_output_and_reports_selection_directory(
@@ -63,12 +95,14 @@ def test_main_select_ratio_scopes_output_and_reports_selection_directory(
         output_dir: str | None,
         force: bool,
         selection_output_ratio: float | None,
+        reliability_metrics: tuple[str, ...],
     ) -> Path:
         received["config"] = copy.deepcopy(resolved)
         received["output_dir"] = output_dir
         received["force"] = force
         received["selection_output_ratio"] = selection_output_ratio
-        return Path("outputs/relcore/test")
+        received["reliability_metrics"] = reliability_metrics
+        return Path("outputs/relcore/test/select-5-top25pct")
 
     monkeypatch.setattr(cli, "select_stage", fake_selection_stage)
 
@@ -79,6 +113,8 @@ def test_main_select_ratio_scopes_output_and_reports_selection_directory(
             "unused.yaml",
             "--selection-ratio",
             "0.25",
+            "--reliability-metrics",
+            "progress,non_noop",
         ]
     )
 
@@ -87,12 +123,13 @@ def test_main_select_ratio_scopes_output_and_reports_selection_directory(
         "selection": {"ratio": 0.25, "budget": None},
     }
     assert received["selection_output_ratio"] == pytest.approx(0.25)
+    assert received["reliability_metrics"] == ("progress", "non_noop")
     assert capsys.readouterr().out.strip() == (
-        "relcore_output=outputs/relcore/test/select-top25pct"
+        "relcore_output=outputs/relcore/test/select-5-top25pct"
     )
 
 
-def test_main_run_ratio_keeps_legacy_output_layout(
+def test_main_run_ratio_reports_metric_and_ratio_scoped_output(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -109,9 +146,13 @@ def test_main_run_ratio_keeps_legacy_output_layout(
         *,
         output_dir: str | None,
         force: bool,
+        selection_output_ratio: float | None,
+        reliability_metrics: tuple[str, ...],
     ) -> Path:
         received["config"] = copy.deepcopy(resolved)
-        return Path("outputs/relcore/test")
+        received["selection_output_ratio"] = selection_output_ratio
+        received["reliability_metrics"] = reliability_metrics
+        return Path("outputs/relcore/test/select-15-top25pct")
 
     monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
 
@@ -129,10 +170,19 @@ def test_main_run_ratio_keeps_legacy_output_layout(
         "runtime": {"max_episodes": None},
         "selection": {"ratio": 0.25, "budget": None},
     }
-    assert capsys.readouterr().out.strip() == "relcore_output=outputs/relcore/test"
+    assert received["selection_output_ratio"] == pytest.approx(0.25)
+    assert received["reliability_metrics"] == (
+        "support",
+        "progress",
+        "smoothness",
+        "non_noop",
+    )
+    assert capsys.readouterr().out.strip() == (
+        "relcore_output=outputs/relcore/test/select-15-top25pct"
+    )
 
 
-def test_main_select_without_ratio_keeps_legacy_output_layout(
+def test_main_select_without_ratio_uses_default_metric_directory(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -150,10 +200,12 @@ def test_main_select_without_ratio_keeps_legacy_output_layout(
         output_dir: str | None,
         force: bool,
         selection_output_ratio: float | None,
+        reliability_metrics: tuple[str, ...],
     ) -> Path:
         received["config"] = copy.deepcopy(resolved)
         received["selection_output_ratio"] = selection_output_ratio
-        return Path("outputs/relcore/test")
+        received["reliability_metrics"] = reliability_metrics
+        return Path("outputs/relcore/test/select-15")
 
     monkeypatch.setattr(cli, "select_stage", fake_selection_stage)
 
@@ -161,7 +213,13 @@ def test_main_select_without_ratio_keeps_legacy_output_layout(
 
     assert received["config"] == config
     assert received["selection_output_ratio"] is None
-    assert capsys.readouterr().out.strip() == "relcore_output=outputs/relcore/test"
+    assert received["reliability_metrics"] == (
+        "support",
+        "progress",
+        "smoothness",
+        "non_noop",
+    )
+    assert capsys.readouterr().out.strip() == "relcore_output=outputs/relcore/test/select-15"
 
 
 def test_main_without_selection_ratio_preserves_configured_budget(
@@ -180,12 +238,17 @@ def test_main_without_selection_ratio_preserves_configured_budget(
         *,
         output_dir: str | None,
         force: bool,
+        selection_output_ratio: float | None,
+        reliability_metrics: tuple[str, ...],
     ) -> Path:
         received["config"] = copy.deepcopy(resolved)
-        return Path("outputs/relcore/test")
+        received["selection_output_ratio"] = selection_output_ratio
+        received["reliability_metrics"] = reliability_metrics
+        return Path("outputs/relcore/test/select-15")
 
     monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
 
     cli.main(["run", "--config", "unused.yaml"])
 
     assert received["config"] == config
+    assert received["selection_output_ratio"] is None

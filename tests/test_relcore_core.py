@@ -5,6 +5,7 @@ import random
 import numpy as np
 import pytest
 
+from relcore import scoring
 from relcore.data.index import build_clip_records, candidate_windows
 from relcore.config import resolve_config
 from relcore.features.normalization import RobustNormalizer
@@ -90,31 +91,27 @@ def test_config_locks_sqcn_windows_and_local_production_clip():
         resolve_config({"visual": {"model": "/tmp/another-clip"}})
 
 
-def test_config_defaults_and_canonicalizes_reliability_metrics():
-    expected = ["support", "progress", "smoothness", "non_noop"]
-
-    assert resolve_config({})["quality"]["reliability_metrics"] == expected
-    assert resolve_config(
-        {
-            "quality": {
-                "reliability_metrics": ["non_noop", "support", "smoothness"],
-            }
-        }
-    )["quality"]["reliability_metrics"] == ["support", "smoothness", "non_noop"]
-
-
 @pytest.mark.parametrize(
-    "metrics",
+    ("metrics", "expected"),
     [
-        [],
-        ["support", "support"],
-        ["support", "unknown"],
-        "support",
+        (["non_noop"], 1),
+        (["smoothness"], 2),
+        (["progress", "non_noop"], 5),
+        (["support", "progress", "smoothness", "non_noop"], 15),
+        (["non_noop", "progress"], 5),
     ],
 )
-def test_config_rejects_invalid_reliability_metrics(metrics):
-    with pytest.raises(ValueError, match="quality.reliability_metrics"):
-        resolve_config({"quality": {"reliability_metrics": metrics}})
+def test_reliability_metric_mask_uses_canonical_four_bit_order(metrics, expected):
+    assert scoring.reliability_metric_mask(metrics) == expected
+
+
+def test_config_has_no_reliability_metric_default():
+    assert "reliability_metrics" not in resolve_config({})["quality"]
+
+
+def test_config_rejects_removed_reliability_metrics_field():
+    with pytest.raises(ValueError, match="removed.*--reliability-metrics"):
+        resolve_config({"quality": {"reliability_metrics": ["progress"]}})
 
 
 def test_seed_everything_resets_python_and_numpy_generators():
