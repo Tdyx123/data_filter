@@ -36,7 +36,7 @@ python -m relcore run --config relcore/config_libero90.yaml \
 ```
 
 上述结果使用掩码 5，位于 `graph-5/` 和 `select-5/`，并与默认结果共享同一份
-`scan/`、`encode/` 和逐 episode CLIP 帧特征缓存。
+`scan/` 和聚合后的 `encode/` 阶段产物。
 
 `select` 和 `run` 可通过 `--selection-ratio` 在调用时设置筛选比例，取值范围为
 `(0, 1]`。命令行比例会覆盖配置中的 `selection.ratio`，并忽略固定的
@@ -97,7 +97,7 @@ python -m relcore run --config relcore/config_libero90.yaml \
 四个原始分量始终计算并保存在 `graph-<mask>/nodes.npz`，但只有参数子集合成的单一
 `reliability` 用于建图、目标函数、种子和候选选择。实际生效列表写入
 `selection_report.json`。不同指标集合写入不同 graph/select 目录，无需 `--force`；
-scan、encode 和 CLIP 帧特征缓存仍可复用。
+scan 和聚合后的 encode 阶段仍可复用。
 
 各阶段用数据、相关配置和上游 artifact 指纹恢复；已有不兼容阶段必须显式传
 `--force`。兼容的上游阶段即使在 `--force` 下也会复用，因此只修改预算或分支参数
@@ -134,8 +134,8 @@ python -m relcore validate \
   --config relcore/config_bridge.yaml
 ```
 
-完整运行前可在独立目录做约 100 条 episode 的中断恢复 smoke test；中断后重跑同一
-命令，日志中的 `reused` 应显示已完成的缓存前缀：
+完整运行前可在独立目录做约 100 条 episode 的编码 smoke test；日志中的
+`relcore_encode completed=... remaining=...` 会显示当前进度：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m relcore encode \
@@ -144,11 +144,9 @@ CUDA_VISIBLE_DEVICES=0 python -m relcore encode \
 ```
 
 可参与 CLIP 的 38,123 条 episode 共 1,299,118 帧；完整运行应选择 10,663 个片段。
-CLIP 帧特征逐 episode 原子写入
-`OUTPUT/.relcore-cache/frame_features/<fingerprint>/`。中断后直接重跑相同命令即可从
-第一条缺失或损坏的 episode 继续，已验证缓存不会重新运行 CLIP。缓存默认保留，
-以便 relation/PCA 失败或参数调整时复用；完整输出通过 `validate` 后，如确定不再重建
-encode，可手工删除该输出目录下的 `.relcore-cache`。已发布结果的验证不依赖隐藏缓存。
+CLIP 帧特征只在处理当前 episode 时驻留内存，生成关系特征后立即释放，不会写入
+`.relcore-cache` 或 `encode/frame_features/`。encode 阶段仍以聚合产物原子发布；如果
+编码中断，临时产物会被清理，重跑时会重新编码全部可用 episode。
 
 ## 原生线程池
 
@@ -195,8 +193,9 @@ NUMEXPR_NUM_THREADS=1 python -m relcore select \
 - `run_manifest.json`：可靠性指标、掩码、阶段目录和阶段指纹；
 - `resolved_config.yaml`、`environment.json`：`run` 写入的配置与运行环境。
 
-逐 episode CLIP 帧特征保存在共享的 `encode/frame_features/`。输出根目录不再发布
-`selected_manifest.jsonl` 等“最后一次运行”副本，因此不同指标组合不会互相覆盖。
+`encode/` 只保存聚合后的 embeddings、关系特征、状态/动作序列、视觉进展、归一化与
+投影参数，不保存逐帧 CLIP 特征。输出根目录不再发布 `selected_manifest.jsonl` 等
+“最后一次运行”副本，因此不同指标组合不会互相覆盖。
 
 `selected_manifest.jsonl` 使用 `sample_id`、`episode_id`、`task_index`、`task_name`、
 inclusive `start_step/end_step` 定位原始 LeRobot 数据。`all_clips.parquet` 区分插入

@@ -14,7 +14,6 @@ from relcore.cli import main
 from relcore.config import load_config
 from relcore.pipeline import (
     _encode_fingerprint,
-    _frame_cache_fingerprint,
     run_pipeline,
     scan_stage,
     select_stage,
@@ -185,6 +184,12 @@ def test_run_pipeline_publishes_aligned_outputs_and_reuses_complete_cache(
     assert result == root / "select-15"
     assert (root / "scan" / "manifest.json").is_file()
     assert (root / "encode" / "manifest.json").is_file()
+    assert not (root / ".relcore-cache").exists()
+    assert not (root / "encode" / "frame_features").exists()
+    assert not (root / "encode" / "frame_features_index.json").exists()
+    encode_manifest = json.loads((root / "encode" / "manifest.json").read_text())
+    assert "encoded_episodes" not in encode_manifest
+    assert not any(key.startswith("frame_cache_") for key in encode_manifest)
     assert (root / "graph-15" / "manifest.json").is_file()
     assert (result / "manifest.json").is_file()
     assert (result / "run_manifest.json").is_file()
@@ -225,8 +230,10 @@ def test_run_pipeline_publishes_aligned_outputs_and_reuses_complete_cache(
     }
 
     first_mtime = (result / "selected_manifest.jsonl").stat().st_mtime_ns
-    cached = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    cached_encoder = InterruptingVisualEncoder(fail_on_call=1)
+    cached = run_pipeline(config, visual_encoder=cached_encoder)
     assert cached == result
+    assert cached_encoder.episode_lengths == []
     assert (result / "selected_manifest.jsonl").stat().st_mtime_ns == first_mtime
 
     validation = validate_output(result, config=config)
@@ -576,18 +583,20 @@ def test_validate_rejects_missing_stage_artifact(tmp_path: Path):
         validate_output(result, config=config)
 
 
-def test_missing_frame_feature_invalidates_encode_cache(tmp_path: Path):
+def test_missing_aggregate_feature_invalidates_encode_cache(tmp_path: Path):
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
     root = result.parent
-    (root / "encode" / "frame_features" / "ep000000.npy").unlink()
+    (root / "encode" / "embeddings.npy").unlink()
 
     with pytest.raises(FileExistsError, match="pass --force"):
         run_pipeline(config, visual_encoder=PipelineVisualEncoder())
 
 
-def test_interrupted_encode_reuses_completed_episode_frame_cache(tmp_path: Path):
+def test_interrupted_encode_restarts_all_episode_encoding_without_frame_cache(
+    tmp_path: Path,
+):
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     config = _config(tmp_path)
     interrupted = InterruptingVisualEncoder(fail_on_call=2)
@@ -600,37 +609,16 @@ def test_interrupted_encode_reuses_completed_episode_frame_cache(tmp_path: Path)
     root = result.parent
 
     assert interrupted.episode_lengths == [31, 31]
-    assert resumed.episode_lengths == [31]
-    assert (root / "encode" / "frame_features" / "ep000000.npy").is_file()
-    assert (root / "encode" / "frame_features" / "ep000001.npy").is_file()
+    assert resumed.episode_lengths == [31, 31]
+    assert not (root / ".relcore-cache").exists()
+    assert not (root / "encode" / "frame_features").exists()
+    assert not (root / "encode" / "frame_features_index.json").exists()
     manifest = json.loads((root / "encode" / "manifest.json").read_text())
-    assert manifest["frame_cache_reused_episodes"] == 1
-    assert manifest["frame_cache_encoded_episodes"] == 1
+    assert "encoded_episodes" not in manifest
+    assert not any(key.startswith("frame_cache_") for key in manifest)
 
 
-def test_damaged_frame_cache_reuses_valid_prefix_and_reencodes_suffix(tmp_path: Path):
-    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
-    config = _config(tmp_path)
-    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
-    root = result.parent
-    cache_directories = list((root / ".relcore-cache" / "frame_features").iterdir())
-    assert len(cache_directories) == 1
-    with (cache_directories[0] / "ep000001.npy").open("r+b") as handle:
-        handle.seek(-1, 2)
-        handle.write(b"\x00")
-    changed = _config(tmp_path)
-    changed["relation"]["output_dim"] = 7
-    resumed = InterruptingVisualEncoder(fail_on_call=None)
-
-    run_pipeline(changed, force=True, visual_encoder=resumed)
-
-    assert resumed.episode_lengths == [31]
-    manifest = json.loads((root / "encode" / "manifest.json").read_text())
-    assert manifest["frame_cache_reused_episodes"] == 1
-    assert manifest["frame_cache_encoded_episodes"] == 1
-
-
-def test_local_model_content_invalidates_frame_cache_and_encode_fingerprints(
+def test_local_model_content_invalidates_encode_fingerprint(
     tmp_path: Path,
 ) -> None:
     adapter = PipelineAdapter({})
@@ -646,14 +634,11 @@ def test_local_model_content_invalidates_frame_cache_and_encode_fingerprints(
         "batch_size": 1,
         "device": "cuda",
     }
-    first_cache = _frame_cache_fingerprint(adapter, config)
-    first_encode = _encode_fingerprint(adapter, config, "scan-v1", first_cache)
+    first_encode = _encode_fingerprint(adapter, config, "scan-v1")
 
     weights.write_bytes(b"weights-v2")
 
-    second_cache = _frame_cache_fingerprint(adapter, config)
-    second_encode = _encode_fingerprint(adapter, config, "scan-v1", second_cache)
-    assert second_cache != first_cache
+    second_encode = _encode_fingerprint(adapter, config, "scan-v1")
     assert second_encode != first_encode
 
 

@@ -17,7 +17,7 @@ import pyarrow.parquet as pq
 import yaml
 from scipy import sparse
 
-from trajectory_data import DatasetAdapter, EpisodeRecord, create_dataset
+from trajectory_data import DatasetAdapter, create_dataset
 
 from relcore import __version__
 from relcore.config import resolve_config
@@ -25,12 +25,9 @@ from relcore.data.index import build_clip_records
 from relcore.export import write_selection_outputs
 from relcore.features.encoding import (
     EncodedClips,
-    FrameCacheSummary,
-    encode_dataset_from_frame_cache,
+    encode_dataset,
     fit_numeric_normalizers,
-    populate_frame_feature_cache,
 )
-from relcore.features.frame_cache import FrameFeatureCache, directory_sha256
 from relcore.features.normalization import RobustNormalizer
 from relcore.features.visual_encoder import (
     DummyVisualEncoder,
@@ -54,6 +51,7 @@ from relcore.selection.objective import (
 from relcore.selection.quota import allocate_task_quotas
 from relcore.utils.io import (
     cache_is_valid,
+    directory_sha256,
     file_sha256,
     publish_stage,
     stable_hash,
@@ -148,56 +146,22 @@ def _manifest_fingerprint(path: Path) -> str:
     return str(json.loads(path.read_text(encoding="utf-8"))["fingerprint"])
 
 
-def _configured_records(
-    adapter: DatasetAdapter,
-    config: Mapping[str, Any],
-) -> list[EpisodeRecord]:
-    records = list(adapter.episodes())
-    max_episodes = config["runtime"].get("max_episodes")
-    return records[: int(max_episodes)] if max_episodes is not None else records
-
-
-def _frame_cache_fingerprint(
-    adapter: DatasetAdapter,
-    config: Mapping[str, Any],
-) -> str:
-    clip_length = int(config["clip"]["length"])
-    usable = [record for record in _configured_records(adapter, config) if record.length >= clip_length]
-    visual = dict(config["visual"])
-    model_sha256 = (
-        directory_sha256(str(visual["model"])) if visual["encoder"] == "clip" else None
-    )
-    return stable_hash(
-        {
-            "version": __version__,
-            "adapter": adapter.fingerprint(),
-            "tasks": _tasks_hash(config),
-            "episodes": [(record.episode_id, record.length) for record in usable],
-            "image_key": adapter.image_observation_keys[0],
-            "visual": visual,
-            "model_sha256": model_sha256,
-        }
-    )
-
-
 def _encode_fingerprint(
     adapter: DatasetAdapter,
     config: Mapping[str, Any],
     scan_fingerprint: str,
-    frame_cache_fingerprint: str,
 ) -> str:
-    stage_fingerprint = _fingerprint(
+    visual = dict(config["visual"])
+    model_sha256 = (
+        directory_sha256(str(visual["model"])) if visual["encoder"] == "clip" else None
+    )
+    return _fingerprint(
         "encode",
         adapter,
         config,
         ("dataset", "clip", "visual", "normalization", "relation", "runtime"),
         scan_fingerprint,
-    )
-    return stable_hash(
-        {
-            "stage_fingerprint": stage_fingerprint,
-            "frame_cache_fingerprint": frame_cache_fingerprint,
-        }
+        parameters={"visual_model_sha256": model_sha256},
     )
 
 
@@ -301,11 +265,6 @@ def _save_encoded(
     encoded: EncodedClips,
     fingerprint: str,
     runtime_seconds: float,
-    *,
-    frame_cache: FrameFeatureCache,
-    frame_records: list[EpisodeRecord],
-    frame_cache_fingerprint: str,
-    frame_cache_summary: FrameCacheSummary,
 ) -> None:
     np.save(temporary / "embeddings.npy", encoded.embeddings)
     np.save(temporary / "raw_relations.npy", encoded.raw_relations)
@@ -329,15 +288,6 @@ def _save_encoded(
         scale=encoded.relation_projector.scale_,
         components=encoded.relation_projector.components_,
     )
-    frame_files = frame_cache.publish_features(
-        frame_records,
-        temporary / "frame_features",
-        output_dim=int(encoded.relation_encoder.projection_matrices["visual"].shape[0]),
-    )
-    write_json(
-        temporary / "frame_features_index.json",
-        {"files": frame_files, "episodes": len(frame_files)},
-    )
     write_json(
         temporary / "manifest.json",
         {
@@ -345,10 +295,6 @@ def _save_encoded(
             "fingerprint": fingerprint,
             "clips": len(encoded.clips),
             "embedding_dim": int(encoded.embeddings.shape[1]),
-            "encoded_episodes": len(frame_files),
-            "frame_cache_fingerprint": frame_cache_fingerprint,
-            "frame_cache_reused_episodes": frame_cache_summary.reused_episodes,
-            "frame_cache_encoded_episodes": frame_cache_summary.encoded_episodes,
             "runtime_seconds": runtime_seconds,
         },
     )
@@ -366,12 +312,10 @@ def encode_stage(
     root, adapter, clips, scan_fingerprint = scan_stage(
         resolved, output_dir=output_dir, force=force
     )
-    frame_cache_fingerprint = _frame_cache_fingerprint(adapter, resolved)
     fingerprint = _encode_fingerprint(
         adapter,
         resolved,
         scan_fingerprint,
-        frame_cache_fingerprint,
     )
     destination = root / "encode"
     normalization = np.load(root / "scan" / "normalization.npz")
@@ -385,36 +329,22 @@ def encode_stage(
 
     def build(temporary: Path) -> None:
         started = time.perf_counter()
-        records = _configured_records(adapter, resolved)
-        frame_records = [
-            record for record in records if record.length >= int(resolved["clip"]["length"])
-        ]
         encoder = visual_encoder or _make_visual_encoder(resolved)
-        frame_cache = FrameFeatureCache(
-            root / ".relcore-cache" / "frame_features" / frame_cache_fingerprint,
-            fingerprint=frame_cache_fingerprint,
-        )
-        frame_cache_summary = populate_frame_feature_cache(
+        encoded = encode_dataset(
             adapter,
-            frame_records,
             encoder,
-            frame_cache,
-            num_workers=int(resolved["runtime"].get("num_workers", 0)),
-        )
-        encoded = encode_dataset_from_frame_cache(
-            adapter,
-            records,
-            frame_cache,
             clip_length=int(resolved["clip"]["length"]),
             clip_stride=int(resolved["clip"]["stride"]),
             projection_dim=int(resolved["relation"]["projection_dim"]),
             output_dim=int(resolved["relation"]["output_dim"]),
             lags=tuple(int(lag) for lag in resolved["relation"]["lags"]),
             seed=int(resolved["seed"]),
+            epsilon=float(resolved["normalization"]["epsilon"]),
             num_workers=int(resolved["runtime"].get("num_workers", 0)),
+            max_episodes=resolved["runtime"].get("max_episodes"),
+            progress_interval=100,
             action_normalizer=action_normalizer,
             state_normalizer=state_normalizer,
-            visual_output_dim=int(encoder.output_dim),
         )
         if [clip.sample_id for clip in encoded.clips] != [clip.sample_id for clip in clips]:
             raise ValueError("encode clip order does not match scan clip index")
@@ -423,10 +353,6 @@ def encode_stage(
             encoded,
             fingerprint,
             time.perf_counter() - started,
-            frame_cache=frame_cache,
-            frame_records=frame_records,
-            frame_cache_fingerprint=frame_cache_fingerprint,
-            frame_cache_summary=frame_cache_summary,
         )
 
     publish_stage(
@@ -441,7 +367,6 @@ def encode_stage(
             "normalization.npz",
             "projection_matrices.npz",
             "relation_pca.npz",
-            "frame_features_index.json",
         ),
         force=force,
         resume=bool(resolved["runtime"].get("resume", True)),
@@ -977,7 +902,6 @@ def validate_output(
             "normalization.npz",
             "projection_matrices.npz",
             "relation_pca.npz",
-            "frame_features_index.json",
         ),
         "graph": (
             "nodes.npz",
@@ -1113,12 +1037,10 @@ def validate_output(
             resolved,
             ("dataset", "clip", "normalization", "runtime"),
         )
-        expected_frame_cache = _frame_cache_fingerprint(adapter, resolved)
         expected_encode = _encode_fingerprint(
             adapter,
             resolved,
             expected_scan,
-            expected_frame_cache,
         )
         expected_graph = _fingerprint(
             "graph",

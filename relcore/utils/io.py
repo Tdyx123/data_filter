@@ -29,6 +29,26 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def directory_sha256(path: str | Path) -> str:
+    """Hash every regular file below a local model directory."""
+
+    root = Path(path).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"local model directory does not exist: {root}")
+    digest = hashlib.sha256()
+    files = sorted(candidate for candidate in root.rglob("*") if candidate.is_file())
+    if not files:
+        raise ValueError(f"local model directory contains no files: {root}")
+    for candidate in files:
+        relative = candidate.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, byteorder="big"))
+        digest.update(relative)
+        with candidate.open("rb") as handle:
+            while block := handle.read(1024 * 1024):
+                digest.update(block)
+    return digest.hexdigest()
+
+
 def write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -47,24 +67,6 @@ def cache_is_valid(destination: Path, fingerprint: str, required: Sequence[str])
         return False
     if payload.get("status") != "complete" or payload.get("fingerprint") != fingerprint:
         return False
-    frame_index = destination / "frame_features_index.json"
-    if frame_index.is_file():
-        try:
-            frame_payload = json.loads(frame_index.read_text(encoding="utf-8"))
-            files = frame_payload["files"]
-            if not isinstance(files, list) or int(frame_payload["episodes"]) != len(files):
-                return False
-            if int(payload.get("encoded_episodes", -1)) != len(files):
-                return False
-            if any(
-                not isinstance(name, str)
-                or Path(name).name != name
-                or not (destination / "frame_features" / name).is_file()
-                for name in files
-            ):
-                return False
-        except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
-            return False
     return True
 
 

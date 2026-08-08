@@ -6,13 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from relcore.features.encoding import (
-    encode_dataset,
-    encode_dataset_from_frame_cache,
-    fit_numeric_normalizers,
-    populate_frame_feature_cache,
-)
-from relcore.features.frame_cache import FrameFeatureCache
+from relcore.features.encoding import encode_dataset, fit_numeric_normalizers
 from relcore.features.visual_encoder import FrozenClipEncoder
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
 
@@ -87,7 +81,7 @@ class CountingVisualEncoder:
 
 
 def test_encode_dataset_uses_numeric_then_image_pass_and_one_visual_call_per_episode(
-    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ):
     adapter = CountingAdapter()
     visual = CountingVisualEncoder()
@@ -101,7 +95,7 @@ def test_encode_dataset_uses_numeric_then_image_pass_and_one_visual_call_per_epi
         output_dim=8,
         lags=(0, 1, 2, 4),
         seed=11,
-        frame_cache_dir=tmp_path / "frames",
+        progress_interval=1,
     )
 
     assert adapter.load_images_calls == [False, True]
@@ -120,19 +114,19 @@ def test_encode_dataset_uses_numeric_then_image_pass_and_one_visual_call_per_epi
     )
     assert encoded.state_sequences.shape == (4, 15, 2)
     assert encoded.action_sequences.shape == (4, 15, 2)
-    assert (tmp_path / "frames" / "ep000000.npy").is_file()
-    assert (tmp_path / "frames" / "ep000001.npy").is_file()
-    assert not (tmp_path / "frames" / "ep000002.npy").exists()
+    assert capsys.readouterr().err.splitlines() == [
+        "relcore_encode completed=1 remaining=1",
+        "relcore_encode completed=2 remaining=0",
+    ]
 
 
-def test_encode_dataset_is_deterministic_for_same_seed(tmp_path: Path):
+def test_encode_dataset_is_deterministic_for_same_seed():
     first = encode_dataset(
         CountingAdapter(),
         CountingVisualEncoder(),
         projection_dim=4,
         output_dim=8,
         seed=23,
-        frame_cache_dir=tmp_path / "first",
     )
     second = encode_dataset(
         CountingAdapter(),
@@ -140,14 +134,13 @@ def test_encode_dataset_is_deterministic_for_same_seed(tmp_path: Path):
         projection_dim=4,
         output_dim=8,
         seed=23,
-        frame_cache_dir=tmp_path / "second",
     )
 
     np.testing.assert_array_equal(first.embeddings, second.embeddings)
     np.testing.assert_array_equal(first.raw_relations, second.raw_relations)
 
 
-def test_frame_cache_encoding_matches_direct_encoding(tmp_path: Path) -> None:
+def test_supplied_normalizers_match_direct_encoding() -> None:
     direct = encode_dataset(
         CountingAdapter(),
         CountingVisualEncoder(),
@@ -158,36 +151,24 @@ def test_frame_cache_encoding_matches_direct_encoding(tmp_path: Path) -> None:
     adapter = CountingAdapter()
     records = list(adapter.episodes())
     action_normalizer, state_normalizer = fit_numeric_normalizers(adapter, records)
-    usable = [record for record in records if record.length >= 15]
-    cache = FrameFeatureCache(tmp_path / "cache", fingerprint="frame-v1")
-    populate_frame_feature_cache(
+    supplied = encode_dataset(
         adapter,
-        usable,
         CountingVisualEncoder(),
-        cache,
-        progress_interval=0,
-    )
-
-    cached = encode_dataset_from_frame_cache(
-        adapter,
-        records,
-        cache,
         projection_dim=4,
         output_dim=8,
         seed=23,
         action_normalizer=action_normalizer,
         state_normalizer=state_normalizer,
-        visual_output_dim=3,
     )
 
-    assert [clip.sample_id for clip in cached.clips] == [
+    assert [clip.sample_id for clip in supplied.clips] == [
         clip.sample_id for clip in direct.clips
     ]
-    np.testing.assert_array_equal(cached.raw_relations, direct.raw_relations)
-    np.testing.assert_array_equal(cached.embeddings, direct.embeddings)
-    np.testing.assert_array_equal(cached.state_sequences, direct.state_sequences)
-    np.testing.assert_array_equal(cached.action_sequences, direct.action_sequences)
-    np.testing.assert_array_equal(cached.visual_progress, direct.visual_progress)
+    np.testing.assert_array_equal(supplied.raw_relations, direct.raw_relations)
+    np.testing.assert_array_equal(supplied.embeddings, direct.embeddings)
+    np.testing.assert_array_equal(supplied.state_sequences, direct.state_sequences)
+    np.testing.assert_array_equal(supplied.action_sequences, direct.action_sequences)
+    np.testing.assert_array_equal(supplied.visual_progress, direct.visual_progress)
 
 
 @pytest.mark.gpu
