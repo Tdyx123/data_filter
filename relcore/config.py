@@ -110,6 +110,15 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "quality.reliability_metrics was removed; use --reliability-metrics instead"
         )
+    configured_objective = config.get("objective")
+    if (
+        isinstance(configured_objective, Mapping)
+        and "prototype_gain_metrics" in configured_objective
+    ):
+        raise ValueError(
+            "objective.prototype_gain_metrics is not configurable; "
+            "use --prototype-gain-metrics instead"
+        )
     resolved = _merge(DEFAULT_CONFIG, config)
     if resolved["dataset"].get("empty_task_policy") not in {"error", "exclude"}:
         raise ValueError("dataset.empty_task_policy must be error or exclude")

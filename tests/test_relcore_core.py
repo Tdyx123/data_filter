@@ -128,6 +128,44 @@ def test_config_rejects_removed_reliability_metrics_field():
         resolve_config({"quality": {"reliability_metrics": ["progress"]}})
 
 
+@pytest.mark.parametrize(
+    ("metrics", "expected"),
+    [
+        (["sequence"], 1),
+        (["cooccurrence"], 2),
+        (["transition"], 4),
+        (["cooccurrence", "sequence"], 3),
+        (["transition", "sequence"], 5),
+        (["transition", "cooccurrence"], 6),
+        (["sequence", "transition", "cooccurrence"], 7),
+    ],
+)
+def test_prototype_gain_metric_mask_uses_canonical_three_bit_order(metrics, expected):
+    from relcore.selection import prototype_gain_metric_mask
+
+    assert prototype_gain_metric_mask(metrics) == expected
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    [[], ["transition", "transition"], ["transition", "unknown"], "transition", [1]],
+)
+def test_prototype_gain_metrics_reject_invalid_values(metrics):
+    from relcore.selection import normalize_prototype_gain_metrics
+
+    with pytest.raises(ValueError):
+        normalize_prototype_gain_metrics(metrics)
+
+
+def test_config_has_no_prototype_gain_metric_default():
+    assert "prototype_gain_metrics" not in resolve_config({})["objective"]
+
+
+def test_config_rejects_prototype_gain_metrics_field():
+    with pytest.raises(ValueError, match="objective.prototype_gain_metrics.*--prototype-gain-metrics"):
+        resolve_config({"objective": {"prototype_gain_metrics": ["transition"]}})
+
+
 def test_seed_everything_resets_python_and_numpy_generators():
     seed_everything(91)
     first = (random.random(), np.random.random())

@@ -256,13 +256,19 @@ class RankZeroLogger:
         if not self.enabled:
             return
         payload = {"timestamp": time.time(), **metrics}
+        serialized = json.dumps(payload, sort_keys=True)
         with self.metrics_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            handle.write(serialized + "\n")
+        print(serialized, flush=True)
         step = int(metrics["step"])
         for key, value in metrics.items():
             if key != "step" and isinstance(value, (int, float)):
                 self.writer.add_scalar(key, value, step)
         self.writer.flush()
+
+    def status(self, message: str) -> None:
+        if self.enabled:
+            print(message, flush=True)
 
     def close(self) -> None:
         if self.writer is not None:
@@ -437,6 +443,15 @@ def train(config: dict[str, Any]) -> None:
                 }
             )
         engine.train()
+        compile_enabled = bool(
+            config["model"].get("torch_compile", {}).get("enabled", False)
+        )
+        first_batch_status = "Starting first training batch."
+        if compile_enabled:
+            first_batch_status = (
+                "Starting first training batch; TorchInductor warm-up may take several minutes."
+            )
+        logger.status(first_batch_status)
         while global_step < maximum_steps:
             if (
                 not any(parameter.requires_grad for parameter in policy.lora_parameters())

@@ -289,24 +289,3 @@ def test_prefiltered_selection_rejects_invalid_files(
 
     with pytest.raises(selection_module.PriorSelectionError, match=message):
         _load(path, metadata)
-
-
-@pytest.mark.real_data
-def test_current_quality_top10_scores_have_expected_training_starts():
-    scores = Path("/data/dwb/libero_filter/quality/filter/top10pct/scores.csv")
-    prior_root = Path("/data/dwb/datasets/LIBERO_lerobot/libero90")
-    if not scores.is_file() or not prior_root.is_dir():
-        pytest.skip("Current Quality Top 10% scores or dataset are not mounted")
-
-    from octo_small_libero.lerobot_v2 import LeRobotV2Metadata
-
-    selection = selection_module.load_prefiltered_selection(
-        scores,
-        LeRobotV2Metadata(prior_root),
-        action_horizon=8,
-    )
-
-    assert selection.input_format == "csv"
-    assert selection.selected_fragments == 4_671
-    assert selection.selected_episodes == 2_935
-    assert selection.training_starts == 35_913

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ from torch import nn  # noqa: E402
 
 from qwen3_vl_groot.config import load_config  # noqa: E402
 from qwen3_vl_groot.training import (  # noqa: E402
+    RankZeroLogger,
     _should_save_checkpoint,
     _should_save_final_checkpoint,
     build_optimizer_and_scheduler,
@@ -28,6 +30,33 @@ class TinyPolicy(nn.Module):
 
     def lora_parameters(self):
         return [self.lora_a, self.lora_b]
+
+
+def test_rank_zero_logger_mirrors_persisted_payload_to_stdout(tmp_path, capsys):
+    logger = RankZeroLogger(tmp_path, enabled=True)
+    try:
+        logger.log({"step": 10, "train/loss": 1.25})
+    finally:
+        logger.close()
+
+    stdout_payload = json.loads(capsys.readouterr().out)
+    persisted_payload = json.loads((tmp_path / "metrics.jsonl").read_text())
+    assert stdout_payload == persisted_payload
+    assert stdout_payload["step"] == 10
+    assert stdout_payload["train/loss"] == pytest.approx(1.25)
+
+
+def test_rank_zero_logger_status_messages_obey_enabled_flag(tmp_path, capsys):
+    enabled_logger = RankZeroLogger(tmp_path / "enabled", enabled=True)
+    disabled_logger = RankZeroLogger(tmp_path / "disabled", enabled=False)
+    try:
+        enabled_logger.status("Starting first training batch.")
+        disabled_logger.status("This must remain hidden.")
+    finally:
+        enabled_logger.close()
+        disabled_logger.close()
+
+    assert capsys.readouterr().out == "Starting first training batch.\n"
 
 
 def test_optimizer_groups_are_nonempty_and_trainable_before_zero_init():

@@ -50,6 +50,11 @@ from relcore.selection.objective import (
     ObjectiveContext,
     ObjectiveWeights,
 )
+from relcore.selection.prototype_gain import (
+    PROTOTYPE_GAIN_METRICS,
+    normalize_prototype_gain_metrics,
+    prototype_gain_metric_mask,
+)
 from relcore.selection.quota import allocate_task_quotas
 from relcore.utils.io import (
     cache_is_valid,
@@ -90,8 +95,13 @@ def selection_directory_name(
     reliability_metrics: Sequence[str],
     ratio: float | None = None,
     prototype_method: str = "kmeans",
+    *,
+    prototype_gain_metrics: Sequence[str] = PROTOTYPE_GAIN_METRICS,
 ) -> str:
-    prefix = f"select-{reliability_metric_mask(reliability_metrics)}"
+    prefix = (
+        f"select-r{reliability_metric_mask(reliability_metrics)}"
+        f"-g{prototype_gain_metric_mask(prototype_gain_metrics)}"
+    )
     if prototype_method != "kmeans":
         prefix = f"{prefix}-motion-primitives"
     if ratio is None:
@@ -139,6 +149,7 @@ def _total_fingerprint(
     adapter: DatasetAdapter,
     config: Mapping[str, Any],
     reliability_metrics: Sequence[str],
+    prototype_gain_metrics: Sequence[str],
 ) -> str:
     return stable_hash(
         {
@@ -147,6 +158,9 @@ def _total_fingerprint(
             "tasks": _tasks_hash(config),
             "config": config,
             "reliability_metrics": list(normalize_reliability_metrics(reliability_metrics)),
+            "prototype_gain_metrics": list(
+                normalize_prototype_gain_metrics(prototype_gain_metrics)
+            ),
         }
     )
 
@@ -587,6 +601,7 @@ def _selection_budget(config: Mapping[str, Any], candidate_count: int) -> int:
 def _select(
     config: Mapping[str, Any],
     graph: GraphData,
+    prototype_gain_metrics: Sequence[str],
 ) -> tuple[
     SelectionResult,
     list[SelectionResult],
@@ -608,6 +623,7 @@ def _select(
         graph,
         _objective_weights(config),
         similarity_threshold=float(config["graph"]["similarity_threshold"]),
+        prototype_gain_metrics=prototype_gain_metrics,
     )
     if selection["engine"] == "exact":
         result = ExactGreedySelector(context, quotas).select(budget)
@@ -641,6 +657,7 @@ def _selection_rows(
     result: SelectionResult,
     context: ObjectiveContext,
     reliability_metrics: Sequence[str],
+    prototype_gain_metrics: Sequence[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     final_state = context.state_from_indices(result.selected_indices)
     selected_position = {index: position for position, index in enumerate(result.selected_indices)}
@@ -698,6 +715,9 @@ def _selection_rows(
         "selected_clips": len(result.selected_indices),
         "selection_ratio": len(result.selected_indices) / len(clips),
         "reliability_metrics": list(normalize_reliability_metrics(reliability_metrics)),
+        "prototype_gain_metrics": list(
+            normalize_prototype_gain_metrics(prototype_gain_metrics)
+        ),
         "prototype_method": str(config["prototypes"]["method"]),
         "objective": asdict(breakdown),
         "prototype_coverage": {
@@ -716,10 +736,13 @@ def select_stage(
     visual_encoder: VisualEncoder | None = None,
     selection_output_ratio: float | None = None,
     reliability_metrics: Sequence[str] = RELIABILITY_METRICS,
+    prototype_gain_metrics: Sequence[str] = PROTOTYPE_GAIN_METRICS,
 ) -> Path:
     resolved = resolve_config(config)
     metrics = normalize_reliability_metrics(reliability_metrics)
     metric_mask = reliability_metric_mask(metrics)
+    gain_metrics = normalize_prototype_gain_metrics(prototype_gain_metrics)
+    gain_mask = prototype_gain_metric_mask(gain_metrics)
     scoped_ratio = (
         float(selection_output_ratio) if selection_output_ratio is not None else None
     )
@@ -740,10 +763,16 @@ def select_stage(
         resolved,
         ("objective", "selection", "seed"),
         graph_fingerprint,
+        parameters={"prototype_gain_metrics": gain_metrics},
     )
     prototype_method = str(resolved["prototypes"]["method"])
     graph_directory = graph_directory_name(metrics, prototype_method)
-    selection_directory = selection_directory_name(metrics, scoped_ratio, prototype_method)
+    selection_directory = selection_directory_name(
+        metrics,
+        scoped_ratio,
+        prototype_method,
+        prototype_gain_metrics=gain_metrics,
+    )
     destination = root / selection_directory
     stage_directories = {
         "scan": "scan",
@@ -754,7 +783,11 @@ def select_stage(
 
     def build(temporary: Path) -> None:
         started = time.perf_counter()
-        result, branch_results, context, quotas = _select(resolved, graph)
+        result, branch_results, context, quotas = _select(
+            resolved,
+            graph,
+            gain_metrics,
+        )
         selected_rows, all_rows, report = _selection_rows(
             resolved,
             clips,
@@ -762,6 +795,7 @@ def select_stage(
             result,
             context,
             metrics,
+            gain_metrics,
         )
         report["quota_mode"] = str(resolved["selection"]["quota_mode"])
         report["task_quotas"] = (
@@ -815,6 +849,8 @@ def select_stage(
                 "stage_directory": selection_directory,
                 "reliability_metrics": list(metrics),
                 "reliability_mask": metric_mask,
+                "prototype_gain_metrics": list(gain_metrics),
+                "prototype_gain_mask": gain_mask,
                 "prototype_method": prototype_method,
                 "selected_clips": len(result.selected_indices),
                 "budget": len(result.selected_indices),
@@ -837,9 +873,16 @@ def select_stage(
         destination / "run_manifest.json",
         {
             "status": "complete",
-            "fingerprint": _total_fingerprint(adapter, resolved, metrics),
+            "fingerprint": _total_fingerprint(
+                adapter,
+                resolved,
+                metrics,
+                gain_metrics,
+            ),
             "reliability_metrics": list(metrics),
             "reliability_mask": metric_mask,
+            "prototype_gain_metrics": list(gain_metrics),
+            "prototype_gain_mask": gain_mask,
             "prototype_method": prototype_method,
             "selection_output_ratio": scoped_ratio,
             "stage_directories": stage_directories,
@@ -860,6 +903,7 @@ def run_pipeline(
     visual_encoder: VisualEncoder | None = None,
     selection_output_ratio: float | None = None,
     reliability_metrics: Sequence[str] = RELIABILITY_METRICS,
+    prototype_gain_metrics: Sequence[str] = PROTOTYPE_GAIN_METRICS,
 ) -> Path:
     resolved = resolve_config(config)
     root = _output_root(resolved, output_dir)
@@ -871,6 +915,7 @@ def run_pipeline(
         visual_encoder=visual_encoder,
         selection_output_ratio=selection_output_ratio,
         reliability_metrics=reliability_metrics,
+        prototype_gain_metrics=prototype_gain_metrics,
     )
     result.mkdir(parents=True, exist_ok=True)
     (result / "resolved_config.yaml").write_text(
@@ -919,6 +964,20 @@ def validate_output(
     metric_mask = reliability_metric_mask(metrics)
     if int(run_manifest.get("reliability_mask", -1)) != metric_mask:
         raise ValueError("run manifest reliability_mask does not match reliability_metrics")
+    recorded_gain_metrics = run_manifest.get("prototype_gain_metrics")
+    try:
+        gain_metrics = normalize_prototype_gain_metrics(recorded_gain_metrics)
+    except ValueError as error:
+        raise ValueError(f"run manifest prototype_gain_metrics {error}") from error
+    if list(gain_metrics) != recorded_gain_metrics:
+        raise ValueError(
+            "run manifest prototype_gain_metrics are not in canonical order"
+        )
+    gain_mask = prototype_gain_metric_mask(gain_metrics)
+    if int(run_manifest.get("prototype_gain_mask", -1)) != gain_mask:
+        raise ValueError(
+            "run manifest prototype_gain_mask does not match prototype_gain_metrics"
+        )
     scoped_ratio = run_manifest.get("selection_output_ratio")
     if scoped_ratio is not None:
         try:
@@ -929,13 +988,18 @@ def validate_output(
         "scan": "scan",
         "encode": "encode",
         "graph": graph_directory_name(metrics, prototype_method),
-        "select": selection_directory_name(metrics, scoped_ratio, prototype_method),
+        "select": selection_directory_name(
+            metrics,
+            scoped_ratio,
+            prototype_method,
+            prototype_gain_metrics=gain_metrics,
+        ),
     }
     stage_directories = run_manifest.get("stage_directories")
     if stage_directories != expected_directories:
-        raise ValueError("run manifest stage_directories do not match reliability parameters")
+        raise ValueError("run manifest stage_directories do not match metric parameters")
     if result.name != expected_directories["select"]:
-        raise ValueError("selection output directory does not match reliability parameters")
+        raise ValueError("selection output directory does not match metric parameters")
     stage_paths = {stage: root / directory for stage, directory in expected_directories.items()}
     stage_manifests: dict[str, dict[str, Any]] = {}
     for stage in ("scan", "encode", "graph", "select"):
@@ -1002,6 +1066,11 @@ def validate_output(
             raise ValueError(f"{stage} manifest stage_directory mismatch")
         if str(manifest.get("prototype_method", "kmeans")) != prototype_method:
             raise ValueError(f"{stage} manifest prototype_method mismatch")
+    select_manifest = stage_manifests["select"]
+    if select_manifest.get("prototype_gain_metrics") != list(gain_metrics):
+        raise ValueError("select manifest prototype_gain_metrics mismatch")
+    if int(select_manifest.get("prototype_gain_mask", -1)) != gain_mask:
+        raise ValueError("select manifest prototype_gain_mask mismatch")
     selected_rows = [
         json.loads(line)
         for line in required[0].read_text(encoding="utf-8").splitlines()
@@ -1018,6 +1087,23 @@ def validate_output(
         raise ValueError("selection report reliability_metrics are not in canonical order")
     if tuple(normalized_reported_metrics) != metrics:
         raise ValueError("selection report reliability_metrics do not match the run manifest")
+    reported_gain_metrics = report.get("prototype_gain_metrics")
+    try:
+        normalized_reported_gain_metrics = list(
+            normalize_prototype_gain_metrics(reported_gain_metrics)
+        )
+    except ValueError as error:
+        raise ValueError(
+            f"selection report prototype_gain_metrics {error}"
+        ) from error
+    if reported_gain_metrics != normalized_reported_gain_metrics:
+        raise ValueError(
+            "selection report prototype_gain_metrics are not in canonical order"
+        )
+    if tuple(normalized_reported_gain_metrics) != gain_metrics:
+        raise ValueError(
+            "selection report prototype_gain_metrics do not match the run manifest"
+        )
     if str(report.get("prototype_method", "kmeans")) != prototype_method:
         raise ValueError("selection report prototype_method does not match the run manifest")
     if [row["sample_id"] for row in all_rows] != sorted(row["sample_id"] for row in all_rows):
@@ -1028,7 +1114,6 @@ def validate_output(
         raise ValueError("selected manifest count does not match report")
     if len(all_rows) != int(report["number_of_clips"]):
         raise ValueError("candidate clip count does not match report")
-    select_manifest = stage_manifests["select"]
     if (
         len(selected_rows) != int(select_manifest.get("selected_clips", -1))
         or len(selected_rows) != int(select_manifest.get("budget", -1))
@@ -1153,6 +1238,7 @@ def validate_output(
             resolved,
             ("objective", "selection", "seed"),
             expected_graph,
+            parameters={"prototype_gain_metrics": gain_metrics},
         )
         expected_stages = {
             "scan": expected_scan,
@@ -1164,7 +1250,12 @@ def validate_output(
             actual = _manifest_fingerprint(stage_paths[stage] / "manifest.json")
             if actual != expected:
                 raise ValueError(f"{stage} fingerprint does not match the supplied config")
-        if run_manifest.get("fingerprint") != _total_fingerprint(adapter, resolved, metrics):
+        if run_manifest.get("fingerprint") != _total_fingerprint(
+            adapter,
+            resolved,
+            metrics,
+            gain_metrics,
+        ):
             raise ValueError("run fingerprint does not match the supplied config")
         if len(selected_rows) != _selection_budget(resolved, len(all_rows)):
             raise ValueError("selected manifest count does not match the configured budget")

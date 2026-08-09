@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -12,7 +14,11 @@ from qwen3_vl_groot.modeling import (  # noqa: E402
     compile_policy_modules,
     lora_coverage,
 )
+from qwen3_vl_groot.config import load_config  # noqa: E402
 from qwen3_vl_groot.normalization import QuantileStats  # noqa: E402
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeLoraLinear(nn.Linear):
@@ -94,6 +100,22 @@ def test_compile_policy_modules_compiles_backbone_and_action_head_in_place():
     }
     assert policy.backbone.calls == [expected]
     assert policy.action_head.calls == [expected]
+
+
+def test_qwen_libero_default_skips_compile_for_backbone_and_action_head():
+    policy = type(
+        "Policy",
+        (),
+        {"backbone": CompileRecorder(), "action_head": CompileRecorder()},
+    )()
+    config = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
+    )
+
+    compile_policy_modules(policy, config["model"])
+
+    assert policy.backbone.calls == []
+    assert policy.action_head.calls == []
 
 
 def test_disabling_qwen_gradient_checkpointing_calls_disable():

@@ -41,7 +41,7 @@ model:
   attn_implementation: auto
   gradient_checkpointing: false
   torch_compile:
-    enabled: true
+    enabled: false
     backend: inductor
     mode: default
     dynamic: true

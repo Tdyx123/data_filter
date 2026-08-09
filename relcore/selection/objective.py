@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
 
 from relcore.graph.prototypes import valid_prototype_assignments
 from relcore.schemas import GraphData, ObjectiveState
+from relcore.selection.prototype_gain import (
+    PROTOTYPE_GAIN_METRICS,
+    normalize_prototype_gain_metrics,
+)
 
 
 @dataclass(frozen=True)
@@ -36,10 +41,15 @@ class ObjectiveContext:
         weights: ObjectiveWeights,
         *,
         similarity_threshold: float,
+        prototype_gain_metrics: Sequence[str] = PROTOTYPE_GAIN_METRICS,
         epsilon: float = 1.0e-8,
     ):
         self.graph = graph
         self.weights = weights
+        self.prototype_gain_metrics = normalize_prototype_gain_metrics(
+            prototype_gain_metrics
+        )
+        self._enabled_prototype_gains = frozenset(self.prototype_gain_metrics)
         self.similarity_threshold = float(similarity_threshold)
         self.epsilon = float(epsilon)
         self.prototype_count = int(graph.transition_matrix.shape[0])
@@ -245,9 +255,21 @@ class ObjectiveContext:
         )
         return float(
             self.weights.node * node_delta
-            + self.weights.transition * transition_delta
-            + self.weights.cooccurrence * cooccurrence_delta
-            + self.weights.sequence * sequence_delta
+            + (
+                self.weights.transition * transition_delta
+                if "transition" in self._enabled_prototype_gains
+                else 0.0
+            )
+            + (
+                self.weights.cooccurrence * cooccurrence_delta
+                if "cooccurrence" in self._enabled_prototype_gains
+                else 0.0
+            )
+            + (
+                self.weights.sequence * sequence_delta
+                if "sequence" in self._enabled_prototype_gains
+                else 0.0
+            )
             - self.weights.redundancy * redundancy_delta
         )
 
@@ -267,9 +289,21 @@ class ObjectiveContext:
         redundancy = float(state.redundancy_sum / self.redundancy_normalizer)
         total = (
             self.weights.node * node
-            + self.weights.transition * transition
-            + self.weights.cooccurrence * cooccurrence
-            + self.weights.sequence * sequence
+            + (
+                self.weights.transition * transition
+                if "transition" in self._enabled_prototype_gains
+                else 0.0
+            )
+            + (
+                self.weights.cooccurrence * cooccurrence
+                if "cooccurrence" in self._enabled_prototype_gains
+                else 0.0
+            )
+            + (
+                self.weights.sequence * sequence
+                if "sequence" in self._enabled_prototype_gains
+                else 0.0
+            )
             - self.weights.redundancy * redundancy
         )
         return ObjectiveBreakdown(
@@ -347,8 +381,14 @@ def recompute_objective(
     weights: ObjectiveWeights,
     *,
     similarity_threshold: float,
+    prototype_gain_metrics: Sequence[str] = PROTOTYPE_GAIN_METRICS,
 ) -> ObjectiveBreakdown:
-    context = ObjectiveContext(graph, weights, similarity_threshold=similarity_threshold)
+    context = ObjectiveContext(
+        graph,
+        weights,
+        similarity_threshold=similarity_threshold,
+        prototype_gain_metrics=prototype_gain_metrics,
+    )
     selected = np.zeros(len(graph.sample_ids), dtype=bool)
     selected[np.asarray(selected_indices, dtype=np.int64)] = True
     coverage = np.zeros(context.prototype_count, dtype=np.float64)

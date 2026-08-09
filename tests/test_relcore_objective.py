@@ -62,6 +62,108 @@ def test_incremental_objective_matches_full_recomputation():
     assert state.objective_value == pytest.approx(expected.total, abs=1.0e-6)
 
 
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        ["transition"],
+        ["cooccurrence"],
+        ["sequence"],
+        ["transition", "cooccurrence"],
+        ["transition", "sequence"],
+        ["cooccurrence", "sequence"],
+        ["transition", "cooccurrence", "sequence"],
+    ],
+)
+def test_incremental_objective_matches_recomputation_for_every_gain_subset(metrics):
+    graph = replace(
+        _small_graph(),
+        cooccurrence_matrix=sparse.csr_matrix(
+            np.asarray([[0.0, 0.25], [0.5, 0.0]], dtype=np.float32)
+        ),
+    )
+    weights = ObjectiveWeights()
+    context = ObjectiveContext(
+        graph,
+        weights,
+        similarity_threshold=0.8,
+        prototype_gain_metrics=metrics,
+    )
+    state = context.empty_state()
+    selected: list[int] = []
+
+    for candidate in (0, 1, 2):
+        expected = recompute_objective(
+            selected + [candidate],
+            graph,
+            weights,
+            similarity_threshold=0.8,
+            prototype_gain_metrics=metrics,
+        )
+        assert context.marginal_gain(state, candidate) == pytest.approx(
+            expected.total - state.objective_value,
+            abs=1.0e-6,
+        )
+        context.add_candidate(state, candidate)
+        selected.append(candidate)
+        assert state.objective_value == pytest.approx(expected.total, abs=1.0e-6)
+
+
+@pytest.mark.parametrize(
+    ("metrics", "enabled_component"),
+    [
+        (["transition"], "transition"),
+        (["cooccurrence"], "cooccurrence"),
+        (["sequence"], "sequence"),
+    ],
+)
+def test_breakdown_reports_all_raw_gains_but_totals_only_enabled_gain(
+    metrics,
+    enabled_component,
+):
+    graph = replace(
+        _small_graph(),
+        cooccurrence_matrix=sparse.csr_matrix(
+            np.asarray([[0.0, 0.25], [0.5, 0.0]], dtype=np.float32)
+        ),
+    )
+    weights = ObjectiveWeights()
+
+    breakdown = recompute_objective(
+        [0, 1, 2],
+        graph,
+        weights,
+        similarity_threshold=0.8,
+        prototype_gain_metrics=metrics,
+    )
+
+    assert breakdown.transition > 0.0
+    assert breakdown.cooccurrence > 0.0
+    assert breakdown.sequence > 0.0
+    assert breakdown.redundancy > 0.0
+    expected = (
+        weights.node * breakdown.node
+        + getattr(weights, enabled_component) * getattr(breakdown, enabled_component)
+        - weights.redundancy * breakdown.redundancy
+    )
+    assert breakdown.total == pytest.approx(expected, abs=1.0e-6)
+
+
+def test_explicit_all_prototype_gain_metrics_match_default():
+    graph = _small_graph()
+    weights = ObjectiveWeights()
+
+    default = recompute_objective([0, 1], graph, weights, similarity_threshold=0.8)
+    explicit = recompute_objective(
+        [0, 1],
+        graph,
+        weights,
+        similarity_threshold=0.8,
+        prototype_gain_metrics=["sequence", "transition", "cooccurrence"],
+    )
+
+    assert explicit == default
+
+
 def test_incremental_remove_matches_full_recomputation_and_allows_reinsertion():
     graph = _small_graph()
     weights = ObjectiveWeights()

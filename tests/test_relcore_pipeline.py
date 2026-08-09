@@ -205,7 +205,7 @@ def test_run_pipeline_publishes_aligned_outputs_and_reuses_complete_cache(
     result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
     root = Path(config["output"]["directory"])
 
-    assert result == root / "select-15"
+    assert result == root / "select-r15-g7"
     assert (root / "scan" / "manifest.json").is_file()
     assert (root / "encode" / "manifest.json").is_file()
     assert not (root / ".relcore-cache").exists()
@@ -235,6 +235,11 @@ def test_run_pipeline_publishes_aligned_outputs_and_reuses_complete_cache(
         "smoothness",
         "non_noop",
     ]
+    assert report["prototype_gain_metrics"] == [
+        "transition",
+        "cooccurrence",
+        "sequence",
+    ]
     assert report["task_quotas"] == {"0": 1, "1": 1}
     assert set(report["runtime_seconds"]) == {"scan", "encode", "graph", "select"}
     assert "prototype_coverage" in report
@@ -246,11 +251,17 @@ def test_run_pipeline_publishes_aligned_outputs_and_reuses_complete_cache(
 
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert run_manifest["reliability_mask"] == 15
+    assert run_manifest["prototype_gain_metrics"] == [
+        "transition",
+        "cooccurrence",
+        "sequence",
+    ]
+    assert run_manifest["prototype_gain_mask"] == 7
     assert run_manifest["stage_directories"] == {
         "scan": "scan",
         "encode": "encode",
         "graph": "graph-15",
-        "select": "select-15",
+        "select": "select-r15-g7",
     }
 
     first_mtime = (result / "selected_manifest.jsonl").stat().st_mtime_ns
@@ -278,8 +289,8 @@ def test_motion_primitive_pipeline_coexists_with_kmeans_and_exports_labels(
     motion_result = run_pipeline(motion_config, visual_encoder=PipelineVisualEncoder())
     root = Path(motion_config["output"]["directory"])
 
-    assert kmeans_result == root / "select-15"
-    assert motion_result == root / "select-15-motion-primitives"
+    assert kmeans_result == root / "select-r15-g7"
+    assert motion_result == root / "select-r15-g7-motion-primitives"
     assert (root / "graph-15" / "prototype_centers.npy").is_file()
     graph_root = root / "graph-15-motion-primitives"
     assert not (graph_root / "prototype_centers.npy").exists()
@@ -316,7 +327,7 @@ def test_motion_primitive_pipeline_coexists_with_kmeans_and_exports_labels(
         "scan": "scan",
         "encode": "encode",
         "graph": "graph-15-motion-primitives",
-        "select": "select-15-motion-primitives",
+        "select": "select-r15-g7-motion-primitives",
     }
     assert validate_output(motion_result, config=motion_config) == {
         "status": "valid",
@@ -382,13 +393,13 @@ def test_reliability_metric_variants_share_encode_and_keep_graphs_and_selects(
         visual_encoder=PipelineVisualEncoder(),
     )
 
-    assert all_metrics == root / "select-15"
-    assert selected == root / "select-5"
+    assert all_metrics == root / "select-r15-g7"
+    assert selected == root / "select-r5-g7"
     assert (root / "encode" / "manifest.json").stat().st_mtime_ns == encode_mtime
     assert (root / "graph-15" / "manifest.json").is_file()
     assert (root / "graph-5" / "manifest.json").is_file()
-    assert (root / "select-15" / "manifest.json").is_file()
-    assert (root / "select-5" / "manifest.json").is_file()
+    assert (root / "select-r15-g7" / "manifest.json").is_file()
+    assert (root / "select-r5-g7" / "manifest.json").is_file()
     nodes = np.load(root / "graph-5" / "nodes.npz")
     assert not np.array_equal(nodes["reliability"], baseline_reliability)
     np.testing.assert_allclose(
@@ -403,6 +414,39 @@ def test_reliability_metric_variants_share_encode_and_keep_graphs_and_selects(
     assert graph_manifest["upstream_fingerprint"] == encode_manifest["fingerprint"]
     report = json.loads((selected / "selection_report.json").read_text())
     assert report["reliability_metrics"] == ["progress", "non_noop"]
+    assert validate_output(selected, config=config)["status"] == "valid"
+
+
+def test_prototype_gain_metric_variants_reuse_graph_and_keep_selects(
+    tmp_path: Path,
+):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    root = Path(config["output"]["directory"])
+    all_metrics = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    graph_manifest_path = root / "graph-15" / "manifest.json"
+    graph_mtime = graph_manifest_path.stat().st_mtime_ns
+    graph_fingerprint = json.loads(graph_manifest_path.read_text())["fingerprint"]
+
+    selected = run_pipeline(
+        config,
+        prototype_gain_metrics=["sequence", "transition"],
+        visual_encoder=PipelineVisualEncoder(),
+    )
+
+    assert all_metrics == root / "select-r15-g7"
+    assert selected == root / "select-r15-g5"
+    assert graph_manifest_path.stat().st_mtime_ns == graph_mtime
+    assert json.loads(graph_manifest_path.read_text())["fingerprint"] == graph_fingerprint
+    assert (all_metrics / "manifest.json").is_file()
+    select_manifest = json.loads((selected / "manifest.json").read_text())
+    assert select_manifest["prototype_gain_metrics"] == ["transition", "sequence"]
+    assert select_manifest["prototype_gain_mask"] == 5
+    report = json.loads((selected / "selection_report.json").read_text())
+    assert report["prototype_gain_metrics"] == ["transition", "sequence"]
+    run_manifest = json.loads((selected / "run_manifest.json").read_text())
+    assert run_manifest["prototype_gain_metrics"] == ["transition", "sequence"]
+    assert run_manifest["prototype_gain_mask"] == 5
     assert validate_output(selected, config=config)["status"] == "valid"
 
 
@@ -442,7 +486,7 @@ def test_ratio_scoped_selects_coexist_and_preserve_shared_outputs(tmp_path: Path
             selection_output_ratio=0.5,
             visual_encoder=PipelineVisualEncoder(),
         )
-        == root / "select-15-top50pct"
+        == root / "select-r15-g7-top50pct"
     )
     assert (
         select_stage(
@@ -450,11 +494,11 @@ def test_ratio_scoped_selects_coexist_and_preserve_shared_outputs(tmp_path: Path
             selection_output_ratio=1.0,
             visual_encoder=PipelineVisualEncoder(),
         )
-        == root / "select-15-top100pct"
+        == root / "select-r15-g7-top100pct"
     )
 
-    half_root = root / "select-15-top50pct"
-    full_root = root / "select-15-top100pct"
+    half_root = root / "select-r15-g7-top50pct"
+    full_root = root / "select-r15-g7-top100pct"
     assert json.loads((half_root / "manifest.json").read_text())["selected_clips"] == 3
     assert json.loads((full_root / "manifest.json").read_text())["selected_clips"] == 6
     for selection_root in (half_root, full_root):
@@ -612,6 +656,58 @@ def test_validate_rejects_reliability_mask_that_differs_from_metrics(tmp_path: P
         validate_output(result, config=config)
 
 
+def test_validate_rejects_noncanonical_reported_prototype_gain_metrics(tmp_path: Path):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    report_path = result / "selection_report.json"
+    report = json.loads(report_path.read_text())
+    report["prototype_gain_metrics"] = ["sequence", "transition"]
+    write_json(report_path, report)
+
+    with pytest.raises(ValueError, match="prototype_gain_metrics"):
+        validate_output(result)
+
+
+def test_validate_rejects_prototype_gain_mask_that_differs_from_metrics(tmp_path: Path):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    manifest_path = result / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["prototype_gain_mask"] = 5
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="prototype_gain_mask"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_legacy_manifest_without_prototype_gain_metrics(tmp_path: Path):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    manifest_path = result / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.pop("prototype_gain_metrics")
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="prototype_gain_metrics"):
+        validate_output(result)
+
+
+def test_validate_rejects_tampered_select_prototype_gain_metrics(tmp_path: Path):
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    manifest_path = result / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["prototype_gain_metrics"] = ["transition"]
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="select.*prototype_gain_metrics"):
+        validate_output(result)
+
+
 def test_validate_rejects_tampered_stage_directory(tmp_path: Path):
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     config = _config(tmp_path)
@@ -640,7 +736,7 @@ def test_validate_rejects_tampered_graph_metrics(tmp_path: Path):
 
 @pytest.mark.parametrize(
     ("stage", "directory"),
-    [("graph", "graph-15"), ("select", "select-15")],
+    [("graph", "graph-15"), ("select", "select-r15-g7")],
 )
 def test_validate_rejects_tampered_upstream_fingerprint(
     tmp_path: Path,
@@ -776,7 +872,7 @@ def test_cli_run_and_validate_use_exact_output_directory(tmp_path: Path, capsys)
             str(output),
         ]
     )
-    result = output / "select-15"
+    result = output / "select-r15-g7"
     main(
         [
             "validate",

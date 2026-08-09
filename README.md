@@ -583,11 +583,12 @@ bash scripts/train_bridge_4x4090.sh --gpu-ids 0,1,2,3 --deepspeed-stage 3
 训练只保存 LoRA 和动作头权重，不保存优化器、scheduler、随机状态或 DeepSpeed
 分片，因此不支持 `--resume` 断点续训。
 
-4 卡和 8 卡配置默认同时关闭 Qwen 主干与 DiT 动作头的 gradient checkpointing，
-并使用 PyTorch Inductor 原地编译两个模块。编译采用动态 shape、允许局部 graph
-break；首次训练调用以及第 2,000 步 LoRA 解冻后可能出现一次性编译延迟。该配置
-减少重复计算并提高稳定阶段吞吐，但会增加激活显存占用。遇到编译器或算子兼容
-问题时，可在配置中将 `model.torch_compile.enabled` 改为 `false`。
+所有配置默认同时关闭 Qwen 主干与 DiT 动作头的 gradient checkpointing。Bridge
+4 卡和 8 卡配置使用 PyTorch Inductor 原地编译两个模块；编译采用动态 shape、允许
+局部 graph break，首次训练调用以及第 2,000 步 LoRA 解冻后可能出现一次性编译
+延迟。Qwen LIBERO 配置默认关闭 `torch.compile`，避免 Qwen3-VL FlashAttention
+路径中的 graph break 和按层重复编译；需要自行评估吞吐时，可将
+`model.torch_compile.enabled` 改回 `true`。
 
 完整参数见：
 
@@ -614,6 +615,18 @@ Bridge 只读取 `observation.images.image_0`；LIBERO 只读取主视角
   Safetensors checkpoint；
 - `checkpoints/latest.json` 与 `checkpoints/best.json` 分别标记最新和验证集
   最优 step。
+
+rank 0 会把 `metrics.jsonl` 中的同一份 JSON 指标同步打印到终端。也可以从另一个
+终端直接跟踪指标或启动 TensorBoard：
+
+```bash
+tail -f /path/to/output/metrics.jsonl
+tensorboard --logdir /path/to/output/tensorboard --port 6006
+```
+
+日志按 `train.log_every_steps` 个 optimizer step 输出；首次 batch 前会明确提示是否
+正在进行 TorchInductor warm-up。短时间没有新行不等于 NCCL 卡死，应结合指标文件
+更新时间和 GPU 利用率判断。
 
 最多保留 latest 与 best 引用的两个 `step-*` 目录；二者指向同一步时只保留
 一份。不会额外复制到 `best/` 或 `inference/` 目录。

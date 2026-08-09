@@ -52,6 +52,32 @@ def test_reliability_metrics_reject_invalid_values(value: str) -> None:
         cli.build_parser().parse_args(["run", "--reliability-metrics", value])
 
 
+@pytest.mark.parametrize("command", ["select", "run"])
+def test_selection_commands_accept_prototype_gain_metric_names(command: str) -> None:
+    arguments = cli.build_parser().parse_args(
+        [command, "--prototype-gain-metrics", "sequence,transition"]
+    )
+
+    assert arguments.prototype_gain_metrics == ("transition", "sequence")
+
+
+@pytest.mark.parametrize("command", ["scan", "encode", "build-graph"])
+def test_preselection_commands_reject_prototype_gain_metrics(command: str) -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            [command, "--prototype-gain-metrics", "transition"]
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "transition,transition", "transition,unknown"],
+)
+def test_prototype_gain_metrics_reject_invalid_values(value: str) -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["run", "--prototype-gain-metrics", value])
+
+
 @pytest.mark.parametrize("command", ["build-graph", "run"])
 def test_graph_building_commands_accept_prototype_method(command: str) -> None:
     arguments = cli.build_parser().parse_args([command, "--prototype-method", "motion_primitives"])
@@ -77,20 +103,33 @@ def test_motion_primitive_graph_directory_is_isolated_from_kmeans() -> None:
 
 
 @pytest.mark.parametrize(
-    ("metrics", "ratio", "expected"),
+    ("metrics", "gain_metrics", "ratio", "expected"),
     [
-        (["support", "progress", "smoothness", "non_noop"], None, "select-15"),
-        (["progress", "non_noop"], 0.20, "select-5-top20pct"),
-        (["non_noop"], 0.125, "select-1-top12p5pct"),
-        (["support"], 1.0, "select-8-top100pct"),
+        (
+            ["support", "progress", "smoothness", "non_noop"],
+            ["transition", "cooccurrence", "sequence"],
+            None,
+            "select-r15-g7",
+        ),
+        (["progress", "non_noop"], ["transition", "sequence"], 0.20, "select-r5-g5-top20pct"),
+        (["non_noop"], ["cooccurrence"], 0.125, "select-r1-g2-top12p5pct"),
+        (["support"], ["sequence"], 1.0, "select-r8-g1-top100pct"),
     ],
 )
 def test_selection_directory_name_uses_canonical_percent_tag(
     metrics: list[str],
+    gain_metrics: list[str],
     ratio: float | None,
     expected: str,
 ) -> None:
-    assert pipeline.selection_directory_name(metrics, ratio) == expected
+    assert (
+        pipeline.selection_directory_name(
+            metrics,
+            ratio,
+            prototype_gain_metrics=gain_metrics,
+        )
+        == expected
+    )
 
 
 def test_motion_primitive_selection_directory_is_isolated_from_kmeans() -> None:
@@ -99,8 +138,9 @@ def test_motion_primitive_selection_directory_is_isolated_from_kmeans() -> None:
             ["support", "progress", "smoothness", "non_noop"],
             0.125,
             "motion_primitives",
+            prototype_gain_metrics=["transition", "sequence"],
         )
-        == "select-15-motion-primitives-top12p5pct"
+        == "select-r15-g5-motion-primitives-top12p5pct"
     )
 
 
@@ -123,9 +163,10 @@ def test_main_run_prototype_method_overrides_loaded_config(
         force: bool,
         selection_output_ratio: float | None,
         reliability_metrics: tuple[str, ...],
+        prototype_gain_metrics: tuple[str, ...],
     ) -> Path:
         received["config"] = copy.deepcopy(resolved)
-        return Path("outputs/relcore/test/select-15-motion-primitives")
+        return Path("outputs/relcore/test/select-r15-g7-motion-primitives")
 
     monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
 
@@ -157,13 +198,15 @@ def test_main_select_ratio_scopes_output_and_reports_selection_directory(
         force: bool,
         selection_output_ratio: float | None,
         reliability_metrics: tuple[str, ...],
+        prototype_gain_metrics: tuple[str, ...],
     ) -> Path:
         received["config"] = copy.deepcopy(resolved)
         received["output_dir"] = output_dir
         received["force"] = force
         received["selection_output_ratio"] = selection_output_ratio
         received["reliability_metrics"] = reliability_metrics
-        return Path("outputs/relcore/test/select-5-top25pct")
+        received["prototype_gain_metrics"] = prototype_gain_metrics
+        return Path("outputs/relcore/test/select-r5-g5-top25pct")
 
     monkeypatch.setattr(cli, "select_stage", fake_selection_stage)
 
@@ -176,6 +219,8 @@ def test_main_select_ratio_scopes_output_and_reports_selection_directory(
             "0.25",
             "--reliability-metrics",
             "progress,non_noop",
+            "--prototype-gain-metrics",
+            "sequence,transition",
         ]
     )
 
@@ -185,8 +230,9 @@ def test_main_select_ratio_scopes_output_and_reports_selection_directory(
     }
     assert received["selection_output_ratio"] == pytest.approx(0.25)
     assert received["reliability_metrics"] == ("progress", "non_noop")
+    assert received["prototype_gain_metrics"] == ("transition", "sequence")
     assert capsys.readouterr().out.strip() == (
-        "relcore_output=outputs/relcore/test/select-5-top25pct"
+        "relcore_output=outputs/relcore/test/select-r5-g5-top25pct"
     )
 
 
@@ -209,11 +255,13 @@ def test_main_run_ratio_reports_metric_and_ratio_scoped_output(
         force: bool,
         selection_output_ratio: float | None,
         reliability_metrics: tuple[str, ...],
+        prototype_gain_metrics: tuple[str, ...],
     ) -> Path:
         received["config"] = copy.deepcopy(resolved)
         received["selection_output_ratio"] = selection_output_ratio
         received["reliability_metrics"] = reliability_metrics
-        return Path("outputs/relcore/test/select-15-top25pct")
+        received["prototype_gain_metrics"] = prototype_gain_metrics
+        return Path("outputs/relcore/test/select-r15-g7-top25pct")
 
     monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
 
@@ -238,8 +286,13 @@ def test_main_run_ratio_reports_metric_and_ratio_scoped_output(
         "smoothness",
         "non_noop",
     )
+    assert received["prototype_gain_metrics"] == (
+        "transition",
+        "cooccurrence",
+        "sequence",
+    )
     assert capsys.readouterr().out.strip() == (
-        "relcore_output=outputs/relcore/test/select-15-top25pct"
+        "relcore_output=outputs/relcore/test/select-r15-g7-top25pct"
     )
 
 
@@ -262,11 +315,13 @@ def test_main_select_without_ratio_uses_default_metric_directory(
         force: bool,
         selection_output_ratio: float | None,
         reliability_metrics: tuple[str, ...],
+        prototype_gain_metrics: tuple[str, ...],
     ) -> Path:
         received["config"] = copy.deepcopy(resolved)
         received["selection_output_ratio"] = selection_output_ratio
         received["reliability_metrics"] = reliability_metrics
-        return Path("outputs/relcore/test/select-15")
+        received["prototype_gain_metrics"] = prototype_gain_metrics
+        return Path("outputs/relcore/test/select-r15-g7")
 
     monkeypatch.setattr(cli, "select_stage", fake_selection_stage)
 
@@ -280,7 +335,12 @@ def test_main_select_without_ratio_uses_default_metric_directory(
         "smoothness",
         "non_noop",
     )
-    assert capsys.readouterr().out.strip() == "relcore_output=outputs/relcore/test/select-15"
+    assert received["prototype_gain_metrics"] == (
+        "transition",
+        "cooccurrence",
+        "sequence",
+    )
+    assert capsys.readouterr().out.strip() == "relcore_output=outputs/relcore/test/select-r15-g7"
 
 
 def test_main_without_selection_ratio_preserves_configured_budget(
@@ -301,11 +361,13 @@ def test_main_without_selection_ratio_preserves_configured_budget(
         force: bool,
         selection_output_ratio: float | None,
         reliability_metrics: tuple[str, ...],
+        prototype_gain_metrics: tuple[str, ...],
     ) -> Path:
         received["config"] = copy.deepcopy(resolved)
         received["selection_output_ratio"] = selection_output_ratio
         received["reliability_metrics"] = reliability_metrics
-        return Path("outputs/relcore/test/select-15")
+        received["prototype_gain_metrics"] = prototype_gain_metrics
+        return Path("outputs/relcore/test/select-r15-g7")
 
     monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
 

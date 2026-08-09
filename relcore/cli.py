@@ -18,6 +18,7 @@ from .pipeline import (
     validate_output,
 )
 from .scoring import RELIABILITY_METRICS, normalize_reliability_metrics
+from .selection import PROTOTYPE_GAIN_METRICS, normalize_prototype_gain_metrics
 
 
 def _selection_ratio(value: str) -> float:
@@ -40,6 +41,18 @@ def _reliability_metrics(value: str) -> tuple[str, ...]:
         return normalize_reliability_metrics(tuple(part.strip() for part in parts))
     except ValueError as error:
         raise argparse.ArgumentTypeError(f"reliability metrics {error}") from error
+
+
+def _prototype_gain_metrics(value: str) -> tuple[str, ...]:
+    parts = value.split(",")
+    if any(not part.strip() for part in parts):
+        raise argparse.ArgumentTypeError(
+            "prototype gain metrics must be a comma-separated list of metric names"
+        )
+    try:
+        return normalize_prototype_gain_metrics(tuple(part.strip() for part in parts))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"prototype gain metrics {error}") from error
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,6 +81,13 @@ def build_parser() -> argparse.ArgumentParser:
                 help="override prototypes.method while building the graph",
             )
         if command in {"select", "run"}:
+            child.add_argument(
+                "--prototype-gain-metrics",
+                type=_prototype_gain_metrics,
+                default=PROTOTYPE_GAIN_METRICS,
+                metavar="NAMES",
+                help="comma-separated subset of transition,cooccurrence,sequence",
+            )
             child.add_argument(
                 "--selection-ratio",
                 type=_selection_ratio,
@@ -121,6 +141,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             force=args.force,
             selection_output_ratio=args.selection_ratio,
             reliability_metrics=args.reliability_metrics,
+            prototype_gain_metrics=args.prototype_gain_metrics,
         )
         print(f"relcore_output={result}")
     else:
@@ -130,6 +151,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             force=args.force,
             selection_output_ratio=args.selection_ratio,
             reliability_metrics=args.reliability_metrics,
+            prototype_gain_metrics=args.prototype_gain_metrics,
         )
         print(f"relcore_output={result}")
 

@@ -23,19 +23,20 @@ python -m relcore encode --config relcore/config_libero90.yaml
 python -m relcore build-graph --config relcore/config_libero90.yaml
 python -m relcore select --config relcore/config_libero90.yaml
 python -m relcore run --config relcore/config_libero90.yaml
-python -m relcore validate --output-dir outputs/relcore/libero90/select-15 \
+python -m relcore validate --output-dir outputs/relcore/libero90/select-r15-g7 \
   --config relcore/config_libero90.yaml
 ```
 
-默认启用全部四项可靠性指标，因此 graph 和最终结果分别位于 `graph-15/` 与
-`select-15/`。`build-graph`、`select` 和 `run` 可通过逗号分隔参数选择指标：
+默认启用全部四项可靠性指标和全部三项原型间增益指标，因此 graph 和最终结果分别位于
+`graph-15/` 与 `select-r15-g7/`。`build-graph`、`select` 和 `run` 可通过逗号分隔参数
+选择可靠性指标：
 
 ```bash
 python -m relcore run --config relcore/config_libero90.yaml \
   --reliability-metrics progress,non_noop
 ```
 
-上述结果使用掩码 5，位于 `graph-5/` 和 `select-5/`，并与默认结果共享同一份
+上述结果使用可靠性掩码 5，位于 `graph-5/` 和 `select-r5-g7/`，并与默认结果共享同一份
 `scan/` 和聚合后的 `encode/` 阶段产物。
 
 `select` 和 `run` 可通过 `--selection-ratio` 在调用时设置筛选比例，取值范围为
@@ -52,9 +53,9 @@ python -m relcore select --config relcore/config_libero90.yaml \
   --selection-ratio 0.20
 ```
 
-上述结果分别位于 `outputs/relcore/libero90/select-15-top10pct/` 和
-`outputs/relcore/libero90/select-15-top20pct/`；12.5% 使用
-`select-15-top12p5pct/`。
+上述结果分别位于 `outputs/relcore/libero90/select-r15-g7-top10pct/` 和
+`outputs/relcore/libero90/select-r15-g7-top20pct/`；12.5% 使用
+`select-r15-g7-top12p5pct/`。
 比例目录包含 `manifest.json`、`selected_manifest.jsonl`、`all_clips.parquet` 和
 `selection_report.json`，同时保存 `run_manifest.json`。命令打印的
 `relcore_output=` 直接指向本次选择目录。同一指标掩码和比例目录的其他配置发生
@@ -67,14 +68,14 @@ python -m relcore run --config relcore/config_libero90.yaml \
   --selection-ratio 0.20 --force
 ```
 
-`validate` 接受具体的 `select-<mask>/` 或 `select-<mask>-topXpct/` 目录，并从其中的
+`validate` 接受具体的 `select-r<可靠性掩码>-g<增益掩码>[-topXpct]/` 目录，并从其中的
 manifest 定位共享输出根目录下的 scan、encode 和匹配的 graph。
 
 ## 原型方法
 
 `prototypes.method` 控制 graph 阶段使用的原型与软类别方法。默认值 `kmeans` 保持
-原有 MiniBatchKMeans 行为和 `graph-<mask>/`、`select-<mask>/` 目录。LIBERO 数据也可
-切换为运动原语：
+原有 MiniBatchKMeans 行为和 `graph-<mask>/` 目录；选择结果使用双掩码目录。LIBERO
+数据也可切换为运动原语：
 
 ```yaml
 prototypes:
@@ -97,8 +98,8 @@ python -m relcore run --config relcore/config_libero90.yaml \
 
 `select` 不接受 `--prototype-method`；它按配置中的方法使用对应 graph。运动原语结果写入
 `graph-<mask>-motion-primitives/` 和
-`select-<mask>-motion-primitives[-topXpct]/`，因此可与 KMeans 结果共享 scan/encode
-并安全共存。
+`select-r<可靠性掩码>-g<增益掩码>-motion-primitives[-topXpct]/`，因此可与 KMeans
+结果共享 scan/encode 并安全共存。
 
 运动原语方法固定使用原始 `observation.state`，以 horizon 8、状态阈值 0.03 在每个
 episode 内统计类别；只保留全局占比严格大于 0.005 的类别。每个 15 帧片段使用
@@ -137,8 +138,35 @@ python -m relcore run --config relcore/config_libero90.yaml \
 
 四个原始分量始终计算并保存在 `graph-<mask>/nodes.npz`，但只有参数子集合成的单一
 `reliability` 用于建图、目标函数、种子和候选选择。实际生效列表写入
-`selection_report.json`。不同指标集合写入不同 graph/select 目录，无需 `--force`；
-scan 和聚合后的 encode 阶段仍可复用。
+`selection_report.json`。不同可靠性指标集合写入不同 graph 和带对应 `r` 掩码的 select
+目录，无需 `--force`；scan 和聚合后的 encode 阶段仍可复用。
+
+## 原型间增益指标
+
+原型间增益指标同样是独立的 CLI/Python API 参数，不属于 YAML `objective` 配置。
+`select` 和 `run` 接受 `--prototype-gain-metrics`，默认启用全部三项：
+
+- `transition`：根据全池原型转移矩阵奖励已覆盖的原型对；
+- `cooccurrence`：根据全池共现矩阵奖励已覆盖的原型对；
+- `sequence`：奖励筛选集合中真实相邻片段保留的原型转移关系。
+
+列表必须非空、不能重复且只能包含上述名称；解析后固定按
+`[transition, cooccurrence, sequence]` 保存，对应二进制权重 `[4, 2, 1]`。例如只启用
+转移与序列增益：
+
+```bash
+python -m relcore run --config relcore/config_libero90.yaml \
+  --prototype-gain-metrics transition,sequence
+```
+
+该组合的增益掩码为 5；默认可靠性指标下结果位于 `select-r15-g5/`，并复用
+`graph-15/`。单原型覆盖 `node` 与相似片段惩罚 `redundancy` 始终生效；禁用的三项
+仍保留在 `selection_report.json` 的原始目标分解中，但不计入边际增益和总分。实际
+启用列表及掩码写入 select/run manifest，不同组合可安全并存且不会重建 graph。
+
+YAML 若包含 `objective.prototype_gain_metrics` 会明确提示改用 CLI 参数。新版选择目录
+始终包含 `r`/`g` 双掩码；缺少原型增益字段的旧 `select-15/` 产物不再由 `validate`
+接受，需要重新运行 select 或 run。
 
 各阶段用数据、相关配置和上游 artifact 指纹恢复；已有不兼容阶段必须显式传
 `--force`。兼容的上游阶段即使在 `--force` 下也会复用，因此只修改预算或分支参数
@@ -171,7 +199,7 @@ python -m relcore scan --config relcore/config_bridge.yaml
 CUDA_VISIBLE_DEVICES=0 python -m relcore encode --config relcore/config_bridge.yaml
 CUDA_VISIBLE_DEVICES=0 python -m relcore run --config relcore/config_bridge.yaml
 python -m relcore validate \
-  --output-dir outputs/relcore/bridge_orig_1.0.0_top10pct/select-15 \
+  --output-dir outputs/relcore/bridge_orig_1.0.0_top10pct/select-r15-g7 \
   --config relcore/config_bridge.yaml
 ```
 
@@ -205,7 +233,7 @@ TRAJECTORY_DATA_NUM_THREADS=4 python -m relcore select \
   --output-dir /data/dwb/libero_filter/relcore
 ```
 
-该命令的筛选结果位于 `/data/dwb/libero_filter/relcore/select-15-top30pct/`。
+该命令的筛选结果位于 `/data/dwb/libero_filter/relcore/select-r15-g7-top30pct/`。
 
 在尚未包含该启动保护的旧版本上，可用下面的等价命令临时规避；四个变量必须在
 启动 Python 前设置：
@@ -223,15 +251,15 @@ NUMEXPR_NUM_THREADS=1 python -m relcore select \
 窗口固定长度 15、stride 15，并与 SQCN 一样追加末尾对齐窗口；不足 15 帧的 episode
 跳过。只有边界严格相邻的窗口才建立时序边，重叠的尾部窗口不会伪造时序关系。
 
-共享输出根目录始终保留 `scan/`、`encode/` 和一个或多个 `graph-<mask>/`。最终结果
-位于 `select-<mask>/`；显式传入 `--selection-ratio` 时位于
-`select-<mask>-topXpct/`。每个选择目录包含：
+共享输出根目录始终保留 `scan/`、`encode/` 和一个或多个 `graph-<可靠性掩码>/`。
+最终结果位于 `select-r<可靠性掩码>-g<增益掩码>/`；显式传入 `--selection-ratio`
+时追加 `-topXpct`。每个选择目录包含：
 
 - `selected_manifest.jsonl`：按选择顺序记录 LeRobot `episode_id` 与 inclusive
   `start_step/end_step`；
 - `all_clips.parquet`：全部候选、可靠性、原型、选择状态和最终边际；
 - `selection_report.json`：目标分解、实际任务计数、可选任务额度和分支结果；
-- `run_manifest.json`：可靠性指标、掩码、阶段目录和阶段指纹；
+- `run_manifest.json`：可靠性/原型增益指标、双掩码、阶段目录和阶段指纹；
 - `resolved_config.yaml`、`environment.json`：`run` 写入的配置与运行环境。
 
 `encode/` 只保存聚合后的 embeddings、关系特征、状态/动作序列、视觉进展、归一化与
