@@ -10,7 +10,7 @@ from scipy import sparse
 
 from relcore.schemas import ClipRecord, EdgeTable, GraphData
 
-from .prototypes import PrototypeData
+from .prototypes import PrototypeData, valid_prototype_assignments
 
 
 def _edge_table(edges: list[tuple[int, int, float]], edge_type: str) -> EdgeTable:
@@ -33,15 +33,17 @@ def _prototype_matrix(
     edges: list[tuple[int, int, float]],
     prototypes: PrototypeData,
 ) -> sparse.csr_matrix:
-    count = len(prototypes.centers)
+    count = prototypes.count
     matrix = np.zeros((count, count), dtype=np.float64)
     for source, target, edge_weight in edges:
-        for source_index, source_weight in zip(
-            prototypes.indices[source], prototypes.weights[source], strict=True
-        ):
-            for target_index, target_weight in zip(
-                prototypes.indices[target], prototypes.weights[target], strict=True
-            ):
+        source_indices, source_weights = valid_prototype_assignments(
+            prototypes.indices[source], prototypes.weights[source]
+        )
+        target_indices, target_weights = valid_prototype_assignments(
+            prototypes.indices[target], prototypes.weights[target]
+        )
+        for source_index, source_weight in zip(source_indices, source_weights, strict=True):
+            for target_index, target_weight in zip(target_indices, target_weights, strict=True):
                 matrix[source_index, target_index] += (
                     edge_weight * float(source_weight) * float(target_weight)
                 )
@@ -149,4 +151,5 @@ def build_graph(
             prototypes,
         ),
         cooccurrence_matrix=_prototype_matrix(cooccurrence, prototypes),
+        prototype_labels=prototypes.labels,
     )

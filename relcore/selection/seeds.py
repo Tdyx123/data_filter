@@ -7,6 +7,8 @@ from collections.abc import Mapping
 
 import numpy as np
 
+from relcore.graph.prototypes import valid_prototype_assignments
+
 from .objective import ObjectiveContext
 
 
@@ -54,7 +56,15 @@ def generate_seed_pairs(
         if _pair_feasible(context, pair, task_quotas):
             pairs.add(pair)
 
-    primary = graph.prototype_indices[:, 0]
+    primary = np.asarray(
+        [
+            valid_prototype_assignments(indices, weights)[0][0]
+            for indices, weights in zip(
+                graph.prototype_indices, graph.prototype_weights, strict=True
+            )
+        ],
+        dtype=np.int32,
+    )
     by_prototype: dict[int, list[int]] = defaultdict(list)
     for index, prototype in enumerate(primary):
         by_prototype[int(prototype)].append(index)

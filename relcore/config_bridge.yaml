@@ -42,6 +42,7 @@ quality:
   min_reliability: 0.05
 
 prototypes:
+  method: kmeans
   count: 64
   batch_size: 4096
   max_iter: 100

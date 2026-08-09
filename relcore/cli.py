@@ -60,6 +60,13 @@ def build_parser() -> argparse.ArgumentParser:
                 metavar="NAMES",
                 help="comma-separated subset of support,progress,smoothness,non_noop",
             )
+        if command in {"build-graph", "run"}:
+            child.add_argument(
+                "--prototype-method",
+                choices=("kmeans", "motion_primitives"),
+                default=None,
+                help="override prototypes.method while building the graph",
+            )
         if command in {"select", "run"}:
             child.add_argument(
                 "--selection-ratio",
@@ -81,6 +88,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(json.dumps(validate_output(args.output_dir, config=config), sort_keys=True))
         return
     config = load_config(args.config)
+    if getattr(args, "prototype_method", None) is not None:
+        config["prototypes"]["method"] = args.prototype_method
     if args.max_episodes is not None:
         if args.max_episodes <= 0:
             raise SystemExit("--max-episodes must be positive")
@@ -102,7 +111,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             reliability_metrics=args.reliability_metrics,
         )
         print(
-            f"relcore_output={root / graph_directory_name(args.reliability_metrics)} "
+            f"relcore_output={root / graph_directory_name(args.reliability_metrics, config['prototypes']['method'])} "
             f"nodes={len(graph.sample_ids)}"
         )
     elif args.command == "select":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
@@ -86,6 +87,29 @@ class PipelineAdapter(DatasetAdapter):
 
     def fingerprint(self) -> str:
         return "relcore-pipeline-adapter-v1"
+
+
+class MotionPipelineAdapter(PipelineAdapter):
+    def iter_episodes(
+        self,
+        *,
+        num_workers: int = 0,
+        max_episodes: int | None = None,
+        load_images: bool = True,
+    ) -> Iterator[EpisodeData]:
+        for episode in super().iter_episodes(
+            num_workers=num_workers,
+            max_episodes=max_episodes,
+            load_images=load_images,
+        ):
+            source = episode.observations["observation.state"]
+            states = np.zeros((episode.length, 8), dtype=np.float32)
+            states[:, : source.shape[1]] = source
+            episode.observations["observation.state"] = states
+            yield episode
+
+    def fingerprint(self) -> str:
+        return "relcore-motion-pipeline-adapter-v1"
 
 
 class PipelineVisualEncoder:
@@ -241,6 +265,65 @@ def test_run_pipeline_publishes_aligned_outputs_and_reuses_complete_cache(
     assert validation["selected_clips"] == 2
 
 
+def test_motion_primitive_pipeline_coexists_with_kmeans_and_exports_labels(
+    tmp_path: Path,
+) -> None:
+    register_dataset_adapter("relcore_motion_pipeline_synthetic", MotionPipelineAdapter)
+    kmeans_config = _config(tmp_path)
+    kmeans_config["dataset"]["type"] = "relcore_motion_pipeline_synthetic"
+    kmeans_result = run_pipeline(kmeans_config, visual_encoder=PipelineVisualEncoder())
+
+    motion_config = copy.deepcopy(kmeans_config)
+    motion_config["prototypes"]["method"] = "motion_primitives"
+    motion_result = run_pipeline(motion_config, visual_encoder=PipelineVisualEncoder())
+    root = Path(motion_config["output"]["directory"])
+
+    assert kmeans_result == root / "select-15"
+    assert motion_result == root / "select-15-motion-primitives"
+    assert (root / "graph-15" / "prototype_centers.npy").is_file()
+    graph_root = root / "graph-15-motion-primitives"
+    assert not (graph_root / "prototype_centers.npy").exists()
+    catalog = json.loads((graph_root / "prototype_catalog.json").read_text())
+    assert catalog["method"] == "motion_primitives"
+    assert catalog["constants"] == {
+        "clip_anchors": [0, 7, 14],
+        "dominance_ratio": 4.0,
+        "fallback_weight": 0.8,
+        "horizon": 8,
+        "min_frequency": 0.005,
+        "state_threshold": 0.03,
+    }
+    assert catalog["total_labels"] == 46
+    graph_manifest = json.loads((graph_root / "manifest.json").read_text())
+    assert graph_manifest["prototype_method"] == "motion_primitives"
+
+    rows = [
+        json.loads(line)
+        for line in (motion_result / "selected_manifest.jsonl").read_text().splitlines()
+    ]
+    assert rows
+    for row in rows:
+        assert 1 <= len(row["prototype_indices"]) <= 4
+        assert len(row["prototype_indices"]) == len(row["prototype_weights"])
+        assert len(row["prototype_indices"]) == len(row["prototype_labels"])
+        assert row["primary_prototype_label"] == row["prototype_labels"][0]
+        assert all(index >= 0 for index in row["prototype_indices"])
+    report = json.loads((motion_result / "selection_report.json").read_text())
+    run_manifest = json.loads((motion_result / "run_manifest.json").read_text())
+    assert report["prototype_method"] == "motion_primitives"
+    assert run_manifest["prototype_method"] == "motion_primitives"
+    assert run_manifest["stage_directories"] == {
+        "scan": "scan",
+        "encode": "encode",
+        "graph": "graph-15-motion-primitives",
+        "select": "select-15-motion-primitives",
+    }
+    assert validate_output(motion_result, config=motion_config) == {
+        "status": "valid",
+        "selected_clips": 2,
+    }
+
+
 def test_scan_performs_the_numeric_pass_without_loading_images(tmp_path: Path):
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     PipelineAdapter.load_images_calls.clear()
@@ -353,16 +436,22 @@ def test_ratio_scoped_selects_coexist_and_preserve_shared_outputs(tmp_path: Path
     full_config["selection"]["budget"] = None
     full_config["selection"]["ratio"] = 1.0
 
-    assert select_stage(
-        half_config,
-        selection_output_ratio=0.5,
-        visual_encoder=PipelineVisualEncoder(),
-    ) == root / "select-15-top50pct"
-    assert select_stage(
-        full_config,
-        selection_output_ratio=1.0,
-        visual_encoder=PipelineVisualEncoder(),
-    ) == root / "select-15-top100pct"
+    assert (
+        select_stage(
+            half_config,
+            selection_output_ratio=0.5,
+            visual_encoder=PipelineVisualEncoder(),
+        )
+        == root / "select-15-top50pct"
+    )
+    assert (
+        select_stage(
+            full_config,
+            selection_output_ratio=1.0,
+            visual_encoder=PipelineVisualEncoder(),
+        )
+        == root / "select-15-top100pct"
+    )
 
     half_root = root / "select-15-top50pct"
     full_root = root / "select-15-top100pct"
@@ -383,10 +472,7 @@ def test_ratio_scoped_selects_coexist_and_preserve_shared_outputs(tmp_path: Path
             "graph": "graph-15",
         }.items()
     } == upstream_mtimes
-    assert {
-        name: (default_result / name).read_bytes()
-        for name in published
-    } == published
+    assert {name: (default_result / name).read_bytes() for name in published} == published
 
 
 def test_ratio_scoped_select_reuses_matching_cache_and_requires_force_for_changes(

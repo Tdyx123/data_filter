@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from relcore.graph.prototypes import valid_prototype_assignments
 from relcore.schemas import GraphData, ObjectiveState
 
 
@@ -46,8 +47,13 @@ class ObjectiveContext:
         self.cooccurrence = graph.cooccurrence_matrix.toarray().astype(np.float64)
         frequency = np.zeros(self.prototype_count, dtype=np.float64)
         for indices, values in zip(graph.prototype_indices, graph.prototype_weights, strict=True):
-            np.add.at(frequency, indices, values)
-        inverse = 1.0 / np.sqrt(frequency + self.epsilon)
+            valid_indices, valid_values = valid_prototype_assignments(indices, values)
+            np.add.at(frequency, valid_indices, valid_values)
+        inverse = np.zeros(self.prototype_count, dtype=np.float64)
+        reachable = frequency > 0.0
+        inverse[reachable] = 1.0 / np.sqrt(frequency[reachable] + self.epsilon)
+        if not np.any(reachable):
+            raise ValueError("graph contains no reachable prototypes")
         self.prototype_weights = inverse / inverse.sum()
         self.prototype_members: list[list[tuple[int, float]]] = [
             [] for _ in range(self.prototype_count)
@@ -55,7 +61,8 @@ class ObjectiveContext:
         for node, (indices, assignments) in enumerate(
             zip(graph.prototype_indices, graph.prototype_weights, strict=True)
         ):
-            for prototype, assignment in zip(indices, assignments, strict=True):
+            valid_indices, valid_assignments = valid_prototype_assignments(indices, assignments)
+            for prototype, assignment in zip(valid_indices, valid_assignments, strict=True):
                 self.prototype_members[int(prototype)].append((node, float(assignment)))
         self.task_labels = sorted({int(task) for task in graph.task_indices})
         self.task_position = {task: position for position, task in enumerate(self.task_labels)}
@@ -104,16 +111,14 @@ class ObjectiveContext:
         node_weight = (
             float(self.graph.reliability[source]) * float(self.graph.reliability[target]) * sign
         )
-        for source_proto, source_weight in zip(
-            self.graph.prototype_indices[source],
-            self.graph.prototype_weights[source],
-            strict=True,
-        ):
-            for target_proto, target_weight in zip(
-                self.graph.prototype_indices[target],
-                self.graph.prototype_weights[target],
-                strict=True,
-            ):
+        source_indices, source_weights = valid_prototype_assignments(
+            self.graph.prototype_indices[source], self.graph.prototype_weights[source]
+        )
+        target_indices, target_weights = valid_prototype_assignments(
+            self.graph.prototype_indices[target], self.graph.prototype_weights[target]
+        )
+        for source_proto, source_weight in zip(source_indices, source_weights, strict=True):
+            for target_proto, target_weight in zip(target_indices, target_weights, strict=True):
                 counts[source_proto, target_proto] += (
                     node_weight * float(source_weight) * float(target_weight)
                 )
@@ -175,11 +180,10 @@ class ObjectiveContext:
 
     def _candidate_gain(self, state: ObjectiveState, candidate: int) -> float:
         new_coverage = state.prototype_coverage.copy()
-        for prototype, assignment in zip(
-            self.graph.prototype_indices[candidate],
-            self.graph.prototype_weights[candidate],
-            strict=True,
-        ):
+        candidate_indices, candidate_weights = valid_prototype_assignments(
+            self.graph.prototype_indices[candidate], self.graph.prototype_weights[candidate]
+        )
+        for prototype, assignment in zip(candidate_indices, candidate_weights, strict=True):
             new_coverage[prototype] = max(
                 new_coverage[prototype],
                 float(self.graph.reliability[candidate]) * float(assignment),
@@ -210,16 +214,14 @@ class ObjectiveContext:
             edge_quality = float(self.graph.reliability[source]) * float(
                 self.graph.reliability[target]
             )
-            for source_proto, source_weight in zip(
-                self.graph.prototype_indices[source],
-                self.graph.prototype_weights[source],
-                strict=True,
-            ):
-                for target_proto, target_weight in zip(
-                    self.graph.prototype_indices[target],
-                    self.graph.prototype_weights[target],
-                    strict=True,
-                ):
+            source_indices, source_weights = valid_prototype_assignments(
+                self.graph.prototype_indices[source], self.graph.prototype_weights[source]
+            )
+            target_indices, target_weights = valid_prototype_assignments(
+                self.graph.prototype_indices[target], self.graph.prototype_weights[target]
+            )
+            for source_proto, source_weight in zip(source_indices, source_weights, strict=True):
+                for target_proto, target_weight in zip(target_indices, target_weights, strict=True):
                     key = (int(source_proto), int(target_proto))
                     relation_delta[key] = relation_delta.get(key, 0.0) + (
                         edge_quality * float(source_weight) * float(target_weight)
@@ -278,11 +280,10 @@ class ObjectiveContext:
         if state.selected_mask[candidate]:
             raise ValueError("candidate is already selected")
         gain = self._candidate_gain(state, candidate)
-        for prototype, assignment in zip(
-            self.graph.prototype_indices[candidate],
-            self.graph.prototype_weights[candidate],
-            strict=True,
-        ):
+        candidate_indices, candidate_weights = valid_prototype_assignments(
+            self.graph.prototype_indices[candidate], self.graph.prototype_weights[candidate]
+        )
+        for prototype, assignment in zip(candidate_indices, candidate_weights, strict=True):
             state.prototype_coverage[prototype] = max(
                 state.prototype_coverage[prototype],
                 float(self.graph.reliability[candidate]) * float(assignment),
@@ -319,7 +320,10 @@ class ObjectiveContext:
         task = int(self.graph.task_indices[candidate])
         state.task_counts[self.task_position[task]] -= 1
         state.selected_mask[candidate] = False
-        for prototype in self.graph.prototype_indices[candidate]:
+        candidate_indices, _ = valid_prototype_assignments(
+            self.graph.prototype_indices[candidate], self.graph.prototype_weights[candidate]
+        )
+        for prototype in candidate_indices:
             state.prototype_coverage[prototype] = max(
                 (
                     float(self.graph.reliability[node]) * assignment
@@ -349,11 +353,10 @@ def recompute_objective(
     selected[np.asarray(selected_indices, dtype=np.int64)] = True
     coverage = np.zeros(context.prototype_count, dtype=np.float64)
     for index in np.flatnonzero(selected):
-        for prototype, assignment in zip(
-            graph.prototype_indices[index],
-            graph.prototype_weights[index],
-            strict=True,
-        ):
+        candidate_indices, candidate_weights = valid_prototype_assignments(
+            graph.prototype_indices[index], graph.prototype_weights[index]
+        )
+        for prototype, assignment in zip(candidate_indices, candidate_weights, strict=True):
             coverage[prototype] = max(
                 coverage[prototype],
                 float(graph.reliability[index]) * float(assignment),

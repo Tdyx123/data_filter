@@ -49,6 +49,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "min_reliability": 0.05,
     },
     "prototypes": {
+        "method": "kmeans",
         "count": 64,
         "batch_size": 4096,
         "max_iter": 100,
@@ -143,6 +144,9 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not 0.0 < float(quality["min_reliability"]) <= 1.0:
         raise ValueError("quality.min_reliability must be in (0, 1]")
     prototype_count = int(resolved["prototypes"]["count"])
+    prototype_method = str(resolved["prototypes"].get("method", ""))
+    if prototype_method not in {"kmeans", "motion_primitives"}:
+        raise ValueError("prototypes.method must be kmeans or motion_primitives")
     top_r = int(resolved["prototypes"]["top_r"])
     if prototype_count <= 0 or not 0 < top_r <= prototype_count:
         raise ValueError("prototype count/top_r configuration is invalid")

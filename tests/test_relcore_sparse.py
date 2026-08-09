@@ -111,6 +111,25 @@ def test_sparse_greedy_fills_exact_budget_and_hard_quotas():
     assert {int(graph.task_indices[index]) for index in result.selected_indices} == {0, 1}
 
 
+def test_sparse_greedy_prototype_pool_excludes_padded_assignments():
+    graph = _small_graph()
+    graph.prototype_indices = np.pad(
+        graph.prototype_indices,
+        ((0, 0), (0, 3)),
+        constant_values=-1,
+    )
+    graph.prototype_weights = np.pad(
+        graph.prototype_weights,
+        ((0, 0), (0, 3)),
+        constant_values=0.0,
+    )
+    context = ObjectiveContext(graph, ObjectiveWeights(), similarity_threshold=0.8)
+
+    selector = SparseGreedySelector(context, None)
+
+    assert selector.prototype_nodes == [[0, 2], [1, 3]]
+
+
 def test_sparse_greedy_global_mode_has_no_task_cap():
     graph = _small_graph()
     context = ObjectiveContext(graph, ObjectiveWeights(), similarity_threshold=0.8)

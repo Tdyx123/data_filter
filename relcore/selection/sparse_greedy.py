@@ -8,6 +8,8 @@ from collections.abc import Mapping
 
 import numpy as np
 
+from relcore.graph.prototypes import valid_prototype_assignments
+
 from .greedy import SelectionResult
 from .objective import ObjectiveContext
 
@@ -59,7 +61,10 @@ class SparseGreedySelector:
         self.task_nodes: dict[int, list[int]] = defaultdict(list)
         for index in range(len(context.graph.sample_ids)):
             self.task_nodes[int(context.graph.task_indices[index])].append(index)
-            for prototype in context.graph.prototype_indices[index]:
+            prototypes, _ = valid_prototype_assignments(
+                context.graph.prototype_indices[index], context.graph.prototype_weights[index]
+            )
+            for prototype in prototypes:
                 self.prototype_nodes[int(prototype)].append(index)
 
         def ordering(index: int) -> tuple[float, str]:

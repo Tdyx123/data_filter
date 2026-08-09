@@ -13,6 +13,7 @@ relation:
   projection_dim: 8
   output_dim: 32
 prototypes:
+  method: kmeans
   count: 4
   top_r: 2
 selection:

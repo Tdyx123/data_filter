@@ -70,6 +70,47 @@ python -m relcore run --config relcore/config_libero90.yaml \
 `validate` 接受具体的 `select-<mask>/` 或 `select-<mask>-topXpct/` 目录，并从其中的
 manifest 定位共享输出根目录下的 scan、encode 和匹配的 graph。
 
+## 原型方法
+
+`prototypes.method` 控制 graph 阶段使用的原型与软类别方法。默认值 `kmeans` 保持
+原有 MiniBatchKMeans 行为和 `graph-<mask>/`、`select-<mask>/` 目录。LIBERO 数据也可
+切换为运动原语：
+
+```yaml
+prototypes:
+  method: motion_primitives
+  count: 64
+  batch_size: 4096
+  max_iter: 100
+  top_r: 3
+  temperature: 0.1
+```
+
+`build-graph` 和 `run` 可以临时覆盖该字段：
+
+```bash
+python -m relcore build-graph --config relcore/config_libero90.yaml \
+  --prototype-method motion_primitives
+python -m relcore run --config relcore/config_libero90.yaml \
+  --prototype-method motion_primitives
+```
+
+`select` 不接受 `--prototype-method`；它按配置中的方法使用对应 graph。运动原语结果写入
+`graph-<mask>-motion-primitives/` 和
+`select-<mask>-motion-primitives[-topXpct]/`，因此可与 KMeans 结果共享 scan/encode
+并安全共存。
+
+运动原语方法固定使用原始 `observation.state`，以 horizon 8、状态阈值 0.03 在每个
+episode 内统计类别；只保留全局占比严格大于 0.005 的类别。每个 15 帧片段使用
+`0→7` 与 `7→14` 两段生成软标签，低频复合动作按删除一个原子动作的规则泛化，主次
+占比阈值固定为 4，兜底权重固定为 0.8。该方法要求 LIBERO 的 8 维 state 布局，不会在
+输入不兼容时退回 KMeans。
+
+对应 graph 使用 `prototype_catalog.json` 代替 `prototype_centers.npy`，其中记录固定
+常量、全局标签总数、类别 count/proportion、稳定 prototype ID 及频率保留状态。选择
+清单额外包含 `primary_prototype_label` 和 `prototype_labels`；数值 ID/权重字段继续
+保留，并且不会导出内部四槽表示的 `-1/0` 填充项。
+
 ## 可靠性指标
 
 可靠性指标是独立的 CLI/Python API 参数，不属于 YAML quality 配置。未传

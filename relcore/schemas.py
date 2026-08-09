@@ -41,6 +41,7 @@ class GraphData:
     similarity_edges: EdgeTable
     transition_matrix: sparse.csr_matrix
     cooccurrence_matrix: sparse.csr_matrix
+    prototype_labels: tuple[str, ...] | None = None
 
 
 @dataclass

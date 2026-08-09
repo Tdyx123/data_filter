@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 from scipy import sparse
@@ -75,6 +77,63 @@ def test_incremental_remove_matches_full_recomputation_and_allows_reinsertion():
         - expected.total
     )
     assert context.marginal_gain(state, 1) == pytest.approx(expected_gain, abs=1.0e-6)
+
+
+def test_padded_soft_assignments_match_unpadded_objective() -> None:
+    graph = _small_graph()
+    padded = replace(
+        graph,
+        prototype_indices=np.pad(
+            graph.prototype_indices,
+            ((0, 0), (0, 3)),
+            constant_values=-1,
+        ),
+        prototype_weights=np.pad(
+            graph.prototype_weights,
+            ((0, 0), (0, 3)),
+            constant_values=0.0,
+        ),
+    )
+
+    expected = recompute_objective([0, 1, 3], graph, ObjectiveWeights(), similarity_threshold=0.8)
+    actual = recompute_objective([0, 1, 3], padded, ObjectiveWeights(), similarity_threshold=0.8)
+
+    assert actual == expected
+
+
+def test_objective_members_exclude_padded_soft_assignments() -> None:
+    graph = _small_graph()
+    padded = replace(
+        graph,
+        prototype_indices=np.pad(
+            graph.prototype_indices,
+            ((0, 0), (0, 3)),
+            constant_values=-1,
+        ),
+        prototype_weights=np.pad(
+            graph.prototype_weights,
+            ((0, 0), (0, 3)),
+            constant_values=0.0,
+        ),
+    )
+
+    context = ObjectiveContext(padded, ObjectiveWeights(), similarity_threshold=0.8)
+
+    assert context.prototype_members == [
+        [(0, 1.0), (2, 1.0)],
+        [(1, 1.0), (3, 1.0)],
+    ]
+
+
+def test_objective_gives_unreachable_catalog_prototypes_zero_rarity_weight() -> None:
+    graph = _small_graph()
+    graph.prototype_indices[:] = 0
+    graph.transition_matrix = sparse.csr_matrix((2, 2), dtype=np.float32)
+    graph.cooccurrence_matrix = sparse.csr_matrix((2, 2), dtype=np.float32)
+
+    context = ObjectiveContext(graph, ObjectiveWeights(), similarity_threshold=0.8)
+
+    np.testing.assert_array_equal(context.prototype_weights, [1.0, 0.0])
 
 
 def test_incremental_objective_matches_full_recomputation_on_random_soft_graph():

@@ -11,9 +11,7 @@ from relcore import pipeline
 
 @pytest.mark.parametrize("command", ["select", "run"])
 def test_selection_commands_accept_selection_ratio(command: str) -> None:
-    arguments = cli.build_parser().parse_args(
-        [command, "--selection-ratio", "0.20"]
-    )
+    arguments = cli.build_parser().parse_args([command, "--selection-ratio", "0.20"])
 
     assert arguments.selection_ratio == pytest.approx(0.20)
 
@@ -42,9 +40,7 @@ def test_graph_commands_accept_reliability_metric_names(command: str) -> None:
 @pytest.mark.parametrize("command", ["scan", "encode"])
 def test_pregraph_commands_reject_reliability_metrics(command: str) -> None:
     with pytest.raises(SystemExit):
-        cli.build_parser().parse_args(
-            [command, "--reliability-metrics", "progress"]
-        )
+        cli.build_parser().parse_args([command, "--reliability-metrics", "progress"])
 
 
 @pytest.mark.parametrize(
@@ -56,8 +52,28 @@ def test_reliability_metrics_reject_invalid_values(value: str) -> None:
         cli.build_parser().parse_args(["run", "--reliability-metrics", value])
 
 
+@pytest.mark.parametrize("command", ["build-graph", "run"])
+def test_graph_building_commands_accept_prototype_method(command: str) -> None:
+    arguments = cli.build_parser().parse_args([command, "--prototype-method", "motion_primitives"])
+
+    assert arguments.prototype_method == "motion_primitives"
+
+
+@pytest.mark.parametrize("command", ["scan", "encode", "select"])
+def test_commands_that_do_not_choose_graph_method_reject_prototype_method(command: str) -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args([command, "--prototype-method", "motion_primitives"])
+
+
 def test_graph_directory_name_uses_reliability_mask() -> None:
     assert pipeline.graph_directory_name(["progress", "non_noop"]) == "graph-5"
+
+
+def test_motion_primitive_graph_directory_is_isolated_from_kmeans() -> None:
+    assert (
+        pipeline.graph_directory_name(["progress", "non_noop"], "motion_primitives")
+        == "graph-5-motion-primitives"
+    )
 
 
 @pytest.mark.parametrize(
@@ -75,6 +91,51 @@ def test_selection_directory_name_uses_canonical_percent_tag(
     expected: str,
 ) -> None:
     assert pipeline.selection_directory_name(metrics, ratio) == expected
+
+
+def test_motion_primitive_selection_directory_is_isolated_from_kmeans() -> None:
+    assert (
+        pipeline.selection_directory_name(
+            ["support", "progress", "smoothness", "non_noop"],
+            0.125,
+            "motion_primitives",
+        )
+        == "select-15-motion-primitives-top12p5pct"
+    )
+
+
+def test_main_run_prototype_method_overrides_loaded_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = {
+        "runtime": {"max_episodes": None},
+        "selection": {"ratio": 0.10, "budget": None},
+        "prototypes": {"method": "kmeans"},
+    }
+    received: dict[str, object] = {}
+
+    monkeypatch.setattr(cli, "load_config", lambda _path: config)
+
+    def fake_run_pipeline(
+        resolved: dict[str, object],
+        *,
+        output_dir: str | None,
+        force: bool,
+        selection_output_ratio: float | None,
+        reliability_metrics: tuple[str, ...],
+    ) -> Path:
+        received["config"] = copy.deepcopy(resolved)
+        return Path("outputs/relcore/test/select-15-motion-primitives")
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+
+    cli.main(["run", "--config", "unused.yaml", "--prototype-method", "motion_primitives"])
+
+    assert received["config"] == {
+        "runtime": {"max_episodes": None},
+        "selection": {"ratio": 0.10, "budget": None},
+        "prototypes": {"method": "motion_primitives"},
+    }
 
 
 def test_main_select_ratio_scopes_output_and_reports_selection_directory(

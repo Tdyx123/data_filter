@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from relcore.graph.build import build_graph
-from relcore.graph.prototypes import discover_prototypes
+from relcore.graph.prototypes import PrototypeData, discover_prototypes
 from relcore.scoring.reliability import compute_reliability
 from relcore.schemas import ClipRecord
 
@@ -179,3 +179,48 @@ def test_graph_keeps_directed_sequence_and_one_undirected_similarity_edge():
     assert graph.cooccurrence_matrix.shape == (2, 2)
     assert graph.transition_matrix.nnz > 0
     assert graph.cooccurrence_matrix.nnz == 0
+
+
+def test_graph_uses_labeled_prototypes_and_ignores_padded_assignments():
+    clips = [
+        ClipRecord(
+            "ep000000_fragment_000000_000014",
+            0,
+            0,
+            "task",
+            0,
+            14,
+            15,
+            None,
+            "ep000000_fragment_000015_000029",
+        ),
+        ClipRecord(
+            "ep000000_fragment_000015_000029",
+            0,
+            0,
+            "task",
+            15,
+            29,
+            15,
+            "ep000000_fragment_000000_000014",
+            None,
+        ),
+    ]
+    prototypes = PrototypeData(
+        centers=None,
+        indices=np.asarray([[0, -1, -1, -1], [1, -1, -1, -1]], dtype=np.int32),
+        weights=np.asarray([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+        labels=("move forward", "move right"),
+    )
+
+    graph = build_graph(
+        clips,
+        np.eye(2, dtype=np.float32),
+        np.ones(2, dtype=np.float32),
+        prototypes,
+        knn=1,
+        similarity_threshold=0.99,
+    )
+
+    assert graph.prototype_labels == ("move forward", "move right")
+    np.testing.assert_allclose(graph.transition_matrix.toarray(), [[0.0, 1.0], [0.0, 0.0]])

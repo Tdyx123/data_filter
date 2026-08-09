@@ -35,6 +35,8 @@ from relcore.features.visual_encoder import (
     VisualEncoder,
 )
 from relcore.graph import build_graph, discover_prototypes
+from relcore.graph.motion_primitives import build_motion_primitive_prototypes
+from relcore.graph.prototypes import valid_prototype_assignments
 from relcore.schemas import ClipRecord, EdgeTable, GraphData
 from relcore.scoring import (
     RELIABILITY_METRICS,
@@ -76,15 +78,22 @@ def _output_root(config: Mapping[str, Any], output_dir: str | Path | None) -> Pa
     ).expanduser()
 
 
-def graph_directory_name(reliability_metrics: Sequence[str]) -> str:
-    return f"graph-{reliability_metric_mask(reliability_metrics)}"
+def graph_directory_name(
+    reliability_metrics: Sequence[str],
+    prototype_method: str = "kmeans",
+) -> str:
+    name = f"graph-{reliability_metric_mask(reliability_metrics)}"
+    return name if prototype_method == "kmeans" else f"{name}-motion-primitives"
 
 
 def selection_directory_name(
     reliability_metrics: Sequence[str],
     ratio: float | None = None,
+    prototype_method: str = "kmeans",
 ) -> str:
     prefix = f"select-{reliability_metric_mask(reliability_metrics)}"
+    if prototype_method != "kmeans":
+        prefix = f"{prefix}-motion-primitives"
     if ratio is None:
         return prefix
     percent_tag = format(float(ratio) * 100.0, ".12g").replace(".", "p")
@@ -418,7 +427,8 @@ def graph_stage(
         encoded.fingerprint,
         parameters={"reliability_metrics": metrics},
     )
-    destination = root / graph_directory_name(metrics)
+    prototype_method = str(resolved["prototypes"]["method"])
+    destination = root / graph_directory_name(metrics, prototype_method)
 
     def build(temporary: Path) -> None:
         started = time.perf_counter()
@@ -437,15 +447,24 @@ def graph_stage(
             reliability_metrics=metrics,
         )
         prototype_config = resolved["prototypes"]
-        prototypes = discover_prototypes(
-            encoded.embeddings,
-            count=int(prototype_config["count"]),
-            batch_size=int(prototype_config["batch_size"]),
-            max_iter=int(prototype_config["max_iter"]),
-            top_r=int(prototype_config["top_r"]),
-            temperature=float(prototype_config["temperature"]),
-            seed=int(resolved["seed"]),
-        )
+        if prototype_method == "kmeans":
+            prototypes = discover_prototypes(
+                encoded.embeddings,
+                count=int(prototype_config["count"]),
+                batch_size=int(prototype_config["batch_size"]),
+                max_iter=int(prototype_config["max_iter"]),
+                top_r=int(prototype_config["top_r"]),
+                temperature=float(prototype_config["temperature"]),
+                seed=int(resolved["seed"]),
+            )
+            primitive_catalog = None
+        else:
+            prototypes, primitive_catalog = build_motion_primitive_prototypes(
+                adapter,
+                encoded.clips,
+                max_episodes=resolved["runtime"].get("max_episodes"),
+                num_workers=int(resolved["runtime"].get("num_workers", 0)),
+            )
         graph_config = resolved["graph"]
         graph = build_graph(
             encoded.clips,
@@ -467,7 +486,11 @@ def graph_stage(
             smoothness=reliability.smoothness,
             noop_ratio=reliability.noop_ratio,
         )
-        np.save(temporary / "prototype_centers.npy", prototypes.centers)
+        if prototypes.centers is not None:
+            np.save(temporary / "prototype_centers.npy", prototypes.centers)
+        else:
+            assert primitive_catalog is not None
+            write_json(temporary / "prototype_catalog.json", primitive_catalog.to_dict())
         _save_edge_table(temporary / "sequence_edges.npz", graph.sequence_edges)
         _save_edge_table(temporary / "similarity_edges.npz", graph.similarity_edges)
         sparse.save_npz(temporary / "transition_matrix.npz", graph.transition_matrix)
@@ -481,6 +504,7 @@ def graph_stage(
                 "stage_directory": destination.name,
                 "reliability_metrics": list(metrics),
                 "reliability_mask": metric_mask,
+                "prototype_method": prototype_method,
                 "nodes": len(graph.sample_ids),
                 "sequence_edges": len(graph.sequence_edges.source),
                 "similarity_edges": len(graph.similarity_edges.source),
@@ -488,12 +512,15 @@ def graph_stage(
             },
         )
 
+    prototype_artifact = (
+        "prototype_centers.npy" if prototype_method == "kmeans" else "prototype_catalog.json"
+    )
     publish_stage(
         destination,
         fingerprint=fingerprint,
         required=(
             "nodes.npz",
-            "prototype_centers.npy",
+            prototype_artifact,
             "sequence_edges.npz",
             "similarity_edges.npz",
             "transition_matrix.npz",
@@ -504,6 +531,20 @@ def graph_stage(
         build=build,
     )
     nodes = np.load(destination / "nodes.npz")
+    prototype_labels: tuple[str, ...] | None = None
+    if prototype_method == "motion_primitives":
+        catalog_payload = json.loads(
+            (destination / "prototype_catalog.json").read_text(encoding="utf-8")
+        )
+        assigned = sorted(
+            (
+                category
+                for category in catalog_payload["categories"]
+                if category["prototype_id"] is not None
+            ),
+            key=lambda category: int(category["prototype_id"]),
+        )
+        prototype_labels = tuple(str(category["label"]) for category in assigned)
     graph = GraphData(
         sample_ids=[clip.sample_id for clip in encoded.clips],
         task_indices=nodes["task_indices"],
@@ -515,6 +556,7 @@ def graph_stage(
         similarity_edges=_load_edge_table(destination / "similarity_edges.npz", "similarity"),
         transition_matrix=sparse.load_npz(destination / "transition_matrix.npz"),
         cooccurrence_matrix=sparse.load_npz(destination / "cooccurrence_matrix.npz"),
+        prototype_labels=prototype_labels,
     )
     return root, adapter, encoded.clips, graph, fingerprint
 
@@ -614,23 +656,29 @@ def _selection_rows(
             final_remove_loss = None
             final_add_gain = float(context.marginal_gain(final_state, index))
         position = selected_position.get(index)
-        all_rows.append(
-            {
-                **asdict(clip),
-                "selected": selected,
-                "reliability": float(graph.reliability[index]),
-                "primary_prototype": int(graph.prototype_indices[index, 0]),
-                "prototype_indices": [int(value) for value in graph.prototype_indices[index]],
-                "prototype_weights": [float(value) for value in graph.prototype_weights[index]],
-                "selection_order": position + 1 if position is not None else None,
-                "selection_marginal_gain": (
-                    float(result.marginal_gains[position]) if position is not None else None
-                ),
-                "final_add_gain": final_add_gain,
-                "final_remove_loss": final_remove_loss,
-                "branch_id": result.branch_id if selected else None,
-            }
+        prototype_indices, prototype_weights = valid_prototype_assignments(
+            graph.prototype_indices[index], graph.prototype_weights[index]
         )
+        row = {
+            **asdict(clip),
+            "selected": selected,
+            "reliability": float(graph.reliability[index]),
+            "primary_prototype": int(prototype_indices[0]),
+            "prototype_indices": [int(value) for value in prototype_indices],
+            "prototype_weights": [float(value) for value in prototype_weights],
+            "selection_order": position + 1 if position is not None else None,
+            "selection_marginal_gain": (
+                float(result.marginal_gains[position]) if position is not None else None
+            ),
+            "final_add_gain": final_add_gain,
+            "final_remove_loss": final_remove_loss,
+            "branch_id": result.branch_id if selected else None,
+        }
+        if graph.prototype_labels is not None:
+            labels = [graph.prototype_labels[int(value)] for value in prototype_indices]
+            row["primary_prototype_label"] = labels[0]
+            row["prototype_labels"] = labels
+        all_rows.append(row)
     dataset_name = str(config["dataset"]["name"])
     dataset_path = str(config["dataset"].get("path", ""))
     selected_rows: list[dict[str, Any]] = []
@@ -650,6 +698,7 @@ def _selection_rows(
         "selected_clips": len(result.selected_indices),
         "selection_ratio": len(result.selected_indices) / len(clips),
         "reliability_metrics": list(normalize_reliability_metrics(reliability_metrics)),
+        "prototype_method": str(config["prototypes"]["method"]),
         "objective": asdict(breakdown),
         "prototype_coverage": {
             str(index): float(value) for index, value in enumerate(final_state.prototype_coverage)
@@ -692,8 +741,9 @@ def select_stage(
         ("objective", "selection", "seed"),
         graph_fingerprint,
     )
-    graph_directory = graph_directory_name(metrics)
-    selection_directory = selection_directory_name(metrics, scoped_ratio)
+    prototype_method = str(resolved["prototypes"]["method"])
+    graph_directory = graph_directory_name(metrics, prototype_method)
+    selection_directory = selection_directory_name(metrics, scoped_ratio, prototype_method)
     destination = root / selection_directory
     stage_directories = {
         "scan": "scan",
@@ -765,6 +815,7 @@ def select_stage(
                 "stage_directory": selection_directory,
                 "reliability_metrics": list(metrics),
                 "reliability_mask": metric_mask,
+                "prototype_method": prototype_method,
                 "selected_clips": len(result.selected_indices),
                 "budget": len(result.selected_indices),
             },
@@ -789,6 +840,7 @@ def select_stage(
             "fingerprint": _total_fingerprint(adapter, resolved, metrics),
             "reliability_metrics": list(metrics),
             "reliability_mask": metric_mask,
+            "prototype_method": prototype_method,
             "selection_output_ratio": scoped_ratio,
             "stage_directories": stage_directories,
             "stage_fingerprints": {
@@ -854,6 +906,9 @@ def validate_output(
     run_manifest = json.loads(required[3].read_text(encoding="utf-8"))
     if run_manifest.get("status") != "complete":
         raise ValueError("run is not complete")
+    prototype_method = str(run_manifest.get("prototype_method", "kmeans"))
+    if prototype_method not in {"kmeans", "motion_primitives"}:
+        raise ValueError("run manifest prototype_method is invalid")
     recorded_metrics = run_manifest.get("reliability_metrics")
     try:
         metrics = normalize_reliability_metrics(recorded_metrics)
@@ -873,8 +928,8 @@ def validate_output(
     expected_directories = {
         "scan": "scan",
         "encode": "encode",
-        "graph": graph_directory_name(metrics),
-        "select": selection_directory_name(metrics, scoped_ratio),
+        "graph": graph_directory_name(metrics, prototype_method),
+        "select": selection_directory_name(metrics, scoped_ratio, prototype_method),
     }
     stage_directories = run_manifest.get("stage_directories")
     if stage_directories != expected_directories:
@@ -891,6 +946,9 @@ def validate_output(
         if manifest.get("status") != "complete":
             raise ValueError(f"stage is not complete: {stage}")
         stage_manifests[stage] = manifest
+    prototype_artifact = (
+        "prototype_centers.npy" if prototype_method == "kmeans" else "prototype_catalog.json"
+    )
     stage_required = {
         "scan": ("episodes.parquet", "clips.parquet", "normalization.npz"),
         "encode": (
@@ -905,7 +963,7 @@ def validate_output(
         ),
         "graph": (
             "nodes.npz",
-            "prototype_centers.npy",
+            prototype_artifact,
             "sequence_edges.npz",
             "similarity_edges.npz",
             "transition_matrix.npz",
@@ -942,6 +1000,8 @@ def validate_output(
             raise ValueError(f"{stage} manifest reliability_mask mismatch")
         if manifest.get("stage_directory") != expected_directories[stage]:
             raise ValueError(f"{stage} manifest stage_directory mismatch")
+        if str(manifest.get("prototype_method", "kmeans")) != prototype_method:
+            raise ValueError(f"{stage} manifest prototype_method mismatch")
     selected_rows = [
         json.loads(line)
         for line in required[0].read_text(encoding="utf-8").splitlines()
@@ -958,6 +1018,8 @@ def validate_output(
         raise ValueError("selection report reliability_metrics are not in canonical order")
     if tuple(normalized_reported_metrics) != metrics:
         raise ValueError("selection report reliability_metrics do not match the run manifest")
+    if str(report.get("prototype_method", "kmeans")) != prototype_method:
+        raise ValueError("selection report prototype_method does not match the run manifest")
     if [row["sample_id"] for row in all_rows] != sorted(row["sample_id"] for row in all_rows):
         raise ValueError("all_clips.parquet is not sorted by sample_id")
     if len({row["sample_id"] for row in selected_rows}) != len(selected_rows):
@@ -996,6 +1058,25 @@ def validate_output(
         "selection_order",
         "marginal_gain",
     }
+    prototype_labels: tuple[str, ...] | None = None
+    if prototype_method == "motion_primitives":
+        required_fields |= {"primary_prototype_label", "prototype_labels"}
+        catalog = json.loads(
+            (stage_paths["graph"] / "prototype_catalog.json").read_text(encoding="utf-8")
+        )
+        if catalog.get("method") != "motion_primitives":
+            raise ValueError("motion primitive catalog method is invalid")
+        assigned = sorted(
+            (
+                category
+                for category in catalog.get("categories", [])
+                if category.get("prototype_id") is not None
+            ),
+            key=lambda category: int(category["prototype_id"]),
+        )
+        if [int(category["prototype_id"]) for category in assigned] != list(range(len(assigned))):
+            raise ValueError("motion primitive catalog prototype ids are not contiguous")
+        prototype_labels = tuple(str(category["label"]) for category in assigned)
     for row in selected_rows:
         missing_fields = sorted(required_fields - row.keys())
         if missing_fields:
@@ -1008,6 +1089,20 @@ def validate_output(
         )
         if row["sample_id"] != expected_id:
             raise ValueError(f"non-canonical sample id: {row['sample_id']}")
+        row_indices = [int(value) for value in row["prototype_indices"]]
+        row_weights = [float(value) for value in row["prototype_weights"]]
+        if not row_indices or len(row_indices) != len(row_weights):
+            raise ValueError(f"invalid prototype assignments: {row['sample_id']}")
+        if prototype_labels is not None:
+            if len(row_indices) > 4 or any(
+                index < 0 or index >= len(prototype_labels) for index in row_indices
+            ):
+                raise ValueError(f"invalid motion primitive ids: {row['sample_id']}")
+            expected_labels = [prototype_labels[index] for index in row_indices]
+            if row["prototype_labels"] != expected_labels:
+                raise ValueError(f"motion primitive labels disagree: {row['sample_id']}")
+            if row["primary_prototype_label"] != expected_labels[0]:
+                raise ValueError(f"primary motion primitive label disagrees: {row['sample_id']}")
         task = str(row["task_index"])
         counts[task] = counts.get(task, 0) + 1
     if counts != reported_counts:
@@ -1029,6 +1124,8 @@ def validate_output(
         raise ValueError(f"unknown selection quota mode: {quota_mode}")
     if config is not None:
         resolved = resolve_config(config)
+        if str(resolved["prototypes"]["method"]) != prototype_method:
+            raise ValueError("run prototype_method does not match the supplied config")
         resolved["output"]["directory"] = str(root)
         adapter = create_dataset(resolved["dataset"])
         expected_scan = _fingerprint(

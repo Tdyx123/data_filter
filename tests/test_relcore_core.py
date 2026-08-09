@@ -109,6 +109,20 @@ def test_config_has_no_reliability_metric_default():
     assert "reliability_metrics" not in resolve_config({})["quality"]
 
 
+def test_config_defaults_to_kmeans_prototype_method():
+    assert resolve_config({})["prototypes"]["method"] == "kmeans"
+
+
+@pytest.mark.parametrize("method", ["kmeans", "motion_primitives"])
+def test_config_accepts_supported_prototype_methods(method: str):
+    assert resolve_config({"prototypes": {"method": method}})["prototypes"]["method"] == method
+
+
+def test_config_rejects_unknown_prototype_method():
+    with pytest.raises(ValueError, match="prototypes.method"):
+        resolve_config({"prototypes": {"method": "unknown"}})
+
+
 def test_config_rejects_removed_reliability_metrics_field():
     with pytest.raises(ValueError, match="removed.*--reliability-metrics"):
         resolve_config({"quality": {"reliability_metrics": ["progress"]}})
