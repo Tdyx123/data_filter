@@ -9,10 +9,12 @@ from torch import nn  # noqa: E402
 from qwen3_vl_groot.config import load_config  # noqa: E402
 from qwen3_vl_groot.training import (  # noqa: E402
     RankZeroLogger,
+    _lora_step_metrics,
     _should_save_checkpoint,
     _should_save_final_checkpoint,
     build_optimizer_and_scheduler,
 )
+from qwen3_vl_groot.schedules import LoraUpdateSchedule  # noqa: E402
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -85,6 +87,62 @@ def test_optimizer_groups_receive_independent_configured_learning_rates():
     assert scheduler.base_lrs == pytest.approx([2e-4, 5e-6])
     assert optimizer.param_groups[0]["group_name"] == "action_head"
     assert optimizer.param_groups[1]["group_name"] == "qwen_lora"
+
+
+def test_lora_scheduler_uses_only_active_update_clock():
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
+    config["train"].update(
+        {
+            "lora_freeze_steps": 5,
+            "lora_cycle_steps": 10,
+            "lora_active_steps": 2,
+            "lora_warmup_steps": 4,
+            "max_steps": 25,
+        }
+    )
+    optimizer, scheduler = build_optimizer_and_scheduler(TinyPolicy(), config)
+    base_lr = float(config["train"]["lora_learning_rate"])
+
+    used_lrs = {}
+    for step in range(1, 26):
+        used_lrs[step] = optimizer.param_groups[1]["lr"]
+        optimizer.step()
+        scheduler.step()
+
+    assert {step for step, learning_rate in used_lrs.items() if learning_rate > 0} == {
+        14,
+        15,
+        24,
+        25,
+    }
+    assert [used_lrs[step] / base_lr for step in (14, 15, 24, 25)] == pytest.approx(
+        [0.25, 0.5, 0.75, 1.0]
+    )
+
+
+@pytest.mark.parametrize(
+    ("step", "enabled", "updates"),
+    [
+        (5_090, 0, 0),
+        (5_091, 1, 1),
+        (5_100, 1, 10),
+        (5_101, 0, 10),
+    ],
+)
+def test_lora_step_metrics_describe_completed_optimizer_step(step, enabled, updates):
+    schedule = LoraUpdateSchedule(
+        freeze_steps=5_000,
+        cycle_steps=100,
+        active_steps=10,
+    )
+
+    metrics = _lora_step_metrics(schedule, optimizer_step=step, learning_rate=5e-6)
+
+    assert metrics == {
+        "train/lora_lr": 5e-6,
+        "train/lora_enabled": enabled,
+        "train/lora_updates": updates,
+    }
 
 
 def test_checkpoint_schedule_saves_improvements_and_unscheduled_final_step():

@@ -24,6 +24,7 @@ from .data import (
 )
 from .modeling import Qwen3VLGrootPolicy, compile_policy_modules
 from .normalization import QuantileStats
+from .schedules import LoraUpdateSchedule
 
 
 def seed_everything(seed: int, rank: int) -> None:
@@ -48,6 +49,19 @@ def _should_save_checkpoint(*, step: int, save_every: int, improved: bool) -> bo
 
 def _should_save_final_checkpoint(*, step: int, last_checkpoint_step: int) -> bool:
     return step != last_checkpoint_step
+
+
+def _lora_step_metrics(
+    schedule: LoraUpdateSchedule,
+    *,
+    optimizer_step: int,
+    learning_rate: float,
+) -> dict[str, float | int]:
+    return {
+        "train/lora_lr": learning_rate,
+        "train/lora_enabled": int(schedule.is_active(optimizer_step)),
+        "train/lora_updates": schedule.active_steps_through(optimizer_step),
+    }
 
 
 def _cosine_after_warmup(step: int, warmup: int, maximum: int) -> float:
@@ -95,18 +109,23 @@ def build_optimizer_and_scheduler(
         **optimizer_kwargs,
     )
     maximum = int(train["max_steps"])
-    freeze = int(train["lora_freeze_steps"])
     lora_warmup = int(train["lora_warmup_steps"])
+    lora_update_schedule = LoraUpdateSchedule.from_train_config(train)
+    maximum_lora_updates = lora_update_schedule.active_steps_through(maximum)
 
     def head_schedule(step: int) -> float:
         return _cosine_after_warmup(step, int(train["head_warmup_steps"]), maximum)
 
-    def lora_schedule(step: int) -> float:
-        if step < freeze:
+    def lora_schedule(completed_steps: int) -> float:
+        upcoming_step = completed_steps + 1
+        if not lora_update_schedule.is_active(upcoming_step):
             return 0.0
-        relative_step = step - freeze
-        relative_maximum = max(maximum - freeze, 1)
-        return _cosine_after_warmup(relative_step, lora_warmup, relative_maximum)
+        active_before = lora_update_schedule.active_steps_through(completed_steps)
+        return _cosine_after_warmup(
+            active_before,
+            lora_warmup,
+            maximum_lora_updates,
+        )
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=[head_schedule, lora_schedule]
@@ -425,6 +444,7 @@ def train(config: dict[str, Any]) -> None:
     if validation_enabled and validation_loader is None:
         raise RuntimeError("validation is enabled but no validation loader was configured")
     maximum_steps = int(train_config["max_steps"])
+    lora_update_schedule = LoraUpdateSchedule.from_train_config(train_config)
     previous_global_step = global_step
     last_checkpoint_step = -1
     validation_mae: float | None = None
@@ -453,13 +473,16 @@ def train(config: dict[str, Any]) -> None:
             )
         logger.status(first_batch_status)
         while global_step < maximum_steps:
-            if (
-                not any(parameter.requires_grad for parameter in policy.lora_parameters())
-                and global_step >= int(train_config["lora_freeze_steps"])
-            ):
-                policy.set_lora_trainable(True)
+            upcoming_step = global_step + 1
+            lora_enabled_for_update = lora_update_schedule.is_active(upcoming_step)
+            lora_is_trainable = any(
+                parameter.requires_grad for parameter in policy.lora_parameters()
+            )
+            if lora_enabled_for_update != lora_is_trainable:
+                policy.set_lora_trainable(lora_enabled_for_update)
 
             batch = next(train_iterator)
+            lora_lr_used = float(optimizer.param_groups[1]["lr"])
             loss = engine(
                 images=batch["images"],
                 state=batch["state"],
@@ -486,9 +509,10 @@ def train(config: dict[str, Any]) -> None:
                             "step": global_step,
                             "train/loss": mean_loss,
                             "train/head_lr": float(optimizer.param_groups[0]["lr"]),
-                            "train/lora_lr": float(optimizer.param_groups[1]["lr"]),
-                            "train/lora_enabled": int(
-                                global_step >= int(train_config["lora_freeze_steps"])
+                            **_lora_step_metrics(
+                                lora_update_schedule,
+                                optimizer_step=global_step,
+                                learning_rate=lora_lr_used,
                             ),
                         }
                     )
