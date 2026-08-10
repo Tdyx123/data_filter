@@ -536,6 +536,25 @@ bash scripts/train_libero_qwen3_vl_4b_groot_all_tasks_4x4090.sh \
   --output-dir outputs/qwen3_vl_groot_libero
 ```
 
+使用周期性 LoRA 调度的新入口：
+
+```bash
+bash scripts/train_libero_qwen3_vl_4b_groot_cyclic_lora_all_tasks_4x4090.sh \
+  --output-dir outputs/qwen3_vl_groot_libero_cyclic_lora
+```
+
+该入口的第 1–5,000 个 optimizer step 只训练 GR00T 动作头。之后每 100 步的
+前 90 步仍只训练动作头，最后 10 步训练 LoRA 与动作头；例如 5,001–5,090
+只训练动作头，5,091–5,100 训练两者，5,101 步开始下一个周期。这里的“训练
+Qwen”只更新覆盖 36 层注意力投影的 LoRA，Qwen3-VL-4B 原始参数始终冻结。
+LoRA 的 warmup 与余弦衰减只统计实际启用 LoRA 的 optimizer step。
+
+默认调度可分别用 `--lora-freeze-steps`、`--lora-cycle-steps` 和
+`--lora-active-steps` 覆盖；后两个参数必须同时提供，且 active steps 不能超过
+cycle steps。`train/lora_enabled`、`train/lora_updates` 和 `train/lora_lr`
+分别记录刚完成 step 是否更新 LoRA、累计 LoRA 更新次数和该 step 实际使用的
+LoRA 学习率。
+
 默认的 `--prior-prefiltered-scores PATH` 把传入文件中的全部行视为已经完成筛选的
 片段，不在训练端重新排序或截取。文件可为 CSV 或 JSONL，只要求
 `episode_id`、`start_step`、`end_step`；其他分数、rank 和诊断字段全部忽略。
