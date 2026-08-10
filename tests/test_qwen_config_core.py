@@ -125,3 +125,18 @@ def test_config_rejects_invalid_lora_schedule(updates, message):
 
     with pytest.raises(ConfigError, match=message):
         validate_config(config)
+
+
+def test_lora_schedule_overrides_are_applied():
+    config = apply_overrides(
+        load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml"),
+        {
+            "lora_freeze_steps": 5_000,
+            "lora_cycle_steps": 100,
+            "lora_active_steps": 10,
+        },
+    )
+
+    assert config["train"]["lora_freeze_steps"] == 5_000
+    assert config["train"]["lora_cycle_steps"] == 100
+    assert config["train"]["lora_active_steps"] == 10

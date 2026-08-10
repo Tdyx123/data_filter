@@ -9,6 +9,11 @@ LIBERO_SCRIPT = (
     / "scripts"
     / "train_libero_qwen3_vl_4b_groot_all_tasks_4x4090.sh"
 )
+CYCLIC_LIBERO_SCRIPT = (
+    PROJECT_ROOT
+    / "scripts"
+    / "train_libero_qwen3_vl_4b_groot_cyclic_lora_all_tasks_4x4090.sh"
+)
 BRIDGE_SCRIPT = PROJECT_ROOT / "scripts" / "train_bridge_4x4090.sh"
 LIBERO_CONFIG = PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
 BRIDGE_CONFIG = PROJECT_ROOT / "configs" / "bridge_4x4090.yaml"
@@ -142,3 +147,61 @@ def test_libero_script_preserves_explicit_weights_and_prior_mode(tmp_path):
     assert arguments[weight_index + 1 : weight_index + 3] == ["3", "1"]
     assert arguments[arguments.index("--prior-relcore-manifest") + 1] == relcore
     assert "--prior-prefiltered-scores" not in arguments
+
+
+def test_cyclic_libero_script_injects_schedule_and_preserves_defaults(tmp_path):
+    environment, calls = _fake_python_environment(tmp_path)
+
+    subprocess.run(
+        [
+            "bash",
+            str(CYCLIC_LIBERO_SCRIPT),
+            "--output-dir",
+            "outputs/libero-cyclic",
+            "--preflight-only",
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        check=True,
+    )
+
+    arguments = calls.read_text(encoding="utf-8").splitlines()
+    assert "--all-tasks" in arguments
+    weight_index = arguments.index("--sample-weights")
+    assert arguments[weight_index + 1 : weight_index + 3] == ["1", "1"]
+    assert arguments[arguments.index("--prior-prefiltered-scores") + 1] == SQCN_SCORES
+    assert arguments[arguments.index("--lora-freeze-steps") + 1] == "5000"
+    assert arguments[arguments.index("--lora-cycle-steps") + 1] == "100"
+    assert arguments[arguments.index("--lora-active-steps") + 1] == "10"
+
+
+def test_cyclic_libero_script_allows_explicit_schedule_overrides(tmp_path):
+    environment, calls = _fake_python_environment(tmp_path)
+
+    subprocess.run(
+        [
+            "bash",
+            str(CYCLIC_LIBERO_SCRIPT),
+            "--lora-freeze-steps",
+            "6000",
+            "--lora-cycle-steps",
+            "200",
+            "--lora-active-steps",
+            "20",
+            "--output-dir",
+            "outputs/libero-cyclic-custom",
+            "--preflight-only",
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        check=True,
+    )
+
+    arguments = calls.read_text(encoding="utf-8").splitlines()
+
+    def values_for(option):
+        return [arguments[index + 1] for index, value in enumerate(arguments) if value == option]
+
+    assert values_for("--lora-freeze-steps") == ["5000", "6000"]
+    assert values_for("--lora-cycle-steps") == ["100", "200"]
+    assert values_for("--lora-active-steps") == ["10", "20"]

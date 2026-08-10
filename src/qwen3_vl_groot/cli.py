@@ -68,6 +68,9 @@ def _add_override_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--deepspeed-stage", type=int, choices=(2, 3))
     parser.add_argument("--lora-learning-rate", type=positive_finite_float)
     parser.add_argument("--action-head-learning-rate", type=positive_finite_float)
+    parser.add_argument("--lora-freeze-steps", type=int)
+    parser.add_argument("--lora-cycle-steps", type=int)
+    parser.add_argument("--lora-active-steps", type=int)
     parser.add_argument("--all-tasks", action="store_true", default=None)
     parser.add_argument("--target-only", action="store_true", default=None)
     parser.add_argument(
@@ -102,6 +105,9 @@ def _overrides(namespace: argparse.Namespace) -> dict[str, Any]:
         "deepspeed_stage",
         "lora_learning_rate",
         "action_head_learning_rate",
+        "lora_freeze_steps",
+        "lora_cycle_steps",
+        "lora_active_steps",
         "target_all_tasks",
         "target_only",
         "sample_weights",

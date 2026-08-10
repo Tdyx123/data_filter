@@ -68,6 +68,31 @@ def test_launch_cli_overrides_lora_and_action_head_learning_rates_independently(
     assert config["train"]["head_learning_rate"] == pytest.approx(2e-4)
 
 
+def test_launch_cli_overrides_lora_update_schedule(tmp_path):
+    parser = build_parser()
+    arguments = parser.parse_args(
+        [
+            "launch",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml"),
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--lora-freeze-steps",
+            "5000",
+            "--lora-cycle-steps",
+            "100",
+            "--lora-active-steps",
+            "10",
+        ]
+    )
+
+    config = _resolve_config(arguments)
+
+    assert config["train"]["lora_freeze_steps"] == 5_000
+    assert config["train"]["lora_cycle_steps"] == 100
+    assert config["train"]["lora_active_steps"] == 10
+
+
 @pytest.mark.parametrize(
     ("option", "changed_key", "changed_value", "unchanged_key", "unchanged_value"),
     [
