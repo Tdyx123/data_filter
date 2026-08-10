@@ -105,3 +105,23 @@ def test_resolved_config_persists_final_independent_learning_rates(tmp_path):
 
     assert reloaded["train"]["lora_learning_rate"] == pytest.approx(5e-6)
     assert reloaded["train"]["head_learning_rate"] == pytest.approx(2e-4)
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"lora_freeze_steps": -1}, "lora_freeze_steps"),
+        ({"lora_cycle_steps": 100}, "provided together"),
+        ({"lora_cycle_steps": 0, "lora_active_steps": 1}, "lora_cycle_steps"),
+        ({"lora_cycle_steps": 100, "lora_active_steps": 0}, "lora_active_steps"),
+        ({"lora_cycle_steps": 10, "lora_active_steps": 11}, "must not exceed"),
+        ({"lora_cycle_steps": True, "lora_active_steps": 1}, "lora_cycle_steps"),
+        ({"lora_cycle_steps": 100.0, "lora_active_steps": 10}, "lora_cycle_steps"),
+    ],
+)
+def test_config_rejects_invalid_lora_schedule(updates, message):
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
+    config["train"].update(updates)
+
+    with pytest.raises(ConfigError, match=message):
+        validate_config(config)

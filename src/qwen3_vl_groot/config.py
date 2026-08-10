@@ -9,6 +9,8 @@ from typing import Any
 
 import yaml
 
+from .schedules import LoraUpdateSchedule
+
 
 class ConfigError(ValueError):
     """Raised when the run configuration violates a model/data invariant."""
@@ -186,6 +188,10 @@ def validate_config(config: dict[str, Any]) -> None:
             or float(value) <= 0.0
         ):
             raise ConfigError(f"train.{name} must be finite and positive")
+    try:
+        LoraUpdateSchedule.from_train_config(train)
+    except (KeyError, ValueError) as error:
+        raise ConfigError(str(error)) from error
     if dataset_type == "libero":
         if not isinstance(config["paths"].get("lerobot"), str):
             raise ConfigError("paths.lerobot must be set for LIBERO")
