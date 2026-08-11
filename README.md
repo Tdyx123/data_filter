@@ -8,7 +8,8 @@ GR00T 风格 flow-matching DiT 动作头开始训练。
 仓库同时包含与训练解耦的通用轨迹数据价值工具
 [TDUS](tdus/README.md)，用于直接从 LeRobot trajectory/chunk 计算 Quality、
 Coverage、Diversity 和 Novelty；以及仿照 SQCN 两遍数据流、面向 LIBERO 关系图与
-集合目标筛选的 [RelCore](relcore/README.md)。
+集合目标筛选的 [RelCore](relcore/README.md)。另有固定使用 support、progress 和
+运动原语、以共现减冗余目标执行 top-8 束搜索的 [Cocore](cocore/README.md)。
 
 另有分阶段的 [Quality Filter](quality_filter/README.md)，只计算 SQCN Quality，
 再用相同的融合 embedding 和 0.4.0 多样化 Filter 完成片段筛选。SQCN 与

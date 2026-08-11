@@ -1,0 +1,11 @@
+numpy>=2.0
+pyarrow>=18
+av>=14
+Pillow>=11
+PyYAML>=6
+scipy>=1.14
+scikit-learn>=1.5
+torch>=2.5
+transformers>=4.45
+faiss-cpu>=1.9
+pytest>=8.0

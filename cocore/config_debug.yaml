@@ -1,0 +1,38 @@
+seed: 42
+
+dataset:
+  type: lerobot
+  name: libero90-debug
+  path: /data/dwb/datasets/LIBERO_lerobot/libero90
+  use_images: true
+  feature_keys:
+    vector_observations: [observation.state]
+    image_observations: [observation.images.image]
+
+visual:
+  encoder: dummy
+
+relation:
+  projection_dim: 8
+  output_dim: 32
+
+prototypes:
+  method: motion_primitives
+
+objective:
+  cooccurrence_weight: 1.0
+
+selection:
+  ratio: 1.0
+  budget: null
+  global_candidates: 32
+  prototype_candidates: 16
+  similarity_candidates: 16
+  random_candidates: 16
+
+runtime:
+  max_episodes: 2
+  num_workers: 0
+
+output:
+  directory: outputs/cocore/debug

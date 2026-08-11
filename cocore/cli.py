@@ -1,0 +1,91 @@
+"""Command-line entrypoint for Cocore."""
+
+from __future__ import annotations
+
+import argparse
+import math
+from pathlib import Path
+from typing import Sequence
+
+from .config import load_config
+from .pipeline import (
+    encode_stage,
+    graph_stage,
+    run_pipeline,
+    scan_stage,
+    select_stage,
+    validate_output,
+)
+
+
+def _selection_ratio(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 < parsed <= 1.0:
+        raise argparse.ArgumentTypeError("selection ratio must be in (0, 1]")
+    return parsed
+
+
+def _cooccurrence_weight(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise argparse.ArgumentTypeError("cooccurrence weight must be finite and non-negative")
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="LIBERO motion-primitive co-occurrence filter")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    default_config = str(Path(__file__).with_name("config_libero90.yaml"))
+    for command in ("scan", "encode", "build-graph", "select", "run"):
+        child = subparsers.add_parser(command)
+        child.add_argument("--config", default=default_config)
+        child.add_argument("--output-dir", default=None)
+        child.add_argument("--max-episodes", type=int, default=None)
+        child.add_argument("--force", action="store_true")
+        if command in {"select", "run"}:
+            child.add_argument("--selection-ratio", type=_selection_ratio, default=None)
+            child.add_argument(
+                "--cooccurrence-weight", type=_cooccurrence_weight, default=None
+            )
+    validate = subparsers.add_parser("validate")
+    validate.add_argument("--output-dir", required=True)
+    validate.add_argument("--config", default=None)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    if args.command == "validate":
+        config = load_config(args.config) if args.config is not None else None
+        result = validate_output(args.output_dir, config=config)
+        import json
+
+        print(json.dumps(result, sort_keys=True))
+        return
+    config = load_config(args.config)
+    if args.max_episodes is not None:
+        if args.max_episodes <= 0:
+            raise SystemExit("--max-episodes must be positive")
+        config.setdefault("runtime", {})["max_episodes"] = args.max_episodes
+    if args.command in {"select", "run"}:
+        if args.selection_ratio is not None:
+            config.setdefault("selection", {})["ratio"] = args.selection_ratio
+            config["selection"]["budget"] = None
+        if args.cooccurrence_weight is not None:
+            config.setdefault("objective", {})[
+                "cooccurrence_weight"
+            ] = args.cooccurrence_weight
+    kwargs = {"output_dir": args.output_dir, "force": args.force}
+    if args.command == "scan":
+        root, _, clips, _ = scan_stage(config, **kwargs)
+        print(f"cocore_output={root} clips={len(clips)}")
+    elif args.command == "encode":
+        root, _, artifact = encode_stage(config, **kwargs)
+        print(f"cocore_output={root} clips={len(artifact.clips)}")
+    elif args.command == "build-graph":
+        root, _, _, graph, _ = graph_stage(config, **kwargs)
+        print(f"cocore_output={root / 'graph-12-motion-primitives'} nodes={len(graph.sample_ids)}")
+    elif args.command == "select":
+        print(f"cocore_output={select_stage(config, **kwargs)}")
+    else:
+        print(f"cocore_output={run_pipeline(config, **kwargs)}")
