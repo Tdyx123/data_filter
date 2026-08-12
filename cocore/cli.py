@@ -25,15 +25,15 @@ def _selection_ratio(value: str) -> float:
     return parsed
 
 
-def _cooccurrence_weight(value: str) -> float:
+def _relation_weight(value: str) -> float:
     parsed = float(value)
     if not math.isfinite(parsed) or parsed < 0.0:
-        raise argparse.ArgumentTypeError("cooccurrence weight must be finite and non-negative")
+        raise argparse.ArgumentTypeError("relation weight must be finite and non-negative")
     return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="LIBERO motion-primitive co-occurrence filter")
+    parser = argparse.ArgumentParser(description="LIBERO motion-primitive relation filter")
     subparsers = parser.add_subparsers(dest="command", required=True)
     default_config = str(Path(__file__).with_name("config_libero90.yaml"))
     for command in ("scan", "encode", "build-graph", "select", "run"):
@@ -45,8 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
         if command in {"select", "run"}:
             child.add_argument("--selection-ratio", type=_selection_ratio, default=None)
             child.add_argument(
-                "--cooccurrence-weight", type=_cooccurrence_weight, default=None
+                "--relation", choices=("sequence", "cooccurrence"), default=None
             )
+            child.add_argument("--relation-weight", type=_relation_weight, default=None)
     validate = subparsers.add_parser("validate")
     validate.add_argument("--output-dir", required=True)
     validate.add_argument("--config", default=None)
@@ -71,10 +72,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.selection_ratio is not None:
             config.setdefault("selection", {})["ratio"] = args.selection_ratio
             config["selection"]["budget"] = None
-        if args.cooccurrence_weight is not None:
-            config.setdefault("objective", {})[
-                "cooccurrence_weight"
-            ] = args.cooccurrence_weight
+        if args.relation is not None:
+            config.setdefault("objective", {})["relation"] = args.relation
+        if args.relation_weight is not None:
+            config.setdefault("objective", {})["relation_weight"] = args.relation_weight
     kwargs = {"output_dir": args.output_dir, "force": args.force}
     if args.command == "scan":
         root, _, clips, _ = scan_stage(config, **kwargs)

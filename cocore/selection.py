@@ -26,7 +26,7 @@ class HeapSelectionResult:
     selection_steps: tuple[int, ...]
     heap_refreshes: tuple[int, ...]
     objective_value: float
-    cooccurrence: float
+    relation: float
     redundancy: float
     initial_heap_size: int
     total_refreshes: int
@@ -231,7 +231,7 @@ class LazyHeapSelector:
             selection_steps=tuple(selection_steps),
             heap_refreshes=tuple(refresh_counts),
             objective_value=float(state.score),
-            cooccurrence=float(state.cooccurrence),
+            relation=float(state.relation),
             redundancy=float(state.redundancy),
             initial_heap_size=initial_heap_size,
             total_refreshes=sum(refresh_counts),

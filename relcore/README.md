@@ -71,6 +71,38 @@ python -m relcore run --config relcore/config_libero90.yaml \
 `validate` 接受具体的 `select-r<可靠性掩码>-g<增益掩码>[-topXpct]/` 目录，并从其中的
 manifest 定位共享输出根目录下的 scan、encode 和匹配的 graph。
 
+## 按任务随机 Top K% 基线
+
+`scripts/select_random_clips_per_task.py` 可直接从 LeRobot v2 元数据生成与 RelCore
+训练清单兼容的逐任务随机基线。脚本使用与 RelCore 相同的 15 帧、stride 15 和末尾
+对齐切分规则，不读取图像、state、action 或 Parquet 数据。每个任务独立选择
+`ceil(候选片段数 × K / 100)` 条，因此实际全局比例可能略高于指定比例。
+
+例如分别生成 Top 10% 和 Top 20% 随机基线：
+
+```bash
+python scripts/select_random_clips_per_task.py \
+  --dataset-root /data/dwb/datasets/LIBERO_lerobot/libero90 \
+  --output-dir outputs/random/libero90-top10pct \
+  --top-k-percent 10 \
+  --seed 42
+
+python scripts/select_random_clips_per_task.py \
+  --dataset-root /data/dwb/datasets/LIBERO_lerobot/libero90 \
+  --output-dir outputs/random/libero90-top20pct \
+  --top-k-percent 20 \
+  --seed 42
+```
+
+相同的数据集、比例和 seed 会产生相同结果。输出目录包含
+`selected_manifest.jsonl` 和 `selection_report.json`；前者可直接传给训练入口的
+prefiltered selection 参数，后者记录 seed、比例和逐任务数量。已有目标文件默认不会
+覆盖，需要显式传 `--force`；目录内其他文件不会删除。
+
+该输出只是 RelCore 训练清单兼容格式，不包含或伪造 reliability、prototype、
+marginal gain、graph、run manifest 或阶段指纹，因此不能交给 `python -m relcore
+validate` 当作完整 RelCore artifact 验证。
+
 ## 原型方法
 
 `prototypes.method` 控制 graph 阶段使用的原型与软类别方法。默认值 `kmeans` 保持

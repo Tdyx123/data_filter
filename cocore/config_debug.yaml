@@ -20,7 +20,8 @@ prototypes:
   method: motion_primitives
 
 objective:
-  cooccurrence_weight: 1.0
+  relation: cooccurrence
+  relation_weight: 1.0
 
 selection:
   ratio: 1.0

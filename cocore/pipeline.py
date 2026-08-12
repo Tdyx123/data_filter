@@ -44,8 +44,11 @@ def _number_tag(value: float) -> str:
     return format(float(value), ".12g").replace("-", "m").replace(".", "p")
 
 
-def selection_directory_name(cooccurrence_weight: float, ratio: float) -> str:
-    return f"select-w{_number_tag(cooccurrence_weight)}-top{_number_tag(ratio * 100.0)}pct"
+def selection_directory_name(relation_type: str, relation_weight: float, ratio: float) -> str:
+    return (
+        f"select-{relation_type}-w{_number_tag(relation_weight)}-"
+        f"top{_number_tag(ratio * 100.0)}pct"
+    )
 
 
 def _output_root(config: Mapping[str, Any], output_dir: str | Path | None) -> Path:
@@ -239,9 +242,10 @@ def select_stage(
         visual_encoder=visual_encoder,
     )
     budget = _selection_budget(resolved, len(graph.sample_ids))
-    objective_weight = float(resolved["objective"]["cooccurrence_weight"])
+    relation_type = str(resolved["objective"]["relation"])
+    relation_weight = float(resolved["objective"]["relation_weight"])
     ratio = float(resolved["selection"]["ratio"])
-    directory = selection_directory_name(objective_weight, ratio)
+    directory = selection_directory_name(relation_type, relation_weight, ratio)
     destination = root / directory
     selection_config = resolved["selection"]
     max_refreshes = int(selection_config["max_refreshes"])
@@ -263,7 +267,8 @@ def select_stage(
         started = time.perf_counter()
         context = CocoreObjectiveContext(
             graph,
-            objective_weight,
+            relation_type,
+            relation_weight,
             similarity_threshold=float(resolved["graph"]["similarity_threshold"]),
         )
         coverage_seed = build_max_coverage_seed(context, budget=budget)
@@ -302,10 +307,11 @@ def select_stage(
                 "target": [float(value) for value in coverage_seed.target_coverage],
                 "achieved": [float(value) for value in final_coverage],
             },
-            "cooccurrence_weight": objective_weight,
+            "relation_type": relation_type,
+            "relation_weight": relation_weight,
             "objective": {
-                "cooccurrence": float(result.cooccurrence),
-                "weighted_cooccurrence": objective_weight * float(result.cooccurrence),
+                "relation": float(result.relation),
+                "weighted_relation": relation_weight * float(result.relation),
                 "redundancy": float(result.redundancy),
                 "total": float(result.objective_value),
             },
@@ -346,7 +352,8 @@ def select_stage(
                 "selected_clips": len(result.selected_indices),
                 "budget": budget,
                 "selection_ratio": ratio,
-                "cooccurrence_weight": objective_weight,
+                "relation_type": relation_type,
+                "relation_weight": relation_weight,
                 "algorithm": algorithm,
             },
         )
@@ -387,7 +394,8 @@ def select_stage(
             "reliability_metrics": list(RELIABILITY_METRICS),
             "prototype_method": "motion_primitives",
             "selection_ratio": ratio,
-            "cooccurrence_weight": objective_weight,
+            "relation_type": relation_type,
+            "relation_weight": relation_weight,
             "similarity_threshold": float(resolved["graph"]["similarity_threshold"]),
             "algorithm": algorithm,
             "stage_directories": stage_directories,
@@ -458,10 +466,13 @@ def validate_output(
         raise ValueError("cocore max_refreshes is invalid")
     if max_refreshes <= 0:
         raise ValueError("cocore max_refreshes is invalid")
-    weight = float(run_manifest["cooccurrence_weight"])
+    relation_type = str(run_manifest["relation_type"])
+    if relation_type not in {"sequence", "cooccurrence"}:
+        raise ValueError("cocore relation type is invalid")
+    weight = float(run_manifest["relation_weight"])
     ratio = float(run_manifest["selection_ratio"])
-    if result.name != selection_directory_name(weight, ratio):
-        raise ValueError("selection directory does not match weight and ratio")
+    if result.name != selection_directory_name(relation_type, weight, ratio):
+        raise ValueError("selection directory does not match relation, weight, and ratio")
     expected_directories = {
         "scan": "scan",
         "encode": "encode",
@@ -514,6 +525,14 @@ def validate_output(
     report = json.loads(required["report"].read_text(encoding="utf-8"))
     if select_manifest.get("algorithm") != algorithm or report.get("algorithm") != algorithm:
         raise ValueError("cocore heap algorithm metadata does not match")
+    if report.get("relation_type") != relation_type:
+        raise ValueError("selection report relation type mismatch")
+    if not np.isclose(float(report.get("relation_weight", np.nan)), weight):
+        raise ValueError("selection report relation weight mismatch")
+    if select_manifest.get("relation_type") != relation_type:
+        raise ValueError("selection manifest relation type mismatch")
+    if not np.isclose(float(select_manifest.get("relation_weight", np.nan)), weight):
+        raise ValueError("selection manifest relation weight mismatch")
     if len({row["sample_id"] for row in selected_rows}) != len(selected_rows):
         raise ValueError("selected manifest contains duplicate sample ids")
     if len(selected_rows) != int(select_manifest["budget"]):
@@ -533,6 +552,7 @@ def validate_output(
     selected_indices = [id_to_index[row["sample_id"]] for row in selected_rows]
     context = CocoreObjectiveContext(
         graph,
+        relation_type,
         weight,
         similarity_threshold=float(run_manifest["similarity_threshold"]),
     )
@@ -592,12 +612,19 @@ def validate_output(
         raise ValueError("selection report coverage does not match artifacts")
     objective = report.get("objective", {})
     for name, actual in {
-        "cooccurrence": state.cooccurrence,
+        "relation": state.relation,
         "redundancy": state.redundancy,
         "total": state.score,
     }.items():
         if not np.isclose(float(objective.get(name, np.nan)), actual, rtol=1.0e-7, atol=1.0e-8):
             raise ValueError(f"selection report objective {name} mismatch")
+    if not np.isclose(
+        float(objective.get("weighted_relation", np.nan)),
+        weight * state.relation,
+        rtol=1.0e-7,
+        atol=1.0e-8,
+    ):
+        raise ValueError("selection report objective weighted_relation mismatch")
 
     expected_heap = {
         "initial_size": (
@@ -626,8 +653,10 @@ def validate_output(
         raise ValueError("selection report task counts mismatch")
     if config is not None:
         resolved = resolve_config(config)
-        if not np.isclose(float(resolved["objective"]["cooccurrence_weight"]), weight):
-            raise ValueError("configuration cooccurrence weight does not match output")
+        if str(resolved["objective"]["relation"]) != relation_type:
+            raise ValueError("configuration relation type does not match output")
+        if not np.isclose(float(resolved["objective"]["relation_weight"]), weight):
+            raise ValueError("configuration relation weight does not match output")
         if not np.isclose(float(resolved["selection"]["ratio"]), ratio):
             raise ValueError("configuration selection ratio does not match output")
         if int(resolved["selection"]["max_refreshes"]) != max_refreshes:

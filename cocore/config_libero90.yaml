@@ -55,7 +55,8 @@ graph:
   cooccurrence_max_gap: 4
 
 objective:
-  cooccurrence_weight: 1.0
+  relation: cooccurrence
+  relation_weight: 1.0
 
 selection:
   ratio: 0.10

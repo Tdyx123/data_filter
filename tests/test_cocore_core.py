@@ -13,6 +13,10 @@ from cocore.selection import (
     build_max_coverage_seed,
 )
 from relcore.schemas import EdgeTable, GraphData
+from relcore.selection.objective import (
+    ObjectiveWeights,
+    recompute_objective as recompute_relcore_objective,
+)
 
 
 def _edges(rows: list[tuple[int, int, float]], edge_type: str) -> EdgeTable:
@@ -42,34 +46,121 @@ def _graph() -> GraphData:
     )
 
 
-def test_incremental_asymmetric_cooccurrence_and_redundancy_match_literal_values() -> None:
-    context = CocoreObjectiveContext(_graph(), cooccurrence_weight=2.0, similarity_threshold=0.8)
+def test_incremental_asymmetric_relation_and_redundancy_match_literal_values() -> None:
+    context = CocoreObjectiveContext(
+        _graph(), "cooccurrence", relation_weight=2.0, similarity_threshold=0.8
+    )
     state = context.state_from_indices([0, 1])
 
-    assert state.prototype_mass.tolist() == pytest.approx([1.0, 0.5])
-    assert state.cooccurrence == pytest.approx(0.5)
+    assert state.prototype_coverage.tolist() == pytest.approx([1.0, 0.5])
+    assert state.relation == pytest.approx(2.0**-0.5)
     assert state.redundancy == pytest.approx(0.0)
-    assert state.score == pytest.approx(1.0)
-    assert context.marginal_gain(state, 2) == pytest.approx(0.52)
+    assert state.score == pytest.approx(2.0**0.5)
+    assert context.marginal_gain(state, 2) == pytest.approx(-1.0)
 
     context.add_candidate(state, 2)
 
-    assert state.prototype_mass.tolist() == pytest.approx([1.4, 0.9])
-    assert state.cooccurrence == pytest.approx(1.26)
+    assert state.prototype_coverage.tolist() == pytest.approx([1.0, 0.5])
+    assert state.relation == pytest.approx(2.0**-0.5)
     assert state.redundancy == pytest.approx(1.0)
-    assert state.score == pytest.approx(1.52)
+    assert state.score == pytest.approx(2.0**0.5 - 1.0)
     assert recompute_objective(
         [0, 1, 2],
         _graph(),
-        cooccurrence_weight=2.0,
+        relation_type="cooccurrence",
+        relation_weight=2.0,
         similarity_threshold=0.8,
     ).score == pytest.approx(state.score)
 
 
 @pytest.mark.parametrize("weight", [-0.1, float("nan"), float("inf")])
-def test_objective_rejects_invalid_cooccurrence_weight(weight: float) -> None:
-    with pytest.raises(ValueError, match="cooccurrence_weight"):
-        CocoreObjectiveContext(_graph(), weight, similarity_threshold=0.8)
+def test_objective_rejects_invalid_relation_weight(weight: float) -> None:
+    with pytest.raises(ValueError, match="relation_weight"):
+        CocoreObjectiveContext(
+            _graph(), "cooccurrence", weight, similarity_threshold=0.8
+        )
+
+
+def test_objective_rejects_unknown_relation_type() -> None:
+    with pytest.raises(ValueError, match="relation_type"):
+        CocoreObjectiveContext(_graph(), "transition", 1.0, similarity_threshold=0.8)
+
+
+def test_sequence_relation_counts_only_selected_directed_sequence_edges() -> None:
+    graph = _graph()
+    graph.sequence_edges = _edges([(0, 1, 1.0)], "sequence")
+    graph.transition_matrix = sparse.csr_matrix(
+        np.asarray([[0.0, 1.0], [0.0, 0.0]], dtype=np.float32)
+    )
+
+    adjacent = CocoreObjectiveContext(
+        graph, "sequence", relation_weight=2.0, similarity_threshold=0.8
+    ).state_from_indices([0, 1])
+    nonadjacent = CocoreObjectiveContext(
+        graph, "sequence", relation_weight=2.0, similarity_threshold=0.8
+    ).state_from_indices([0, 2])
+
+    assert adjacent.relation == pytest.approx(1.0, abs=1.0e-7)
+    assert adjacent.score == pytest.approx(2.0, abs=1.0e-7)
+    assert nonadjacent.relation == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("relation", ["sequence", "cooccurrence"])
+@pytest.mark.parametrize("selected", [[], [0], [0, 1], [0, 1, 2]])
+def test_cocore_raw_relation_matches_relcore_breakdown(
+    relation: str,
+    selected: list[int],
+) -> None:
+    graph = _graph()
+    graph.sequence_edges = _edges([(0, 1, 1.0), (1, 2, 1.0)], "sequence")
+    graph.transition_matrix = sparse.csr_matrix(
+        np.asarray([[0.0, 0.6], [0.4, 0.0]], dtype=np.float32)
+    )
+
+    actual = CocoreObjectiveContext(
+        graph, relation, relation_weight=1.0, similarity_threshold=0.8
+    ).state_from_indices(selected)
+    expected = recompute_relcore_objective(
+        selected,
+        graph,
+        ObjectiveWeights(),
+        similarity_threshold=0.8,
+        prototype_gain_metrics=[relation],
+    )
+
+    assert actual.relation == pytest.approx(getattr(expected, relation), abs=1.0e-7)
+
+
+@pytest.mark.parametrize("relation", ["sequence", "cooccurrence"])
+def test_cocore_marginal_relation_gain_matches_relcore(relation: str) -> None:
+    graph = _graph()
+    graph.sequence_edges = _edges([(0, 1, 1.0), (1, 2, 1.0)], "sequence")
+    graph.transition_matrix = sparse.csr_matrix(
+        np.asarray([[0.0, 0.6], [0.4, 0.0]], dtype=np.float32)
+    )
+    context = CocoreObjectiveContext(
+        graph, relation, relation_weight=1.0, similarity_threshold=0.8
+    )
+    state = context.state_from_indices([0])
+    before = recompute_relcore_objective(
+        [0],
+        graph,
+        ObjectiveWeights(),
+        similarity_threshold=0.8,
+        prototype_gain_metrics=[relation],
+    )
+    after = recompute_relcore_objective(
+        [0, 1],
+        graph,
+        ObjectiveWeights(),
+        similarity_threshold=0.8,
+        prototype_gain_metrics=[relation],
+    )
+
+    assert context.marginal_gain(state, 1) == pytest.approx(
+        getattr(after, relation) - getattr(before, relation),
+        abs=1.0e-7,
+    )
 
 
 def test_max_coverage_seed_uses_reliable_soft_assignments_and_stable_ties() -> None:
@@ -82,7 +173,7 @@ def test_max_coverage_seed_uses_reliable_soft_assignments_and_stable_ties() -> N
     graph.prototype_indices = np.vstack([graph.prototype_indices, [0, -1]])
     graph.prototype_weights = np.vstack([graph.prototype_weights, [1.0, 0.0]])
 
-    context = CocoreObjectiveContext(graph, 1.0, similarity_threshold=0.8)
+    context = CocoreObjectiveContext(graph, "cooccurrence", 1.0, similarity_threshold=0.8)
     seed = build_max_coverage_seed(context, budget=3)
 
     assert seed.selected_indices == (3, 1)
@@ -91,7 +182,9 @@ def test_max_coverage_seed_uses_reliable_soft_assignments_and_stable_ties() -> N
 
 
 def test_max_coverage_seed_rejects_budget_smaller_than_required_union() -> None:
-    context = CocoreObjectiveContext(_graph(), 1.0, similarity_threshold=0.8)
+    context = CocoreObjectiveContext(
+        _graph(), "cooccurrence", 1.0, similarity_threshold=0.8
+    )
 
     with pytest.raises(ValueError, match="minimum required budget is 2"):
         build_max_coverage_seed(context, budget=1)
@@ -116,13 +209,13 @@ def _heap_graph(count: int = 14) -> GraphData:
 
 def test_lazy_heap_selects_current_top_then_refreshes_the_next_stale_top() -> None:
     graph = _heap_graph()
-    context = CocoreObjectiveContext(graph, 1.0, similarity_threshold=0.8)
+    context = CocoreObjectiveContext(graph, "cooccurrence", 1.0, similarity_threshold=0.8)
     seed = build_max_coverage_seed(context, budget=3)
     selector = LazyHeapSelector(context, max_refreshes=100)
 
     result = selector.select(3, initial_indices=seed.selected_indices)
 
-    assert result.selected_indices == (13, 12, 11)
+    assert result.selected_indices == (13, 0, 1)
     assert result.selection_phases == ("coverage_seed", "heap", "heap")
     assert result.selection_steps == (0, 1, 2)
     assert result.heap_refreshes == (0, 0, 1)
@@ -134,7 +227,7 @@ def test_lazy_heap_selects_current_top_then_refreshes_the_next_stale_top() -> No
 
 def test_lazy_heap_returns_seed_without_building_a_heap_when_budget_is_full() -> None:
     graph = _heap_graph()
-    context = CocoreObjectiveContext(graph, 1.0, similarity_threshold=0.8)
+    context = CocoreObjectiveContext(graph, "cooccurrence", 1.0, similarity_threshold=0.8)
     seed = build_max_coverage_seed(context, budget=1)
     selector = LazyHeapSelector(context)
 
@@ -149,7 +242,7 @@ def test_lazy_heap_returns_seed_without_building_a_heap_when_budget_is_full() ->
 class _ScriptedState:
     selected_mask: np.ndarray
     score: float = 0.0
-    cooccurrence: float = 0.0
+    relation: float = 0.0
     redundancy: float = 0.0
 
 
@@ -168,7 +261,7 @@ class _ScriptedContext:
         gain = float(self._gain(int(state.selected_mask.sum()), index))
         state.selected_mask[index] = True
         state.score += gain
-        state.cooccurrence = state.score
+        state.relation = state.score
 
 
 class _RecordingScriptedContext(_ScriptedContext):
@@ -301,13 +394,13 @@ def test_lazy_heap_breaks_equal_gain_ties_by_sample_id() -> None:
 def test_lazy_heap_has_no_task_quota_and_can_select_one_task_repeatedly() -> None:
     graph = _heap_graph(6)
     graph.task_indices = np.asarray([1, 1, 1, 0, 0, 1], dtype=np.int64)
-    context = CocoreObjectiveContext(graph, 1.0, similarity_threshold=0.8)
+    context = CocoreObjectiveContext(graph, "cooccurrence", 1.0, similarity_threshold=0.8)
     seed = build_max_coverage_seed(context, budget=3)
 
     result = LazyHeapSelector(context).select(3, initial_indices=seed.selected_indices)
 
-    assert result.selected_indices == (5, 4, 3)
-    assert graph.task_indices[list(result.selected_indices)].tolist() == [1, 0, 0]
+    assert result.selected_indices == (5, 0, 1)
+    assert graph.task_indices[list(result.selected_indices)].tolist() == [1, 1, 1]
 
 
 def test_lazy_heap_rejects_non_finite_gains() -> None:
@@ -332,7 +425,9 @@ class _CountingObjectiveContext(CocoreObjectiveContext):
 
 def test_lazy_heap_bounds_marginal_gain_recomputations() -> None:
     graph = _heap_graph(20)
-    context = _CountingObjectiveContext(graph, 1.0, similarity_threshold=0.8)
+    context = _CountingObjectiveContext(
+        graph, "cooccurrence", 1.0, similarity_threshold=0.8
+    )
     budget = 10
     seed = build_max_coverage_seed(context, budget=budget)
     selector = LazyHeapSelector(context, max_refreshes=3)
@@ -351,8 +446,8 @@ def test_lazy_heap_bounds_marginal_gain_recomputations() -> None:
         remaining_candidates + 3 * heap_selections + full_refresh_candidates
     )
     recomputed = CocoreObjectiveContext(
-        graph, 1.0, similarity_threshold=0.8
+        graph, "cooccurrence", 1.0, similarity_threshold=0.8
     ).state_from_indices(result.selected_indices)
     assert result.objective_value == pytest.approx(recomputed.score)
-    assert result.cooccurrence == pytest.approx(recomputed.cooccurrence)
+    assert result.relation == pytest.approx(recomputed.relation)
     assert result.redundancy == pytest.approx(recomputed.redundancy)

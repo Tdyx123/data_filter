@@ -9,25 +9,56 @@ from cocore.config import load_config, resolve_config
 from cocore.pipeline import selection_directory_name
 
 
-def test_config_fixes_motion_primitives_and_support_progress_reliability() -> None:
-    resolved = resolve_config({})
+def _objective(relation: str = "cooccurrence", weight: float = 1.0) -> dict[str, object]:
+    return {"objective": {"relation": relation, "relation_weight": weight}}
+
+
+def test_config_requires_explicit_relation_and_weight() -> None:
+    with pytest.raises(ValueError, match="objective.relation is required"):
+        resolve_config({})
+
+    with pytest.raises(ValueError, match="objective.relation_weight is required"):
+        resolve_config({"objective": {"relation": "cooccurrence"}})
+
+
+@pytest.mark.parametrize("relation", ["sequence", "cooccurrence"])
+def test_config_accepts_supported_relations(relation: str) -> None:
+    resolved = resolve_config(_objective(relation))
 
     assert resolved["prototypes"]["method"] == "motion_primitives"
     assert resolved["reliability_metrics"] == ["support", "progress"]
-    assert resolved["objective"]["cooccurrence_weight"] == 1.0
+    assert resolved["objective"] == {"relation": relation, "relation_weight": 1.0}
     assert resolved["selection"]["max_refreshes"] == 100
 
 
 @pytest.mark.parametrize("weight", [-1.0, float("nan"), float("inf")])
-def test_config_rejects_invalid_cooccurrence_weight(weight: float) -> None:
-    with pytest.raises(ValueError, match="cooccurrence_weight"):
-        resolve_config({"objective": {"cooccurrence_weight": weight}})
+def test_config_rejects_invalid_relation_weight(weight: float) -> None:
+    with pytest.raises(ValueError, match="objective.relation_weight"):
+        resolve_config(_objective(weight=weight))
+
+
+def test_config_rejects_unknown_relation() -> None:
+    with pytest.raises(ValueError, match="objective.relation must be sequence or cooccurrence"):
+        resolve_config(_objective("transition"))
+
+
+def test_config_rejects_removed_cooccurrence_weight_with_migration_message() -> None:
+    with pytest.raises(ValueError, match="use objective.relation_weight"):
+        resolve_config(
+            {
+                "objective": {
+                    "relation": "cooccurrence",
+                    "relation_weight": 1.0,
+                    "cooccurrence_weight": 1.0,
+                }
+            }
+        )
 
 
 @pytest.mark.parametrize("max_refreshes", [0, -1, 1.5, True])
 def test_config_rejects_non_positive_or_non_integer_max_refreshes(max_refreshes) -> None:
     with pytest.raises(ValueError, match="selection.max_refreshes"):
-        resolve_config({"selection": {"max_refreshes": max_refreshes}})
+        resolve_config({**_objective(), "selection": {"max_refreshes": max_refreshes}})
 
 
 @pytest.mark.parametrize(
@@ -41,34 +72,49 @@ def test_config_rejects_non_positive_or_non_integer_max_refreshes(max_refreshes)
 )
 def test_config_rejects_removed_candidate_pool_options(obsolete: str) -> None:
     with pytest.raises(ValueError, match=f"selection.{obsolete}"):
-        resolve_config({"selection": {obsolete: 1}})
+        resolve_config({**_objective(), "selection": {obsolete: 1}})
 
 
-def test_selection_directory_always_encodes_weight_and_ratio() -> None:
-    assert selection_directory_name(1.5, 0.1) == "select-w1p5-top10pct"
-    assert selection_directory_name(0.0, 0.125) == "select-w0-top12p5pct"
-
-
-def test_run_cli_accepts_weight_and_ratio_but_rejects_relcore_switches() -> None:
-    arguments = cli.build_parser().parse_args(
-        ["run", "--cooccurrence-weight", "1.5", "--selection-ratio", "0.2"]
+def test_selection_directory_encodes_relation_weight_and_ratio() -> None:
+    assert (
+        selection_directory_name("sequence", 1.5, 0.1)
+        == "select-sequence-w1p5-top10pct"
+    )
+    assert (
+        selection_directory_name("cooccurrence", 0.0, 0.125)
+        == "select-cooccurrence-w0-top12p5pct"
     )
 
-    assert arguments.cooccurrence_weight == 1.5
+
+def test_run_cli_accepts_relation_weight_and_ratio_but_rejects_old_weight() -> None:
+    arguments = cli.build_parser().parse_args(
+        [
+            "run",
+            "--relation",
+            "sequence",
+            "--relation-weight",
+            "1.5",
+            "--selection-ratio",
+            "0.2",
+        ]
+    )
+
+    assert arguments.relation == "sequence"
+    assert arguments.relation_weight == 1.5
     assert arguments.selection_ratio == 0.2
     with pytest.raises(SystemExit):
-        cli.build_parser().parse_args(["run", "--prototype-method", "kmeans"])
+        cli.build_parser().parse_args(["run", "--cooccurrence-weight", "1.5"])
 
 
 def test_main_applies_cli_overrides_to_run_pipeline(monkeypatch, capsys) -> None:
     received: dict[str, object] = {}
 
-    monkeypatch.setattr(cli, "load_config", lambda _: {})
+    monkeypatch.setattr(cli, "load_config", lambda _: _objective())
 
     def fake_run_pipeline(config, **kwargs):
         received["config"] = config
         received.update(kwargs)
-        return Path("outputs/cocore/test/select-w2-top25pct")
+        return Path("outputs/cocore/test/select-sequence-w2-top25pct")
 
     monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
 
@@ -77,17 +123,22 @@ def test_main_applies_cli_overrides_to_run_pipeline(monkeypatch, capsys) -> None
             "run",
             "--config",
             "unused.yaml",
-            "--cooccurrence-weight",
+            "--relation",
+            "sequence",
+            "--relation-weight",
             "2",
             "--selection-ratio",
             "0.25",
         ]
     )
 
-    assert received["config"]["objective"]["cooccurrence_weight"] == 2.0
+    assert received["config"]["objective"] == {
+        "relation": "sequence",
+        "relation_weight": 2.0,
+    }
     assert received["config"]["selection"]["ratio"] == 0.25
     assert received["config"]["selection"]["budget"] is None
-    assert capsys.readouterr().out.strip().endswith("select-w2-top25pct")
+    assert capsys.readouterr().out.strip().endswith("select-sequence-w2-top25pct")
 
 
 @pytest.mark.parametrize("path", ["cocore/config_libero90.yaml", "cocore/config_debug.yaml"])
@@ -96,6 +147,10 @@ def test_shipped_configs_resolve_to_fixed_cocore_contract(path: str) -> None:
 
     assert config["prototypes"]["method"] == "motion_primitives"
     assert config["reliability_metrics"] == ["support", "progress"]
+    assert config["objective"] == {
+        "relation": "cooccurrence",
+        "relation_weight": 1.0,
+    }
     assert config["selection"]["max_refreshes"] == 100
     assert not {
         "global_candidates",

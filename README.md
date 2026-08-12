@@ -9,7 +9,8 @@ GR00T 风格 flow-matching DiT 动作头开始训练。
 [TDUS](tdus/README.md)，用于直接从 LeRobot trajectory/chunk 计算 Quality、
 Coverage、Diversity 和 Novelty；以及仿照 SQCN 两遍数据流、面向 LIBERO 关系图与
 集合目标筛选的 [RelCore](relcore/README.md)。另有固定使用 support、progress 和
-运动原语、以共现减冗余目标执行有界惰性最大堆选择的 [Cocore](cocore/README.md)。
+运动原语、以可配置 sequence/cooccurrence 关系减冗余目标执行有界惰性最大堆选择的
+[Cocore](cocore/README.md)。
 
 另有分阶段的 [Quality Filter](quality_filter/README.md)，只计算 SQCN Quality，
 再用相同的融合 embedding 和 0.4.0 多样化 Filter 完成片段筛选。SQCN 与

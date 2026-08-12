@@ -31,7 +31,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "seed": 42,
     **{section: copy.deepcopy(RELCORE_DEFAULT_CONFIG[section]) for section in _SHARED_SECTIONS},
     "reliability_metrics": ["support", "progress"],
-    "objective": {"cooccurrence_weight": 1.0},
+    "objective": {},
     "selection": {
         "ratio": 0.1,
         "budget": None,
@@ -53,6 +53,15 @@ def _merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    configured_objective = config.get("objective")
+    if isinstance(configured_objective, Mapping) and "cooccurrence_weight" in configured_objective:
+        raise ValueError(
+            "objective.cooccurrence_weight was removed; use objective.relation_weight"
+        )
+    if not isinstance(configured_objective, Mapping) or "relation" not in configured_objective:
+        raise ValueError("objective.relation is required")
+    if "relation_weight" not in configured_objective:
+        raise ValueError("objective.relation_weight is required")
     configured_selection = config.get("selection")
     if isinstance(configured_selection, Mapping):
         for name in (
@@ -76,10 +85,14 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     resolved = _merge(DEFAULT_CONFIG, config)
     resolved["prototypes"]["method"] = "motion_primitives"
     resolved["reliability_metrics"] = ["support", "progress"]
-    weight = float(resolved["objective"]["cooccurrence_weight"])
+    relation = str(resolved["objective"]["relation"])
+    if relation not in {"sequence", "cooccurrence"}:
+        raise ValueError("objective.relation must be sequence or cooccurrence")
+    resolved["objective"]["relation"] = relation
+    weight = float(resolved["objective"]["relation_weight"])
     if not math.isfinite(weight) or weight < 0.0:
-        raise ValueError("objective.cooccurrence_weight must be finite and non-negative")
-    resolved["objective"]["cooccurrence_weight"] = weight
+        raise ValueError("objective.relation_weight must be finite and non-negative")
+    resolved["objective"]["relation_weight"] = weight
     ratio = float(resolved["selection"]["ratio"])
     if not 0.0 < ratio <= 1.0:
         raise ValueError("selection.ratio must be in (0, 1]")
