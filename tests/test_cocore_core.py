@@ -171,6 +171,17 @@ class _ScriptedContext:
         state.cooccurrence = state.score
 
 
+class _RecordingScriptedContext(_ScriptedContext):
+    def __init__(self, sample_ids: list[str], gain) -> None:
+        super().__init__(sample_ids, gain)
+        self.marginal_gain_candidates: dict[int, list[int]] = {}
+
+    def marginal_gain(self, state: _ScriptedState, index: int) -> float:
+        selected_count = int(state.selected_mask.sum())
+        self.marginal_gain_candidates.setdefault(selected_count, []).append(index)
+        return super().marginal_gain(state, index)
+
+
 def test_lazy_heap_keeps_refreshing_when_a_recomputed_gain_falls_below_stale_entries() -> None:
     def gain(selected_count: int, index: int) -> float:
         if selected_count == 0:
@@ -207,6 +218,51 @@ def test_lazy_heap_selects_a_refreshed_entry_as_soon_as_it_returns_to_the_top() 
 
     assert result.selected_indices == (0, 1, 2)
     assert result.heap_refreshes == (0, 0, 1)
+
+
+def test_lazy_heap_fully_rebuilds_before_heap_steps_8_16_and_32() -> None:
+    candidate_count = 42
+    context = _RecordingScriptedContext(
+        [f"node-{index:02d}" for index in range(candidate_count)],
+        lambda selected_count, index: float(candidate_count - index),
+    )
+    initial = [0, 1, 2]
+
+    result = LazyHeapSelector(context, max_refreshes=3).select(
+        36,
+        initial_indices=initial,
+    )
+
+    assert result.selected_indices == tuple(range(36))
+    assert len(context.marginal_gain_candidates[8]) == 1
+    assert len(context.marginal_gain_candidates[10]) == 32
+    assert len(context.marginal_gain_candidates[18]) == 24
+    assert len(context.marginal_gain_candidates[34]) == 8
+    assert result.heap_refreshes[9] == 1
+    assert result.heap_refreshes[10] == 0
+    assert result.heap_refreshes[11] == 1
+    assert result.heap_refreshes[18] == 0
+    assert result.heap_refreshes[34] == 0
+
+
+def test_lazy_heap_step_8_rebuild_selects_the_new_global_maximum() -> None:
+    def gain(selected_count: int, index: int) -> float:
+        if selected_count >= 8 and index == 9:
+            return 200.0
+        if index <= 7:
+            return float(100 - index)
+        return {8: 20.0, 9: 0.0, 10: 10.0, 11: 5.0}[index]
+
+    selector = LazyHeapSelector(
+        _ScriptedContext([f"node-{index:02d}" for index in range(12)], gain),
+        max_refreshes=3,
+    )
+
+    result = selector.select(9, initial_indices=[0])
+
+    assert result.selected_indices == (0, 1, 2, 3, 4, 5, 6, 7, 9)
+    assert result.score_deltas[-1] == pytest.approx(200.0)
+    assert result.heap_refreshes[-1] == 0
 
 
 def test_lazy_heap_caps_refreshes_and_lazily_skips_the_selected_heap_entry() -> None:
@@ -285,8 +341,15 @@ def test_lazy_heap_bounds_marginal_gain_recomputations() -> None:
 
     heap_selections = budget - len(seed.selected_indices)
     remaining_candidates = len(graph.sample_ids) - len(seed.selected_indices)
+    full_refresh_candidates = sum(
+        remaining_candidates - (step - 1)
+        for step in range(8, heap_selections + 1)
+        if (step & (step - 1)) == 0
+    )
     calls_excluding_seed = context.marginal_gain_calls - len(seed.selected_indices)
-    assert calls_excluding_seed <= remaining_candidates + 3 * heap_selections
+    assert calls_excluding_seed <= (
+        remaining_candidates + 3 * heap_selections + full_refresh_candidates
+    )
     recomputed = CocoreObjectiveContext(
         graph, 1.0, similarity_threshold=0.8
     ).state_from_indices(result.selected_indices)

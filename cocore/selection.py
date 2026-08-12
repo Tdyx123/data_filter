@@ -100,6 +100,19 @@ class LazyHeapSelector:
             version,
         )
 
+    @staticmethod
+    def _is_full_refresh_step(step: int) -> bool:
+        return step >= 8 and (step & (step - 1)) == 0
+
+    def _build_heap(self, state, version: int) -> list[_HeapEntry]:
+        heap = [
+            self._entry(self.context.marginal_gain(state, candidate), candidate, version)
+            for candidate in range(len(self.context.graph.sample_ids))
+            if not state.selected_mask[candidate]
+        ]
+        heapq.heapify(heap)
+        return heap
+
     def select(
         self,
         budget: int,
@@ -139,18 +152,15 @@ class LazyHeapSelector:
             )
 
         current_version = 0
-        heap: list[_HeapEntry] = []
-        for candidate in range(candidate_count):
-            if state.selected_mask[candidate]:
-                continue
-            gain = self.context.marginal_gain(state, candidate)
-            heap.append(self._entry(gain, candidate, current_version))
-        heapq.heapify(heap)
+        heap = self._build_heap(state, current_version)
         initial_heap_size = len(heap)
         capped_selections = 0
         heap_step = 1
 
         while len(selected) < budget:
+            if self._is_full_refresh_step(heap_step):
+                heap = self._build_heap(state, current_version)
+
             refreshed: list[_HeapEntry] = []
             chosen_index: int | None = None
             chosen_gain = 0.0
