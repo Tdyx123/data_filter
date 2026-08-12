@@ -50,6 +50,7 @@ def apply_overrides(config: dict[str, Any], overrides: dict[str, Any]) -> dict[s
             "torch_compile",
             "action_head_enabled",
         ),
+        "episode_cache_size": ("data", "episode_cache_size"),
         "lora_rank": ("model", "lora", "rank"),
         "lora_alpha": ("model", "lora", "alpha"),
         "lora_dropout": ("model", "lora", "dropout"),
@@ -222,6 +223,8 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ConfigError("paths.lerobot must be set for LIBERO")
         if data.get("prior_dataset") != "libero90" or data.get("target_dataset") != "libero10_5":
             raise ConfigError("LIBERO requires prior=libero90 and target=libero10_5")
+        if int(data.get("episode_cache_size", 0)) <= 0:
+            raise ConfigError("data.episode_cache_size must be positive")
         weights = data.get("sample_weights")
         if not isinstance(weights, list) or len(weights) != 2:
             raise ConfigError("data.sample_weights must contain target and prior weights")

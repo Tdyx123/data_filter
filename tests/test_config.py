@@ -88,6 +88,15 @@ def test_config_rejects_unknown_context_forward_mode():
         validate_config(config)
 
 
+def test_libero_config_rejects_non_positive_episode_cache():
+    config = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
+    )
+    config["data"]["episode_cache_size"] = 0
+    with pytest.raises(ConfigError, match="episode_cache_size"):
+        validate_config(config)
+
+
 def test_local_qwen_is_36_layers():
     model_path = Path("/data/dwb/models/Qwen3-VL-4B-Instruct")
     if not model_path.is_dir():

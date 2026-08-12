@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from qwen3_vl_groot.cli import (
     _resolve_config,
     build_parser,
     configure_visible_gpus,
+    launch,
     parse_gpu_ids,
 )
 
@@ -106,6 +108,8 @@ def test_launch_cli_overrides_context_and_independent_compile_targets(tmp_path):
             "backbone",
             "--no-compile-qwen-backbone",
             "--compile-action-head",
+            "--episode-cache-size",
+            "16",
         ]
     )
 
@@ -114,6 +118,42 @@ def test_launch_cli_overrides_context_and_independent_compile_targets(tmp_path):
     assert config["model"]["context_forward"] == "backbone"
     assert config["model"]["torch_compile"]["backbone_enabled"] is False
     assert config["model"]["torch_compile"]["action_head_enabled"] is True
+    assert config["data"]["episode_cache_size"] == 16
+
+
+def test_launch_persists_preflight_report_and_can_skip_memory_probe(
+    tmp_path,
+    monkeypatch,
+):
+    from qwen3_vl_groot import preflight
+
+    parser = build_parser()
+    output = tmp_path / "run"
+    arguments = parser.parse_args(
+        [
+            "launch",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"),
+            "--output-dir",
+            str(output),
+            "--preflight-only",
+            "--skip-memory-probe",
+        ]
+    )
+    calls = []
+
+    def fake_preflight(config, *, memory_probe):
+        calls.append(memory_probe)
+        return {"gpu": {"devices": []}}
+
+    monkeypatch.setattr(preflight, "run_preflight", fake_preflight)
+
+    launch(arguments)
+
+    assert calls == [False]
+    assert json.loads((output / "preflight.json").read_text()) == {
+        "gpu": {"devices": []}
+    }
 
 
 @pytest.mark.parametrize(

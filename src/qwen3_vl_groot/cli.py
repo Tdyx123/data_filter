@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import subprocess
@@ -75,6 +76,7 @@ def _add_override_arguments(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
+    parser.add_argument("--episode-cache-size", type=int)
     parser.add_argument("--lora-rank", type=int)
     parser.add_argument("--lora-alpha", type=int)
     parser.add_argument("--lora-dropout", type=float)
@@ -115,6 +117,7 @@ def _overrides(namespace: argparse.Namespace) -> dict[str, Any]:
         "context_forward",
         "compile_qwen_backbone",
         "compile_action_head",
+        "episode_cache_size",
         "lora_rank",
         "lora_alpha",
         "lora_dropout",
@@ -197,7 +200,16 @@ def launch(arguments: argparse.Namespace) -> None:
 
     if visible_devices is not None:
         print(f"Using physical GPU IDs: {visible_devices}", flush=True)
-    run_preflight(config, memory_probe=True)
+    preflight_report = run_preflight(
+        config,
+        memory_probe=not arguments.skip_memory_probe,
+    )
+    temporary_report = output / "preflight.json.tmp"
+    temporary_report.write_text(
+        json.dumps(preflight_report, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary_report.replace(output / "preflight.json")
     if arguments.preflight_only:
         return
 
@@ -259,6 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     launch_parser.add_argument("--config", required=True)
     launch_parser.add_argument("--preflight-only", action="store_true")
+    launch_parser.add_argument("--skip-memory-probe", action="store_true")
     launch_parser.add_argument("--smoke-test", action="store_true")
     _add_override_arguments(launch_parser)
     launch_parser.set_defaults(function=launch)
