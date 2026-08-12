@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -53,6 +54,96 @@ class FakeBackbone(nn.Module):
         self.language_model.layers = nn.ModuleList([FakeLayer() for _ in range(layers)])
 
 
+class FakeContextModel(nn.Module):
+    def __init__(self, hidden_size=16):
+        super().__init__()
+        self.lora_context = nn.Parameter(torch.arange(hidden_size, dtype=torch.float32))
+        self.calls = 0
+
+    def forward(self, input_ids, **kwargs):
+        del kwargs
+        self.calls += 1
+        context = input_ids.float().unsqueeze(-1) + self.lora_context
+        return SimpleNamespace(last_hidden_state=context)
+
+
+class FakeConditionalGeneration(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = FakeContextModel()
+        self.lm_head_calls = 0
+
+    def forward(self, **inputs):
+        outputs = self.model(**inputs)
+        self.lm_head_calls += 1
+        return SimpleNamespace(hidden_states=(outputs.last_hidden_state,))
+
+
+class FakePeftBackbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.base = FakeConditionalGeneration()
+
+    def get_base_model(self):
+        return self.base
+
+    def forward(self, **inputs):
+        return self.base(**inputs)
+
+
+class FakeProcessor:
+    def apply_chat_template(self, *args, **kwargs):
+        return "prompt"
+
+    def __call__(self, *, text, images, **kwargs):
+        del images, kwargs
+        batch_size = len(text)
+        return {
+            "input_ids": torch.tensor([[1, 2]]).repeat(batch_size, 1),
+            "attention_mask": torch.ones(batch_size, 2, dtype=torch.long),
+        }
+
+
+def _tiny_policy_config(context_forward="causal_lm"):
+    return {
+        "data": {"state_dim": 8, "action_dim": 7, "action_horizon": 8},
+        "model": {
+            "context_dim": 16,
+            "max_context_tokens": 32,
+            "context_forward": context_forward,
+            "gradient_checkpointing": False,
+            "state_dropout_prob": 0.0,
+            "flow": {
+                "beta_alpha": 1.5,
+                "beta_beta": 1.0,
+                "noise_s": 0.999,
+                "denoising_steps": 4,
+            },
+            "dit": {
+                "hidden_size": 32,
+                "num_layers": 2,
+                "num_heads": 4,
+                "mlp_ratio": 2,
+                "dropout": 0.0,
+            },
+        },
+    }
+
+
+def _tiny_context_policy(context_forward):
+    return Qwen3VLGrootPolicy(
+        backbone=FakePeftBackbone(),
+        processor=FakeProcessor(),
+        stats=QuantileStats(
+            state_q01=np.zeros(8),
+            state_q99=np.ones(8),
+            action_q01=np.zeros(7),
+            action_q99=np.ones(7),
+        ),
+        config=_tiny_policy_config(context_forward),
+    )
+
+
 def test_all_36_layers_have_all_four_lora_targets():
     model = FakeBackbone()
     coverage = lora_coverage(model)
@@ -67,6 +158,36 @@ def test_missing_projection_is_rejected():
     model.language_model.layers[17].self_attn.o_proj = nn.Linear(4, 4)
     with pytest.raises(RuntimeError, match="layer 17"):
         assert_full_lora_coverage(model)
+
+
+def test_direct_context_forward_skips_lm_head_and_preserves_lora_gradients():
+    policy = _tiny_context_policy("backbone")
+    policy.train()
+    policy.set_lora_trainable(True)
+
+    context, attention_mask = policy.encode_context([object()], ["pick up the cup"])
+    context.sum().backward()
+
+    conditional = policy.backbone.get_base_model()
+    assert conditional.lm_head_calls == 0
+    assert conditional.model.calls == 1
+    assert conditional.model.lora_context.grad is not None
+    assert torch.count_nonzero(conditional.model.lora_context.grad) > 0
+    assert attention_mask.dtype == torch.bool
+
+
+def test_direct_and_legacy_context_paths_return_identical_hidden_states():
+    legacy = _tiny_context_policy("causal_lm")
+    direct = _tiny_context_policy("backbone")
+    direct.load_state_dict(legacy.state_dict())
+
+    legacy_context, legacy_mask = legacy.encode_context([object()], ["pick up the cup"])
+    direct_context, direct_mask = direct.encode_context([object()], ["pick up the cup"])
+
+    assert legacy.backbone.get_base_model().lm_head_calls == 1
+    assert direct.backbone.get_base_model().lm_head_calls == 0
+    torch.testing.assert_close(direct_context, legacy_context)
+    torch.testing.assert_close(direct_mask, legacy_mask)
 
 
 class CompileRecorder:

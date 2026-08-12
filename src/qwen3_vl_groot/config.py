@@ -131,6 +131,10 @@ def validate_config(config: dict[str, Any]) -> None:
         )
     if model["context_dim"] != 2560:
         raise ConfigError("Qwen3-VL-4B context_dim must be 2560")
+    if model.get("context_forward", "causal_lm") not in {"causal_lm", "backbone"}:
+        raise ConfigError(
+            "model.context_forward must be either causal_lm or backbone"
+        )
     if not isinstance(model["gradient_checkpointing"], bool):
         raise ConfigError("model.gradient_checkpointing must be a boolean")
     compile_config = model.get("torch_compile")

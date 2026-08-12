@@ -9,6 +9,7 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 from torch import nn
+from torch.autograd.profiler import record_function
 
 from .flow import (
     FlowMatchingActionHead,
@@ -213,6 +214,7 @@ class Qwen3VLGrootPolicy(nn.Module):
         self.noise_s = float(flow["noise_s"])
         self.default_denoising_steps = int(flow["denoising_steps"])
         self.max_context_tokens = int(model["max_context_tokens"])
+        self.context_forward = str(model.get("context_forward", "causal_lm"))
 
         dit = model["dit"]
         self.action_head = FlowMatchingActionHead(
@@ -314,37 +316,70 @@ class Qwen3VLGrootPolicy(nn.Module):
         images: Sequence[Any],
         instructions: Sequence[str],
     ) -> dict[str, torch.Tensor]:
-        if len(images) != len(instructions):
-            raise ValueError("images and instructions have different batch sizes")
-        prompts = []
-        for instruction in instructions:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": instruction},
-                    ],
-                }
-            ]
-            prompts.append(
-                self.processor.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=False,
+        with record_function("processor"):
+            if len(images) != len(instructions):
+                raise ValueError("images and instructions have different batch sizes")
+            prompts = []
+            for instruction in instructions:
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image"},
+                            {"type": "text", "text": instruction},
+                        ],
+                    }
+                ]
+                prompts.append(
+                    self.processor.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                    )
                 )
+            inputs = self.processor(
+                text=prompts,
+                images=list(images),
+                padding=True,
+                return_tensors="pt",
             )
-        inputs = self.processor(
-            text=prompts,
-            images=list(images),
-            padding=True,
-            return_tensors="pt",
-        )
-        return {
-            key: value.to(self.device)
-            for key, value in inputs.items()
-            if isinstance(value, torch.Tensor)
-        }
+            return {
+                key: value.to(self.device)
+                for key, value in inputs.items()
+                if isinstance(value, torch.Tensor)
+            }
+
+    def _forward_context_model(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        with record_function("qwen_backbone"):
+            if self.context_forward == "causal_lm":
+                outputs = self.backbone(
+                    **inputs,
+                    output_hidden_states=True,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                return outputs.hidden_states[-1]
+
+            if self.context_forward != "backbone":
+                raise ModelContractError(
+                    f"Unknown Qwen context forward mode: {self.context_forward}"
+                )
+            if not hasattr(self.backbone, "get_base_model"):
+                raise ModelContractError(
+                    "Direct Qwen context forward requires a PEFT model with get_base_model()"
+                )
+            conditional_generation = self.backbone.get_base_model()
+            context_model = getattr(conditional_generation, "model", None)
+            if not isinstance(context_model, nn.Module):
+                raise ModelContractError(
+                    "Direct Qwen context forward could not locate the inner multimodal model"
+                )
+            outputs = context_model(
+                **inputs,
+                use_cache=False,
+                return_dict=True,
+            )
+            return outputs.last_hidden_state
 
     def encode_context(
         self,
@@ -357,13 +392,7 @@ class Qwen3VLGrootPolicy(nn.Module):
         )
         gradient_context = nullcontext() if lora_requires_grad else torch.no_grad()
         with gradient_context:
-            outputs = self.backbone(
-                **inputs,
-                output_hidden_states=True,
-                use_cache=False,
-                return_dict=True,
-            )
-        context = outputs.hidden_states[-1]
+            context = self._forward_context_model(inputs)
         attention_mask = inputs.get("attention_mask")
         if attention_mask is None:
             attention_mask = torch.ones(
@@ -398,13 +427,14 @@ class Qwen3VLGrootPolicy(nn.Module):
             beta_beta=self.beta_beta,
             noise_s=self.noise_s,
         )
-        prediction = self.action_head(
-            noisy,
-            state,
-            timestep,
-            context.to(dtype=self.compute_dtype),
-            context_attention_mask,
-        )
+        with record_function("action_head"):
+            prediction = self.action_head(
+                noisy,
+                state,
+                timestep,
+                context.to(dtype=self.compute_dtype),
+                context_attention_mask,
+            )
         return masked_velocity_mse(prediction, velocity, action_mask)
 
     def forward(

@@ -12,6 +12,7 @@ from typing import Any, Iterator
 import numpy as np
 import torch
 import torch.distributed as distributed
+from torch.autograd.profiler import record_function
 from torch.utils.data import DataLoader
 
 from .checkpointing import save_compact_checkpoint
@@ -574,8 +575,10 @@ def train(config: dict[str, Any]) -> None:
                 raise FloatingPointError(
                     f"Rank {rank} encountered non-finite loss at step {global_step}: {loss}"
                 )
-            engine.backward(loss)
-            engine.step()
+            with record_function("backward"):
+                engine.backward(loss)
+            with record_function("optimizer"):
+                engine.step()
             global_step = int(engine.global_steps)
             if global_step == previous_global_step:
                 continue

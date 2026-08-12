@@ -74,6 +74,13 @@ def test_config_rejects_invalid_torch_compile_mode():
         validate_config(config)
 
 
+def test_config_rejects_unknown_context_forward_mode():
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_8x4090.yaml")
+    config["model"]["context_forward"] = "hidden_states_and_logits"
+    with pytest.raises(ConfigError, match="model.context_forward"):
+        validate_config(config)
+
+
 def test_local_qwen_is_36_layers():
     model_path = Path("/data/dwb/models/Qwen3-VL-4B-Instruct")
     if not model_path.is_dir():
