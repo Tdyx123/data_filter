@@ -12,6 +12,11 @@ Coverage、Diversity 和 Novelty；以及仿照 SQCN 两遍数据流、面向 LI
 运动原语、以可配置 sequence/cooccurrence 关系减冗余目标执行有界惰性最大堆选择的
 [Cocore](cocore/README.md)。
 
+BridgeData V2 可通过独立的仓库内命令包
+[Cocore BridgeV2](cocore_bridge_v2/README.md) 使用同一 Cocore 算法。该适配入口固定
+读取 LeRobot v2 的 `image_0`、8 维 state 和 7 维 action，排除空任务 episode，
+并保留与 Cocore 相同的选择 artifact 格式。
+
 另有分阶段的 [Quality Filter](quality_filter/README.md)，只计算 SQCN Quality，
 再用相同的融合 embedding 和 0.4.0 多样化 Filter 完成片段筛选。SQCN 与
 Quality Filter 的共同算法位于 `segment_filter_core`。
