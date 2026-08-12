@@ -177,10 +177,23 @@ def assert_qwen_freeze_contract(model: nn.Module) -> None:
         )
 
 
-def compile_policy_modules(policy: Any, model_config: dict[str, Any]) -> None:
-    """Compile the Qwen/PEFT backbone and DiT action head in place for training."""
+def resolve_compile_targets(model_config: dict[str, Any]) -> tuple[bool, bool]:
+    """Resolve target switches while preserving the legacy global flag."""
     compile_config = model_config.get("torch_compile")
-    if not compile_config or not bool(compile_config["enabled"]):
+    if not compile_config:
+        return False, False
+    legacy_enabled = bool(compile_config["enabled"])
+    return (
+        bool(compile_config.get("backbone_enabled", legacy_enabled)),
+        bool(compile_config.get("action_head_enabled", legacy_enabled)),
+    )
+
+
+def compile_policy_modules(policy: Any, model_config: dict[str, Any]) -> None:
+    """Compile independently selected Qwen and DiT modules in place."""
+    compile_config = model_config.get("torch_compile")
+    compile_backbone, compile_action_head = resolve_compile_targets(model_config)
+    if not compile_config or not (compile_backbone or compile_action_head):
         return
     compile_kwargs = {
         "backend": str(compile_config["backend"]),
@@ -188,8 +201,10 @@ def compile_policy_modules(policy: Any, model_config: dict[str, Any]) -> None:
         "dynamic": bool(compile_config["dynamic"]),
         "fullgraph": bool(compile_config["fullgraph"]),
     }
-    policy.backbone.compile(**compile_kwargs)
-    policy.action_head.compile(**compile_kwargs)
+    if compile_backbone:
+        policy.backbone.compile(**compile_kwargs)
+    if compile_action_head:
+        policy.action_head.compile(**compile_kwargs)
 
 
 class Qwen3VLGrootPolicy(nn.Module):

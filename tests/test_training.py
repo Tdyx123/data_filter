@@ -11,6 +11,7 @@ from qwen3_vl_groot.training import (  # noqa: E402
     PerformanceWindow,
     RankZeroLogger,
     _lora_step_metrics,
+    _runtime_metadata,
     _runtime_versions,
     _should_save_checkpoint,
     _should_save_final_checkpoint,
@@ -229,3 +230,27 @@ def test_runtime_versions_records_optional_packages_without_failing(monkeypatch)
     assert result["peft"] == "0.17.1"
     assert result["deepspeed"] == "0.17.6"
     assert result["flash_attn"] is None
+
+
+def test_runtime_metadata_records_resolved_attention_and_compile_targets(monkeypatch):
+    config = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
+    )
+    config["model"]["attn_implementation"] = "eager"
+    config["model"]["context_forward"] = "backbone"
+    config["model"]["torch_compile"].update(
+        {"backbone_enabled": False, "action_head_enabled": True}
+    )
+    monkeypatch.setattr(
+        "qwen3_vl_groot.training._runtime_versions",
+        lambda: {"torch": "test"},
+    )
+
+    metadata = _runtime_metadata(config, world_size=4)
+
+    assert metadata["packages"] == {"torch": "test"}
+    assert metadata["attention"] == {"requested": "eager", "resolved": "eager"}
+    assert metadata["context_forward"] == "backbone"
+    assert metadata["torch_compile"]["backbone_enabled"] is False
+    assert metadata["torch_compile"]["action_head_enabled"] is True
+    assert metadata["effective_batch_size"] == 64

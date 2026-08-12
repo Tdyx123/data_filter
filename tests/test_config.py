@@ -74,6 +74,13 @@ def test_config_rejects_invalid_torch_compile_mode():
         validate_config(config)
 
 
+def test_config_rejects_non_boolean_compile_target_switch():
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_8x4090.yaml")
+    config["model"]["torch_compile"]["action_head_enabled"] = "yes"
+    with pytest.raises(ConfigError, match="action_head_enabled"):
+        validate_config(config)
+
+
 def test_config_rejects_unknown_context_forward_mode():
     config = load_config(PROJECT_ROOT / "configs" / "bridge_8x4090.yaml")
     config["model"]["context_forward"] = "hidden_states_and_logits"

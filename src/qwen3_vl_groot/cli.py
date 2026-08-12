@@ -60,6 +60,21 @@ def _add_override_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--micro-batch-size", type=int)
     parser.add_argument("--gradient-accumulation-steps", type=int)
     parser.add_argument("--max-steps", type=int)
+    parser.add_argument(
+        "--qwen-context-forward",
+        dest="context_forward",
+        choices=("causal_lm", "backbone"),
+    )
+    parser.add_argument(
+        "--compile-qwen-backbone",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--compile-action-head",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--lora-rank", type=int)
     parser.add_argument("--lora-alpha", type=int)
     parser.add_argument("--lora-dropout", type=float)
@@ -97,6 +112,9 @@ def _overrides(namespace: argparse.Namespace) -> dict[str, Any]:
         "micro_batch_size",
         "gradient_accumulation_steps",
         "max_steps",
+        "context_forward",
+        "compile_qwen_backbone",
+        "compile_action_head",
         "lora_rank",
         "lora_alpha",
         "lora_dropout",

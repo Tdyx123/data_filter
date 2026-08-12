@@ -24,7 +24,12 @@ from .data import (
     bridge_collate,
     compute_quantile_stats,
 )
-from .modeling import Qwen3VLGrootPolicy, compile_policy_modules
+from .modeling import (
+    Qwen3VLGrootPolicy,
+    compile_policy_modules,
+    resolve_compile_targets,
+    select_attention_implementation,
+)
 from .normalization import QuantileStats
 from .schedules import LoraUpdateSchedule
 
@@ -92,6 +97,37 @@ def _runtime_versions() -> dict[str, str | None]:
         except (PackageNotFoundError, ModuleNotFoundError):
             result[key] = None
     return result
+
+
+def _runtime_metadata(config: dict[str, Any], *, world_size: int) -> dict[str, Any]:
+    model_config = config["model"]
+    train_config = config["train"]
+    compile_backbone, compile_action_head = resolve_compile_targets(model_config)
+    attention_requested = str(model_config["attn_implementation"])
+    compile_config = model_config.get("torch_compile", {})
+    return {
+        "packages": _runtime_versions(),
+        "attention": {
+            "requested": attention_requested,
+            "resolved": select_attention_implementation(attention_requested),
+        },
+        "context_forward": str(
+            model_config.get("context_forward", "causal_lm")
+        ),
+        "torch_compile": {
+            "backbone_enabled": compile_backbone,
+            "action_head_enabled": compile_action_head,
+            "backend": compile_config.get("backend"),
+            "mode": compile_config.get("mode"),
+            "dynamic": compile_config.get("dynamic"),
+            "fullgraph": compile_config.get("fullgraph"),
+        },
+        "effective_batch_size": (
+            int(train_config["micro_batch_size"])
+            * int(train_config["gradient_accumulation_steps"])
+            * world_size
+        ),
+    }
 
 
 def seed_everything(seed: int, rank: int) -> None:
@@ -419,7 +455,7 @@ def train(config: dict[str, Any]) -> None:
     if rank == 0:
         output.mkdir(parents=True, exist_ok=True)
         save_resolved_config(config, output / "run_config.yaml")
-        _atomic_json(output / "runtime.json", {"packages": _runtime_versions()})
+        _atomic_json(output / "runtime.json", _runtime_metadata(config, world_size=world_size))
     distributed.barrier()
 
     dataset_type = config["data"].get("dataset_type", "bridge")
@@ -531,9 +567,7 @@ def train(config: dict[str, Any]) -> None:
                 }
             )
         engine.train()
-        compile_enabled = bool(
-            config["model"].get("torch_compile", {}).get("enabled", False)
-        )
+        compile_enabled = any(resolve_compile_targets(config["model"]))
         first_batch_status = "Starting first training batch."
         if compile_enabled:
             first_batch_status = (

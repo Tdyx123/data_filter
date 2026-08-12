@@ -14,6 +14,7 @@ from qwen3_vl_groot.modeling import (  # noqa: E402
     assert_qwen_freeze_contract,
     compile_policy_modules,
     lora_coverage,
+    resolve_compile_targets,
 )
 from qwen3_vl_groot.config import load_config  # noqa: E402
 from qwen3_vl_groot.inference import BridgePolicy  # noqa: E402
@@ -222,6 +223,31 @@ def test_compile_policy_modules_compiles_backbone_and_action_head_in_place():
     }
     assert policy.backbone.calls == [expected]
     assert policy.action_head.calls == [expected]
+
+
+def test_compile_policy_modules_can_compile_only_the_action_head():
+    policy = type(
+        "Policy",
+        (),
+        {"backbone": CompileRecorder(), "action_head": CompileRecorder()},
+    )()
+    compile_config = {
+        "torch_compile": {
+            "enabled": True,
+            "backbone_enabled": False,
+            "action_head_enabled": True,
+            "backend": "inductor",
+            "mode": "default",
+            "dynamic": True,
+            "fullgraph": False,
+        }
+    }
+
+    compile_policy_modules(policy, compile_config)
+
+    assert resolve_compile_targets(compile_config) == (False, True)
+    assert policy.backbone.calls == []
+    assert len(policy.action_head.calls) == 1
 
 
 def test_qwen_libero_default_skips_compile_for_backbone_and_action_head():

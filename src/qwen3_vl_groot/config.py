@@ -39,6 +39,17 @@ def apply_overrides(config: dict[str, Any], overrides: dict[str, Any]) -> dict[s
         "micro_batch_size": ("train", "micro_batch_size"),
         "gradient_accumulation_steps": ("train", "gradient_accumulation_steps"),
         "max_steps": ("train", "max_steps"),
+        "context_forward": ("model", "context_forward"),
+        "compile_qwen_backbone": (
+            "model",
+            "torch_compile",
+            "backbone_enabled",
+        ),
+        "compile_action_head": (
+            "model",
+            "torch_compile",
+            "action_head_enabled",
+        ),
         "lora_rank": ("model", "lora", "rank"),
         "lora_alpha": ("model", "lora", "alpha"),
         "lora_dropout": ("model", "lora", "dropout"),
@@ -143,6 +154,13 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ConfigError("model.torch_compile must be a mapping")
         if not isinstance(compile_config.get("enabled"), bool):
             raise ConfigError("model.torch_compile.enabled must be a boolean")
+        for target_switch in ("backbone_enabled", "action_head_enabled"):
+            if target_switch in compile_config and not isinstance(
+                compile_config[target_switch], bool
+            ):
+                raise ConfigError(
+                    f"model.torch_compile.{target_switch} must be a boolean"
+                )
         if not isinstance(compile_config.get("backend"), str) or not compile_config["backend"]:
             raise ConfigError("model.torch_compile.backend must be a non-empty string")
         valid_compile_modes = {

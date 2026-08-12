@@ -93,6 +93,29 @@ def test_launch_cli_overrides_lora_update_schedule(tmp_path):
     assert config["train"]["lora_active_steps"] == 10
 
 
+def test_launch_cli_overrides_context_and_independent_compile_targets(tmp_path):
+    parser = build_parser()
+    arguments = parser.parse_args(
+        [
+            "launch",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"),
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--qwen-context-forward",
+            "backbone",
+            "--no-compile-qwen-backbone",
+            "--compile-action-head",
+        ]
+    )
+
+    config = _resolve_config(arguments)
+
+    assert config["model"]["context_forward"] == "backbone"
+    assert config["model"]["torch_compile"]["backbone_enabled"] is False
+    assert config["model"]["torch_compile"]["action_head_enabled"] is True
+
+
 @pytest.mark.parametrize(
     ("option", "changed_key", "changed_value", "unchanged_key", "unchanged_value"),
     [

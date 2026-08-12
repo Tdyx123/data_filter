@@ -173,6 +173,11 @@ def test_cyclic_libero_script_injects_schedule_and_preserves_defaults(tmp_path):
     assert arguments[arguments.index("--lora-freeze-steps") + 1] == "5000"
     assert arguments[arguments.index("--lora-cycle-steps") + 1] == "100"
     assert arguments[arguments.index("--lora-active-steps") + 1] == "10"
+    assert arguments[arguments.index("--micro-batch-size") + 1] == "1"
+    assert arguments[arguments.index("--gradient-accumulation-steps") + 1] == "16"
+    assert arguments[arguments.index("--qwen-context-forward") + 1] == "backbone"
+    assert "--no-compile-qwen-backbone" in arguments
+    assert "--no-compile-action-head" in arguments
 
 
 def test_cyclic_libero_script_allows_explicit_schedule_overrides(tmp_path):
