@@ -12,4 +12,5 @@ exec "${SCRIPT_DIR}/train_libero_qwen3_vl_4b_groot_all_tasks_4x4090.sh" \
   --qwen-context-forward backbone \
   --no-compile-qwen-backbone \
   --no-compile-action-head \
+  --episode-cache-size 2 \
   "$@"

@@ -178,6 +178,7 @@ def test_cyclic_libero_script_injects_schedule_and_preserves_defaults(tmp_path):
     assert arguments[arguments.index("--qwen-context-forward") + 1] == "backbone"
     assert "--no-compile-qwen-backbone" in arguments
     assert "--no-compile-action-head" in arguments
+    assert arguments[arguments.index("--episode-cache-size") + 1] == "2"
 
 
 def test_cyclic_libero_script_allows_explicit_schedule_overrides(tmp_path):
