@@ -434,6 +434,7 @@ class Qwen3VLGrootPolicy(nn.Module):
         denoising_steps: int | None = None,
         *,
         initial_noise: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         images = list(image) if isinstance(image, (list, tuple)) else [image]
         instructions = (
@@ -457,6 +458,7 @@ class Qwen3VLGrootPolicy(nn.Module):
             steps=denoising_steps or self.default_denoising_steps,
             noise_s=self.noise_s,
             initial_noise=initial_noise,
+            generator=generator,
         )
         actions = self.denormalize_action(normalized_actions).float()
         if was_training:

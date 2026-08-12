@@ -15,6 +15,7 @@ from qwen3_vl_groot.modeling import (  # noqa: E402
     lora_coverage,
 )
 from qwen3_vl_groot.config import load_config  # noqa: E402
+from qwen3_vl_groot.inference import BridgePolicy  # noqa: E402
 from qwen3_vl_groot.normalization import QuantileStats  # noqa: E402
 
 
@@ -173,3 +174,96 @@ def test_module_compile_preserves_state_dict_names():
     expected = set(module.state_dict())
     module.compile(backend="eager")
     assert set(module.state_dict()) == expected
+
+
+def test_bridge_policy_forwards_the_inference_generator():
+    generator = torch.Generator().manual_seed(31)
+
+    class RecordingPolicy:
+        def __init__(self):
+            self.generator = None
+
+        def predict_actions(
+            self,
+            image,
+            state,
+            instruction,
+            denoising_steps=None,
+            *,
+            generator=None,
+        ):
+            self.generator = generator
+            return torch.zeros(1, 8, 7)
+
+    recording = RecordingPolicy()
+    policy = BridgePolicy(recording)
+
+    actions = policy.predict_actions(
+        np.zeros((4, 4, 3), dtype=np.uint8),
+        np.zeros(8, dtype=np.float32),
+        "put the book away",
+        generator=generator,
+    )
+
+    assert actions.shape == (1, 8, 7)
+    assert recording.generator is generator
+
+
+def test_qwen_policy_forwards_the_inference_generator_to_flow(monkeypatch):
+    import qwen3_vl_groot.modeling as modeling
+
+    config = {
+        "data": {"state_dim": 8, "action_dim": 7, "action_horizon": 8},
+        "model": {
+            "context_dim": 16,
+            "max_context_tokens": 32,
+            "gradient_checkpointing": False,
+            "state_dropout_prob": 0.0,
+            "flow": {
+                "beta_alpha": 1.5,
+                "beta_beta": 1.0,
+                "noise_s": 0.999,
+                "denoising_steps": 4,
+            },
+            "dit": {
+                "hidden_size": 32,
+                "num_layers": 2,
+                "num_heads": 4,
+                "mlp_ratio": 2,
+                "dropout": 0.0,
+            },
+        },
+    }
+    policy = Qwen3VLGrootPolicy(
+        backbone=nn.Linear(4, 4),
+        processor=None,
+        stats=QuantileStats(
+            state_q01=np.zeros(8),
+            state_q99=np.ones(8),
+            action_q01=np.zeros(7),
+            action_q99=np.ones(7),
+        ),
+        config=config,
+    )
+    policy.encode_context = lambda images, instructions: (
+        torch.zeros(1, 2, 16),
+        torch.ones(1, 2, dtype=torch.bool),
+    )
+    recorded = {}
+
+    def fake_denoise(action_head, **kwargs):
+        recorded.update(kwargs)
+        return torch.zeros(1, 8, 7)
+
+    monkeypatch.setattr(modeling, "euler_denoise", fake_denoise)
+    generator = torch.Generator().manual_seed(37)
+
+    actions = policy.predict_actions(
+        np.zeros((4, 4, 3), dtype=np.uint8),
+        np.zeros(8, dtype=np.float32),
+        "put the book away",
+        generator=generator,
+    )
+
+    assert actions.shape == (1, 8, 7)
+    assert recorded["generator"] is generator

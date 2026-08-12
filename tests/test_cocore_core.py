@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 from scipy import sparse
 
 from cocore.objective import CocoreObjectiveContext, recompute_objective
 from cocore.selection import (
-    BeamRolloutSelector,
-    CandidatePoolConfig,
-    allocate_residual_task_quotas,
+    LazyHeapSelector,
     build_max_coverage_seed,
 )
 from relcore.schemas import EdgeTable, GraphData
@@ -96,17 +97,7 @@ def test_max_coverage_seed_rejects_budget_smaller_than_required_union() -> None:
         build_max_coverage_seed(context, budget=1)
 
 
-def test_residual_hamilton_quotas_ignore_seed_distribution() -> None:
-    quotas = allocate_residual_task_quotas(
-        np.asarray([0, 0, 1, 1, 1], dtype=np.int64),
-        selected_indices=[0],
-        budget=4,
-    )
-
-    assert quotas == {0: 1, 1: 2}
-
-
-def _beam_graph(count: int = 14) -> GraphData:
+def _heap_graph(count: int = 14) -> GraphData:
     reliabilities = np.linspace(0.1, 1.0, count, dtype=np.float32)
     return GraphData(
         sample_ids=[f"node-{index:02d}" for index in range(count)],
@@ -123,72 +114,182 @@ def _beam_graph(count: int = 14) -> GraphData:
     )
 
 
-def test_beam_rollout_uses_root_eight_node_four_exact_dedup_and_top_eight() -> None:
-    graph = _beam_graph()
+def test_lazy_heap_selects_current_top_then_refreshes_the_next_stale_top() -> None:
+    graph = _heap_graph()
     context = CocoreObjectiveContext(graph, 1.0, similarity_threshold=0.8)
     seed = build_max_coverage_seed(context, budget=3)
-    quotas = allocate_residual_task_quotas(
-        graph.task_indices,
-        selected_indices=seed.selected_indices,
-        budget=3,
-    )
-    selector = BeamRolloutSelector(
-        context,
-        quotas,
-        seed=17,
-        pool_config=CandidatePoolConfig(
-            global_candidates=32,
-            prototype_candidates=0,
-            similarity_candidates=0,
-            random_candidates=0,
-        ),
-    )
+    selector = LazyHeapSelector(context, max_refreshes=100)
 
     result = selector.select(3, initial_indices=seed.selected_indices)
 
     assert result.selected_indices == (13, 12, 11)
-    assert result.selection_phases == ("coverage_seed", "rollout", "rollout")
-    assert result.rollout_depths == (0, 1, 2)
-    assert result.layer_stats[0].generated == 8
-    assert result.layer_stats[0].unique == 8
-    assert result.layer_stats[0].retained == 8
-    assert result.layer_stats[1].generated == 32
-    assert result.layer_stats[1].unique < result.layer_stats[1].generated
-    assert result.layer_stats[1].retained == 8
-    assert len(result.final_beam_scores) == 8
+    assert result.selection_phases == ("coverage_seed", "heap", "heap")
+    assert result.selection_steps == (0, 1, 2)
+    assert result.heap_refreshes == (0, 0, 1)
+    assert result.initial_heap_size == 13
+    assert result.total_refreshes == 1
+    assert result.capped_selections == 0
+    assert result.max_refreshes_observed == 1
 
 
-def test_sparse_candidate_pool_random_component_depends_on_set_not_path_order() -> None:
-    graph = _beam_graph(20)
-    context = CocoreObjectiveContext(graph, 1.0, similarity_threshold=0.8)
-    selector = BeamRolloutSelector(
-        context,
-        {0: 10},
-        seed=123,
-        pool_config=CandidatePoolConfig(
-            global_candidates=0,
-            prototype_candidates=0,
-            similarity_candidates=0,
-            random_candidates=5,
-        ),
-    )
-    left = context.state_from_indices([0, 1])
-    right = context.state_from_indices([1, 0])
-
-    left_pool = selector.candidate_pool(left, {0: 0})
-    right_pool = selector.candidate_pool(right, {0: 0})
-
-    assert left_pool == right_pool
-    assert len(left_pool) >= 5
-
-
-def test_beam_rollout_returns_seed_without_generating_a_layer_when_budget_is_full() -> None:
-    graph = _beam_graph()
+def test_lazy_heap_returns_seed_without_building_a_heap_when_budget_is_full() -> None:
+    graph = _heap_graph()
     context = CocoreObjectiveContext(graph, 1.0, similarity_threshold=0.8)
     seed = build_max_coverage_seed(context, budget=1)
-    selector = BeamRolloutSelector(context, {0: 0}, seed=1)
+    selector = LazyHeapSelector(context)
 
     result = selector.select(1, initial_indices=seed.selected_indices)
 
     assert result.selected_indices == seed.selected_indices
-    assert result.layer_stats == ()
+    assert result.initial_heap_size == 0
+    assert result.total_refreshes == 0
+
+
+@dataclass
+class _ScriptedState:
+    selected_mask: np.ndarray
+    score: float = 0.0
+    cooccurrence: float = 0.0
+    redundancy: float = 0.0
+
+
+class _ScriptedContext:
+    def __init__(self, sample_ids: list[str], gain) -> None:
+        self.graph = SimpleNamespace(sample_ids=sample_ids)
+        self._gain = gain
+
+    def empty_state(self) -> _ScriptedState:
+        return _ScriptedState(np.zeros(len(self.graph.sample_ids), dtype=bool))
+
+    def marginal_gain(self, state: _ScriptedState, index: int) -> float:
+        return float(self._gain(int(state.selected_mask.sum()), index))
+
+    def add_candidate(self, state: _ScriptedState, index: int) -> None:
+        gain = float(self._gain(int(state.selected_mask.sum()), index))
+        state.selected_mask[index] = True
+        state.score += gain
+        state.cooccurrence = state.score
+
+
+def test_lazy_heap_keeps_refreshing_when_a_recomputed_gain_falls_below_stale_entries() -> None:
+    def gain(selected_count: int, index: int) -> float:
+        if selected_count == 0:
+            return 0.0
+        if selected_count == 1:
+            return {1: 10.0, 2: 9.0, 3: 8.0}[index]
+        return {2: 1.0, 3: 7.0}[index]
+
+    selector = LazyHeapSelector(
+        _ScriptedContext(["seed", "first", "falls", "winner"], gain),
+        max_refreshes=100,
+    )
+
+    result = selector.select(3, initial_indices=[0])
+
+    assert result.selected_indices == (0, 1, 3)
+    assert result.heap_refreshes == (0, 0, 2)
+
+
+def test_lazy_heap_selects_a_refreshed_entry_as_soon_as_it_returns_to_the_top() -> None:
+    def gain(selected_count: int, index: int) -> float:
+        if selected_count == 0:
+            return 0.0
+        if selected_count == 1:
+            return {1: 10.0, 2: 9.0, 3: 8.0}[index]
+        return {2: 20.0, 3: 7.0}[index]
+
+    selector = LazyHeapSelector(
+        _ScriptedContext(["seed", "first", "winner", "other"], gain),
+        max_refreshes=100,
+    )
+
+    result = selector.select(3, initial_indices=[0])
+
+    assert result.selected_indices == (0, 1, 2)
+    assert result.heap_refreshes == (0, 0, 1)
+
+
+def test_lazy_heap_caps_refreshes_and_lazily_skips_the_selected_heap_entry() -> None:
+    sample_ids = [f"node-{index:03d}" for index in range(102)]
+
+    def gain(selected_count: int, index: int) -> float:
+        if selected_count == 0:
+            return 0.0
+        if selected_count == 1:
+            return 10_000.0 - index
+        return float(index)
+
+    selector = LazyHeapSelector(_ScriptedContext(sample_ids, gain), max_refreshes=100)
+
+    result = selector.select(4, initial_indices=[0])
+
+    assert result.selected_indices == (0, 1, 101, 100)
+    assert result.heap_refreshes == (0, 0, 100, 1)
+    assert len(set(result.selected_indices)) == 4
+    assert result.total_refreshes == 101
+    assert result.capped_selections == 1
+    assert result.max_refreshes_observed == 100
+
+
+def test_lazy_heap_breaks_equal_gain_ties_by_sample_id() -> None:
+    context = _ScriptedContext(
+        ["seed", "z-candidate", "a-candidate"],
+        lambda selected_count, index: 0.0 if selected_count == 0 else 1.0,
+    )
+
+    result = LazyHeapSelector(context).select(2, initial_indices=[0])
+
+    assert result.selected_indices == (0, 2)
+
+
+def test_lazy_heap_has_no_task_quota_and_can_select_one_task_repeatedly() -> None:
+    graph = _heap_graph(6)
+    graph.task_indices = np.asarray([1, 1, 1, 0, 0, 1], dtype=np.int64)
+    context = CocoreObjectiveContext(graph, 1.0, similarity_threshold=0.8)
+    seed = build_max_coverage_seed(context, budget=3)
+
+    result = LazyHeapSelector(context).select(3, initial_indices=seed.selected_indices)
+
+    assert result.selected_indices == (5, 4, 3)
+    assert graph.task_indices[list(result.selected_indices)].tolist() == [1, 0, 0]
+
+
+def test_lazy_heap_rejects_non_finite_gains() -> None:
+    context = _ScriptedContext(
+        ["seed", "bad"],
+        lambda selected_count, index: 0.0 if selected_count == 0 else float("nan"),
+    )
+
+    with pytest.raises(ValueError, match="finite marginal gain"):
+        LazyHeapSelector(context).select(2, initial_indices=[0])
+
+
+class _CountingObjectiveContext(CocoreObjectiveContext):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.marginal_gain_calls = 0
+
+    def marginal_gain(self, state, candidate: int) -> float:
+        self.marginal_gain_calls += 1
+        return super().marginal_gain(state, candidate)
+
+
+def test_lazy_heap_bounds_marginal_gain_recomputations() -> None:
+    graph = _heap_graph(20)
+    context = _CountingObjectiveContext(graph, 1.0, similarity_threshold=0.8)
+    budget = 10
+    seed = build_max_coverage_seed(context, budget=budget)
+    selector = LazyHeapSelector(context, max_refreshes=3)
+
+    result = selector.select(budget, initial_indices=seed.selected_indices)
+
+    heap_selections = budget - len(seed.selected_indices)
+    remaining_candidates = len(graph.sample_ids) - len(seed.selected_indices)
+    calls_excluding_seed = context.marginal_gain_calls - len(seed.selected_indices)
+    assert calls_excluding_seed <= remaining_candidates + 3 * heap_selections
+    recomputed = CocoreObjectiveContext(
+        graph, 1.0, similarity_threshold=0.8
+    ).state_from_indices(result.selected_indices)
+    assert result.objective_value == pytest.approx(recomputed.score)
+    assert result.cooccurrence == pytest.approx(recomputed.cooccurrence)
+    assert result.redundancy == pytest.approx(recomputed.redundancy)

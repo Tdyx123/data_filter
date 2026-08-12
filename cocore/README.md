@@ -6,7 +6,7 @@ Cocore 从 LeRobot v2 LIBERO episode 中选择固定预算的 15 帧片段。它
 
 可靠性固定为 `sqrt(support * progress)`。初始集合为每个可达运动原语选择
 `reliability * assignment` 最大的片段并取并集，使所有原型 coverage 达到全池最大值。
-其余预算使用固定宽度的束搜索，优化：
+其余预算使用确定性的惰性最大堆近似优化：
 
 ```text
 score(S) = w * a(S)^T C a(S) - redundancy(S)
@@ -14,8 +14,13 @@ a(S) = sum(reliability_i * assignment_i)
 ```
 
 其中 `C` 是全池运动原语共现先验，冗余与 RelCore 使用相同的可靠性加权相似边定义。
-根节点 rollout 8 个结果，后续每个节点 rollout 4 个结果；每层对选择集合精确去重后
-保留 top 8。
+初始化后，所有剩余片段按相对初始集合的边际增益建成最大堆。每选一个片段后，堆顶的
+旧增益按当前集合惰性重算；如果已更新条目成为堆顶就立即选择，否则每轮最多重算
+`selection.max_refreshes` 个条目（默认 100），达到上限时选择本轮已更新条目中增益
+最大的片段。增益相同时按 `sample_id` 稳定排序。
+
+堆阶段不施加任务配额，所有剩余片段全局竞争。由于共现项可能使边际增益随集合增长，
+旧堆值不一定是严格上界，因此这是有界近似算法，不保证与全量贪心或旧束搜索结果一致。
 
 ## 运行
 
@@ -54,11 +59,11 @@ python -m cocore run --config cocore/config_debug.yaml --force
 
 - `selected_manifest.jsonl`：训练入口可直接消费的片段清单；
 - `all_clips.parquet`：全池 support、progress、reliability、运动原语与选择诊断；
-- `selection_report.json`：coverage、目标分解、残余配额、束搜索层统计与最终 beam；
+- `selection_report.json`：coverage、目标分解、任务计数与堆刷新统计；
 - `manifest.json`、`run_manifest.json`：Cocore 参数、阶段目录与指纹；
 - `resolved_config.yaml`、`environment.json`：`run` 的完整配置与环境。
 
-使用以下命令独立重算 coverage、目标、预算、唯一性、残余配额和清单一致性：
+使用以下命令独立重算 coverage、逐步边际增益、目标、预算、唯一性、堆统计和清单一致性：
 
 ```bash
 python -m cocore validate \

@@ -257,6 +257,7 @@ def euler_denoise(
     steps: int = 4,
     noise_s: float = 0.999,
     initial_noise: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     if steps <= 0:
         raise ValueError("steps must be positive")
@@ -272,6 +273,7 @@ def euler_denoise(
             action_head.action_dim,
             device=state.device,
             dtype=state.dtype,
+            generator=generator,
         )
     )
     # GR00T trains with the reflected/clamped Beta schedule above but integrates

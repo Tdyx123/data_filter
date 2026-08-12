@@ -51,11 +51,13 @@ class BridgePolicy:
         state: np.ndarray | torch.Tensor | Sequence[float],
         instruction: str | Sequence[str],
         denoising_steps: int = 4,
+        *,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         return self.policy.predict_actions(
             image,
             state,
             instruction,
             denoising_steps=denoising_steps,
+            generator=generator,
         )
-

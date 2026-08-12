@@ -101,3 +101,30 @@ def test_bfloat16_action_head_forward_and_backward_has_consistent_dtypes():
     assert prediction.dtype == torch.bfloat16
     assert torch.isfinite(prediction).all()
     prediction.float().square().mean().backward()
+
+
+def test_euler_denoise_uses_the_supplied_generator_for_initial_noise():
+    torch.manual_seed(19)
+    head = tiny_head().eval()
+    state = torch.randn(1, 8)
+    context = torch.randn(1, 5, 16)
+    context_mask = torch.ones(1, 5, dtype=torch.bool)
+
+    first = euler_denoise(
+        head,
+        state=state,
+        context=context,
+        context_attention_mask=context_mask,
+        steps=2,
+        generator=torch.Generator().manual_seed(73),
+    )
+    second = euler_denoise(
+        head,
+        state=state,
+        context=context,
+        context_attention_mask=context_mask,
+        steps=2,
+        generator=torch.Generator().manual_seed(73),
+    )
+
+    torch.testing.assert_close(first, second)

@@ -7,6 +7,7 @@ from typing import ClassVar
 
 import numpy as np
 import pyarrow.parquet as pq
+import pytest
 import yaml
 
 from cocore.pipeline import run_pipeline, validate_output
@@ -97,10 +98,7 @@ def _config(tmp_path: Path) -> dict[str, object]:
         "selection": {
             "ratio": 0.5,
             "budget": None,
-            "global_candidates": 8,
-            "prototype_candidates": 4,
-            "similarity_candidates": 4,
-            "random_candidates": 2,
+            "max_refreshes": 2,
         },
         "runtime": {"num_workers": 0, "max_episodes": None, "resume": True},
         "output": {"directory": str(tmp_path / "cocore-output")},
@@ -123,7 +121,7 @@ def test_run_pipeline_publishes_cocore_outputs_and_validate_recomputes_them(
     for directory in ("scan", "encode", "graph-12-motion-primitives"):
         manifest = json.loads((root / directory / "manifest.json").read_text())
         assert manifest["producer"] == "cocore"
-        assert manifest["cocore_version"] == "0.1.0"
+        assert manifest["cocore_version"] == "0.2.0"
     nodes = np.load(root / "graph-12-motion-primitives" / "nodes.npz")
     np.testing.assert_allclose(
         nodes["reliability"],
@@ -138,16 +136,33 @@ def test_run_pipeline_publishes_cocore_outputs_and_validate_recomputes_them(
     report = json.loads((result / "selection_report.json").read_text())
     assert len(selected) == 3
     assert len(all_rows) == 6
-    assert {row["selection_phase"] for row in selected} == {"coverage_seed", "rollout"}
+    assert {row["selection_phase"] for row in selected} == {"coverage_seed", "heap"}
+    assert all(
+        {"selection_step", "selection_score_delta", "heap_refreshes"} <= row.keys()
+        for row in selected
+    )
     assert all({"support", "progress", "reliability", "prototype_labels"} <= row.keys() for row in all_rows)
     assert report["objective"]["total"] == report["objective"]["cooccurrence"] - report["objective"]["redundancy"]
     assert report["coverage"]["target"] == report["coverage"]["achieved"]
     assert report["algorithm"] == {
-        "beam_width": 8,
-        "node_rollouts": 4,
-        "root_rollouts": 8,
+        "type": "lazy_max_heap",
+        "max_refreshes": 2,
     }
-    assert json.loads((result / "run_manifest.json").read_text())["producer"] == "cocore"
+    assert report["heap"] == {
+        "initial_size": 5,
+        "total_refreshes": sum(row["heap_refreshes"] for row in selected),
+        "capped_selections": sum(row["heap_refreshes"] == 2 for row in selected),
+        "max_refreshes_observed": max(row["heap_refreshes"] for row in selected),
+    }
+    run_manifest = json.loads((result / "run_manifest.json").read_text())
+    assert run_manifest["producer"] == "cocore"
+    assert run_manifest["cocore_version"] == "0.2.0"
+    assert run_manifest["algorithm"] == report["algorithm"]
     resolved = yaml.safe_load((result / "resolved_config.yaml").read_text())
     assert resolved["output"]["directory"] == str(root)
     assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 3}
+
+    report["heap"]["total_refreshes"] += 1
+    (result / "selection_report.json").write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="heap total refreshes"):
+        validate_output(result, config=config)

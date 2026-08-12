@@ -31,9 +31,7 @@ from cocore import __version__
 from cocore.config import resolve_config, to_relcore_config
 from cocore.objective import CocoreObjectiveContext
 from cocore.selection import (
-    BeamRolloutSelector,
-    CandidatePoolConfig,
-    allocate_residual_task_quotas,
+    LazyHeapSelector,
     build_max_coverage_seed,
 )
 
@@ -207,7 +205,8 @@ def _selection_rows(
             "prototype_labels": labels,
             "selection_order": position + 1 if position is not None else None,
             "selection_phase": result.selection_phases[position] if position is not None else None,
-            "rollout_depth": result.rollout_depths[position] if position is not None else None,
+            "selection_step": result.selection_steps[position] if position is not None else None,
+            "heap_refreshes": result.heap_refreshes[position] if position is not None else None,
             "selection_score_delta": (
                 float(result.score_deltas[position]) if position is not None else None
             ),
@@ -245,12 +244,8 @@ def select_stage(
     directory = selection_directory_name(objective_weight, ratio)
     destination = root / directory
     selection_config = resolved["selection"]
-    pool_config = CandidatePoolConfig(
-        global_candidates=int(selection_config["global_candidates"]),
-        prototype_candidates=int(selection_config["prototype_candidates"]),
-        similarity_candidates=int(selection_config["similarity_candidates"]),
-        random_candidates=int(selection_config["random_candidates"]),
-    )
+    max_refreshes = int(selection_config["max_refreshes"])
+    algorithm = {"type": "lazy_max_heap", "max_refreshes": max_refreshes}
     fingerprint = stable_hash(
         {
             "producer": "cocore",
@@ -260,7 +255,7 @@ def select_stage(
             "objective": resolved["objective"],
             "selection": resolved["selection"],
             "seed": resolved["seed"],
-            "algorithm": {"beam_width": 8, "root_rollouts": 8, "node_rollouts": 4},
+            "algorithm": algorithm,
         }
     )
 
@@ -272,16 +267,9 @@ def select_stage(
             similarity_threshold=float(resolved["graph"]["similarity_threshold"]),
         )
         coverage_seed = build_max_coverage_seed(context, budget=budget)
-        quotas = allocate_residual_task_quotas(
-            graph.task_indices,
-            selected_indices=coverage_seed.selected_indices,
-            budget=budget,
-        )
-        selector = BeamRolloutSelector(
+        selector = LazyHeapSelector(
             context,
-            quotas,
-            seed=int(resolved["seed"]),
-            pool_config=pool_config,
+            max_refreshes=max_refreshes,
         )
         result = selector.select(budget, initial_indices=coverage_seed.selected_indices)
         graph_nodes = np.load(root / GRAPH_DIRECTORY / "nodes.npz")
@@ -296,14 +284,6 @@ def select_stage(
                 int(graph.task_indices[index]) == task for index in result.selected_indices
             )
             for task in sorted({int(value) for value in graph.task_indices})
-        }
-        rollout_task_counts = {
-            str(task): sum(
-                result.selection_phases[position] == "rollout"
-                and int(graph.task_indices[index]) == task
-                for position, index in enumerate(result.selected_indices)
-            )
-            for task in sorted(quotas)
         }
         scan_manifest = json.loads(
             (root / "scan" / "manifest.json").read_text(encoding="utf-8")
@@ -329,17 +309,14 @@ def select_stage(
                 "redundancy": float(result.redundancy),
                 "total": float(result.objective_value),
             },
-            "algorithm": {
-                "beam_width": BeamRolloutSelector.BEAM_WIDTH,
-                "root_rollouts": BeamRolloutSelector.ROOT_ROLLOUTS,
-                "node_rollouts": BeamRolloutSelector.NODE_ROLLOUTS,
+            "algorithm": algorithm,
+            "heap": {
+                "initial_size": result.initial_heap_size,
+                "total_refreshes": result.total_refreshes,
+                "capped_selections": result.capped_selections,
+                "max_refreshes_observed": result.max_refreshes_observed,
             },
-            "candidate_pool": asdict(pool_config),
-            "residual_task_quotas": {str(task): quota for task, quota in quotas.items()},
-            "rollout_task_counts": rollout_task_counts,
             "task_counts": task_counts,
-            "layers": [asdict(layer) for layer in result.layer_stats],
-            "final_beam_scores": list(result.final_beam_scores),
             "skipped_short_episodes": scan_manifest.get("skipped_short_episodes", []),
             "runtime_seconds": {"select": time.perf_counter() - started},
         }
@@ -370,8 +347,7 @@ def select_stage(
                 "budget": budget,
                 "selection_ratio": ratio,
                 "cooccurrence_weight": objective_weight,
-                "algorithm": report["algorithm"],
-                "candidate_pool": report["candidate_pool"],
+                "algorithm": algorithm,
             },
         )
 
@@ -413,6 +389,7 @@ def select_stage(
             "selection_ratio": ratio,
             "cooccurrence_weight": objective_weight,
             "similarity_threshold": float(resolved["graph"]["similarity_threshold"]),
+            "algorithm": algorithm,
             "stage_directories": stage_directories,
             "stage_fingerprints": stage_fingerprints,
         },
@@ -471,6 +448,16 @@ def validate_output(
     run_manifest = json.loads(required["run"].read_text(encoding="utf-8"))
     if run_manifest.get("status") != "complete" or run_manifest.get("producer") != "cocore":
         raise ValueError("cocore run manifest is not complete")
+    if run_manifest.get("cocore_version") != __version__:
+        raise ValueError("cocore run manifest version is incompatible")
+    algorithm = run_manifest.get("algorithm")
+    if not isinstance(algorithm, Mapping) or algorithm.get("type") != "lazy_max_heap":
+        raise ValueError("cocore run manifest algorithm is invalid")
+    max_refreshes = algorithm.get("max_refreshes")
+    if isinstance(max_refreshes, bool) or not isinstance(max_refreshes, int):
+        raise ValueError("cocore max_refreshes is invalid")
+    if max_refreshes <= 0:
+        raise ValueError("cocore max_refreshes is invalid")
     weight = float(run_manifest["cooccurrence_weight"])
     ratio = float(run_manifest["selection_ratio"])
     if result.name != selection_directory_name(weight, ratio):
@@ -525,6 +512,8 @@ def validate_output(
     ]
     all_rows = pq.read_table(required["all"]).to_pylist()
     report = json.loads(required["report"].read_text(encoding="utf-8"))
+    if select_manifest.get("algorithm") != algorithm or report.get("algorithm") != algorithm:
+        raise ValueError("cocore heap algorithm metadata does not match")
     if len({row["sample_id"] for row in selected_rows}) != len(selected_rows):
         raise ValueError("selected manifest contains duplicate sample ids")
     if len(selected_rows) != int(select_manifest["budget"]):
@@ -547,7 +536,51 @@ def validate_output(
         weight,
         similarity_threshold=float(run_manifest["similarity_threshold"]),
     )
-    state = context.state_from_indices(selected_indices)
+    initial_set_size = report.get("initial_set_size")
+    if (
+        isinstance(initial_set_size, bool)
+        or not isinstance(initial_set_size, int)
+        or not 0 < initial_set_size <= len(selected_rows)
+    ):
+        raise ValueError("selection report initial set size is invalid")
+    expected_seed = build_max_coverage_seed(context, budget=len(selected_indices))
+    if tuple(selected_indices[:initial_set_size]) != expected_seed.selected_indices:
+        raise ValueError("selected coverage seed does not match the deterministic seed")
+
+    state = context.empty_state()
+    refresh_counts: list[int] = []
+    for position, (index, row) in enumerate(
+        zip(selected_indices, selected_rows, strict=True), start=1
+    ):
+        phase = row.get("selection_phase")
+        step = row.get("selection_step")
+        refreshes = row.get("heap_refreshes")
+        if position <= initial_set_size:
+            if phase != "coverage_seed" or step != 0 or refreshes != 0:
+                raise ValueError("coverage seed heap metadata is invalid")
+        else:
+            expected_step = position - initial_set_size
+            if phase != "heap" or step != expected_step:
+                raise ValueError("heap selection order metadata is invalid")
+            if (
+                isinstance(refreshes, bool)
+                or not isinstance(refreshes, int)
+                or not 0 <= refreshes <= max_refreshes
+            ):
+                raise ValueError("heap refresh count is invalid")
+            refresh_counts.append(refreshes)
+        gain = context.marginal_gain(state, index)
+        recorded_gain = float(row.get("selection_score_delta", np.nan))
+        if not np.isfinite(recorded_gain) or not np.isclose(
+            recorded_gain, gain, rtol=1.0e-7, atol=1.0e-8
+        ):
+            raise ValueError("selection score delta does not match the objective")
+        if not np.isclose(
+            float(row.get("marginal_gain", np.nan)), gain, rtol=1.0e-7, atol=1.0e-8
+        ):
+            raise ValueError("selected marginal gain does not match the objective")
+        context.add_candidate(state, index)
+
     target = context.prototype_mass.max(axis=0)
     achieved = context.prototype_mass[np.asarray(selected_indices, dtype=np.int64)].max(axis=0)
     if not np.allclose(target, achieved, rtol=1.0e-7, atol=1.0e-8):
@@ -565,36 +598,38 @@ def validate_output(
     }.items():
         if not np.isclose(float(objective.get(name, np.nan)), actual, rtol=1.0e-7, atol=1.0e-8):
             raise ValueError(f"selection report objective {name} mismatch")
-    seed_indices = [
-        index
-        for index, row in zip(selected_indices, selected_rows, strict=True)
-        if row["selection_phase"] == "coverage_seed"
-    ]
-    expected_quotas = allocate_residual_task_quotas(
-        graph.task_indices,
-        selected_indices=seed_indices,
-        budget=len(selected_indices),
-    )
-    if report.get("residual_task_quotas") != {
-        str(task): quota for task, quota in expected_quotas.items()
-    }:
-        raise ValueError("selection report residual task quotas mismatch")
-    actual_rollout_counts = {
-        str(task): sum(
-            row["selection_phase"] == "rollout"
-            and int(row["task_index"]) == task
-            for row in selected_rows
-        )
-        for task in sorted(expected_quotas)
+
+    expected_heap = {
+        "initial_size": (
+            0 if initial_set_size == len(selected_rows) else len(graph.sample_ids) - initial_set_size
+        ),
+        "total_refreshes": sum(refresh_counts),
+        "capped_selections": sum(value == max_refreshes for value in refresh_counts),
+        "max_refreshes_observed": max(refresh_counts, default=0),
     }
-    if actual_rollout_counts != report.get("rollout_task_counts"):
-        raise ValueError("rollout task counts do not match residual quotas")
-    if actual_rollout_counts != {str(task): quota for task, quota in expected_quotas.items()}:
-        raise ValueError("rollout selection violates residual task quotas")
+    heap_report = report.get("heap")
+    if not isinstance(heap_report, Mapping):
+        raise ValueError("selection report heap metadata is invalid")
+    if heap_report.get("initial_size") != expected_heap["initial_size"]:
+        raise ValueError("selection report heap initial size mismatch")
+    if heap_report.get("total_refreshes") != expected_heap["total_refreshes"]:
+        raise ValueError("selection report heap total refreshes mismatch")
+    if heap_report.get("capped_selections") != expected_heap["capped_selections"]:
+        raise ValueError("selection report heap capped selections mismatch")
+    if heap_report.get("max_refreshes_observed") != expected_heap["max_refreshes_observed"]:
+        raise ValueError("selection report heap maximum refreshes mismatch")
+    actual_task_counts = {
+        str(task): sum(int(graph.task_indices[index]) == task for index in selected_indices)
+        for task in sorted({int(value) for value in graph.task_indices})
+    }
+    if report.get("task_counts") != actual_task_counts:
+        raise ValueError("selection report task counts mismatch")
     if config is not None:
         resolved = resolve_config(config)
         if not np.isclose(float(resolved["objective"]["cooccurrence_weight"]), weight):
             raise ValueError("configuration cooccurrence weight does not match output")
         if not np.isclose(float(resolved["selection"]["ratio"]), ratio):
             raise ValueError("configuration selection ratio does not match output")
+        if int(resolved["selection"]["max_refreshes"]) != max_refreshes:
+            raise ValueError("configuration max_refreshes does not match output")
     return {"status": "valid", "selected_clips": len(selected_rows)}

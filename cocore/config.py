@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Mapping
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -34,10 +35,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "selection": {
         "ratio": 0.1,
         "budget": None,
-        "global_candidates": 256,
-        "prototype_candidates": 128,
-        "similarity_candidates": 128,
-        "random_candidates": 128,
+        "max_refreshes": 100,
     },
     "output": {"directory": "outputs/cocore/libero90"},
 }
@@ -55,6 +53,18 @@ def _merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    configured_selection = config.get("selection")
+    if isinstance(configured_selection, Mapping):
+        for name in (
+            "global_candidates",
+            "prototype_candidates",
+            "similarity_candidates",
+            "random_candidates",
+        ):
+            if name in configured_selection:
+                raise ValueError(
+                    f"selection.{name} was removed; lazy heap selection uses max_refreshes"
+                )
     configured_method = config.get("prototypes", {}).get("method") if isinstance(
         config.get("prototypes"), Mapping
     ) else None
@@ -78,26 +88,12 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if budget is not None and int(budget) <= 0:
         raise ValueError("selection.budget must be positive or null")
     resolved["selection"]["budget"] = None if budget is None else int(budget)
-    for name in (
-        "global_candidates",
-        "prototype_candidates",
-        "similarity_candidates",
-        "random_candidates",
-    ):
-        value = int(resolved["selection"][name])
-        if value < 0:
-            raise ValueError(f"selection.{name} cannot be negative")
-        resolved["selection"][name] = value
-    if not any(
-        resolved["selection"][name] > 0
-        for name in (
-            "global_candidates",
-            "prototype_candidates",
-            "similarity_candidates",
-            "random_candidates",
-        )
-    ):
-        raise ValueError("at least one candidate pool must be non-empty")
+    max_refreshes = resolved["selection"]["max_refreshes"]
+    if isinstance(max_refreshes, bool) or not isinstance(max_refreshes, Integral):
+        raise ValueError("selection.max_refreshes must be a positive integer")
+    if int(max_refreshes) <= 0:
+        raise ValueError("selection.max_refreshes must be a positive integer")
+    resolved["selection"]["max_refreshes"] = int(max_refreshes)
     # Reuse RelCore's strict validation for all shared encoding and graph fields.
     to_relcore_config(resolved)
     return resolved

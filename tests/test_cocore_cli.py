@@ -15,12 +15,33 @@ def test_config_fixes_motion_primitives_and_support_progress_reliability() -> No
     assert resolved["prototypes"]["method"] == "motion_primitives"
     assert resolved["reliability_metrics"] == ["support", "progress"]
     assert resolved["objective"]["cooccurrence_weight"] == 1.0
+    assert resolved["selection"]["max_refreshes"] == 100
 
 
 @pytest.mark.parametrize("weight", [-1.0, float("nan"), float("inf")])
 def test_config_rejects_invalid_cooccurrence_weight(weight: float) -> None:
     with pytest.raises(ValueError, match="cooccurrence_weight"):
         resolve_config({"objective": {"cooccurrence_weight": weight}})
+
+
+@pytest.mark.parametrize("max_refreshes", [0, -1, 1.5, True])
+def test_config_rejects_non_positive_or_non_integer_max_refreshes(max_refreshes) -> None:
+    with pytest.raises(ValueError, match="selection.max_refreshes"):
+        resolve_config({"selection": {"max_refreshes": max_refreshes}})
+
+
+@pytest.mark.parametrize(
+    "obsolete",
+    [
+        "global_candidates",
+        "prototype_candidates",
+        "similarity_candidates",
+        "random_candidates",
+    ],
+)
+def test_config_rejects_removed_candidate_pool_options(obsolete: str) -> None:
+    with pytest.raises(ValueError, match=f"selection.{obsolete}"):
+        resolve_config({"selection": {obsolete: 1}})
 
 
 def test_selection_directory_always_encodes_weight_and_ratio() -> None:
@@ -75,4 +96,11 @@ def test_shipped_configs_resolve_to_fixed_cocore_contract(path: str) -> None:
 
     assert config["prototypes"]["method"] == "motion_primitives"
     assert config["reliability_metrics"] == ["support", "progress"]
+    assert config["selection"]["max_refreshes"] == 100
+    assert not {
+        "global_candidates",
+        "prototype_candidates",
+        "similarity_candidates",
+        "random_candidates",
+    } & config["selection"].keys()
     assert config["output"]["directory"].startswith("outputs/cocore/")

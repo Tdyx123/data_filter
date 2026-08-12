@@ -1,14 +1,12 @@
-"""Coverage seeding, residual quotas, and deterministic sparse beam rollout."""
+"""Coverage seeding and deterministic lazy maximum-heap selection."""
 
 from __future__ import annotations
 
+import heapq
+import math
 from dataclasses import dataclass
-from collections.abc import Mapping
 
 import numpy as np
-
-from relcore.selection.quota import allocate_task_quotas
-from relcore.utils.io import stable_hash
 
 from .objective import CocoreObjectiveContext
 
@@ -21,54 +19,19 @@ class CoverageSeed:
 
 
 @dataclass(frozen=True)
-class CandidatePoolConfig:
-    global_candidates: int = 256
-    prototype_candidates: int = 128
-    similarity_candidates: int = 128
-    random_candidates: int = 128
-
-    def __post_init__(self) -> None:
-        if any(
-            value < 0
-            for value in (
-                self.global_candidates,
-                self.prototype_candidates,
-                self.similarity_candidates,
-                self.random_candidates,
-            )
-        ):
-            raise ValueError("candidate pool sizes cannot be negative")
-
-
-@dataclass(frozen=True)
-class BeamLayerStats:
-    depth: int
-    generated: int
-    unique: int
-    retained: int
-
-
-@dataclass(frozen=True)
-class BeamSelectionResult:
+class HeapSelectionResult:
     selected_indices: tuple[int, ...]
     score_deltas: tuple[float, ...]
     selection_phases: tuple[str, ...]
-    rollout_depths: tuple[int, ...]
+    selection_steps: tuple[int, ...]
+    heap_refreshes: tuple[int, ...]
     objective_value: float
     cooccurrence: float
     redundancy: float
-    layer_stats: tuple[BeamLayerStats, ...]
-    final_beam_scores: tuple[float, ...]
-
-
-@dataclass
-class _BeamPath:
-    selected_indices: tuple[int, ...]
-    score_deltas: tuple[float, ...]
-    selection_phases: tuple[str, ...]
-    rollout_depths: tuple[int, ...]
-    rollout_task_counts: dict[int, int]
-    state: object
+    initial_heap_size: int
+    total_refreshes: int
+    capped_selections: int
+    max_refreshes_observed: int
 
 
 def build_max_coverage_seed(
@@ -101,321 +64,167 @@ def build_max_coverage_seed(
     return CoverageSeed(tuple(selected), target.copy(), achieved)
 
 
-def allocate_residual_task_quotas(
-    task_indices: np.ndarray,
-    *,
-    selected_indices: list[int] | tuple[int, ...],
-    budget: int,
-) -> dict[int, int]:
-    tasks = np.asarray(task_indices, dtype=np.int64)
-    if tasks.ndim != 1 or len(tasks) == 0:
-        raise ValueError("task_indices must be a non-empty vector")
-    selected = np.asarray(selected_indices, dtype=np.int64)
-    if len(np.unique(selected)) != len(selected) or np.any((selected < 0) | (selected >= len(tasks))):
-        raise ValueError("selected_indices must contain unique in-range values")
-    if budget < len(selected) or budget > len(tasks):
-        raise ValueError("selection budget must contain the seed and fit candidate count")
-    remaining_budget = budget - len(selected)
-    remaining_mask = np.ones(len(tasks), dtype=bool)
-    remaining_mask[selected] = False
-    remaining_tasks = tasks[remaining_mask]
-    if remaining_budget == 0:
-        return {int(task): 0 for task in sorted(set(remaining_tasks.tolist()))}
-    return allocate_task_quotas(
-        remaining_tasks,
-        budget=remaining_budget,
-        minimum_per_task=0,
-    )
+_HeapEntry = tuple[float, str, int, int]
 
 
-class BeamRolloutSelector:
-    BEAM_WIDTH = 8
-    ROOT_ROLLOUTS = 8
-    NODE_ROLLOUTS = 4
+class LazyHeapSelector:
+    """Approximate greedy selection with bounded lazy marginal-gain refreshes."""
 
     def __init__(
         self,
         context: CocoreObjectiveContext,
-        residual_task_quotas: Mapping[int, int],
         *,
-        seed: int = 42,
-        pool_config: CandidatePoolConfig = CandidatePoolConfig(),
+        max_refreshes: int = 100,
     ) -> None:
-        self.context = context
-        self.residual_task_quotas = {
-            int(task): int(quota) for task, quota in residual_task_quotas.items()
-        }
-        if any(quota < 0 for quota in self.residual_task_quotas.values()):
-            raise ValueError("residual task quotas cannot be negative")
-        self.seed = int(seed)
-        self.pool_config = pool_config
-        graph = context.graph
-        self._static_potential = np.einsum(
-            "ni,ij,nj->n",
-            context.prototype_mass,
-            context.cooccurrence_matrix,
-            context.prototype_mass,
-        )
-        self._global_order = sorted(
-            range(len(graph.sample_ids)),
-            key=lambda index: (
-                -float(self._static_potential[index]),
-                -float(graph.reliability[index]),
-                graph.sample_ids[index],
-            ),
-        )
-        self._prototype_members: list[list[int]] = [
-            [] for _ in range(context.prototype_mass.shape[1])
-        ]
-        for index in range(len(graph.sample_ids)):
-            for prototype in np.flatnonzero(context.prototype_mass[index] > 0.0):
-                self._prototype_members[int(prototype)].append(index)
-        for prototype, members in enumerate(self._prototype_members):
-            members.sort(
-                key=lambda index: (
-                    -float(context.prototype_mass[index, prototype]),
-                    graph.sample_ids[index],
-                )
-            )
-        self._similarity_adjacency: list[list[tuple[int, float]]] = [
-            [] for _ in graph.sample_ids
-        ]
-        for source, target, similarity in zip(
-            graph.similarity_edges.source,
-            graph.similarity_edges.target,
-            graph.similarity_edges.weight,
-            strict=True,
+        if isinstance(max_refreshes, bool) or not isinstance(
+            max_refreshes, (int, np.integer)
         ):
-            left, right, value = int(source), int(target), float(similarity)
-            self._similarity_adjacency[left].append((right, value))
-            self._similarity_adjacency[right].append((left, value))
-        self._task_members: dict[int, list[int]] = {}
-        for task in sorted({int(value) for value in graph.task_indices}):
-            members = np.flatnonzero(graph.task_indices == task).tolist()
-            members.sort(
-                key=lambda index: (-float(graph.reliability[index]), graph.sample_ids[index])
-            )
-            self._task_members[task] = members
+            raise ValueError("max_refreshes must be a positive integer")
+        if int(max_refreshes) <= 0:
+            raise ValueError("max_refreshes must be a positive integer")
+        self.context = context
+        self.max_refreshes = int(max_refreshes)
 
-    def _eligible(
-        self,
-        state,
-        rollout_task_counts: Mapping[int, int],
-        candidate: int,
-    ) -> bool:
-        if state.selected_mask[candidate]:
-            return False
-        task = int(self.context.graph.task_indices[candidate])
-        return int(rollout_task_counts.get(task, 0)) < self.residual_task_quotas.get(task, 0)
+    @staticmethod
+    def _finite_gain(gain: float, candidate: int) -> float:
+        value = float(gain)
+        if not math.isfinite(value):
+            raise ValueError(f"candidate {candidate} has a non-finite marginal gain")
+        return value
 
-    def candidate_pool(
-        self,
-        state,
-        rollout_task_counts: Mapping[int, int],
-    ) -> tuple[int, ...]:
-        graph = self.context.graph
-        selected: set[int] = set()
-
-        global_count = 0
-        for index in self._global_order:
-            if not self._eligible(state, rollout_task_counts, index):
-                continue
-            selected.add(index)
-            global_count += 1
-            if global_count >= self.pool_config.global_candidates:
-                break
-
-        prototype_limit = self.pool_config.prototype_candidates
-        if prototype_limit:
-            direction = (self.context.cooccurrence_matrix + self.context.cooccurrence_matrix.T) @ (
-                state.prototype_mass
-            )
-            prototypes = sorted(
-                range(len(direction)), key=lambda prototype: (-float(direction[prototype]), prototype)
-            )
-            positions = {prototype: 0 for prototype in prototypes}
-            added = 0
-            while added < prototype_limit:
-                progressed = False
-                for prototype in prototypes:
-                    members = self._prototype_members[prototype]
-                    position = positions[prototype]
-                    while position < len(members) and not self._eligible(
-                        state, rollout_task_counts, members[position]
-                    ):
-                        position += 1
-                    positions[prototype] = position + 1
-                    if position >= len(members):
-                        continue
-                    before = len(selected)
-                    selected.add(members[position])
-                    added += len(selected) - before
-                    progressed = True
-                    if added >= prototype_limit:
-                        break
-                if not progressed:
-                    break
-
-        similarity: dict[int, float] = {}
-        for source in np.flatnonzero(state.selected_mask):
-            for candidate, value in self._similarity_adjacency[int(source)]:
-                if self._eligible(state, rollout_task_counts, candidate):
-                    similarity[candidate] = max(similarity.get(candidate, 0.0), value)
-        selected.update(
-            sorted(
-                similarity,
-                key=lambda index: (-similarity[index], graph.sample_ids[index]),
-            )[: self.pool_config.similarity_candidates]
+    def _entry(self, gain: float, candidate: int, version: int) -> _HeapEntry:
+        return (
+            -self._finite_gain(gain, candidate),
+            self.context.graph.sample_ids[candidate],
+            candidate,
+            version,
         )
-
-        eligible = np.asarray(
-            [
-                index
-                for index in range(len(graph.sample_ids))
-                if self._eligible(state, rollout_task_counts, index)
-            ],
-            dtype=np.int64,
-        )
-        sample_size = min(self.pool_config.random_candidates, len(eligible))
-        if sample_size:
-            selected_ids = sorted(
-                graph.sample_ids[index] for index in np.flatnonzero(state.selected_mask)
-            )
-            digest = stable_hash({"seed": self.seed, "selected": selected_ids})
-            rng = np.random.default_rng(int(digest[:16], 16))
-            weights = graph.reliability[eligible].astype(np.float64)
-            weights /= weights.sum()
-            selected.update(
-                int(index)
-                for index in rng.choice(
-                    eligible,
-                    size=sample_size,
-                    replace=False,
-                    p=weights,
-                )
-            )
-
-        for task, quota in self.residual_task_quotas.items():
-            if int(rollout_task_counts.get(task, 0)) >= quota:
-                continue
-            representative = next(
-                (
-                    index
-                    for index in self._task_members.get(task, ())
-                    if self._eligible(state, rollout_task_counts, index)
-                ),
-                None,
-            )
-            if representative is not None:
-                selected.add(representative)
-
-        if not selected and len(eligible):
-            selected.add(
-                min(
-                    eligible.tolist(),
-                    key=lambda index: (-float(graph.reliability[index]), graph.sample_ids[index]),
-                )
-            )
-        return tuple(sorted(selected, key=lambda index: graph.sample_ids[index]))
-
-    def _path_rank(
-        self, path: _BeamPath
-    ) -> tuple[float, tuple[str, ...], tuple[float, ...], tuple[str, ...]]:
-        graph = self.context.graph
-        canonical = tuple(sorted(graph.sample_ids[index] for index in path.selected_indices))
-        prefix_scores = tuple(-float(value) for value in np.cumsum(path.score_deltas))
-        order = tuple(graph.sample_ids[index] for index in path.selected_indices)
-        return (-float(path.state.score), canonical, prefix_scores, order)
-
-    def _expand(self, path: _BeamPath, *, count: int, depth: int) -> list[_BeamPath]:
-        candidates = self.candidate_pool(path.state, path.rollout_task_counts)
-        ranked = sorted(
-            candidates,
-            key=lambda index: (
-                -float(path.state.score + self.context.marginal_gain(path.state, index)),
-                self.context.graph.sample_ids[index],
-            ),
-        )[:count]
-        children: list[_BeamPath] = []
-        for candidate in ranked:
-            state = self.context.clone_state(path.state)
-            gain = self.context.marginal_gain(state, candidate)
-            self.context.add_candidate(state, candidate)
-            counts = dict(path.rollout_task_counts)
-            task = int(self.context.graph.task_indices[candidate])
-            counts[task] = counts.get(task, 0) + 1
-            children.append(
-                _BeamPath(
-                    selected_indices=path.selected_indices + (candidate,),
-                    score_deltas=path.score_deltas + (float(gain),),
-                    selection_phases=path.selection_phases + ("rollout",),
-                    rollout_depths=path.rollout_depths + (depth,),
-                    rollout_task_counts=counts,
-                    state=state,
-                )
-            )
-        return children
 
     def select(
         self,
         budget: int,
         *,
         initial_indices: list[int] | tuple[int, ...],
-    ) -> BeamSelectionResult:
+    ) -> HeapSelectionResult:
+        candidate_count = len(self.context.graph.sample_ids)
         initial = tuple(int(index) for index in initial_indices)
         if len(initial) != len(set(initial)):
             raise ValueError("initial_indices cannot contain duplicates")
-        if not 0 < len(initial) <= budget <= len(self.context.graph.sample_ids):
+        if any(index < 0 or index >= candidate_count for index in initial):
+            raise ValueError("initial_indices must contain in-range values")
+        if not 0 < len(initial) <= budget <= candidate_count:
             raise ValueError("budget must contain a non-empty initial selection")
-        if sum(self.residual_task_quotas.values()) != budget - len(initial):
-            raise ValueError("residual task quotas must sum to remaining budget")
-        initial_state = self.context.empty_state()
-        initial_gains: list[float] = []
+
+        state = self.context.empty_state()
+        selected = list(initial)
+        score_deltas: list[float] = []
         for index in initial:
-            gain = self.context.marginal_gain(initial_state, index)
-            self.context.add_candidate(initial_state, index)
-            initial_gains.append(float(gain))
-        beam = [
-            _BeamPath(
-                selected_indices=initial,
-                score_deltas=tuple(initial_gains),
-                selection_phases=("coverage_seed",) * len(initial),
-                rollout_depths=(0,) * len(initial),
-                rollout_task_counts={task: 0 for task in self.residual_task_quotas},
-                state=initial_state,
+            gain = self._finite_gain(self.context.marginal_gain(state, index), index)
+            self.context.add_candidate(state, index)
+            score_deltas.append(gain)
+
+        selection_phases = ["coverage_seed"] * len(initial)
+        selection_steps = [0] * len(initial)
+        refresh_counts = [0] * len(initial)
+        if len(initial) == budget:
+            return self._result(
+                state,
+                selected,
+                score_deltas,
+                selection_phases,
+                selection_steps,
+                refresh_counts,
+                initial_heap_size=0,
+                capped_selections=0,
             )
-        ]
-        layer_stats: list[BeamLayerStats] = []
-        depth = 1
-        while len(beam[0].selected_indices) < budget:
-            rollout_count = self.ROOT_ROLLOUTS if depth == 1 else self.NODE_ROLLOUTS
-            generated = [
-                child
-                for path in beam
-                for child in self._expand(path, count=rollout_count, depth=depth)
-            ]
-            if not generated:
-                raise ValueError("no quota-feasible rollout candidate remains")
-            unique: dict[tuple[int, ...], _BeamPath] = {}
-            for path in generated:
-                key = tuple(sorted(path.selected_indices))
-                previous = unique.get(key)
-                if previous is None or self._path_rank(path) < self._path_rank(previous):
-                    unique[key] = path
-            beam = sorted(unique.values(), key=self._path_rank)[: self.BEAM_WIDTH]
-            layer_stats.append(
-                BeamLayerStats(depth, len(generated), len(unique), len(beam))
-            )
-            depth += 1
-        best = min(beam, key=self._path_rank)
-        return BeamSelectionResult(
-            selected_indices=best.selected_indices,
-            score_deltas=best.score_deltas,
-            selection_phases=best.selection_phases,
-            rollout_depths=best.rollout_depths,
-            objective_value=float(best.state.score),
-            cooccurrence=float(best.state.cooccurrence),
-            redundancy=float(best.state.redundancy),
-            layer_stats=tuple(layer_stats),
-            final_beam_scores=tuple(float(path.state.score) for path in beam),
+
+        current_version = 0
+        heap: list[_HeapEntry] = []
+        for candidate in range(candidate_count):
+            if state.selected_mask[candidate]:
+                continue
+            gain = self.context.marginal_gain(state, candidate)
+            heap.append(self._entry(gain, candidate, current_version))
+        heapq.heapify(heap)
+        initial_heap_size = len(heap)
+        capped_selections = 0
+        heap_step = 1
+
+        while len(selected) < budget:
+            refreshed: list[_HeapEntry] = []
+            chosen_index: int | None = None
+            chosen_gain = 0.0
+            hit_refresh_cap = False
+
+            while heap:
+                negative_gain, sample_id, candidate, version = heapq.heappop(heap)
+                if state.selected_mask[candidate]:
+                    continue
+                if version == current_version:
+                    chosen_index = candidate
+                    chosen_gain = -negative_gain
+                    break
+
+                gain = self.context.marginal_gain(state, candidate)
+                entry = self._entry(gain, candidate, current_version)
+                heapq.heappush(heap, entry)
+                refreshed.append(entry)
+                if len(refreshed) >= self.max_refreshes:
+                    best = min(refreshed)
+                    chosen_gain = -best[0]
+                    chosen_index = best[2]
+                    hit_refresh_cap = True
+                    break
+
+            if chosen_index is None:
+                raise ValueError("no candidate remains before the selection budget is reached")
+
+            self.context.add_candidate(state, chosen_index)
+            selected.append(chosen_index)
+            score_deltas.append(float(chosen_gain))
+            selection_phases.append("heap")
+            selection_steps.append(heap_step)
+            refresh_counts.append(len(refreshed))
+            capped_selections += int(hit_refresh_cap)
+            current_version += 1
+            heap_step += 1
+
+        if len(selected) != len(set(selected)):
+            raise RuntimeError("lazy heap selection produced duplicate indices")
+        return self._result(
+            state,
+            selected,
+            score_deltas,
+            selection_phases,
+            selection_steps,
+            refresh_counts,
+            initial_heap_size=initial_heap_size,
+            capped_selections=capped_selections,
+        )
+
+    @staticmethod
+    def _result(
+        state,
+        selected: list[int],
+        score_deltas: list[float],
+        selection_phases: list[str],
+        selection_steps: list[int],
+        refresh_counts: list[int],
+        *,
+        initial_heap_size: int,
+        capped_selections: int,
+    ) -> HeapSelectionResult:
+        return HeapSelectionResult(
+            selected_indices=tuple(selected),
+            score_deltas=tuple(score_deltas),
+            selection_phases=tuple(selection_phases),
+            selection_steps=tuple(selection_steps),
+            heap_refreshes=tuple(refresh_counts),
+            objective_value=float(state.score),
+            cooccurrence=float(state.cooccurrence),
+            redundancy=float(state.redundancy),
+            initial_heap_size=initial_heap_size,
+            total_refreshes=sum(refresh_counts),
+            capped_selections=capped_selections,
+            max_refreshes_observed=max(refresh_counts, default=0),
         )

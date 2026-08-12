@@ -9,7 +9,7 @@ GR00T 风格 flow-matching DiT 动作头开始训练。
 [TDUS](tdus/README.md)，用于直接从 LeRobot trajectory/chunk 计算 Quality、
 Coverage、Diversity 和 Novelty；以及仿照 SQCN 两遍数据流、面向 LIBERO 关系图与
 集合目标筛选的 [RelCore](relcore/README.md)。另有固定使用 support、progress 和
-运动原语、以共现减冗余目标执行 top-8 束搜索的 [Cocore](cocore/README.md)。
+运动原语、以共现减冗余目标执行有界惰性最大堆选择的 [Cocore](cocore/README.md)。
 
 另有分阶段的 [Quality Filter](quality_filter/README.md)，只计算 SQCN Quality，
 再用相同的融合 embedding 和 0.4.0 多样化 Filter 完成片段筛选。SQCN 与
@@ -671,6 +671,39 @@ assert actions.shape == (1, 8, 7)
 
 `image` 可为一张 PIL 图像、RGB NumPy 数组或由这些对象组成的 batch；`state`
 为 `[8]` 或 `[B,8]`。输出是反归一化后的 `[B,8,7]` 连续动作。
+
+### Qwen LoRA 的 LIBERO 闭环评测
+
+`evaluate_libero_qwen.sh` 只接受训练产出的具体 `step-XXXXXXXX` 紧凑
+checkpoint。该目录必须包含 `adapter_model.safetensors`、`policy_config.json` 和
+`normalization.json`；评测器加载本地 Qwen3-VL-4B 基座，再叠加其中的 LoRA 与
+GR00T action head，不解析训练输出根目录、`latest.json` 或 `best.json`。
+
+先对 LIBERO-10 index 5 执行单环境预检：
+
+```bash
+bash scripts/evaluate_libero_qwen.sh \
+  --indexes 5 \
+  --checkpoint /data/dwb/qwen_small_libero_relcore_top20pct/checkpoints/step-00020000 \
+  --preflight-only
+```
+
+基础模型默认从 checkpoint 的 `policy_config.json` 读取，也可以用
+`--model-path /data/dwb/models/Qwen3-VL-4B-Instruct` 显式覆盖。预检通过后可执行
+固定三个种子、每个种子一个初始状态、最多八步的 smoke test：
+
+```bash
+bash scripts/evaluate_libero_qwen.sh \
+  --indexes 5 \
+  --checkpoint /data/dwb/qwen_small_libero_relcore_top20pct/checkpoints/step-00020000 \
+  --smoke-test
+```
+
+不传 `--indexes` 时按官方顺序串行评测全部十个任务，每个任务默认运行 150 个
+episode，并分别写入 `outputs/qwen_libero_eval/task-0/` 到 `task-9/`。单卡模型推理
+默认以 `--policy-batch-size 4` 对并行环境分批；该值可根据显存调整，而
+`--num-envs` 仍控制 LIBERO 仿真并行度。已有结果不会自动覆盖，重复正式评测需传
+`--overwrite`。
 
 ## 测试
 

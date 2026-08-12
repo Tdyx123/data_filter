@@ -25,10 +25,7 @@ objective:
 selection:
   ratio: 1.0
   budget: null
-  global_candidates: 32
-  prototype_candidates: 16
-  similarity_candidates: 16
-  random_candidates: 16
+  max_refreshes: 100
 
 runtime:
   max_episodes: 2
