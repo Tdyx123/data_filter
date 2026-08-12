@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -10,12 +11,85 @@ import numpy as np
 from libero_lerobot.sampling import ACTION_WINDOW_POLICY, sample_counts_per_batch
 
 from .config import resolved_paths
-from .data import BridgeEpisodeDataset, BridgeMetadata, validate_episode
+from .data import (
+    BridgeEpisodeDataset,
+    BridgeMetadata,
+    bridge_collate,
+    validate_episode,
+)
 from .normalization import QuantileStats
 
 
 class PreflightError(RuntimeError):
     """Raised when the target host cannot run the requested training configuration."""
+
+
+MAX_RESERVED_MEMORY_GIB = 22.0
+
+
+def _build_memory_probe_batch(
+    dataset: Any,
+    *,
+    micro_batch_size: int,
+) -> dict[str, Any]:
+    if micro_batch_size <= 0:
+        raise ValueError("micro_batch_size must be positive")
+    if hasattr(dataset, "__getitem__") and hasattr(dataset, "__len__"):
+        if len(dataset) < micro_batch_size:
+            raise PreflightError(
+                f"Memory probe needs {micro_batch_size} distinct samples, "
+                f"but the dataset has only {len(dataset)}"
+            )
+        samples = [dataset[index] for index in range(micro_batch_size)]
+    else:
+        samples = list(islice(iter(dataset), micro_batch_size))
+        if len(samples) != micro_batch_size:
+            raise PreflightError(
+                f"Memory probe requested {micro_batch_size} samples, got {len(samples)}"
+            )
+    identities = [
+        (
+            sample.get("dataset_name"),
+            int(sample["episode_index"]),
+            int(sample["frame_index"]),
+        )
+        for sample in samples
+    ]
+    if len(set(identities)) != micro_batch_size:
+        raise PreflightError("Memory probe samples must be distinct")
+    return bridge_collate(samples)
+
+
+def _memory_probe_result(
+    *,
+    loss: float,
+    peak_allocated: int,
+    peak_reserved: int,
+    total: int,
+    micro_batch_size: int,
+) -> dict[str, Any]:
+    limit_bytes = int(MAX_RESERVED_MEMORY_GIB * 2**30)
+    if peak_reserved > limit_bytes:
+        raise PreflightError(
+            "Memory probe reserved "
+            f"{peak_reserved / 2**30:.3f} GiB, above the "
+            f"{MAX_RESERVED_MEMORY_GIB:.1f} GiB candidate limit"
+        )
+    if peak_reserved >= total:
+        raise PreflightError("Memory probe reached or exceeded physical GPU memory")
+    return {
+        "loss": loss,
+        "micro_batch_size": micro_batch_size,
+        "lora_active": True,
+        "peak_allocated_gib": round(peak_allocated / 2**30, 3),
+        "peak_reserved_gib": round(peak_reserved / 2**30, 3),
+        "reserved_limit_gib": MAX_RESERVED_MEMORY_GIB,
+        "reserved_headroom_gib": round(
+            (limit_bytes - peak_reserved) / 2**30,
+            3,
+        ),
+        "total_gib": round(total / 2**30, 3),
+    }
 
 
 def _inspect_qwen_config(model_path: Path) -> dict[str, Any]:
@@ -216,7 +290,7 @@ def probe_single_gpu_memory(config: dict[str, Any]) -> dict[str, Any]:
     """Run one real micro-batch forward/backward before distributed launch."""
     import torch
 
-    from .modeling import Qwen3VLGrootPolicy
+    from .modeling import Qwen3VLGrootPolicy, compile_policy_modules
 
     if int(config["train"]["deepspeed_stage"]) == 3:
         return {
@@ -236,25 +310,28 @@ def probe_single_gpu_memory(config: dict[str, Any]) -> dict[str, Any]:
             action_horizon=int(config["data"]["action_horizon"]),
             train=True,
             seed=int(config["train"]["seed"]),
-            episode_cache_size=1,
+            episode_cache_size=int(config["data"]["episode_cache_size"]),
             config=config["data"],
             frame_indices=sources.target_selection.frame_indices,
         )
-        sample = implementation[0]
     else:
         metadata = BridgeMetadata(config["paths"]["dataset"], config["data"])
         train_episodes, _ = metadata.split()
         implementation = BridgeEpisodeDataset(
             metadata,
-            [train_episodes[0]],
+            train_episodes,
             train=True,
             rank=0,
             world_size=1,
             seed=int(config["train"]["seed"]),
             action_horizon=int(config["data"]["action_horizon"]),
-            video_cache_size=1,
+            video_cache_size=int(config["data"]["video_cache_episodes"]),
         )
-        sample = next(iter(implementation))
+    micro_batch_size = int(config["train"]["micro_batch_size"])
+    batch = _build_memory_probe_batch(
+        implementation,
+        micro_batch_size=micro_batch_size,
+    )
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
     policy = None
@@ -265,32 +342,36 @@ def probe_single_gpu_memory(config: dict[str, Any]) -> dict[str, Any]:
             config=config,
         )
         policy.to(device=device, dtype=torch.bfloat16)
+        compile_policy_modules(policy, config["model"])
         policy.train()
+        policy.set_lora_trainable(True)
         loss = policy(
-            images=[sample["image"]],
-            state=torch.as_tensor(sample["state"]).unsqueeze(0),
-            actions=torch.as_tensor(sample["actions"]).unsqueeze(0),
-            action_mask=torch.as_tensor(sample["action_mask"]).unsqueeze(0),
-            instructions=[sample["instruction"]],
+            images=batch["images"],
+            state=batch["state"],
+            actions=batch["actions"],
+            action_mask=batch["action_mask"],
+            instructions=batch["instructions"],
         )
         if not torch.isfinite(loss):
             raise PreflightError(f"Memory probe produced non-finite loss: {loss.item()}")
         loss.backward()
+        if not any(parameter.grad is not None for parameter in policy.lora_parameters()):
+            raise PreflightError("Memory probe did not produce LoRA gradients")
+        torch.cuda.synchronize(device)
         peak_allocated = torch.cuda.max_memory_allocated(device)
         peak_reserved = torch.cuda.max_memory_reserved(device)
-        peak = max(peak_allocated, peak_reserved)
         total = torch.cuda.get_device_properties(device).total_memory
-        if peak >= total:
-            raise PreflightError("Memory probe reached or exceeded physical GPU memory")
-        return {
-            "loss": float(loss.detach().cpu()),
-            "peak_allocated_gib": round(peak_allocated / 2**30, 3),
-            "peak_reserved_gib": round(peak_reserved / 2**30, 3),
-            "total_gib": round(total / 2**30, 3),
-        }
+        return _memory_probe_result(
+            loss=float(loss.detach().cpu()),
+            peak_allocated=peak_allocated,
+            peak_reserved=peak_reserved,
+            total=total,
+            micro_batch_size=micro_batch_size,
+        )
     except torch.OutOfMemoryError as error:
         raise PreflightError(
-            "The full 36-layer Qwen + 12-layer DiT cannot complete micro-batch 1 "
+            "The full 36-layer Qwen + 12-layer DiT cannot complete "
+            f"micro-batch {micro_batch_size} "
             "on a single 24GB GPU with ZeRO-2. Retry with --deepspeed-stage 3 "
             "(CPU optimizer offload). The model definition and layer count were not changed."
         ) from error

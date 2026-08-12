@@ -3,10 +3,76 @@ from pathlib import Path
 import pytest
 
 from qwen3_vl_groot.config import apply_overrides, load_config
+from qwen3_vl_groot.preflight import (
+    PreflightError,
+    _build_memory_probe_batch,
+    _memory_probe_result,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LIBERO_ROOT = Path("/data/dwb/datasets/LIBERO_lerobot")
+
+
+class RecordingDataset:
+    def __init__(self):
+        self.requested = []
+
+    def __len__(self):
+        return 16
+
+    def __getitem__(self, index):
+        import numpy as np
+
+        self.requested.append(index)
+        return {
+            "image": object(),
+            "state": np.full(8, index, dtype=np.float32),
+            "actions": np.full((8, 7), index, dtype=np.float32),
+            "action_mask": np.ones(8, dtype=np.float32),
+            "instruction": f"instruction {index}",
+            "episode_index": index,
+            "frame_index": index,
+        }
+
+
+def test_memory_probe_batch_uses_real_micro_batch_with_distinct_samples():
+    dataset = RecordingDataset()
+
+    batch = _build_memory_probe_batch(dataset, micro_batch_size=4)
+
+    assert dataset.requested == [0, 1, 2, 3]
+    assert len(batch["images"]) == 4
+    assert tuple(batch["state"].shape) == (4, 8)
+    assert batch["episode_index"].tolist() == [0, 1, 2, 3]
+
+
+def test_memory_probe_rejects_reserved_memory_above_22_gib():
+    gib = 2**30
+    with pytest.raises(PreflightError, match="22.0 GiB"):
+        _memory_probe_result(
+            loss=1.0,
+            peak_allocated=20 * gib,
+            peak_reserved=22 * gib + 1,
+            total=24 * gib,
+            micro_batch_size=4,
+        )
+
+
+def test_memory_probe_accepts_reserved_memory_at_22_gib():
+    gib = 2**30
+    result = _memory_probe_result(
+        loss=1.0,
+        peak_allocated=20 * gib,
+        peak_reserved=22 * gib,
+        total=24 * gib,
+        micro_batch_size=4,
+    )
+
+    assert result["micro_batch_size"] == 4
+    assert result["peak_reserved_gib"] == pytest.approx(22.0)
+    assert result["reserved_limit_gib"] == pytest.approx(22.0)
+    assert result["reserved_headroom_gib"] == pytest.approx(0.0)
 
 
 def test_libero_target_only_preflight_does_not_access_prior(tmp_path, monkeypatch):
