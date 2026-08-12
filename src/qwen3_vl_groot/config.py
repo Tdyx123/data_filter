@@ -16,6 +16,79 @@ class ConfigError(ValueError):
     """Raised when the run configuration violates a model/data invariant."""
 
 
+BACKBONE_CONTRACTS: dict[str, dict[str, Any]] = {
+    "qwen3_vl": {
+        "display_name": "Qwen3-VL-4B",
+        "architecture": "Qwen3VLForConditionalGeneration",
+        "text_layers": 36,
+        "context_dim": 2560,
+        "layer_type_counts": {"full_attention": 36, "linear_attention": 0},
+        "lora_targets": {
+            "full_attention": ("q_proj", "k_proj", "v_proj", "o_proj"),
+            "linear_attention": (),
+        },
+    },
+    "qwen3_5": {
+        "display_name": "Qwen3.5-0.8B",
+        "architecture": "Qwen3_5ForConditionalGeneration",
+        "text_layers": 24,
+        "context_dim": 1024,
+        "layer_type_counts": {"full_attention": 6, "linear_attention": 18},
+        "lora_targets": {
+            "full_attention": ("q_proj", "k_proj", "v_proj", "o_proj"),
+            "linear_attention": (
+                "in_proj_qkv",
+                "in_proj_z",
+                "in_proj_b",
+                "in_proj_a",
+                "out_proj",
+            ),
+        },
+    },
+}
+
+
+def backbone_contract(model_config: dict[str, Any]) -> dict[str, Any]:
+    family = model_config.get("backbone_family", "qwen3_vl")
+    try:
+        return BACKBONE_CONTRACTS[str(family)]
+    except KeyError as error:
+        raise ConfigError(
+            f"model.backbone_family must be one of {sorted(BACKBONE_CONTRACTS)}"
+        ) from error
+
+
+def normalized_lora_target_modules(
+    model_config: dict[str, Any],
+) -> dict[str, tuple[str, ...]]:
+    raw_targets = model_config["lora"]["target_modules"]
+    if isinstance(raw_targets, list):
+        targets = {
+            "full_attention": tuple(raw_targets),
+            "linear_attention": (),
+        }
+    elif isinstance(raw_targets, dict):
+        unknown = set(raw_targets).difference({"full_attention", "linear_attention"})
+        if unknown:
+            raise ConfigError(f"Unknown model.lora.target_modules groups: {sorted(unknown)}")
+        targets = {
+            layer_type: tuple(raw_targets.get(layer_type, ()))
+            for layer_type in ("full_attention", "linear_attention")
+        }
+    else:
+        raise ConfigError("model.lora.target_modules must be a list or mapping")
+    for layer_type, names in targets.items():
+        if any(not isinstance(name, str) or not name for name in names):
+            raise ConfigError(
+                f"model.lora.target_modules.{layer_type} must contain non-empty strings"
+            )
+        if len(names) != len(set(names)):
+            raise ConfigError(
+                f"model.lora.target_modules.{layer_type} must not contain duplicates"
+            )
+    return targets
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
     path = Path(path).expanduser().resolve()
     with path.open("r", encoding="utf-8") as handle:
@@ -137,12 +210,27 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ConfigError(f"{dataset_type} requires state_dim=8 and action_dim=7")
     if data["action_horizon"] <= 0:
         raise ConfigError("action_horizon must be positive")
-    if model["text_layers"] != 36:
+    contract = backbone_contract(model)
+    expected_layers = int(contract["text_layers"])
+    expected_context_dim = int(contract["context_dim"])
+    if model["text_layers"] != expected_layers:
+        if model.get("backbone_family", "qwen3_vl") == "qwen3_vl":
+            raise ConfigError(
+                "Qwen3-VL-4B uses every Qwen text layer and requires "
+                f"model.text_layers={expected_layers}"
+            )
         raise ConfigError(
-            "This project deliberately uses every Qwen text layer; model.text_layers must be 36"
+            f"{contract['display_name']} requires model.text_layers={expected_layers}"
         )
-    if model["context_dim"] != 2560:
-        raise ConfigError("Qwen3-VL-4B context_dim must be 2560")
+    if model["context_dim"] != expected_context_dim:
+        raise ConfigError(
+            f"{contract['display_name']} requires model.context_dim={expected_context_dim}"
+        )
+    targets = normalized_lora_target_modules(model)
+    if targets != contract["lora_targets"]:
+        raise ConfigError(
+            f"{contract['display_name']} requires LoRA targets {contract['lora_targets']}"
+        )
     if model.get("context_forward", "causal_lm") not in {"causal_lm", "backbone"}:
         raise ConfigError(
             "model.context_forward must be either causal_lm or backbone"

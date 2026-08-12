@@ -12,14 +12,41 @@ def _evaluation():
     return importlib.import_module("qwen3_vl_groot.libero_evaluation")
 
 
-def _write_checkpoint(root: Path) -> tuple[Path, Path]:
+def _write_checkpoint(
+    root: Path,
+    *,
+    backbone_family: str = "qwen3_vl",
+) -> tuple[Path, Path]:
+    if backbone_family == "qwen3_vl":
+        architecture = "Qwen3VLForConditionalGeneration"
+        text_config = {"num_hidden_layers": 36, "hidden_size": 2560}
+        model_config = {}
+    elif backbone_family == "qwen3_5":
+        architecture = "Qwen3_5ForConditionalGeneration"
+        text_config = {
+            "num_hidden_layers": 24,
+            "hidden_size": 1024,
+            "layer_types": [
+                layer_type
+                for _ in range(6)
+                for layer_type in (
+                    "linear_attention",
+                    "linear_attention",
+                    "linear_attention",
+                    "full_attention",
+                )
+            ],
+        }
+        model_config = {"backbone_family": "qwen3_5"}
+    else:
+        raise ValueError(backbone_family)
     base_model = root / "base-model"
     base_model.mkdir(parents=True)
     (base_model / "config.json").write_text(
         json.dumps(
             {
-                "architectures": ["Qwen3VLForConditionalGeneration"],
-                "text_config": {"num_hidden_layers": 36, "hidden_size": 2560},
+                "architectures": [architecture],
+                "text_config": text_config,
             }
         ),
         encoding="utf-8",
@@ -54,7 +81,7 @@ def _write_checkpoint(root: Path) -> tuple[Path, Path]:
                         "train_crop_size": 115,
                         "output_image_size": 256,
                     },
-                    "model": {},
+                    "model": model_config,
                     "train": {},
                 },
             }
@@ -116,6 +143,58 @@ def test_resolve_qwen_checkpoint_honors_model_override_and_rejects_bad_contract(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(evaluation.EvaluationError, match="action_horizon=8"):
         evaluation.resolve_qwen_checkpoint(checkpoint)
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        "{",
+        "[]",
+        json.dumps(
+            {
+                "architectures": ["Qwen3VLForConditionalGeneration"],
+                "text_config": {
+                    "num_hidden_layers": 36,
+                    "hidden_size": "not-an-integer",
+                },
+            }
+        ),
+    ],
+)
+def test_resolve_qwen_checkpoint_wraps_malformed_base_model_metadata(
+    tmp_path,
+    config_text,
+):
+    evaluation = _evaluation()
+    checkpoint, base_model = _write_checkpoint(tmp_path)
+    (base_model / "config.json").write_text(config_text, encoding="utf-8")
+
+    with pytest.raises(evaluation.EvaluationError):
+        evaluation.resolve_qwen_checkpoint(checkpoint)
+
+
+def test_resolve_qwen35_checkpoint_and_reject_cross_family_override(tmp_path):
+    evaluation = _evaluation()
+    checkpoint, base_model = _write_checkpoint(tmp_path, backbone_family="qwen3_5")
+
+    resolved = evaluation.resolve_qwen_checkpoint(checkpoint)
+
+    assert resolved.base_model_path == base_model.resolve()
+    assert resolved.config["model"]["backbone_family"] == "qwen3_5"
+
+    override = tmp_path / "qwen3-vl-override"
+    override.mkdir()
+    (override / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3VLForConditionalGeneration"],
+                "text_config": {"num_hidden_layers": 36, "hidden_size": 2560},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(evaluation.EvaluationError, match="backbone family qwen3_5"):
+        evaluation.resolve_qwen_checkpoint(checkpoint, model_path=override)
 
 
 def test_qwen_observation_and_action_conversion_match_libero_training_contract():

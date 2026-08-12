@@ -262,7 +262,7 @@ def inspect_data(arguments: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="qwen3-vl-groot",
-        description="Train a full-36-layer Qwen3-VL Bridge VLA with a GR00T-style action head.",
+        description="Train a Qwen3-VL or Qwen3.5 VLA with a GR00T-style action head.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

@@ -76,6 +76,7 @@ def test_compact_safetensors_round_trip(tmp_path):
     checkpoint_config = json.loads(
         (target / "policy_config.json").read_text(encoding="utf-8")
     )["config"]
+    assert checkpoint_config["model"]["backbone_family"] == "qwen3_vl"
     assert checkpoint_config["train"]["lora_learning_rate"] == pytest.approx(1e-5)
     assert checkpoint_config["train"]["head_learning_rate"] == pytest.approx(1e-4)
 
@@ -91,6 +92,27 @@ def test_compact_safetensors_round_trip(tmp_path):
         original["backbone.base_weight"] + 10,
     )
     np.testing.assert_array_equal(policy.action_q99.cpu().numpy(), np.ones(7))
+
+
+def test_qwen35_compact_manifest_records_backbone_family(tmp_path):
+    config = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_5_0_8b_groot_libero_4x4090.yaml"
+    )
+
+    target = save_compact_checkpoint(
+        DummyEngine(DummyCompactPolicy()),
+        tmp_path,
+        config=config,
+        model_path="/tmp/qwen35-base-model",
+        global_step=11,
+        validation_mae=None,
+    )
+
+    manifest = json.loads(
+        (target / "policy_config.json").read_text(encoding="utf-8")
+    )
+    assert manifest["format"] == "qwen3-vl-groot-bridge-compact-v1"
+    assert manifest["config"]["model"]["backbone_family"] == "qwen3_5"
 
 
 def test_latest_and_best_markers_reuse_steps_and_retain_only_references(tmp_path):

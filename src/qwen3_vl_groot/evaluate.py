@@ -22,7 +22,10 @@ SIMULATION_INFRASTRUCTURE_EXIT_CODE = 3
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate a compact Qwen3-VL-GR00T LoRA checkpoint in LIBERO-10"
+        description=(
+            "Evaluate a compact Qwen3-VL or Qwen3.5 GROOT LoRA checkpoint "
+            "in LIBERO-10"
+        )
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--model-path")

@@ -1,9 +1,9 @@
-# Qwen3-VL-4B-GR00T Bridge
+# Qwen3-VL / Qwen3.5 GROOT Bridge
 
 这是一个独立的 BridgeData V2 视觉—语言—动作（VLA）微调项目。它完整加载本地
-Qwen3-VL-4B-Instruct 的 36 层文本模型，在每一层注意力的
-`q_proj/k_proj/v_proj/o_proj` 上训练 LoRA，并从随机初始化的
-GR00T 风格 flow-matching DiT 动作头开始训练。
+Qwen3-VL-4B-Instruct 的 36 层文本模型，或 Qwen3.5-0.8B 的 24 层混合
+DeltaNet/全注意力文本模型，在全部文本 token-mixer 上训练 LoRA，并从随机初始化的
+GROOT 风格 flow-matching DiT 动作头开始训练。视觉塔和主干原始参数始终冻结。
 
 仓库同时包含与训练解耦的通用轨迹数据价值工具
 [TDUS](tdus/README.md)，用于直接从 LeRobot trajectory/chunk 计算 Quality、
@@ -36,11 +36,26 @@ pip install --index-url https://download.pytorch.org/whl/cu128 \
 pip install -e ".[test]"
 ```
 
+使用已有 pyenv Python 3.12 环境时，直接升级该环境并安装项目：
+
+```bash
+pyenv shell <python-3.12-env>
+python -m pip install --upgrade pip
+python -m pip install --upgrade -e ".[test]"
+```
+
+Qwen3.5 需要 Transformers 5；项目固定使用 `transformers==5.2.0` 和
+`peft==0.18.0`。DeltaNet 默认使用 Transformers 内置的 PyTorch 回退路径，
+不要求安装 `fla` 或 `causal-conv1d`。
+
 FlashAttention 2 是可选项；未安装时自动使用 PyTorch SDPA：
 
 ```bash
 pip install -e ".[flash]"
 ```
+
+Qwen3.5 在 Transformers 5.2 下的 `auto` 模式固定使用 SDPA，避免该版本
+FlashAttention varlen backward 的已知越界问题；Qwen3-VL 的自动选择行为不变。
 
 ## 训练
 
@@ -546,6 +561,19 @@ bash scripts/train_libero_qwen3_vl_4b_groot_all_tasks_4x4090.sh \
   --output-dir outputs/qwen3_vl_groot_libero
 ```
 
+Qwen3.5-0.8B 使用独立 Shell/YAML 入口，默认从
+`/data/dwb/models/Qwen3.5-0.8B` 加载 24 层、hidden size 1024 的多模态主干，
+并复用相同的 LIBERO 数据组合和 12 层 GROOT 动作头：
+
+```bash
+bash scripts/train_libero_qwen3_5_0_8b_groot_all_tasks_4x4090.sh \
+  --output-dir outputs/qwen3_5_0_8b_groot_libero
+```
+
+该入口默认直接读取主干最后一层 hidden state，不计算未使用的 LM logits。LoRA
+覆盖 6 个全注意力层的 `q_proj/k_proj/v_proj/o_proj`，以及 18 个 DeltaNet 层的
+`in_proj_qkv/in_proj_z/in_proj_b/in_proj_a/out_proj`；匹配范围严格限制在文本层。
+
 使用周期性 LoRA 调度的新入口：
 
 ```bash
@@ -685,8 +713,9 @@ assert actions.shape == (1, 8, 7)
 
 `evaluate_libero_qwen.sh` 只接受训练产出的具体 `step-XXXXXXXX` 紧凑
 checkpoint。该目录必须包含 `adapter_model.safetensors`、`policy_config.json` 和
-`normalization.json`；评测器加载本地 Qwen3-VL-4B 基座，再叠加其中的 LoRA 与
-GR00T action head，不解析训练输出根目录、`latest.json` 或 `best.json`。
+`normalization.json`；评测器根据 manifest 加载本地 Qwen3-VL-4B 或
+Qwen3.5-0.8B 基座，再叠加其中的 LoRA 与 GROOT action head，不解析
+训练输出根目录、`latest.json` 或 `best.json`。
 
 先对 LIBERO-10 index 5 执行单环境预检：
 
@@ -698,8 +727,10 @@ bash scripts/evaluate_libero_qwen.sh \
 ```
 
 基础模型默认从 checkpoint 的 `policy_config.json` 读取，也可以用
-`--model-path /data/dwb/models/Qwen3-VL-4B-Instruct` 显式覆盖。预检通过后可执行
-固定三个种子、每个种子一个初始状态、最多八步的 smoke test：
+`--model-path /data/dwb/models/Qwen3-VL-4B-Instruct` 或
+`--model-path /data/dwb/models/Qwen3.5-0.8B` 显式覆盖；覆盖路径必须与
+manifest 的 `backbone_family` 一致。预检通过后可执行固定三个种子、
+每个种子一个初始状态、最多八步的 smoke test：
 
 ```bash
 bash scripts/evaluate_libero_qwen.sh \

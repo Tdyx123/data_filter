@@ -1,40 +1,49 @@
 paths:
-  model: /data/dwb/models/Qwen3-VL-4B-Instruct
-  dataset: /data/dwb/datasets/bridge_orig_1.0.0_lerobo
-  output: outputs/qwen3_vl_4b_groot_bridge_4gpu
+  model: /data/dwb/models/Qwen3.5-0.8B
+  lerobot: /data/dwb/datasets/LIBERO_lerobot
+  output: null
 
 data:
-  image_key: observation.images.image_0
+  dataset_type: libero
+  prior_dataset: libero90
+  target_dataset: libero10_5
+  target_all_tasks: true
+  target_only: false
+  sample_weights: [1.0, 1.0]
+  prior_selection:
+    scores: /data/dwb/libero90_sqcn/filter/top10pct/scores.csv
+    top_percent: null
+    prefiltered: true
+    relcore_manifest: null
+    quality_filter_scores: null
+  image_key: observation.images.image
   state_key: observation.state
   action_key: action
   state_dim: 8
   action_dim: 7
   action_horizon: 8
-  split_seed: 42
-  validation_percent: 1
-  fallback_instruction: "Perform the demonstrated manipulation task."
-  train_crop_size: 230
+  train_crop_size: 115
   output_image_size: 256
   color_jitter:
     brightness: 0.2
     contrast: 0.2
     saturation: 0.2
     hue: 0.05
-  video_cache_episodes: 2
+  episode_cache_size: 2
   num_workers: 4
   prefetch_factor: 2
   normalization_epsilon: 1.0e-6
 
 model:
-  backbone_family: qwen3_vl
-  text_layers: 36
-  context_dim: 2560
+  backbone_family: qwen3_5
+  text_layers: 24
+  context_dim: 1024
   max_context_tokens: 512
-  context_forward: causal_lm
+  context_forward: backbone
   attn_implementation: auto
   gradient_checkpointing: false
   torch_compile:
-    enabled: true
+    enabled: false
     backend: inductor
     mode: default
     dynamic: true
@@ -45,7 +54,7 @@ model:
     dropout: 0.05
     target_modules:
       full_attention: [q_proj, k_proj, v_proj, o_proj]
-      linear_attention: []
+      linear_attention: [in_proj_qkv, in_proj_z, in_proj_b, in_proj_a, out_proj]
   dit:
     hidden_size: 1024
     num_layers: 12
@@ -74,9 +83,8 @@ train:
   lora_warmup_steps: 500
   max_grad_norm: 1.0
   log_every_steps: 10
-  eval_every_steps: 1000
   save_every_steps: 1000
-  validation_batches: 50
+  validation_enabled: false
   bf16: true
   deepspeed_stage: 2
   cpu_optimizer_offload: false

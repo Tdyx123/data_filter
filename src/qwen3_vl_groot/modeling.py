@@ -11,6 +11,12 @@ import torch
 from torch import nn
 from torch.autograd.profiler import record_function
 
+from .config import (
+    BACKBONE_CONTRACTS,
+    ConfigError,
+    backbone_contract,
+    normalized_lora_target_modules,
+)
 from .flow import (
     FlowMatchingActionHead,
     euler_denoise,
@@ -21,7 +27,17 @@ from .normalization import QuantileStats
 
 
 class ModelContractError(RuntimeError):
-    """Raised when the local Qwen checkpoint is not the expected 36-layer model."""
+    """Raised when a local Qwen checkpoint violates its declared backbone contract."""
+
+
+_TEXT_LAYER_PATH = re.compile(
+    r"(?:^|\.)language_model\.layers\.(\d+)\."
+    r"(?:self_attn|linear_attn)\.([^.]+)$"
+)
+_TEXT_LORA_PARAMETER_PATH = re.compile(
+    r"(?:^|\.)language_model\.layers\.\d+\."
+    r"(?:self_attn|linear_attn)\.[^.]+\.lora_"
+)
 
 
 def _configure_qwen_gradient_checkpointing(
@@ -50,8 +66,17 @@ def _flash_attention_available() -> bool:
         return False
 
 
-def select_attention_implementation(requested: str) -> str:
+def select_attention_implementation(
+    requested: str,
+    *,
+    backbone_family: str = "qwen3_vl",
+) -> str:
     if requested == "auto":
+        # Transformers 5.2 misroutes Qwen3.5's packed vision tokens through
+        # FlashAttention varlen backward. Keep the safe PyTorch path for this
+        # family while preserving Qwen3-VL's existing auto-selection behavior.
+        if backbone_family == "qwen3_5":
+            return "sdpa"
         return "flash_attention_2" if _flash_attention_available() else "sdpa"
     if requested not in {"flash_attention_2", "sdpa", "eager"}:
         raise ValueError(f"Unknown attention implementation: {requested}")
@@ -62,23 +87,118 @@ def select_attention_implementation(requested: str) -> str:
     return requested
 
 
-def inspect_qwen_config(model_path: str | Path) -> dict[str, Any]:
+def _family_from_architectures(architectures: Any) -> str:
+    if not isinstance(architectures, list):
+        raise ModelContractError(f"Qwen architectures must be a list, found {architectures!r}")
+    matches = [
+        family
+        for family, contract in BACKBONE_CONTRACTS.items()
+        if contract["architecture"] in architectures
+    ]
+    if len(matches) != 1:
+        expected = sorted(
+            str(contract["architecture"])
+            for contract in BACKBONE_CONTRACTS.values()
+        )
+        raise ModelContractError(
+            f"Expected exactly one supported Qwen architecture from {expected}, "
+            f"found {architectures}"
+        )
+    return matches[0]
+
+
+def _layer_types_from_qwen_config(
+    config: dict[str, Any],
+    *,
+    family: str,
+) -> tuple[str, ...]:
+    text = config["text_config"]
+    layer_count = int(text["num_hidden_layers"])
+    if family == "qwen3_vl":
+        return ("full_attention",) * layer_count
+    raw_layer_types = text.get("layer_types")
+    if not isinstance(raw_layer_types, list) or len(raw_layer_types) != layer_count:
+        raise ModelContractError(
+            f"Qwen3.5 text_config.layer_types must contain {layer_count} entries"
+        )
+    layer_types = tuple(str(layer_type) for layer_type in raw_layer_types)
+    unknown = set(layer_types).difference({"full_attention", "linear_attention"})
+    if unknown:
+        raise ModelContractError(f"Unknown Qwen3.5 layer types: {sorted(unknown)}")
+    return layer_types
+
+
+def inspect_qwen_config(
+    model_path: str | Path,
+    *,
+    expected_family: str | None = None,
+) -> dict[str, Any]:
     path = Path(model_path).expanduser().resolve() / "config.json"
     if not path.is_file():
         raise ModelContractError(f"Missing Qwen config: {path}")
-    with path.open("r", encoding="utf-8") as handle:
-        config = json.load(handle)
-    architecture = config.get("architectures", [])
-    text = config.get("text_config", {})
-    if "Qwen3VLForConditionalGeneration" not in architecture:
-        raise ModelContractError(f"Expected Qwen3VLForConditionalGeneration, found {architecture}")
-    if int(text.get("num_hidden_layers", -1)) != 36:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ModelContractError(f"Invalid Qwen config JSON: {path}") from error
+    if not isinstance(config, dict):
+        raise ModelContractError(f"Qwen config must be a JSON object: {path}")
+    family = _family_from_architectures(config.get("architectures", []))
+    if expected_family is not None and family != expected_family:
         raise ModelContractError(
-            f"Expected all 36 Qwen text layers, found {text.get('num_hidden_layers')}"
+            f"Expected backbone family {expected_family}, found {family}"
         )
-    if int(text.get("hidden_size", -1)) != 2560:
-        raise ModelContractError(f"Expected hidden_size=2560, found {text.get('hidden_size')}")
+    try:
+        contract = backbone_contract({"backbone_family": family})
+    except ConfigError as error:
+        raise ModelContractError(str(error)) from error
+    text = config.get("text_config")
+    if not isinstance(text, dict):
+        raise ModelContractError("Qwen config must contain a text_config mapping")
+    expected_layers = int(contract["text_layers"])
+    expected_context_dim = int(contract["context_dim"])
+    try:
+        actual_layers = int(text.get("num_hidden_layers", -1))
+        actual_context_dim = int(text.get("hidden_size", -1))
+    except (TypeError, ValueError) as error:
+        raise ModelContractError(
+            "Qwen text_config num_hidden_layers and hidden_size must be integers"
+        ) from error
+    if actual_layers != expected_layers:
+        raise ModelContractError(
+            f"Expected all {expected_layers} {contract['display_name']} text layers, "
+            f"found {text.get('num_hidden_layers')}"
+        )
+    if actual_context_dim != expected_context_dim:
+        raise ModelContractError(
+            f"Expected {contract['display_name']} hidden_size={expected_context_dim}, "
+            f"found {text.get('hidden_size')}"
+        )
+    layer_types = _layer_types_from_qwen_config(config, family=family)
+    actual_counts = {
+        layer_type: layer_types.count(layer_type)
+        for layer_type in ("full_attention", "linear_attention")
+    }
+    if actual_counts != contract["layer_type_counts"]:
+        raise ModelContractError(
+            f"Expected {contract['display_name']} layer type counts "
+            f"{contract['layer_type_counts']}, found {actual_counts}"
+        )
     return config
+
+
+def lora_target_pattern(model_config: dict[str, Any]) -> str:
+    targets = normalized_lora_target_modules(model_config)
+    branches = []
+    if targets["full_attention"]:
+        names = "|".join(re.escape(name) for name in targets["full_attention"])
+        branches.append(rf"self_attn\.(?:{names})")
+    if targets["linear_attention"]:
+        names = "|".join(re.escape(name) for name in targets["linear_attention"])
+        branches.append(rf"linear_attn\.(?:{names})")
+    if not branches:
+        raise ModelContractError("At least one text LoRA target module is required")
+    return rf".*language_model\.layers\.\d+\.(?:{'|'.join(branches)})$"
 
 
 def load_qwen_backbone(
@@ -88,14 +208,16 @@ def load_qwen_backbone(
     from peft import LoraConfig, TaskType, get_peft_model
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
-    inspect_qwen_config(model_path)
+    family = str(model_config.get("backbone_family", "qwen3_vl"))
+    qwen_config = inspect_qwen_config(model_path, expected_family=family)
     attention_implementation = select_attention_implementation(
-        model_config["attn_implementation"]
+        model_config["attn_implementation"],
+        backbone_family=family,
     )
     backbone = AutoModelForImageTextToText.from_pretrained(
         str(model_path),
         local_files_only=True,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         attn_implementation=attention_implementation,
         low_cpu_mem_usage=True,
     )
@@ -116,13 +238,14 @@ def load_qwen_backbone(
         lora_alpha=int(lora["alpha"]),
         lora_dropout=float(lora["dropout"]),
         bias="none",
-        target_modules=list(lora["target_modules"]),
+        target_modules=lora_target_pattern(model_config),
     )
     backbone = get_peft_model(backbone, peft_config)
+    layer_types = _layer_types_from_qwen_config(qwen_config, family=family)
     assert_full_lora_coverage(
         backbone,
-        expected_layers=int(model_config["text_layers"]),
-        targets=tuple(lora["target_modules"]),
+        layer_types=layer_types,
+        targets_by_layer_type=normalized_lora_target_modules(model_config),
     )
     assert_qwen_freeze_contract(backbone)
     return backbone, processor
@@ -130,11 +253,10 @@ def load_qwen_backbone(
 
 def lora_coverage(model: nn.Module) -> dict[int, set[str]]:
     coverage: dict[int, set[str]] = {}
-    pattern = re.compile(r"(?:language_model\.)?layers\.(\d+)\..*?\.(q_proj|k_proj|v_proj|o_proj)$")
     for name, module in model.named_modules():
         if not hasattr(module, "lora_A"):
             continue
-        match = pattern.search(name)
+        match = _TEXT_LAYER_PATH.search(name)
         if match:
             coverage.setdefault(int(match.group(1)), set()).add(match.group(2))
     return coverage
@@ -145,11 +267,25 @@ def assert_full_lora_coverage(
     *,
     expected_layers: int = 36,
     targets: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj"),
+    layer_types: Sequence[str] | None = None,
+    targets_by_layer_type: dict[str, tuple[str, ...]] | None = None,
 ) -> None:
+    if layer_types is None:
+        layer_types = ("full_attention",) * expected_layers
+    else:
+        layer_types = tuple(layer_types)
+        expected_layers = len(layer_types)
+    if targets_by_layer_type is None:
+        targets_by_layer_type = {
+            "full_attention": tuple(targets),
+            "linear_attention": (),
+        }
     coverage = lora_coverage(model)
     missing: list[str] = []
-    expected_targets = set(targets)
-    for layer in range(expected_layers):
+    for layer, layer_type in enumerate(layer_types):
+        if layer_type not in targets_by_layer_type:
+            raise ModelContractError(f"Missing LoRA target group for {layer_type}")
+        expected_targets = set(targets_by_layer_type[layer_type])
         absent = expected_targets.difference(coverage.get(layer, set()))
         if absent:
             missing.append(f"layer {layer}: {sorted(absent)}")
@@ -159,7 +295,8 @@ def assert_full_lora_coverage(
         if len(missing) > 8:
             detail += f"; ... ({len(missing)} layers incomplete)"
         raise ModelContractError(
-            "LoRA was not installed on every attention projection of all 36 text layers. "
+            f"LoRA was not installed on every token-mixer projection of all "
+            f"{expected_layers} text layers. "
             f"{detail}; unexpected layers={unexpected}"
         )
 
@@ -168,11 +305,15 @@ def assert_qwen_freeze_contract(model: nn.Module) -> None:
     violations = [
         name
         for name, parameter in model.named_parameters()
-        if parameter.requires_grad and "lora_" not in name
+        if parameter.requires_grad
+        and (
+            "lora_" not in name
+            or _TEXT_LORA_PARAMETER_PATH.search(name) is None
+        )
     ]
     if violations:
         raise ModelContractError(
-            "Original Qwen parameters must remain frozen; trainable non-LoRA parameters: "
+            "Only text token-mixer LoRA parameters may be trainable; violations: "
             + ", ".join(violations[:10])
         )
 

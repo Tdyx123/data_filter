@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+import re
 
 import pytest
 
@@ -13,8 +14,10 @@ from qwen3_vl_groot.modeling import (  # noqa: E402
     assert_full_lora_coverage,
     assert_qwen_freeze_contract,
     compile_policy_modules,
+    lora_target_pattern,
     lora_coverage,
     resolve_compile_targets,
+    select_attention_implementation,
 )
 from qwen3_vl_groot.config import load_config  # noqa: E402
 from qwen3_vl_groot.inference import BridgePolicy  # noqa: E402
@@ -22,6 +25,23 @@ from qwen3_vl_groot.normalization import QuantileStats  # noqa: E402
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_qwen35_auto_attention_uses_sdpa_when_flash_attention_is_installed(
+    monkeypatch,
+):
+    import qwen3_vl_groot.modeling as modeling
+
+    monkeypatch.setattr(modeling, "_flash_attention_available", lambda: True)
+
+    assert (
+        select_attention_implementation("auto", backbone_family="qwen3_5")
+        == "sdpa"
+    )
+    assert (
+        select_attention_implementation("auto", backbone_family="qwen3_vl")
+        == "flash_attention_2"
+    )
 
 
 class FakeLoraLinear(nn.Linear):
@@ -48,11 +68,37 @@ class FakeLayer(nn.Module):
         self.self_attn = FakeAttention()
 
 
+class FakeLinearAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.in_proj_qkv = FakeLoraLinear()
+        self.in_proj_z = FakeLoraLinear()
+        self.in_proj_b = FakeLoraLinear()
+        self.in_proj_a = FakeLoraLinear()
+        self.out_proj = FakeLoraLinear()
+
+
+class FakeLinearLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear_attn = FakeLinearAttention()
+
+
 class FakeBackbone(nn.Module):
     def __init__(self, layers=36):
         super().__init__()
         self.language_model = nn.Module()
         self.language_model.layers = nn.ModuleList([FakeLayer() for _ in range(layers)])
+
+
+class FakeHybridBackbone(nn.Module):
+    def __init__(self, layer_types):
+        super().__init__()
+        self.language_model = nn.Module()
+        self.language_model.layers = nn.ModuleList(
+            FakeLinearLayer() if layer_type == "linear_attention" else FakeLayer()
+            for layer_type in layer_types
+        )
 
 
 class FakeContextModel(nn.Module):
@@ -159,6 +205,66 @@ def test_missing_projection_is_rejected():
     model.language_model.layers[17].self_attn.o_proj = nn.Linear(4, 4)
     with pytest.raises(RuntimeError, match="layer 17"):
         assert_full_lora_coverage(model)
+
+
+def test_visual_tower_lora_parameters_are_rejected_by_freeze_contract():
+    model = FakeBackbone()
+    model.visual = nn.Module()
+    model.visual.attn = FakeAttention()
+
+    with pytest.raises(RuntimeError, match="visual"):
+        assert_qwen_freeze_contract(model)
+
+
+def test_qwen35_hybrid_layers_have_family_specific_lora_targets():
+    layer_types = tuple(
+        layer_type
+        for _ in range(6)
+        for layer_type in (
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        )
+    )
+    targets = {
+        "full_attention": ("q_proj", "k_proj", "v_proj", "o_proj"),
+        "linear_attention": (
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_b",
+            "in_proj_a",
+            "out_proj",
+        ),
+    }
+    model = FakeHybridBackbone(layer_types)
+
+    coverage = lora_coverage(model)
+
+    assert len(coverage) == 24
+    assert coverage[0] == set(targets["linear_attention"])
+    assert coverage[3] == set(targets["full_attention"])
+    assert_full_lora_coverage(
+        model,
+        layer_types=layer_types,
+        targets_by_layer_type=targets,
+    )
+
+
+def test_qwen35_lora_target_pattern_matches_only_text_token_mixers():
+    config = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_5_0_8b_groot_libero_4x4090.yaml"
+    )
+    pattern = re.compile(lora_target_pattern(config["model"]))
+
+    assert pattern.fullmatch(
+        "model.language_model.layers.0.linear_attn.in_proj_qkv"
+    )
+    assert pattern.fullmatch(
+        "base_model.model.model.language_model.layers.3.self_attn.q_proj"
+    )
+    assert not pattern.fullmatch("model.visual.blocks.0.attn.q_proj")
+    assert not pattern.fullmatch("model.language_model.layers.0.mlp.up_proj")
 
 
 def test_direct_context_forward_skips_lm_head_and_preserves_lora_gradients():

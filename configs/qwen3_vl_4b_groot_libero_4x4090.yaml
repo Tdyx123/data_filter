@@ -35,6 +35,7 @@ data:
   normalization_epsilon: 1.0e-6
 
 model:
+  backbone_family: qwen3_vl
   text_layers: 36
   context_dim: 2560
   max_context_tokens: 512
@@ -51,7 +52,9 @@ model:
     rank: 16
     alpha: 32
     dropout: 0.05
-    target_modules: [q_proj, k_proj, v_proj, o_proj]
+    target_modules:
+      full_attention: [q_proj, k_proj, v_proj, o_proj]
+      linear_attention: []
   dit:
     hidden_size: 1024
     num_layers: 12

@@ -6,6 +6,7 @@ from qwen3_vl_groot.config import apply_overrides, load_config
 from qwen3_vl_groot.preflight import (
     PreflightError,
     _build_memory_probe_batch,
+    _memory_probe_model_description,
     _memory_probe_result,
 )
 
@@ -75,6 +76,16 @@ def test_memory_probe_accepts_reserved_memory_at_22_gib():
     assert result["reserved_headroom_gib"] == pytest.approx(0.0)
 
 
+def test_qwen35_memory_probe_description_uses_declared_backbone_contract():
+    config = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_5_0_8b_groot_libero_4x4090.yaml"
+    )
+
+    assert _memory_probe_model_description(config) == (
+        "24-layer Qwen3.5-0.8B + 12-layer GROOT DiT"
+    )
+
+
 def test_libero_target_only_preflight_does_not_access_prior(tmp_path, monkeypatch):
     if not (LIBERO_ROOT / "libero10_5").is_dir():
         pytest.skip("LIBERO-10 LeRobot data is not mounted")
@@ -96,7 +107,10 @@ def test_libero_target_only_preflight_does_not_access_prior(tmp_path, monkeypatc
     monkeypatch.setattr(
         preflight,
         "_inspect_qwen_config",
-        lambda _path: {"text_layers": 36},
+        lambda _path, expected_family=None: {
+            "text_layers": 36,
+            "backbone_family": expected_family,
+        },
     )
 
     report = preflight.validate_paths_and_data(config, decode_samples=False)

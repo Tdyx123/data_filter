@@ -14,8 +14,16 @@ CYCLIC_LIBERO_SCRIPT = (
     / "scripts"
     / "train_libero_qwen3_vl_4b_groot_cyclic_lora_all_tasks_4x4090.sh"
 )
+QWEN35_LIBERO_SCRIPT = (
+    PROJECT_ROOT
+    / "scripts"
+    / "train_libero_qwen3_5_0_8b_groot_all_tasks_4x4090.sh"
+)
 BRIDGE_SCRIPT = PROJECT_ROOT / "scripts" / "train_bridge_4x4090.sh"
 LIBERO_CONFIG = PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
+QWEN35_LIBERO_CONFIG = (
+    PROJECT_ROOT / "configs" / "qwen3_5_0_8b_groot_libero_4x4090.yaml"
+)
 BRIDGE_CONFIG = PROJECT_ROOT / "configs" / "bridge_4x4090.yaml"
 SQCN_SCORES = "/data/dwb/libero90_sqcn/filter/top10pct/scores.csv"
 
@@ -134,6 +142,93 @@ def test_libero_script_preserves_explicit_weights_and_prior_mode(tmp_path):
             relcore,
             "--output-dir",
             "outputs/libero-relcore",
+            "--preflight-only",
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        check=True,
+    )
+
+    arguments = calls.read_text(encoding="utf-8").splitlines()
+    assert arguments.count("--sample-weights") == 1
+    weight_index = arguments.index("--sample-weights")
+    assert arguments[weight_index + 1 : weight_index + 3] == ["3", "1"]
+    assert arguments[arguments.index("--prior-relcore-manifest") + 1] == relcore
+    assert "--prior-prefiltered-scores" not in arguments
+
+
+def test_qwen35_libero_script_uses_independent_config_and_default_mixture(tmp_path):
+    environment, calls = _fake_python_environment(tmp_path)
+
+    subprocess.run(
+        [
+            "bash",
+            str(QWEN35_LIBERO_SCRIPT),
+            "--output-dir",
+            "outputs/qwen35-libero",
+            "--lora-learning-rate",
+            "5e-6",
+            "--action-head-learning-rate",
+            "2e-4",
+            "--preflight-only",
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        check=True,
+    )
+
+    arguments = calls.read_text(encoding="utf-8").splitlines()
+    assert arguments[:3] == ["-m", "qwen3_vl_groot.cli", "launch"]
+    assert arguments[arguments.index("--config") + 1] == str(QWEN35_LIBERO_CONFIG)
+    assert str(LIBERO_CONFIG) not in arguments
+    assert "--all-tasks" in arguments
+    weight_index = arguments.index("--sample-weights")
+    assert arguments[weight_index + 1 : weight_index + 3] == ["1", "1"]
+    assert arguments[arguments.index("--prior-prefiltered-scores") + 1] == SQCN_SCORES
+    assert arguments[arguments.index("--lora-learning-rate") + 1] == "5e-6"
+    assert arguments[arguments.index("--action-head-learning-rate") + 1] == "2e-4"
+    assert arguments.index("--output-dir") > arguments.index("--prior-prefiltered-scores")
+    assert arguments[-1] == "--preflight-only"
+
+
+def test_qwen35_libero_target_only_skips_mixture_defaults(tmp_path):
+    environment, calls = _fake_python_environment(tmp_path)
+
+    subprocess.run(
+        [
+            "bash",
+            str(QWEN35_LIBERO_SCRIPT),
+            "--target-only",
+            "--output-dir",
+            "outputs/qwen35-target-only",
+            "--preflight-only",
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        check=True,
+    )
+
+    arguments = calls.read_text(encoding="utf-8").splitlines()
+    assert "--target-only" in arguments
+    assert "--sample-weights" not in arguments
+    assert "--prior-prefiltered-scores" not in arguments
+
+
+def test_qwen35_libero_preserves_explicit_weights_and_prior(tmp_path):
+    environment, calls = _fake_python_environment(tmp_path)
+    relcore = "/data/relcore/qwen35-selected.jsonl"
+
+    subprocess.run(
+        [
+            "bash",
+            str(QWEN35_LIBERO_SCRIPT),
+            "--sample-weights",
+            "3",
+            "1",
+            "--prior-relcore-manifest",
+            relcore,
+            "--output-dir",
+            "outputs/qwen35-relcore",
             "--preflight-only",
         ],
         cwd=PROJECT_ROOT,

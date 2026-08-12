@@ -6,6 +6,7 @@ from qwen3_vl_groot.config import (
     ConfigError,
     apply_overrides,
     load_config,
+    normalized_lora_target_modules,
     resolved_paths,
     save_resolved_config,
     validate_config,
@@ -13,6 +14,7 @@ from qwen3_vl_groot.config import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+QWEN35_CONFIG = PROJECT_ROOT / "configs" / "qwen3_5_0_8b_groot_libero_4x4090.yaml"
 
 
 @pytest.mark.parametrize(
@@ -140,3 +142,63 @@ def test_lora_schedule_overrides_are_applied():
     assert config["train"]["lora_freeze_steps"] == 5_000
     assert config["train"]["lora_cycle_steps"] == 100
     assert config["train"]["lora_active_steps"] == 10
+
+
+def test_qwen35_libero_config_keeps_groot_head_and_effective_batch_64():
+    config = load_config(QWEN35_CONFIG)
+
+    assert config["paths"]["model"] == "/data/dwb/models/Qwen3.5-0.8B"
+    assert config["model"]["backbone_family"] == "qwen3_5"
+    assert config["model"]["text_layers"] == 24
+    assert config["model"]["context_dim"] == 1024
+    assert config["model"]["context_forward"] == "backbone"
+    assert config["model"]["lora"]["target_modules"] == {
+        "full_attention": ["q_proj", "k_proj", "v_proj", "o_proj"],
+        "linear_attention": [
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_b",
+            "in_proj_a",
+            "out_proj",
+        ],
+    }
+    assert config["model"]["dit"] == {
+        "hidden_size": 1024,
+        "num_layers": 12,
+        "num_heads": 16,
+        "mlp_ratio": 4,
+        "dropout": 0.2,
+    }
+    assert config["data"]["action_horizon"] == 8
+    effective_batch = (
+        config["train"]["gpu_count"]
+        * config["train"]["micro_batch_size"]
+        * config["train"]["gradient_accumulation_steps"]
+    )
+    assert effective_batch == 64
+
+
+def test_qwen35_config_rejects_qwen3_vl_dimensions():
+    config = load_config(QWEN35_CONFIG)
+    config["model"]["text_layers"] = 36
+    config["model"]["context_dim"] = 2560
+
+    with pytest.raises(ConfigError, match="Qwen3.5-0.8B requires"):
+        validate_config(config)
+
+
+def test_qwen3_vl_legacy_flat_lora_targets_remain_supported():
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
+    config["model"]["lora"]["target_modules"] = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+    ]
+
+    validate_config(config)
+
+    assert normalized_lora_target_modules(config["model"]) == {
+        "full_attention": ("q_proj", "k_proj", "v_proj", "o_proj"),
+        "linear_attention": (),
+    }

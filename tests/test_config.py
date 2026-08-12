@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,7 @@ from qwen3_vl_groot.config import (
     load_config,
     validate_config,
 )
-from qwen3_vl_groot.modeling import inspect_qwen_config
+from qwen3_vl_groot.modeling import ModelContractError, inspect_qwen_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,14 +17,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def test_default_config_keeps_all_qwen_layers():
     config = load_config(PROJECT_ROOT / "configs" / "bridge_8x4090.yaml")
+    assert config["model"]["backbone_family"] == "qwen3_vl"
     assert config["model"]["text_layers"] == 36
     assert config["model"]["context_dim"] == 2560
-    assert config["model"]["lora"]["target_modules"] == [
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-    ]
+    assert config["model"]["lora"]["target_modules"] == {
+        "full_attention": ["q_proj", "k_proj", "v_proj", "o_proj"],
+        "linear_attention": [],
+    }
     assert "keep_last_checkpoints" not in config["train"]
 
 
@@ -104,3 +104,56 @@ def test_local_qwen_is_36_layers():
     config = inspect_qwen_config(model_path)
     assert config["text_config"]["num_hidden_layers"] == 36
     assert config["text_config"]["hidden_size"] == 2560
+
+
+def test_local_qwen35_is_24_layers_with_1024_hidden_size():
+    model_path = Path("/data/dwb/models/Qwen3.5-0.8B")
+    if not model_path.is_dir():
+        pytest.skip("Local Qwen3.5 checkpoint is not available")
+    config = inspect_qwen_config(model_path, expected_family="qwen3_5")
+    assert config["text_config"]["num_hidden_layers"] == 24
+    assert config["text_config"]["hidden_size"] == 1024
+
+
+@pytest.mark.parametrize(
+    ("text_config_override", "message"),
+    [
+        ({"num_hidden_layers": 23}, "24 Qwen3.5-0.8B text layers"),
+        ({"hidden_size": 2048}, "hidden_size=1024"),
+        ({"layer_types": ["full_attention"] * 24}, "layer type counts"),
+    ],
+)
+def test_qwen35_rejects_incompatible_text_metadata(
+    tmp_path,
+    text_config_override,
+    message,
+):
+    model_path = tmp_path / "qwen35"
+    model_path.mkdir()
+    text_config = {
+        "num_hidden_layers": 24,
+        "hidden_size": 1024,
+        "layer_types": [
+            layer_type
+            for _ in range(6)
+            for layer_type in (
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            )
+        ],
+    }
+    text_config.update(text_config_override)
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "text_config": text_config,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ModelContractError, match=message):
+        inspect_qwen_config(model_path, expected_family="qwen3_5")

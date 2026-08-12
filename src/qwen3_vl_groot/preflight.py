@@ -10,7 +10,7 @@ import numpy as np
 
 from libero_lerobot.sampling import ACTION_WINDOW_POLICY, sample_counts_per_batch
 
-from .config import resolved_paths
+from .config import backbone_contract, resolved_paths
 from .data import (
     BridgeEpisodeDataset,
     BridgeMetadata,
@@ -92,10 +92,14 @@ def _memory_probe_result(
     }
 
 
-def _inspect_qwen_config(model_path: Path) -> dict[str, Any]:
+def _inspect_qwen_config(
+    model_path: Path,
+    *,
+    expected_family: str | None = None,
+) -> dict[str, Any]:
     from .modeling import inspect_qwen_config
 
-    return inspect_qwen_config(model_path)
+    return inspect_qwen_config(model_path, expected_family=expected_family)
 
 
 def _libero_sample_report(
@@ -203,6 +207,7 @@ def _validate_libero_paths_and_data(
         "model_path": str(paths["model"]),
         "lerobot_path": str(paths["lerobot"]),
         "qwen_text_layers": int(config["model"]["text_layers"]),
+        "backbone_family": str(config["model"].get("backbone_family", "qwen3_vl")),
         "target": target_report,
         "prior": prior_report,
         "sample_weights": list(sources.sample_weights),
@@ -220,7 +225,8 @@ def _validate_libero_paths_and_data(
 
 def validate_paths_and_data(config: dict[str, Any], *, decode_samples: bool = True) -> dict[str, Any]:
     model_path = Path(config["paths"]["model"]).expanduser().resolve()
-    _inspect_qwen_config(model_path)
+    family = str(config["model"].get("backbone_family", "qwen3_vl"))
+    _inspect_qwen_config(model_path, expected_family=family)
     if config["data"].get("dataset_type", "bridge") == "libero":
         return _validate_libero_paths_and_data(
             config,
@@ -238,7 +244,8 @@ def validate_paths_and_data(config: dict[str, Any], *, decode_samples: bool = Tr
     return {
         "model_path": str(model_path),
         "dataset_path": str(dataset_path),
-        "qwen_text_layers": 36,
+        "qwen_text_layers": int(config["model"]["text_layers"]),
+        "backbone_family": family,
         "train_episodes": len(train_episodes),
         "validation_episodes": len(validation_episodes),
         "sampled_episodes": samples,
@@ -283,6 +290,16 @@ def _identity_stats(config: dict[str, Any]) -> QuantileStats:
         state_q99=np.full(state_dim, 1.0, dtype=np.float32),
         action_q01=np.full(action_dim, -1.0, dtype=np.float32),
         action_q99=np.full(action_dim, 1.0, dtype=np.float32),
+    )
+
+
+def _memory_probe_model_description(config: dict[str, Any]) -> str:
+    contract = backbone_contract(config["model"])
+    text_layers = int(config["model"]["text_layers"])
+    dit_layers = int(config["model"]["dit"]["num_layers"])
+    return (
+        f"{text_layers}-layer {contract['display_name']} + "
+        f"{dit_layers}-layer GROOT DiT"
     )
 
 
@@ -370,7 +387,7 @@ def probe_single_gpu_memory(config: dict[str, Any]) -> dict[str, Any]:
         )
     except torch.OutOfMemoryError as error:
         raise PreflightError(
-            "The full 36-layer Qwen + 12-layer DiT cannot complete "
+            f"The full {_memory_probe_model_description(config)} cannot complete "
             f"micro-batch {micro_batch_size} "
             "on a single 24GB GPU with ZeRO-2. Retry with --deepspeed-stage 3 "
             "(CPU optimizer offload). The model definition and layer count were not changed."

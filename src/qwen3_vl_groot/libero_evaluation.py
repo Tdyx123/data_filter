@@ -102,28 +102,13 @@ def _require_integer(mapping: Mapping[str, Any], key: str, expected: int) -> Non
         )
 
 
-def _validate_base_model(path: Path) -> None:
-    config_path = path / "config.json"
-    config = _read_json(config_path, "Qwen base-model config")
-    architectures = config.get("architectures", [])
-    text_config = config.get("text_config", {})
-    if "Qwen3VLForConditionalGeneration" not in architectures:
-        raise EvaluationError(
-            f"Expected Qwen3VLForConditionalGeneration in {config_path}, "
-            f"found {architectures}"
-        )
-    if not isinstance(text_config, Mapping):
-        raise EvaluationError(f"Missing text_config in Qwen base-model config: {config_path}")
+def _validate_base_model(path: Path, *, expected_family: str) -> None:
+    from .modeling import ModelContractError, inspect_qwen_config
+
     try:
-        layers = int(text_config["num_hidden_layers"])
-        hidden_size = int(text_config["hidden_size"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise EvaluationError(f"Invalid Qwen text_config in {config_path}") from error
-    if layers != 36 or hidden_size != 2560:
-        raise EvaluationError(
-            "Qwen base model must have 36 text layers and hidden_size=2560; "
-            f"found layers={layers}, hidden_size={hidden_size}"
-        )
+        inspect_qwen_config(path, expected_family=expected_family)
+    except ModelContractError as error:
+        raise EvaluationError(str(error)) from error
 
 
 @dataclass(frozen=True)
@@ -190,6 +175,10 @@ def resolve_qwen_checkpoint(
     _require_integer(data, "state_dim", PROPRIO_DIM)
     _require_integer(data, "action_dim", ACTION_DIM)
     _require_integer(data, "action_horizon", ACTION_HORIZON)
+    model_config = config.get("model", {})
+    if not isinstance(model_config, Mapping):
+        raise EvaluationError("Qwen policy config model section must be a mapping")
+    backbone_family = str(model_config.get("backbone_family", "qwen3_vl"))
     for key in ("train_crop_size", "output_image_size"):
         try:
             size = int(data[key])
@@ -220,7 +209,7 @@ def resolve_qwen_checkpoint(
     base_model = Path(raw_base_model).expanduser().resolve()
     if not base_model.is_dir():
         raise EvaluationError(f"Qwen base model does not exist: {base_model}")
-    _validate_base_model(base_model)
+    _validate_base_model(base_model, expected_family=backbone_family)
     try:
         global_step = int(manifest["global_step"])
     except (KeyError, TypeError, ValueError) as error:
