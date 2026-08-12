@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from libero_lerobot.sampling import sample_counts_per_batch
+from libero_lerobot.sampling import ACTION_WINDOW_POLICY, sample_counts_per_batch
 
 from .config import resolved_paths
 from .data import BridgeEpisodeDataset, BridgeMetadata, validate_episode
@@ -107,6 +107,7 @@ def _validate_libero_paths_and_data(
                 "mode": "full_dataset",
                 "episodes": len(prior_dataset.metadata.episodes),
                 "frames": len(prior_dataset),
+                "boundary_policy": ACTION_WINDOW_POLICY,
                 "metadata_sha256": prior_dataset.metadata.metadata_sha256(),
             }
         else:
@@ -124,6 +125,7 @@ def _validate_libero_paths_and_data(
     )
     return {
         "dataset_type": "libero",
+        "action_window_policy": ACTION_WINDOW_POLICY,
         "model_path": str(paths["model"]),
         "lerobot_path": str(paths["lerobot"]),
         "qwen_text_layers": int(config["model"]["text_layers"]),

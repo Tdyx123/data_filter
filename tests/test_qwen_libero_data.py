@@ -91,7 +91,7 @@ def test_qwen_prefiltered_scores_load_without_adjacent_manifests(
     selection = sources.prior_selection
     assert selection is not None
     assert selection.input_format == input_format
-    assert selection.frame_indices == tuple(range(8))
+    assert selection.frame_indices == tuple(range(15))
     manifest = selection.as_manifest()
     assert manifest["mode"] == "prefiltered_fragments"
     assert manifest["source_path"] == str(scores.resolve())
@@ -99,6 +99,7 @@ def test_qwen_prefiltered_scores_load_without_adjacent_manifests(
     assert "run_manifest_path" not in manifest
     assert "top_percent" not in manifest
     assert manifest["ordering"] == ["source row order"]
+    assert manifest["boundary_policy"] == "episode_tail_repeat_last_action"
 
 
 def test_qwen_libero_sample_reads_only_primary_image_and_raw_action_window():
@@ -129,7 +130,7 @@ def test_qwen_libero_sample_reads_only_primary_image_and_raw_action_window():
     )
 
 
-def test_qwen_libero_tail_action_window_is_zero_padded_and_masked():
+def test_qwen_libero_tail_action_window_repeats_episode_end_and_stays_valid():
     if not DATASET.is_dir():
         pytest.skip("LIBERO-10 LeRobot data is not mounted")
     from qwen3_vl_groot.libero_data import QwenLiberoFrameDataset
@@ -146,11 +147,11 @@ def test_qwen_libero_tail_action_window_is_zero_padded_and_masked():
 
     sample = dataset[316]
 
+    np.testing.assert_array_equal(sample["action_mask"], np.ones(8, dtype=np.float32))
     np.testing.assert_array_equal(
-        sample["action_mask"],
-        np.asarray([1, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32),
+        sample["actions"][1:],
+        np.repeat(sample["actions"][:1], 7, axis=0),
     )
-    np.testing.assert_array_equal(sample["actions"][1:], np.zeros((7, 7), dtype=np.float32))
 
 
 def test_target_only_source_resolution_never_opens_prior_dataset(tmp_path):
@@ -306,6 +307,7 @@ def test_target_only_manifest_records_selection_normalization_and_learning_rates
     )
 
     assert manifest["training_mode"] == "target_only"
+    assert manifest["action_window_policy"] == "episode_tail_repeat_last_action"
     assert manifest["sample_weights"] == [1.0]
     assert manifest["target"]["selection"]["episodes"] == 50
     assert manifest["prior"] is None

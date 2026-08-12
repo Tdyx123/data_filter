@@ -13,6 +13,7 @@ import numpy as np
 
 from .errors import LiberoDataError
 from .metadata import LeRobotV2Metadata
+from .sampling import ACTION_WINDOW_POLICY, expand_fragment_frame_indices
 
 
 SCORE_COLUMNS = {
@@ -142,7 +143,7 @@ class PriorSelection:
             "training_starts": self.training_starts,
             "action_horizon": self.action_horizon,
             "ordering": ["tdus desc", "length asc", "sample_id asc"],
-            "boundary_policy": "complete_action_window",
+            "boundary_policy": ACTION_WINDOW_POLICY,
             "overlap_policy": "deduplicate_episode_frame_start",
             "selection_sha256": self.selection_sha256,
         }
@@ -187,7 +188,7 @@ class PrefilteredPriorSelection:
             "training_starts": self.training_starts,
             "action_horizon": self.action_horizon,
             "ordering": list(self.ordering),
-            "boundary_policy": "complete_action_window",
+            "boundary_policy": ACTION_WINDOW_POLICY,
             "overlap_policy": "deduplicate_episode_frame_start",
             "selection_sha256": self.selection_sha256,
         }
@@ -226,7 +227,7 @@ class RelCorePriorSelection:
             "training_starts": self.training_starts,
             "action_horizon": self.action_horizon,
             "ordering": ["selection_order asc"],
-            "boundary_policy": "complete_action_window",
+            "boundary_policy": ACTION_WINDOW_POLICY,
             "overlap_policy": "deduplicate_episode_frame_start",
             "selection_sha256": self.selection_sha256,
         }
@@ -584,7 +585,7 @@ def _selection_digest(
         "top_percent": top_percent,
         "action_horizon": action_horizon,
         "ordering": ["tdus desc", "length asc", "sample_id asc"],
-        "boundary_policy": "complete_action_window",
+        "boundary_policy": ACTION_WINDOW_POLICY,
         "overlap_policy": "deduplicate_episode_frame_start",
     }
     digest.update(
@@ -623,23 +624,15 @@ def load_prior_selection(
     )
     selected = rows[:selected_count]
 
-    frame_indices: set[int] = set()
     selected_episode_ids: set[int] = set()
     for row in selected:
-        last_start = row.end_step - action_horizon + 1
-        if last_start < row.start_step:
-            continue
-        global_offset = metadata.global_offsets[row.episode_id]
         selected_episode_ids.add(row.episode_id)
-        frame_indices.update(
-            global_offset + frame
-            for frame in range(row.start_step, last_start + 1)
-        )
-    ordered_indices = tuple(sorted(frame_indices))
+    ordered_indices = expand_fragment_frame_indices(
+        tuple((row.episode_id, row.start_step, row.end_step) for row in selected),
+        metadata.global_offsets,
+    )
     if not ordered_indices:
-        raise PriorSelectionError(
-            "Selected TDUS chunks contain no complete action windows"
-        )
+        raise PriorSelectionError("Selected TDUS chunks contain no frames")
 
     scores_sha256 = _sha256(path)
     return PriorSelection(
@@ -698,7 +691,7 @@ def _prefiltered_selection_digest(
         "filter_manifest_sha256": filter_manifest_sha256,
         "run_manifest_sha256": run_manifest_sha256,
         "action_horizon": action_horizon,
-        "boundary_policy": "complete_action_window",
+        "boundary_policy": ACTION_WINDOW_POLICY,
         "overlap_policy": "deduplicate_episode_frame_start",
     }
     digest.update(
@@ -840,23 +833,15 @@ def load_prefiltered_sqcn_selection(
             "SQCN scores sample IDs do not match filter manifest selection_sha256"
         )
 
-    frame_indices: set[int] = set()
     selected_episode_ids: set[int] = set()
     for row in rows:
-        last_start = row.end_step - action_horizon + 1
-        if last_start < row.start_step:
-            continue
-        global_offset = metadata.global_offsets[row.episode_id]
         selected_episode_ids.add(row.episode_id)
-        frame_indices.update(
-            global_offset + frame
-            for frame in range(row.start_step, last_start + 1)
-        )
-    ordered_indices = tuple(sorted(frame_indices))
+    ordered_indices = expand_fragment_frame_indices(
+        tuple((row.episode_id, row.start_step, row.end_step) for row in rows),
+        metadata.global_offsets,
+    )
     if not ordered_indices:
-        raise PriorSelectionError(
-            "Selected SQCN fragments contain no complete action windows"
-        )
+        raise PriorSelectionError("Selected SQCN fragments contain no frames")
 
     scores_sha256 = _sha256(path)
     filter_manifest_sha256 = _sha256(filter_manifest_path)
@@ -1039,23 +1024,15 @@ def load_prefiltered_quality_filter_selection(
         raise PriorSelectionError(
             "Quality Filter scores do not match filter manifest selection_sha256"
         )
-    frame_indices: set[int] = set()
     selected_episode_ids: set[int] = set()
     for row in rows:
-        last_start = row.end_step - action_horizon + 1
-        if last_start < row.start_step:
-            continue
         selected_episode_ids.add(row.episode_id)
-        global_offset = metadata.global_offsets[row.episode_id]
-        frame_indices.update(
-            global_offset + frame
-            for frame in range(row.start_step, last_start + 1)
-        )
-    ordered_indices = tuple(sorted(frame_indices))
+    ordered_indices = expand_fragment_frame_indices(
+        tuple((row.episode_id, row.start_step, row.end_step) for row in rows),
+        metadata.global_offsets,
+    )
     if not ordered_indices:
-        raise PriorSelectionError(
-            "Selected Quality Filter fragments contain no complete action windows"
-        )
+        raise PriorSelectionError("Selected Quality Filter fragments contain no frames")
     filter_manifest_sha256 = _sha256(filter_manifest_path)
     return QualityFilteredPriorSelection(
         scores_path=path,
@@ -1104,6 +1081,8 @@ def _relcore_selection_digest(
         "manifest_sha256": manifest_sha256,
         "metadata_sha256": metadata_sha256,
         "action_horizon": action_horizon,
+        "boundary_policy": ACTION_WINDOW_POLICY,
+        "overlap_policy": "deduplicate_episode_frame_start",
     }
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1118,7 +1097,7 @@ def load_relcore_prior_selection(
     *,
     action_horizon: int,
 ) -> RelCorePriorSelection:
-    """Load selected RelCore fragments and expand complete action windows."""
+    """Load selected RelCore fragments and expand every selected frame start."""
 
     if action_horizon <= 0:
         raise PriorSelectionError("action_horizon must be positive")
@@ -1244,23 +1223,15 @@ def load_relcore_prior_selection(
     if not rows:
         raise PriorSelectionError(f"RelCore manifest is empty: {path}")
 
-    frame_indices: set[int] = set()
     selected_episode_ids: set[int] = set()
     for row in rows:
-        last_start = row.end_step - action_horizon + 1
-        if last_start < row.start_step:
-            continue
         selected_episode_ids.add(row.episode_id)
-        global_offset = metadata.global_offsets[row.episode_id]
-        frame_indices.update(
-            global_offset + frame
-            for frame in range(row.start_step, last_start + 1)
-        )
-    ordered_indices = tuple(sorted(frame_indices))
+    ordered_indices = expand_fragment_frame_indices(
+        tuple((row.episode_id, row.start_step, row.end_step) for row in rows),
+        metadata.global_offsets,
+    )
     if not ordered_indices:
-        raise PriorSelectionError(
-            "Selected RelCore fragments contain no complete action windows"
-        )
+        raise PriorSelectionError("Selected RelCore fragments contain no frames")
     manifest_sha256 = _sha256(path)
     return RelCorePriorSelection(
         manifest_path=path,

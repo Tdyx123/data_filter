@@ -295,13 +295,11 @@ def test_octo_lerobot_batch_contract_normalization_and_tail_padding(tmp_path):
     assert batch["language_input_ids"].shape == (8, 16)
     assert batch["language_attention_mask"].shape == (8, 16)
     np.testing.assert_allclose(training_data.sample_weights, [0.5, 0.5])
-    torch.testing.assert_close(batch["action"][:, 1:, :6], torch.zeros(8, 7, 6))
     torch.testing.assert_close(
-        batch["action"][:, 1:, 6],
-        batch["action"][:, :1, 6].expand(-1, 7),
+        batch["action"][:, 1:],
+        batch["action"][:, :1].expand(-1, 7, -1),
     )
-    assert torch.all(batch["action_pad_mask"][:, 0])
-    assert not torch.any(batch["action_pad_mask"][:, 1:])
+    assert torch.all(batch["action_pad_mask"])
 
     source_names = set(batch["dataset_name"])
     assert source_names == {"libero90", target_name}
@@ -379,6 +377,9 @@ def test_all_tasks_training_uses_all_target_episodes_and_keeps_one_to_one_batch(
     assert target_manifest["frames_used"] == 50
     assert target_manifest["selection"]["mode"] == "all"
     assert target_manifest["selection"]["tasks"] == 10
+    assert target_manifest["selection"]["action_window_policy"] == (
+        "episode_tail_repeat_last_action"
+    )
 
     config["data"]["sample_weights"] = [3.0, 1.0]
     weighted_training_data = make_training_dataset(
@@ -500,11 +501,11 @@ def test_training_dataset_keeps_target_prior_balance_with_prefiltered_subset(tmp
     training_data = make_training_dataset(config, paths, tokenizer=FakeTokenizer())
     batch = next(iter(training_data.dataloader))
 
-    assert training_data.dataset.source_sizes == (50, 3)
+    assert training_data.dataset.source_sizes == (50, 10)
     assert training_data.target_selection.task_index == 5
     assert training_data.target_selection.episode_indices == (25, 26, 27, 28, 29)
     assert training_data.prior_selection.selected_fragments == 1
-    assert training_data.prior_selection.training_starts == 3
+    assert training_data.prior_selection.training_starts == 10
     assert batch["dataset_name"].count(target_name) == 4
     assert batch["dataset_name"].count("libero90") == 4
     for source, episode_index, frame_index in zip(
@@ -515,7 +516,7 @@ def test_training_dataset_keeps_target_prior_balance_with_prefiltered_subset(tmp
     ):
         if source == "libero90":
             assert episode_index == 1
-            assert 0 <= frame_index <= 2
+            assert 0 <= frame_index <= 9
 
     manifest = build_dataset_manifest(
         config,
@@ -524,6 +525,9 @@ def test_training_dataset_keeps_target_prior_balance_with_prefiltered_subset(tmp
     )
     prior_manifest = manifest["datasets"]["libero90"]
     assert prior_manifest["frames"] == 20
-    assert prior_manifest["frames_used"] == 3
+    assert prior_manifest["frames_used"] == 10
     assert prior_manifest["selection"]["mode"] == "prefiltered_fragments"
     assert prior_manifest["selection"]["selected_fragments"] == 1
+    assert prior_manifest["selection"]["boundary_policy"] == (
+        "episode_tail_repeat_last_action"
+    )

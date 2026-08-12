@@ -13,6 +13,7 @@ from typing import Any, Iterator, Sequence
 import numpy as np
 
 from libero_lerobot.errors import LiberoDataError
+from libero_lerobot.sampling import ACTION_WINDOW_POLICY, make_episode_action_window
 
 from .config import normalized_sample_weights, sample_counts_per_batch
 
@@ -322,6 +323,7 @@ class TargetTaskSelection:
             "episode_indices": list(self.episode_indices),
             "episodes": self.episodes,
             "frames": self.frames,
+            "action_window_policy": ACTION_WINDOW_POLICY,
             "metadata_sha256": self.metadata_sha256,
             "selection_sha256": self.selection_sha256,
         }
@@ -504,6 +506,7 @@ def training_selection_sha256(
         "prior": (
             prior_selection.selection_sha256 if prior_selection is not None else None
         ),
+        "action_window_policy": ACTION_WINDOW_POLICY,
     }
     if sample_weights is not None:
         normalized = normalized_sample_weights(sample_weights)
@@ -675,20 +678,18 @@ class LeRobotFrameDataset:
         global_frame = self._global_frame(int(frame))
         episode_position, frame_position = self._locate(global_frame)
         episode = self._episode(episode_position)
-        length = len(episode["action"])
-        stop = min(frame_position + self.action_horizon, length)
-        valid = stop - frame_position
-
-        actions = np.zeros((self.action_horizon, 7), dtype=np.float32)
-        raw_actions = np.asarray(episode["action"][frame_position:stop], dtype=np.float32)
-        actions[:valid, :6] = (
+        raw_actions, action_mask = make_episode_action_window(
+            episode["action"], frame_position, self.action_horizon
+        )
+        actions = np.empty((self.action_horizon, 7), dtype=np.float32)
+        actions[:, :6] = (
             raw_actions[:, :6] - self.action_mean[None, :6]
         ) / self.action_std[None, :6]
-        actions[:valid, 6] = raw_actions[:, 6]
-        if valid < self.action_horizon:
-            actions[valid:, 6] = raw_actions[-1, 6]
-        action_pad_mask = np.zeros((self.action_horizon, 7), dtype=bool)
-        action_pad_mask[:valid] = True
+        actions[:, 6] = raw_actions[:, 6]
+        action_pad_mask = np.broadcast_to(
+            action_mask[:, None].astype(bool),
+            (self.action_horizon, 7),
+        ).copy()
 
         proprio = np.asarray(episode["state"][frame_position], dtype=np.float32)
         proprio = (proprio - self.proprio_mean) / self.proprio_std

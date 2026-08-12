@@ -2,15 +2,53 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Iterator, Sequence
+from typing import Iterator, Mapping, Sequence
 
 import numpy as np
+
+
+ACTION_WINDOW_POLICY = "episode_tail_repeat_last_action"
 
 
 @dataclass(frozen=True)
 class FrameIndex:
     source: int
     frame: int
+
+
+def make_episode_action_window(
+    actions: np.ndarray,
+    frame_index: int,
+    horizon: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a fixed-length action window, repeating the episode tail."""
+    values = np.asarray(actions, dtype=np.float32)
+    if values.ndim != 2:
+        raise ValueError("actions must have shape [time, action_dim]")
+    if horizon <= 0:
+        raise ValueError("horizon must be positive")
+    if not 0 <= frame_index < len(values):
+        raise IndexError(frame_index)
+
+    count = min(int(horizon), len(values) - int(frame_index))
+    window = np.empty((int(horizon), values.shape[1]), dtype=np.float32)
+    window[:count] = values[frame_index : frame_index + count]
+    if count < horizon:
+        window[count:] = window[count - 1]
+    return window, np.ones((int(horizon),), dtype=np.float32)
+
+
+def expand_fragment_frame_indices(
+    fragments: Sequence[tuple[int, int, int]],
+    global_offsets: Mapping[int, int],
+) -> tuple[int, ...]:
+    """Expand inclusive fragment ranges into deduplicated global frame starts."""
+    frame_indices = {
+        int(global_offsets[episode_id]) + frame
+        for episode_id, start_step, end_step in fragments
+        for frame in range(start_step, end_step + 1)
+    }
+    return tuple(sorted(frame_indices))
 
 
 def normalized_sample_weights(weights: Sequence[float]) -> tuple[float, ...]:

@@ -8,7 +8,7 @@ from typing import Any, Mapping, Sequence
 
 from .errors import LiberoDataError
 from .metadata import LeRobotV2Metadata
-from .sampling import normalized_sample_weights
+from .sampling import ACTION_WINDOW_POLICY, normalized_sample_weights
 from .tasks import LIBERO_10_DEMOS_PER_TASK, LIBERO_10_TASK_COUNT, LIBERO_10_TASKS
 
 
@@ -49,6 +49,7 @@ class TargetTaskSelection:
             "episode_indices": list(self.episode_indices),
             "episodes": self.episodes,
             "frames": self.frames,
+            "action_window_policy": ACTION_WINDOW_POLICY,
             "metadata_sha256": self.metadata_sha256,
             "selection_sha256": self.selection_sha256,
         }
@@ -191,6 +192,7 @@ def training_selection_sha256(
         "prior": (
             prior_selection.selection_sha256 if prior_selection is not None else None
         ),
+        "action_window_policy": ACTION_WINDOW_POLICY,
     }
     if sample_weights is not None:
         normalized = normalized_sample_weights(sample_weights)

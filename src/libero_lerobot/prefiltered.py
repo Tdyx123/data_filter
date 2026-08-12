@@ -12,6 +12,7 @@ import numpy as np
 
 from .errors import LiberoDataError
 from .metadata import LeRobotV2Metadata
+from .sampling import ACTION_WINDOW_POLICY, expand_fragment_frame_indices
 
 
 PREFILTERED_REQUIRED_FIELDS = (
@@ -60,7 +61,7 @@ class PrefilteredPriorSelection:
             "training_starts": self.training_starts,
             "action_horizon": self.action_horizon,
             "ordering": ["source row order"],
-            "boundary_policy": "complete_action_window",
+            "boundary_policy": ACTION_WINDOW_POLICY,
             "overlap_policy": "deduplicate_episode_frame_start",
             "selection_sha256": self.selection_sha256,
         }
@@ -87,7 +88,6 @@ def _parse_prefiltered_row(
     *,
     line_number: int,
     episode_lengths: Mapping[int, int],
-    action_horizon: int,
     seen: set[tuple[int, int, int]],
 ) -> _PrefilteredFragmentRow:
     missing = [field for field in PREFILTERED_REQUIRED_FIELDS if field not in raw]
@@ -119,11 +119,6 @@ def _parse_prefiltered_row(
             f"fragment end_step={end_step} exceeds episode {episode_id} "
             f"length={episode_lengths[episode_id]} at line {line_number}"
         )
-    if end_step - start_step + 1 < action_horizon:
-        raise PriorSelectionError(
-            f"fragment [{start_step}, {end_step}] is shorter than "
-            f"action_horizon={action_horizon} at line {line_number}"
-        )
     return _PrefilteredFragmentRow(
         episode_id=episode_id,
         start_step=start_step,
@@ -145,8 +140,6 @@ def _read_source(path: Path) -> tuple[str, str]:
 def _read_prefiltered_rows(
     path: Path,
     metadata: LeRobotV2Metadata,
-    *,
-    action_horizon: int,
 ) -> tuple[str, str, list[_PrefilteredFragmentRow]]:
     text, source_sha256 = _read_source(path)
     first_content = next((line.lstrip() for line in text.splitlines() if line.strip()), None)
@@ -179,7 +172,6 @@ def _read_prefiltered_rows(
                     raw,
                     line_number=line_number,
                     episode_lengths=episode_lengths,
-                    action_horizon=action_horizon,
                     seen=seen,
                 )
             )
@@ -198,7 +190,6 @@ def _read_prefiltered_rows(
                     raw,
                     line_number=reader.line_num,
                     episode_lengths=episode_lengths,
-                    action_horizon=action_horizon,
                     seen=seen,
                 )
             )
@@ -220,7 +211,7 @@ def _selection_digest(
         "source_sha256": source_sha256,
         "input_format": input_format,
         "action_horizon": action_horizon,
-        "boundary_policy": "complete_action_window",
+        "boundary_policy": ACTION_WINDOW_POLICY,
         "overlap_policy": "deduplicate_episode_frame_start",
     }
     digest.update(
@@ -244,19 +235,14 @@ def load_prefiltered_selection(
     input_format, source_sha256, rows = _read_prefiltered_rows(
         path,
         metadata,
-        action_horizon=action_horizon,
     )
-    frame_indices: set[int] = set()
     selected_episode_ids: set[int] = set()
     for row in rows:
-        last_start = row.end_step - action_horizon + 1
         selected_episode_ids.add(row.episode_id)
-        global_offset = metadata.global_offsets[row.episode_id]
-        frame_indices.update(
-            global_offset + frame
-            for frame in range(row.start_step, last_start + 1)
-        )
-    ordered_indices = tuple(sorted(frame_indices))
+    ordered_indices = expand_fragment_frame_indices(
+        tuple((row.episode_id, row.start_step, row.end_step) for row in rows),
+        metadata.global_offsets,
+    )
     return PrefilteredPriorSelection(
         source_path=path,
         source_sha256=source_sha256,

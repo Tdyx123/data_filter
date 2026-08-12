@@ -14,8 +14,10 @@ import numpy as np
 from libero_lerobot.metadata import ACTION_KEY, STATE_KEY, LeRobotV2Metadata, load_episode
 from libero_lerobot.prefiltered import load_prefiltered_selection
 from libero_lerobot.sampling import (
+    ACTION_WINDOW_POLICY,
     FrameIndex,
     GloballyBalancedDistributedBatchSampler,
+    make_episode_action_window,
     normalized_sample_weights,
 )
 from libero_lerobot.selection import resolve_prior_selection
@@ -25,7 +27,7 @@ from libero_lerobot.targets import (
     training_selection_sha256,
 )
 
-from .data import BridgeImageTransform, bridge_collate, make_action_window
+from .data import BridgeImageTransform, bridge_collate
 from .normalization import QuantileStats
 
 
@@ -154,6 +156,7 @@ def build_libero_dataset_manifest(
                 "mode": "full_dataset",
                 "episodes": int(prior_metadata.info["total_episodes"]),
                 "frames": int(prior_metadata.info["total_frames"]),
+                "boundary_policy": ACTION_WINDOW_POLICY,
                 "metadata_sha256": prior_metadata.metadata_sha256(),
             }
         else:
@@ -167,6 +170,7 @@ def build_libero_dataset_manifest(
     return {
         "format": "qwen3-vl-groot-libero-selection-v1",
         "training_mode": sources.training_mode,
+        "action_window_policy": ACTION_WINDOW_POLICY,
         "sample_weights": list(sources.sample_weights),
         "target": {
             "dataset_name": str(config["data"]["target_dataset"]),
@@ -283,7 +287,7 @@ class QwenLiberoFrameDataset:
         start = 0 if episode_position == 0 else self._episode_ends[episode_position - 1]
         frame_position = global_frame - start
         episode = self._episode(episode_position)
-        actions, action_mask = make_action_window(
+        actions, action_mask = make_episode_action_window(
             episode["action"], frame_position, self.action_horizon
         )
         rng = random.Random(self.seed + global_frame * 1_009)

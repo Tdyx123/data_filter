@@ -1,3 +1,5 @@
+import hashlib
+import json
 import random
 import sys
 from types import ModuleType, SimpleNamespace
@@ -276,7 +278,18 @@ def test_target_only_signature_covers_mode_and_normalization_statistics():
         training_mode="target_only",
         normalization_sha256="stats-a",
     )
+    legacy_payload = {
+        "target": "target-selection",
+        "prior": None,
+        "sample_weights": (1.0,),
+        "training_mode": "target_only",
+        "normalization_sha256": "stats-a",
+    }
+    legacy_signature = hashlib.sha256(
+        json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
+    assert baseline != legacy_signature
     assert training_selection_sha256(target, None, (1.0,)) != baseline
     assert (
         training_selection_sha256(

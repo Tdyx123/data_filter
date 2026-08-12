@@ -98,6 +98,7 @@ def test_target_only_dataset_manifest_omits_prior_and_records_target_normalizati
 
     assert loaded_roots == [paths["target_dataset"]]
     assert manifest["training_mode"] == "target_only"
+    assert manifest["action_window_policy"] == "episode_tail_repeat_last_action"
     assert set(manifest["datasets"]) == {"libero10_5"}
     assert manifest["datasets"]["libero10_5"]["sample_weight"] == 1.0
     assert manifest["normalization"] == {

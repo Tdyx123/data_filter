@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from libero_lerobot.sampling import ACTION_WINDOW_POLICY
 
 from .checkpoint import inspect_octo_checkpoint, load_lerobot_statistics
 from .config import normalized_sample_weights
@@ -95,6 +96,7 @@ def build_dataset_manifest(
     statistics_sha256 = _statistics_sha256(paths["statistics"])
     manifest = {
         "training_mode": "target_only" if target_only else "mixed",
+        "action_window_policy": ACTION_WINDOW_POLICY,
         "lerobot_root": str(paths["lerobot"]),
         "datasets": datasets,
         "normalization": {

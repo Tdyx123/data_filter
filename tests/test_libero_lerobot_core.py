@@ -1,12 +1,65 @@
 from collections import Counter
 import csv
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
-from libero_lerobot.sampling import GloballyBalancedDistributedBatchSampler
+from libero_lerobot.sampling import (
+    GloballyBalancedDistributedBatchSampler,
+    make_episode_action_window,
+)
+
+
+def test_episode_action_window_keeps_eight_real_actions_when_available():
+    actions = np.arange(10 * 7, dtype=np.float32).reshape(10, 7)
+
+    window, mask = make_episode_action_window(actions, frame_index=1, horizon=8)
+
+    np.testing.assert_array_equal(window, actions[1:9])
+    np.testing.assert_array_equal(mask, np.ones(8, dtype=np.float32))
+
+
+def test_shared_training_signature_changes_from_legacy_window_policy():
+    from libero_lerobot.targets import training_selection_sha256
+
+    target = SimpleNamespace(selection_sha256="target-selection")
+    legacy_payload = {
+        "target": "target-selection",
+        "prior": None,
+        "sample_weights": (1.0,),
+        "training_mode": "target_only",
+    }
+    legacy_signature = hashlib.sha256(
+        json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    signature = training_selection_sha256(
+        target,
+        None,
+        (1.0,),
+        training_mode="target_only",
+    )
+
+    assert signature != legacy_signature
+
+
+@pytest.mark.parametrize("remaining", range(1, 8))
+def test_episode_action_window_repeats_last_action_and_marks_padding_valid(remaining):
+    actions = np.arange(10 * 7, dtype=np.float32).reshape(10, 7)
+    frame_index = len(actions) - remaining
+
+    window, mask = make_episode_action_window(actions, frame_index, horizon=8)
+
+    np.testing.assert_array_equal(window[:remaining], actions[frame_index:])
+    np.testing.assert_array_equal(
+        window[remaining:],
+        np.repeat(actions[-1][None, :], 8 - remaining, axis=0),
+    )
+    np.testing.assert_array_equal(mask, np.ones(8, dtype=np.float32))
 
 
 def test_shared_metadata_reads_the_libero_lerobot_v2_contract():
@@ -31,7 +84,7 @@ def test_octo_compatibility_error_catches_shared_metadata_failures(tmp_path):
         LeRobotV2Metadata(tmp_path / "missing")
 
 
-def test_shared_tdus_selection_expands_only_complete_action_windows(tmp_path):
+def test_shared_tdus_selection_includes_every_selected_fragment_frame(tmp_path):
     from libero_lerobot.selection import load_prior_selection
 
     dataset = (tmp_path / "prior" / "libero90").resolve()
@@ -89,7 +142,10 @@ def test_shared_tdus_selection_expands_only_complete_action_windows(tmp_path):
 
     selection = load_prior_selection(scores, 100.0, metadata, action_horizon=8)
 
-    assert selection.frame_indices == (0, 1, 2)
+    assert selection.frame_indices == tuple(range(10))
+    assert selection.as_manifest()["boundary_policy"] == (
+        "episode_tail_repeat_last_action"
+    )
 
 
 def test_shared_target_selection_resolves_all_ten_tasks_and_fifty_episodes():

@@ -77,8 +77,8 @@ def test_prefiltered_selection_reads_csv_key_fields_and_deduplicates_overlap(
     assert selection.input_format == "csv"
     assert selection.selected_fragments == 3
     assert selection.selected_episodes == 2
-    assert selection.frame_indices == (*range(15), *range(50, 58))
-    assert selection.training_starts == 23
+    assert selection.frame_indices == (*range(22), *range(50, 65))
+    assert selection.training_starts == 37
     manifest = selection.as_manifest()
     assert manifest["mode"] == "prefiltered_fragments"
     assert manifest["source_path"] == str(path.resolve())
@@ -91,6 +91,7 @@ def test_prefiltered_selection_reads_csv_key_fields_and_deduplicates_overlap(
     assert "filter_manifest_path" not in manifest
     assert "run_manifest_path" not in manifest
     assert "top_percent" not in manifest
+    assert manifest["boundary_policy"] == "episode_tail_repeat_last_action"
 
 
 def test_prefiltered_selection_reads_jsonl_and_ignores_extra_fields(tmp_path):
@@ -120,7 +121,22 @@ def test_prefiltered_selection_reads_jsonl_and_ignores_extra_fields(tmp_path):
 
     assert selection.input_format == "jsonl"
     assert selection.selected_fragments == 2
-    assert selection.frame_indices == (2, 3, 44, 45)
+    assert selection.frame_indices == (*range(2, 11), *range(44, 53))
+
+
+def test_prefiltered_selection_accepts_fragments_shorter_than_action_horizon(
+    tmp_path,
+):
+    metadata = _metadata(tmp_path)
+    path = tmp_path / "short.csv"
+    path.write_text(
+        "episode_id,start_step,end_step\n0,3,5\n",
+        encoding="utf-8",
+    )
+
+    selection = _load(path, metadata)
+
+    assert selection.frame_indices == (3, 4, 5)
 
 
 def test_resolve_prior_selection_uses_only_the_unified_config_key(
@@ -254,11 +270,6 @@ def test_dataset_manifest_resolves_the_unified_prefiltered_selection(
             "bounds.csv",
             "episode_id,start_step,end_step\n0,30,40\n",
             "exceeds episode 0.*line 2",
-        ),
-        (
-            "short.csv",
-            "episode_id,start_step,end_step\n0,0,6\n",
-            "shorter than action_horizon=8.*line 2",
         ),
         (
             "duplicate.csv",

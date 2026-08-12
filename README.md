@@ -209,14 +209,17 @@ bash scripts/train_libero_octo_small_all_tasks_4x4090.sh \
 变化。该脚本默认把
 `/data/dwb/libero_filter/quality/filter/top10pct/scores.csv` 作为已经筛选完成的
 片段清单。文件中的 4,671 行全部入选，不按 Quality 或其他分数二次排序；每个
-片段只贡献完整落在范围内的 8-step action window，重叠片段去重后覆盖 2,935
-条 episode，共得到 35,913 个 prior 训练起点。
+片段内从 `start_step` 到 `end_step` 的每一帧都贡献训练起点；8-step action
+window 可以越过片段末尾继续读取同一条 episode 的真实动作。只有到达 episode
+末尾仍不足 8 步时，才重复 episode 最后一个完整动作补满，且补位参与训练 loss。
+重叠片段按 episode/frame 起点去重后覆盖 2,974 条 episode，共得到 66,566 个
+prior 训练起点。
 
 训练入口只接受 `--prior-prefiltered-scores PATH`。文件可为 CSV 或 JSONL：首个
 非空内容以 `{` 开头时按 JSONL 读取，否则按 CSV 读取。两种格式都只要求
 `episode_id`、`start_step`、`end_step`，其他分数、rank、`sample_id`、`length`
 和诊断字段全部忽略。预检不读取相邻的 filter/run manifest，也不校验算法来源；
-它只校验 UTF-8、必需字段、整数、episode、边界、重复片段和完整 action window，
+它只校验 UTF-8、必需字段、整数、episode、非空片段边界和重复片段，
 并把输入文件 SHA256 与展开后的选择摘要写入训练 manifest。`--output-dir` 对训练、
 smoke test 和 preflight 都是必填参数：
 
@@ -560,7 +563,7 @@ LoRA 学习率。
 片段，不在训练端重新排序或截取。文件可为 CSV 或 JSONL，只要求
 `episode_id`、`start_step`、`end_step`；其他分数、rank 和诊断字段全部忽略。
 加载与预检不读取相邻的 `filter_manifest.json` 或 `run_manifest.json`，只校验输入
-编码、必需字段、整数、episode、片段边界、重复片段和完整 action window，并把
+编码、必需字段、整数、episode、非空片段边界和重复片段，并把
 输入文件哈希及展开后的选择摘要写入训练 manifest。`--prior-top-percent`、
 `--prior-relcore-manifest` 和 `--prior-quality-filter-scores` 仍保留各自的严格来源与
 manifest 校验。

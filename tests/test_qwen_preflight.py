@@ -36,7 +36,11 @@ def test_libero_target_only_preflight_does_not_access_prior(tmp_path, monkeypatc
     report = preflight.validate_paths_and_data(config, decode_samples=False)
 
     assert report["dataset_type"] == "libero"
+    assert report["action_window_policy"] == "episode_tail_repeat_last_action"
     assert report["target"]["selection"]["episodes"] == 50
+    assert report["target"]["selection"]["action_window_policy"] == (
+        "episode_tail_repeat_last_action"
+    )
     assert report["target"]["selection"]["frames"] == 14_144
     assert report["prior"] is None
     assert report["global_micro_batch_source_counts"] == [4]
