@@ -8,8 +8,10 @@ from torch import nn  # noqa: E402
 
 from qwen3_vl_groot.config import load_config  # noqa: E402
 from qwen3_vl_groot.training import (  # noqa: E402
+    PerformanceWindow,
     RankZeroLogger,
     _lora_step_metrics,
+    _runtime_versions,
     _should_save_checkpoint,
     _should_save_final_checkpoint,
     build_optimizer_and_scheduler,
@@ -151,3 +153,79 @@ def test_checkpoint_schedule_saves_improvements_and_unscheduled_final_step():
     assert not _should_save_checkpoint(step=750, save_every=1_000, improved=False)
     assert _should_save_final_checkpoint(step=4_500, last_checkpoint_step=4_000)
     assert not _should_save_final_checkpoint(step=4_000, last_checkpoint_step=4_000)
+
+
+def test_performance_window_reports_effective_batch_throughput_and_data_wait():
+    window = PerformanceWindow(
+        effective_batch_size=64,
+        start_step=20,
+        started_at=100.0,
+    )
+    window.add_data_wait(4.0)
+
+    metrics = window.metrics(optimizer_step=22, now=120.0)
+
+    assert metrics == pytest.approx(
+        {
+            "performance/step_seconds": 10.0,
+            "performance/samples_per_second": 6.4,
+            "performance/data_wait_fraction": 0.2,
+        }
+    )
+
+
+def test_performance_window_reset_starts_a_fresh_interval():
+    window = PerformanceWindow(
+        effective_batch_size=64,
+        start_step=0,
+        started_at=10.0,
+    )
+    window.add_data_wait(2.0)
+    window.reset(start_step=5, started_at=30.0)
+    window.add_data_wait(1.0)
+
+    metrics = window.metrics(optimizer_step=7, now=40.0)
+
+    assert metrics["performance/step_seconds"] == pytest.approx(5.0)
+    assert metrics["performance/samples_per_second"] == pytest.approx(12.8)
+    assert metrics["performance/data_wait_fraction"] == pytest.approx(0.1)
+
+
+def test_performance_window_excludes_evaluation_and_checkpoint_overhead():
+    window = PerformanceWindow(
+        effective_batch_size=64,
+        start_step=10,
+        started_at=100.0,
+    )
+    window.add_data_wait(2.0)
+    window.exclude_elapsed(30.0)
+
+    metrics = window.metrics(optimizer_step=12, now=150.0)
+
+    assert metrics["performance/step_seconds"] == pytest.approx(10.0)
+    assert metrics["performance/data_wait_fraction"] == pytest.approx(0.1)
+
+
+def test_runtime_versions_records_optional_packages_without_failing(monkeypatch):
+    versions = {
+        "torch": "2.9.0",
+        "transformers": "4.57.3",
+        "peft": "0.17.1",
+        "deepspeed": "0.17.6",
+        "flash-attn": "2.7.4.post1",
+    }
+
+    def fake_version(name):
+        if name == "flash-attn":
+            raise ModuleNotFoundError(name)
+        return versions[name]
+
+    monkeypatch.setattr("qwen3_vl_groot.training.package_version", fake_version)
+
+    result = _runtime_versions()
+
+    assert result["torch"] == "2.9.0"
+    assert result["transformers"] == "4.57.3"
+    assert result["peft"] == "0.17.1"
+    assert result["deepspeed"] == "0.17.6"
+    assert result["flash_attn"] is None

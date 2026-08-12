@@ -5,6 +5,7 @@ import math
 import os
 import random
 import time
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -25,6 +26,71 @@ from .data import (
 from .modeling import Qwen3VLGrootPolicy, compile_policy_modules
 from .normalization import QuantileStats
 from .schedules import LoraUpdateSchedule
+
+
+class PerformanceWindow:
+    """Accumulate steady-state timing for completed optimizer steps."""
+
+    def __init__(
+        self,
+        *,
+        effective_batch_size: int,
+        start_step: int,
+        started_at: float,
+    ) -> None:
+        if effective_batch_size <= 0:
+            raise ValueError("effective_batch_size must be positive")
+        self.effective_batch_size = effective_batch_size
+        self.reset(start_step=start_step, started_at=started_at)
+
+    def add_data_wait(self, seconds: float) -> None:
+        if seconds < 0:
+            raise ValueError("data wait cannot be negative")
+        self.data_wait_seconds += seconds
+
+    def exclude_elapsed(self, seconds: float) -> None:
+        """Remove non-training work from the wall-clock interval."""
+        if seconds < 0:
+            raise ValueError("excluded elapsed time cannot be negative")
+        self.started_at += seconds
+
+    def metrics(self, *, optimizer_step: int, now: float) -> dict[str, float]:
+        completed_steps = optimizer_step - self.start_step
+        elapsed = now - self.started_at
+        if completed_steps <= 0:
+            raise ValueError("optimizer_step must advance beyond start_step")
+        if elapsed <= 0:
+            raise ValueError("now must be later than started_at")
+        step_seconds = elapsed / completed_steps
+        return {
+            "performance/step_seconds": step_seconds,
+            "performance/samples_per_second": (
+                self.effective_batch_size / step_seconds
+            ),
+            "performance/data_wait_fraction": self.data_wait_seconds / elapsed,
+        }
+
+    def reset(self, *, start_step: int, started_at: float) -> None:
+        self.start_step = start_step
+        self.started_at = started_at
+        self.data_wait_seconds = 0.0
+
+
+def _runtime_versions() -> dict[str, str | None]:
+    distributions = {
+        "torch": "torch",
+        "transformers": "transformers",
+        "peft": "peft",
+        "deepspeed": "deepspeed",
+        "flash_attn": "flash-attn",
+    }
+    result: dict[str, str | None] = {}
+    for key, distribution_name in distributions.items():
+        try:
+            result[key] = package_version(distribution_name)
+        except (PackageNotFoundError, ModuleNotFoundError):
+            result[key] = None
+    return result
 
 
 def seed_everything(seed: int, rank: int) -> None:
@@ -352,6 +418,7 @@ def train(config: dict[str, Any]) -> None:
     if rank == 0:
         output.mkdir(parents=True, exist_ok=True)
         save_resolved_config(config, output / "run_config.yaml")
+        _atomic_json(output / "runtime.json", {"packages": _runtime_versions()})
     distributed.barrier()
 
     dataset_type = config["data"].get("dataset_type", "bridge")
@@ -472,6 +539,17 @@ def train(config: dict[str, Any]) -> None:
                 "Starting first training batch; TorchInductor warm-up may take several minutes."
             )
         logger.status(first_batch_status)
+        effective_batch_size = (
+            int(train_config["micro_batch_size"])
+            * int(train_config["gradient_accumulation_steps"])
+            * world_size
+        )
+        torch.cuda.synchronize(local_rank)
+        performance = PerformanceWindow(
+            effective_batch_size=effective_batch_size,
+            start_step=global_step,
+            started_at=time.perf_counter(),
+        )
         while global_step < maximum_steps:
             upcoming_step = global_step + 1
             lora_enabled_for_update = lora_update_schedule.is_active(upcoming_step)
@@ -481,7 +559,9 @@ def train(config: dict[str, Any]) -> None:
             if lora_enabled_for_update != lora_is_trainable:
                 policy.set_lora_trainable(lora_enabled_for_update)
 
+            data_wait_started = time.perf_counter()
             batch = next(train_iterator)
+            performance.add_data_wait(time.perf_counter() - data_wait_started)
             lora_lr_used = float(optimizer.param_groups[1]["lr"])
             loss = engine(
                 images=batch["images"],
@@ -502,6 +582,11 @@ def train(config: dict[str, Any]) -> None:
             previous_global_step = global_step
 
             if global_step % int(train_config["log_every_steps"]) == 0:
+                torch.cuda.synchronize(local_rank)
+                performance_metrics = performance.metrics(
+                    optimizer_step=global_step,
+                    now=time.perf_counter(),
+                )
                 mean_loss = _reduce_scalar(loss)
                 if rank == 0:
                     logger.log(
@@ -514,14 +599,22 @@ def train(config: dict[str, Any]) -> None:
                                 optimizer_step=global_step,
                                 learning_rate=lora_lr_used,
                             ),
+                            **performance_metrics,
                         }
                     )
+                performance.reset(
+                    start_step=global_step,
+                    started_at=time.perf_counter(),
+                )
 
             validation_mae = None
             improved = False
+            non_training_started: float | None = None
             if validation_enabled and global_step % int(
                 train_config["eval_every_steps"]
             ) == 0:
+                torch.cuda.synchronize(local_rank)
+                non_training_started = time.perf_counter()
                 assert validation_loader is not None
                 validation_mae = evaluate(
                     engine,
@@ -542,6 +635,9 @@ def train(config: dict[str, Any]) -> None:
                 improved=improved,
             )
             if should_save:
+                if non_training_started is None:
+                    torch.cuda.synchronize(local_rank)
+                    non_training_started = time.perf_counter()
                 save_compact_checkpoint(
                     engine,
                     output,
@@ -553,6 +649,11 @@ def train(config: dict[str, Any]) -> None:
                 )
                 last_checkpoint_step = global_step
                 distributed.barrier()
+            if non_training_started is not None:
+                torch.cuda.synchronize(local_rank)
+                performance.exclude_elapsed(
+                    time.perf_counter() - non_training_started
+                )
 
         if _should_save_final_checkpoint(
             step=global_step,
