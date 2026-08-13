@@ -11,11 +11,12 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -39,9 +40,7 @@ EASYDICT_REQUIREMENT = ">=1.9,<2"
 FUTURE_REQUIREMENT = ">=0.18.2,<2"
 MATPLOTLIB_REQUIREMENT = ">=3.5.3,<4"
 TERMCOLOR_REQUIREMENT = ">=2.4.0,<4"
-MUJOCO_COMPATIBILITY = (
-    "libero-robosuite-1.4.0-mujoco-3.10.0-gymnasium-1.3.0-v1"
-)
+MUJOCO_COMPATIBILITY = "libero-robosuite-1.4.0-mujoco-3.10.0-gymnasium-1.3.0-v1"
 LIBERO_MULTIPROCESSING_START_METHOD = "spawn"
 RESULT_SCHEMA_VERSION = 3
 EVALUATION_SEEDS = (3471197683, 1232873419, 1448008435)
@@ -53,9 +52,7 @@ LIBERO_WORKER_GRACEFUL_CLOSE_TIMEOUT_SECONDS = 10.0
 LIBERO_WORKER_TERMINATE_TIMEOUT_SECONDS = 5.0
 LIBERO_WORKER_KILL_TIMEOUT_SECONDS = 5.0
 _LIBERO_ORIGINAL_WORKER_ATTRIBUTE = "_octo_small_libero_original_worker"
-_LIBERO_ORIGINAL_CLOUDPICKLE_WRAPPER_ATTRIBUTE = (
-    "_octo_small_libero_original_cloudpickle_wrapper"
-)
+_LIBERO_ORIGINAL_CLOUDPICKLE_WRAPPER_ATTRIBUTE = "_octo_small_libero_original_cloudpickle_wrapper"
 
 
 class EvaluationError(RuntimeError):
@@ -170,6 +167,7 @@ class EvaluationSettings:
     base_model: Path | None = None
     statistics: Path = DEFAULT_STATISTICS
     output_dir: Path = Path("outputs/octo_small_libero_eval")
+    save_videos_path: Path | None = None
     task_name: str = DEFAULT_TASK_NAME
     episodes: int = 150
     num_envs: int = 50
@@ -390,7 +388,7 @@ def observation_to_proprio(observation: Mapping[str, Any]) -> np.ndarray:
     gripper = np.asarray(observation["robot0_gripper_qpos"], dtype=np.float32).reshape(-1)
     if position.shape != (3,) or len(gripper) < 1:
         raise EvaluationError(
-            f"Invalid LIBERO proprio shapes: position={position.shape}, " f"gripper={gripper.shape}"
+            f"Invalid LIBERO proprio shapes: position={position.shape}, gripper={gripper.shape}"
         )
     value = np.concatenate(
         [
@@ -639,16 +637,12 @@ def _find_libero_package_root(source_root: Path | None = None) -> Path:
             if not _is_libero_package_root(root):
                 continue
             if root.name != "libero" or root.parent.name != "libero":
-                raise EvaluationError(
-                    f"LIBERO source has an unsupported package layout: {source}"
-                )
+                raise EvaluationError(f"LIBERO source has an unsupported package layout: {source}")
             import_root = root.parent.parent
             if str(import_root) not in sys.path:
                 sys.path.insert(0, str(import_root))
             return root
-        raise EvaluationError(
-            f"LIBERO source is missing libero/libero benchmark assets: {source}"
-        )
+        raise EvaluationError(f"LIBERO source is missing libero/libero benchmark assets: {source}")
 
     package = importlib.util.find_spec("libero")
     if package is None or not package.submodule_search_locations:
@@ -758,9 +752,7 @@ def load_trusted_libero_init_states(
             weights_only=False,
         )
     except Exception as error:
-        raise EvaluationError(
-            f"Could not load verified LIBERO initial states: {target}"
-        ) from error
+        raise EvaluationError(f"Could not load verified LIBERO initial states: {target}") from error
     states = np.asarray(value)
     if (
         states.ndim != 2
@@ -833,14 +825,14 @@ def resolve_libero_task(task_name: str, *, libero_root: Path) -> LiberoTask:
     try:
         bddl_file.relative_to(bddl_root)
     except ValueError as error:
-        raise EvaluationError(f"LIBERO BDDL file escapes the benchmark root: {bddl_file}") from error
+        raise EvaluationError(
+            f"LIBERO BDDL file escapes the benchmark root: {bddl_file}"
+        ) from error
     if not bddl_file.is_file():
         raise EvaluationError(f"LIBERO BDDL file does not exist: {bddl_file}")
-    init_states_file = (
-        libero_root / "init_files" / "libero_10" / f"{name}.pruned_init"
-    ).resolve()
-    init_states, init_states_sha256, init_states_git_blob = (
-        load_trusted_libero_init_states(libero_root, init_states_file)
+    init_states_file = (libero_root / "init_files" / "libero_10" / f"{name}.pruned_init").resolve()
+    init_states, init_states_sha256, init_states_git_blob = load_trusted_libero_init_states(
+        libero_root, init_states_file
     )
     return LiberoTask(
         task_id=task_id,
@@ -878,9 +870,7 @@ def validate_simulation_dependencies() -> dict[str, str]:
                 "install requirements-octo-libero-eval.txt"
             ) from error
         if actual != required:
-            raise EvaluationError(
-                f"Evaluation requires {distribution}=={required}, found {actual}"
-            )
+            raise EvaluationError(f"Evaluation requires {distribution}=={required}, found {actual}")
         versions[distribution] = actual
     for distribution, requirement in compatible.items():
         try:
@@ -914,9 +904,7 @@ def _install_libero_gymnasium_compatibility(
         try:
             import gymnasium as gymnasium_module
         except ImportError as error:
-            raise EvaluationError(
-                f"Could not import Gymnasium {GYMNASIUM_VERSION}"
-            ) from error
+            raise EvaluationError(f"Could not import Gymnasium {GYMNASIUM_VERSION}") from error
     actual_version = str(getattr(gymnasium_module, "__version__", ""))
     if actual_version != GYMNASIUM_VERSION:
         raise EvaluationError(
@@ -930,8 +918,7 @@ def _install_libero_gymnasium_compatibility(
         return False
     if existing is not None:
         raise EvaluationError(
-            "Legacy gym was imported before the LIBERO Gymnasium compatibility "
-            "alias was installed"
+            "Legacy gym was imported before the LIBERO Gymnasium compatibility alias was installed"
         )
     registry["gym"] = gymnasium_module
     return True
@@ -975,10 +962,7 @@ def _run_libero_subprocess_worker_with_gymnasium(
         _LIBERO_ORIGINAL_WORKER_ATTRIBUTE,
         getattr(libero_venv, "_worker", None),
     )
-    if (
-        original_worker is None
-        or original_worker is _run_libero_subprocess_worker_with_gymnasium
-    ):
+    if original_worker is None or original_worker is _run_libero_subprocess_worker_with_gymnasium:
         raise EvaluationError("Could not resolve the original LIBERO subprocess worker")
     original_worker(parent, pipe, env_fn_wrapper, observation_buffers)
 
@@ -1044,9 +1028,7 @@ def _install_robosuite_mujoco_310_compatibility(
         if isinstance(third, native_data_type):
             current_full_m(model, third, second)
             return
-        raise TypeError(
-            "MuJoCo 3.10 mj_fullM compatibility expected an MjData argument"
-        )
+        raise TypeError("MuJoCo 3.10 mj_fullM compatibility expected an MjData argument")
 
     compatible_full_m._octo_mujoco_310_compatibility = True
     compatible_full_m._octo_native_mj_fullM = current_full_m
@@ -1224,9 +1206,7 @@ def _format_simulation_startup_error(
     num_envs: int,
 ) -> str:
     _, first = failures[0]
-    failed_workers = ", ".join(
-        f"{index}(pid={failure.pid})" for index, failure in failures
-    )
+    failed_workers = ", ".join(f"{index}(pid={failure.pid})" for index, failure in failures)
     root_message = first.message.rstrip(".")
     return (
         "LIBERO offscreen worker startup failed "
@@ -1276,10 +1256,7 @@ def make_vector_environment(task: LiberoTask, num_envs: int) -> Any:
         "camera_heights": 128,
         "camera_widths": 128,
     }
-    factories = [
-        partial(_make_subprocess_offscreen_environment, kwargs)
-        for _ in range(num_envs)
-    ]
+    factories = [partial(_make_subprocess_offscreen_environment, kwargs) for _ in range(num_envs)]
     environment = vector_environment(factories)
     try:
         _validate_vector_environment_startup(environment, num_envs=num_envs)
@@ -1405,9 +1382,7 @@ def rollout_action_chunks(
                 "seed": int(seed),
                 "success": success,
                 "steps": (int(first_success_step[index]) if success else int(executed_steps)),
-                "first_success_step": (
-                    int(first_success_step[index]) if success else None
-                ),
+                "first_success_step": (int(first_success_step[index]) if success else None),
                 "termination": "success" if success else "max_steps",
             }
         )
@@ -1445,9 +1420,7 @@ def validate_settings(settings: EvaluationSettings) -> None:
     if settings.seeds != EVALUATION_SEEDS:
         raise EvaluationError(f"seeds must be the fixed evaluation seeds {EVALUATION_SEEDS}")
     if settings.episodes % len(settings.seeds) != 0:
-        raise EvaluationError(
-            f"episodes must be divisible by {len(settings.seeds)} fixed seeds"
-        )
+        raise EvaluationError(f"episodes must be divisible by {len(settings.seeds)} fixed seeds")
     if settings.num_envs <= 0 or settings.num_envs > settings.episodes:
         raise EvaluationError("num_envs must be in [1, episodes]")
     if settings.max_steps <= 0:
@@ -1460,6 +1433,15 @@ def validate_settings(settings: EvaluationSettings) -> None:
         raise EvaluationError("video_fps must be positive")
 
 
+def _validate_video_settings(settings: EvaluationSettings) -> None:
+    if settings.save_videos_path is None:
+        if settings.record_videos != 0:
+            raise EvaluationError("record_videos requires save_videos_path")
+        return
+    if settings.record_videos <= 0:
+        raise EvaluationError("record_videos must be positive when save_videos_path is set")
+
+
 def _check_output_targets(settings: EvaluationSettings) -> None:
     existing = [
         settings.output_dir / "results.json",
@@ -1468,6 +1450,20 @@ def _check_output_targets(settings: EvaluationSettings) -> None:
     if not settings.overwrite and any(path.exists() for path in existing):
         raise EvaluationError(
             f"Evaluation output already exists in {settings.output_dir}; use --overwrite"
+        )
+
+
+def _check_video_targets(settings: EvaluationSettings) -> None:
+    if settings.save_videos_path is None or settings.overwrite:
+        return
+    existing = [
+        path
+        for outcome in ("success", "failure")
+        for path in (settings.save_videos_path / outcome).glob("episode-*.mp4")
+    ]
+    if existing:
+        raise EvaluationError(
+            f"Video output already exists in {settings.save_videos_path}; use --overwrite"
         )
 
 
@@ -1517,6 +1513,170 @@ def _save_videos(
     return paths
 
 
+def _select_video_episodes(
+    episodes: Sequence[Mapping[str, Any]],
+    *,
+    limit: int,
+) -> list[Mapping[str, Any]]:
+    if limit <= 0:
+        raise EvaluationError("video selection limit must be positive")
+    selected: list[Mapping[str, Any]] = []
+    counts = {True: 0, False: 0}
+    for episode in sorted(episodes, key=lambda item: int(item["episode_id"])):
+        outcome = bool(episode["success"])
+        if counts[outcome] >= limit:
+            continue
+        selected.append(episode)
+        counts[outcome] += 1
+    return selected
+
+
+def _video_action_limit(episode: Mapping[str, Any]) -> int:
+    return int(episode["steps"])
+
+
+def _replay_episode_frames(
+    environment: Any,
+    observations: Any,
+    actions: Sequence[np.ndarray],
+    *,
+    expected_success: bool,
+) -> Iterator[np.ndarray]:
+    values = observation_batch_to_list(observations)
+    if len(values) != 1:
+        raise EvaluationError("Video replay requires exactly one environment")
+    yield _frame_from_observation(values[0])
+
+    reproduced_success = False
+    for step, action in enumerate(actions, start=1):
+        action_array = np.asarray(action, dtype=np.float32)
+        if action_array.shape != (ACTION_DIM,):
+            raise EvaluationError(
+                f"Video replay action shape is {action_array.shape}; expected {(ACTION_DIM,)}"
+            )
+        result = environment.step(action_array[None, :])
+        if not isinstance(result, tuple) or len(result) not in {4, 5}:
+            raise EvaluationError("LIBERO video replay returned an invalid step tuple")
+        observations = result[0]
+        successes = np.asarray(environment.check_success(), dtype=bool)
+        if successes.shape != (1,):
+            raise EvaluationError(
+                f"LIBERO video replay success shape is {successes.shape}; expected {(1,)}"
+            )
+        succeeded = bool(successes[0])
+        if succeeded and not expected_success:
+            raise EvaluationError(f"Failed episode reproduced success at step {step}")
+        if succeeded and step != len(actions):
+            raise EvaluationError(
+                f"Successful episode reproduced success early at step {step}; "
+                f"expected step {len(actions)}"
+            )
+        reproduced_success |= succeeded
+        values = observation_batch_to_list(observations)
+        if len(values) != 1:
+            raise EvaluationError("Video replay requires exactly one observation")
+        yield _frame_from_observation(values[0])
+
+    if expected_success and not reproduced_success:
+        raise EvaluationError(
+            f"Successful episode did not reproduce success after {len(actions)} steps"
+        )
+
+
+def _write_video(path: Path, frames: Iterable[np.ndarray], *, fps: int) -> None:
+    try:
+        import imageio.v2 as imageio
+    except ImportError as error:
+        raise EvaluationError("imageio and imageio-ffmpeg are required to record videos") from error
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with imageio.get_writer(path, fps=fps) as writer:
+            for frame in frames:
+                writer.append_data(np.asarray(frame, dtype=np.uint8))
+    except EvaluationError:
+        raise
+    except Exception as error:
+        raise EvaluationError(f"Could not encode LIBERO video {path}: {error}") from error
+
+
+def _record_replay_videos(
+    settings: EvaluationSettings,
+    *,
+    task: LiberoTask,
+    statistics: NormalizationStatistics,
+    episodes: Sequence[Mapping[str, Any]],
+    action_trajectories: Mapping[int, Sequence[np.ndarray]],
+) -> list[str]:
+    if settings.save_videos_path is None:
+        return []
+    _validate_video_settings(settings)
+    _check_video_targets(settings)
+    selected = _select_video_episodes(episodes, limit=settings.record_videos)
+    video_root = settings.save_videos_path
+    video_root.parent.mkdir(parents=True, exist_ok=True)
+    final_paths: list[Path] = []
+
+    with tempfile.TemporaryDirectory(
+        prefix=f".{video_root.name or 'octo-videos'}-",
+        dir=video_root.parent,
+    ) as temporary_directory:
+        staging_root = Path(temporary_directory)
+        environment = None
+        try:
+            if selected:
+                environment, _ = make_vector_environment_with_backoff(
+                    task,
+                    1,
+                    auto_reduce=settings.auto_reduce_num_envs,
+                )
+            for episode in selected:
+                episode_id = int(episode["episode_id"])
+                init_state_id = int(episode["init_state_id"])
+                replay_steps = _video_action_limit(episode)
+                trajectory = list(action_trajectories.get(episode_id, ()))
+                if len(trajectory) < replay_steps:
+                    raise EvaluationError(
+                        f"Episode {episode_id} has {len(trajectory)} recorded actions; "
+                        f"video replay requires {replay_steps}"
+                    )
+                observations = settle_vector_environment(
+                    environment,
+                    init_states=task.init_states[[init_state_id]],
+                    statistics=statistics,
+                    seed=int(episode["seed"]) + init_state_id,
+                    settle_steps=settings.settle_steps,
+                )
+                outcome = "success" if bool(episode["success"]) else "failure"
+                staged_path = staging_root / outcome / f"episode-{episode_id:03d}.mp4"
+                _write_video(
+                    staged_path,
+                    _replay_episode_frames(
+                        environment,
+                        observations,
+                        trajectory[:replay_steps],
+                        expected_success=bool(episode["success"]),
+                    ),
+                    fps=settings.video_fps,
+                )
+                final_paths.append(video_root / outcome / f"episode-{episode_id:03d}.mp4")
+        finally:
+            if environment is not None:
+                environment.close()
+
+        for outcome in ("success", "failure"):
+            target_directory = video_root / outcome
+            target_directory.mkdir(parents=True, exist_ok=True)
+            if settings.overwrite:
+                for existing in target_directory.glob("episode-*.mp4"):
+                    existing.unlink()
+            staged_directory = staging_root / outcome
+            if staged_directory.is_dir():
+                for staged_path in sorted(staged_directory.glob("episode-*.mp4")):
+                    staged_path.replace(target_directory / staged_path.name)
+
+    return [str(path) for path in final_paths]
+
+
 def _make_report(
     *,
     status: str,
@@ -1534,12 +1694,8 @@ def _make_report(
     successes = sum(bool(episode["success"]) for episode in episodes)
     summaries_by_seed = []
     for seed in settings.seeds:
-        seeded_episodes = [
-            episode for episode in episodes if episode.get("seed") == seed
-        ]
-        seeded_successes = sum(
-            bool(episode["success"]) for episode in seeded_episodes
-        )
+        seeded_episodes = [episode for episode in episodes if episode.get("seed") == seed]
+        seeded_successes = sum(bool(episode["success"]) for episode in seeded_episodes)
         summaries_by_seed.append(
             {
                 "seed": seed,
@@ -1547,9 +1703,7 @@ def _make_report(
                 "successes": seeded_successes,
                 "failures": len(seeded_episodes) - seeded_successes,
                 "success_rate": (
-                    seeded_successes / len(seeded_episodes)
-                    if seeded_episodes
-                    else None
+                    seeded_successes / len(seeded_episodes) if seeded_episodes else None
                 ),
             }
         )
@@ -1699,6 +1853,7 @@ def evaluate_checkpoint(
 ) -> dict[str, Any]:
     configure_evaluation_multiprocessing()
     validate_settings(settings)
+    _validate_video_settings(settings)
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     configure_transformers_offline(settings.output_dir)
     validate_simulation_dependencies()
@@ -1743,11 +1898,11 @@ def evaluate_checkpoint(
         return report
 
     _check_output_targets(settings)
+    _check_video_targets(settings)
     started = time.monotonic()
     episodes: list[dict[str, Any]] = []
-    video_frames: dict[int, list[np.ndarray]] = {
-        episode_id: [] for episode_id in range(settings.record_videos)
-    }
+    action_trajectories: dict[int, list[np.ndarray]] = {}
+    record_actions = settings.save_videos_path is not None
     videos: list[str] = []
     environment = None
     environment_batch_size = 0
@@ -1783,29 +1938,32 @@ def evaluate_checkpoint(
                     settle_steps=settings.settle_steps,
                 )
 
-                def capture_frames(current: Any, step: int) -> None:
-                    del step
-                    values = observation_batch_to_list(current)
-                    for local_index, episode_id in enumerate(episode_ids):
-                        if episode_id in video_frames:
-                            video_frames[episode_id].append(
-                                _frame_from_observation(values[local_index])
+                if record_actions:
+                    for episode_id in episode_ids:
+                        action_trajectories[episode_id] = []
+
+                def predict_actions(current: Any) -> np.ndarray:
+                    actions = policy.predict_action_chunk(
+                        current,
+                        task.language,
+                        generator=generator,
+                    )
+                    if record_actions:
+                        for local_index, episode_id in enumerate(episode_ids):
+                            action_trajectories[episode_id].extend(
+                                np.asarray(actions[local_index], dtype=np.float32).copy()
                             )
+                    return actions
 
                 group_episodes, _ = rollout_action_chunks(
                     environment,
                     observations,
-                    predictor=lambda current: policy.predict_action_chunk(
-                        current,
-                        task.language,
-                        generator=generator,
-                    ),
+                    predictor=predict_actions,
                     episode_ids=episode_ids,
                     init_state_ids=init_state_ids,
                     seed=seed,
                     max_steps=settings.max_steps,
                     action_horizon=ACTION_HORIZON,
-                    frame_callback=capture_frames if video_frames else None,
                 )
                 episodes.extend(group_episodes)
                 _atomic_write_jsonl(
@@ -1813,10 +1971,16 @@ def evaluate_checkpoint(
                     episodes,
                 )
                 seed_start += batch_size
-        videos = _save_videos(
-            settings.output_dir,
-            video_frames,
-            fps=settings.video_fps,
+        if environment is not None:
+            environment.close()
+            environment = None
+            environment_batch_size = 0
+        videos = _record_replay_videos(
+            settings,
+            task=task,
+            statistics=statistics,
+            episodes=episodes,
+            action_trajectories=action_trajectories,
         )
     except Exception as error:
         elapsed = time.monotonic() - started

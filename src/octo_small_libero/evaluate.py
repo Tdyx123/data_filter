@@ -22,6 +22,19 @@ from .evaluation import (
 SIMULATION_INFRASTRUCTURE_EXIT_CODE = 3
 
 
+class _StoreOnce(argparse.Action):
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str,
+        option_string: str | None = None,
+    ) -> None:
+        if getattr(namespace, self.dest, None) is not None:
+            parser.error(f"{option_string} may only be specified once")
+        setattr(namespace, self.dest, values)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Evaluate an Octo-small PyTorch checkpoint in LIBERO-10"
@@ -30,6 +43,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-model")
     parser.add_argument("--statistics", default=str(DEFAULT_STATISTICS))
     parser.add_argument("--output-dir", default="outputs/octo_small_libero_eval")
+    parser.add_argument(
+        "--save-videos-path",
+        action=_StoreOnce,
+        help="Write stratified success/failure replay videos under PATH",
+    )
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument(
         "--episodes",
@@ -57,9 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--record-videos",
         type=int,
-        default=0,
+        default=None,
         metavar="COUNT",
-        help="Record the first COUNT episodes; disabled by default",
+        help=(
+            "Save up to COUNT successful and COUNT failed episodes; requires "
+            "--save-videos-path (default with a video path: 1)"
+        ),
     )
     parser.add_argument("--video-fps", type=int, default=30)
     parser.add_argument(
@@ -91,11 +112,23 @@ def main() -> None:
     episodes = 3 if arguments.smoke_test else arguments.episodes
     num_envs = 1 if arguments.smoke_test else arguments.num_envs
     max_steps = 8 if arguments.smoke_test else arguments.max_steps
+    if arguments.save_videos_path == "":
+        parser.error("--save-videos-path requires a non-empty value")
+    if arguments.save_videos_path is None and arguments.record_videos is not None:
+        parser.error("--record-videos requires --save-videos-path")
+    if arguments.save_videos_path is not None:
+        record_videos = 1 if arguments.record_videos is None else arguments.record_videos
+        if record_videos <= 0:
+            parser.error("--record-videos must be positive")
+        record_videos = min(record_videos, episodes)
+    else:
+        record_videos = 0
     settings = EvaluationSettings(
         checkpoint=Path(arguments.checkpoint),
         base_model=Path(arguments.base_model) if arguments.base_model else None,
         statistics=Path(arguments.statistics),
         output_dir=Path(arguments.output_dir),
+        save_videos_path=(Path(arguments.save_videos_path) if arguments.save_videos_path else None),
         task_name=arguments.task_name,
         episodes=episodes,
         num_envs=num_envs,
@@ -103,7 +136,7 @@ def main() -> None:
         max_steps=max_steps,
         device=arguments.device,
         precision=arguments.precision,
-        record_videos=min(arguments.record_videos, episodes),
+        record_videos=record_videos,
         video_fps=arguments.video_fps,
         libero_root=Path(arguments.libero_root) if arguments.libero_root else None,
         libero_config_path=(

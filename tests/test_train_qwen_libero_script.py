@@ -20,6 +20,11 @@ QWEN35_LIBERO_SCRIPT = (
     / "train_libero_qwen3_5_0_8b_groot_all_tasks_4x4090.sh"
 )
 BRIDGE_SCRIPT = PROJECT_ROOT / "scripts" / "train_bridge_4x4090.sh"
+CYCLIC_BRIDGE_SCRIPT = (
+    PROJECT_ROOT
+    / "scripts"
+    / "train_bridge_qwen3_vl_4b_groot_cyclic_lora_4x4090.sh"
+)
 LIBERO_CONFIG = PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
 QWEN35_LIBERO_CONFIG = (
     PROJECT_ROOT / "configs" / "qwen3_5_0_8b_groot_libero_4x4090.yaml"
@@ -125,6 +130,71 @@ def test_bridge_script_keeps_bridge_config_and_forwards_learning_rates(tmp_path)
     assert "--prior-prefiltered-scores" not in arguments
     assert arguments[arguments.index("--lora-learning-rate") + 1] == "7e-6"
     assert arguments[arguments.index("--action-head-learning-rate") + 1] == "3e-4"
+
+
+def test_cyclic_bridge_script_injects_schedule_and_bridge_defaults(tmp_path):
+    environment, calls = _fake_python_environment(tmp_path)
+
+    subprocess.run(
+        [
+            "bash",
+            str(CYCLIC_BRIDGE_SCRIPT),
+            "--output-dir",
+            "outputs/bridge-cyclic",
+            "--preflight-only",
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        check=True,
+    )
+
+    arguments = calls.read_text(encoding="utf-8").splitlines()
+    assert arguments[arguments.index("--config") + 1] == str(BRIDGE_CONFIG)
+    assert str(LIBERO_CONFIG) not in arguments
+    assert "--all-tasks" not in arguments
+    assert "--sample-weights" not in arguments
+    assert "--prior-prefiltered-scores" not in arguments
+    assert arguments[arguments.index("--lora-freeze-steps") + 1] == "5000"
+    assert arguments[arguments.index("--lora-cycle-steps") + 1] == "100"
+    assert arguments[arguments.index("--lora-active-steps") + 1] == "10"
+    assert arguments[arguments.index("--micro-batch-size") + 1] == "1"
+    assert arguments[arguments.index("--gradient-accumulation-steps") + 1] == "16"
+    assert arguments[arguments.index("--qwen-context-forward") + 1] == "backbone"
+    assert "--no-compile-qwen-backbone" in arguments
+    assert "--no-compile-action-head" in arguments
+    assert arguments[arguments.index("--episode-cache-size") + 1] == "2"
+
+
+def test_cyclic_bridge_script_allows_explicit_schedule_overrides(tmp_path):
+    environment, calls = _fake_python_environment(tmp_path)
+
+    subprocess.run(
+        [
+            "bash",
+            str(CYCLIC_BRIDGE_SCRIPT),
+            "--lora-freeze-steps",
+            "6000",
+            "--lora-cycle-steps",
+            "200",
+            "--lora-active-steps",
+            "20",
+            "--output-dir",
+            "outputs/bridge-cyclic-custom",
+            "--preflight-only",
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        check=True,
+    )
+
+    arguments = calls.read_text(encoding="utf-8").splitlines()
+
+    def values_for(option):
+        return [arguments[index + 1] for index, value in enumerate(arguments) if value == option]
+
+    assert values_for("--lora-freeze-steps") == ["5000", "6000"]
+    assert values_for("--lora-cycle-steps") == ["100", "200"]
+    assert values_for("--lora-active-steps") == ["10", "20"]
 
 
 def test_libero_script_preserves_explicit_weights_and_prior_mode(tmp_path):

@@ -476,6 +476,27 @@ bash scripts/evaluate_libero_octo_small.sh \
 评测进程，并保持原有 `--output-dir` 语义；`--task-name` 不能和 `--indexes`
 同时使用。
 
+默认不记录视频。传入 `--save-videos-path` 后，每个任务会按全局 `episode_id`
+分别选择最早的成功、失败 episode，并把两类视频写入独立目录。未指定
+`--record-videos K` 时两类各保存最多 1 条；显式指定 K 时两类各保存最多 K 条，
+且 `--record-videos` 不能脱离 `--save-videos-path` 单独使用。例如：
+
+```bash
+bash scripts/evaluate_libero_octo_small.sh \
+  --indexes 0,1 \
+  --save-videos-path outputs/libero10_videos \
+  --record-videos 3
+```
+
+上述命令将视频写入
+`outputs/libero10_videos/task-0/{success,failure}/` 和
+`outputs/libero10_videos/task-1/{success,failure}/`；显式使用 `--task-name` 时则直接
+写入给定路径下的 `{success,failure}/`。成功视频包含初始帧并录到首次成功 step；
+失败视频同样保存完整 episode。录像使用正式评测中生成的动作轨迹进行确定性
+单环境回放，不重复模型推理，也不改变正式评测的并行协议。目标目录已有
+`episode-*.mp4` 时需要传入 `--overwrite`；覆盖只替换这些生成视频并保留目录中的
+其他文件。`--preflight-only` 不运行 episode，因此不会生成视频。
+
 服务器启动脚本默认使用 `MUJOCO_GL=egl`；无 GPU 的主机可在安装 OSMesa 后使用
 `MUJOCO_GL=osmesa bash scripts/evaluate_libero_octo_small.sh ...`。并行环境使用
 LIBERO 官方 `SubprocVectorEnv`，评测器会在加载模型和初始化 CUDA 前把
@@ -534,6 +555,19 @@ bash scripts/train_bridge_4x4090.sh \
   --dataset-path /data/dwb/datasets/bridge_orig_1.0.0_lerobo \
   --output-dir outputs/qwen3_vl_4b_groot_bridge_4gpu
 ```
+
+BridgeData V2 也可以使用周期性 LoRA 调度入口：
+
+```bash
+bash scripts/train_bridge_qwen3_vl_4b_groot_cyclic_lora_4x4090.sh \
+  --output-dir outputs/qwen3_vl_4b_groot_bridge_cyclic_lora
+```
+
+该入口的第 1–5,000 个 optimizer step 只训练 GR00T 动作头；之后每 100 步的
+前 90 步仍只训练动作头，最后 10 步训练 LoRA 与动作头。默认调度可以分别用
+`--lora-freeze-steps`、`--lora-cycle-steps` 和 `--lora-active-steps` 覆盖。入口继续
+使用 `configs/bridge_4x4090.yaml` 中的 BridgeData V2 数据配置，并允许通过现有
+Bridge 训练参数覆盖模型、数据集、GPU 和输出路径。
 
 `--gpu-ids` 是宿主机上的物理编号。启动器会将其写入
 `CUDA_VISIBLE_DEVICES`，随后用 4 个 `torchrun` 进程训练；编号数量必须与
@@ -745,11 +779,72 @@ episode，并分别写入 `outputs/qwen_libero_eval/task-0/` 到 `task-9/`。单
 `--num-envs` 仍控制 LIBERO 仿真并行度。已有结果不会自动覆盖，重复正式评测需传
 `--overwrite`。
 
+### Qwen Bridge 的 SimplerEnv 四任务闭环评测
+
+该入口只评测以下固定 WidowX Bridge 任务：`spoon`、`carrot`、`stack`、
+`eggplant`。仓库用 submodule 固定
+`third_party/SimplerEnv@06accaca93535902d408da4855f21cece12bceb7`；首次 checkout 后
+必须同时初始化其嵌套的 `ManiSkill2_real2sim`：
+
+```bash
+git submodule update --init --recursive third_party/SimplerEnv
+```
+
+评测必须使用预先准备的 Python 3.10 或 3.11 单进程环境。不要把当前项目的
+Python 3.12 `pyproject.toml` 安装进该环境；按专用约束安装 Qwen、SAPIEN 和
+ManiSkill2 依赖即可，启动器会直接设置两个源码目录的 `PYTHONPATH`：
+
+```bash
+python3.10 -m venv .venv-simpler
+.venv-simpler/bin/pip install -r requirements-qwen-simpler-eval.txt
+```
+
+脚本不会安装或改写依赖，并会严格检查 Python 版本、NumPy 1.24.4、Qwen 推理栈、
+SAPIEN/CUDA、两个源码 commit、overlay 资源以及 checkpoint 契约。先运行预检；它会
+对四类环境分别创建、reset、读取相机/base-frame proprio 并执行一次安全零动作，且
+让模型完成一次推理：
+
+```bash
+bash scripts/evaluate_simpler_qwen.sh \
+  --python .venv-simpler/bin/python \
+  --checkpoint /data/dwb/qwen_bridge/checkpoints/step-00020000 \
+  --preflight-only
+```
+
+预检通过后运行四任务 smoke test（每任务 seed 0、object episode 0、最多 8 步）：
+
+```bash
+bash scripts/evaluate_simpler_qwen.sh \
+  --python .venv-simpler/bin/python \
+  --checkpoint /data/dwb/qwen_bridge/checkpoints/step-00020000 \
+  --smoke-test
+```
+
+完整协议为 4 个任务 × object episode `0..23` × 策略种子 `0,2,4`，共 288 回合；
+模型只加载一次，每个回合单独创建/关闭环境，每次预测并执行完整 8 步动作块：
+
+```bash
+bash scripts/evaluate_simpler_qwen.sh \
+  --python .venv-simpler/bin/python \
+  --checkpoint /data/dwb/qwen_bridge/checkpoints/step-00020000 \
+  --tasks all \
+  --output-dir outputs/qwen_simpler_eval
+```
+
+`--tasks` 也接受如 `spoon,eggplant` 的逗号列表；`--action-horizon` 可设为 1–8。
+默认不录像；传入 `--save-videos-path outputs/qwen_simpler_videos` 后保存全部执行回合，
+路径为 `TASK/seed-SEED/episode-ID_{success|failure}.mp4`，默认 5 FPS。结果目录在运行中
+原子更新 `episodes.partial.jsonl`，正常结束后写 `episodes.jsonl` 与 `results.json`；
+预检写 `preflight.json`，失败写 `failure.json`。已有输出不会覆盖，需显式传
+`--overwrite`。
+
 ## 测试
 
 ```bash
 pytest
 pytest -m real_data
+pytest -q tests/test_qwen_simpler_evaluation.py tests/test_evaluate_simpler_qwen_script.py
+bash -n scripts/evaluate_simpler_qwen.sh
 ```
 
 真实 4/8 卡 smoke test 必须在能访问 NVIDIA 驱动的训练机运行。

@@ -32,6 +32,11 @@ Launcher options:
   --indexes all      Run all ten LIBERO-10 tasks (also the default).
   --output-dir PATH  Result root in indexes mode; each task uses PATH/task-N/.
                      With --task-name, PATH keeps the Python CLI's original meaning.
+  --save-videos-path PATH
+                     Video root in indexes mode; each task uses PATH/task-N/.
+                     With --task-name, videos are written directly under PATH.
+  --record-videos K  Save at most K successful and K failed episodes per task.
+                     Requires --save-videos-path; defaults to K=1 when omitted.
   --task-name NAME   Run one named task. Cannot be combined with --indexes.
   -h, --help         Show this help and the LIBERO-10 task mapping.
 
@@ -63,6 +68,10 @@ task_name_explicit=false
 task_name=""
 output_dir_explicit=false
 output_root="${DEFAULT_OUTPUT_ROOT}"
+save_videos_path_explicit=false
+save_videos_root=""
+record_videos_explicit=false
+record_videos=""
 forwarded_args=()
 
 while (($# > 0)); do
@@ -106,6 +115,39 @@ while (($# > 0)); do
       [[ -n "${output_root}" ]] || fail_usage "--output-dir requires a non-empty value"
       shift
       ;;
+    --save-videos-path)
+      [[ "${save_videos_path_explicit}" == false ]] \
+        || fail_usage "--save-videos-path may only be specified once"
+      (($# >= 2)) || fail_usage "--save-videos-path requires a value"
+      [[ -n "$2" ]] || fail_usage "--save-videos-path requires a non-empty value"
+      save_videos_path_explicit=true
+      save_videos_root="$2"
+      shift 2
+      ;;
+    --save-videos-path=*)
+      [[ "${save_videos_path_explicit}" == false ]] \
+        || fail_usage "--save-videos-path may only be specified once"
+      save_videos_path_explicit=true
+      save_videos_root="${1#--save-videos-path=}"
+      [[ -n "${save_videos_root}" ]] \
+        || fail_usage "--save-videos-path requires a non-empty value"
+      shift
+      ;;
+    --record-videos)
+      [[ "${record_videos_explicit}" == false ]] \
+        || fail_usage "--record-videos may only be specified once"
+      (($# >= 2)) || fail_usage "--record-videos requires a value"
+      record_videos_explicit=true
+      record_videos="$2"
+      shift 2
+      ;;
+    --record-videos=*)
+      [[ "${record_videos_explicit}" == false ]] \
+        || fail_usage "--record-videos may only be specified once"
+      record_videos_explicit=true
+      record_videos="${1#--record-videos=}"
+      shift
+      ;;
     -h | --help)
       usage
       exit 0
@@ -125,11 +167,28 @@ done
 if [[ "${task_name_explicit}" == true && "${indexes_explicit}" == true ]]; then
   fail_usage "--task-name cannot be combined with --indexes"
 fi
+if [[ "${record_videos_explicit}" == true && "${save_videos_path_explicit}" == false ]]; then
+  fail_usage "--record-videos requires --save-videos-path"
+fi
+if [[ "${save_videos_path_explicit}" == true ]]; then
+  if [[ "${record_videos_explicit}" == false ]]; then
+    record_videos="1"
+  fi
+  if [[ ! "${record_videos}" =~ ^[1-9][0-9]*$ ]]; then
+    fail_usage "--record-videos must be a positive integer"
+  fi
+fi
 
 if [[ "${task_name_explicit}" == true ]]; then
   single_task_args=("${forwarded_args[@]}" --task-name "${task_name}")
   if [[ "${output_dir_explicit}" == true ]]; then
     single_task_args+=(--output-dir "${output_root}")
+  fi
+  if [[ "${save_videos_path_explicit}" == true ]]; then
+    single_task_args+=(
+      --save-videos-path "${save_videos_root}"
+      --record-videos "${record_videos}"
+    )
   fi
   exec python3 -m octo_small_libero.evaluate "${single_task_args[@]}"
 fi
@@ -168,6 +227,15 @@ for index in "${selected_indexes[@]}"; do
     --task-name "${task_name}"
     --output-dir "${task_output_dir}"
   )
+  if [[ "${save_videos_path_explicit}" == true ]]; then
+    task_video_dir="${save_videos_root%/}/task-${index}"
+    [[ -n "${save_videos_root%/}" ]] || task_video_dir="/task-${index}"
+    printf '[info] video directory: %s\n' "${task_video_dir}"
+    task_args+=(
+      --save-videos-path "${task_video_dir}"
+      --record-videos "${record_videos}"
+    )
+  fi
   if python3 -m octo_small_libero.evaluate "${task_args[@]}"; then
     printf '[info] task %d completed successfully\n' "${index}"
   else

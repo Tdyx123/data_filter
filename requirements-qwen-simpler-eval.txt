@@ -1,0 +1,27 @@
+# Dedicated single-process Python 3.10/3.11 environment for Qwen + SimplerEnv.
+# Do not install the project's Python 3.12 pyproject into this environment.
+numpy==1.24.4
+torch==2.9.0
+torchvision==0.24.0
+transformers==5.2.0
+peft==0.18.0
+safetensors==0.5.3
+Pillow==11.1.0
+
+# Pinned SimplerEnv / ManiSkill2_real2sim runtime dependencies.
+scipy==1.12.0
+gymnasium==0.29.1
+sapien==2.2.2
+h5py==3.10.0
+PyYAML==6.0.2
+tqdm==4.67.1
+GitPython==3.1.44
+tabulate==0.9.0
+gdown==5.2.0
+transforms3d==0.4.2
+opencv-python==4.11.0.86
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+trimesh==4.8.3
+rtree==1.4.1
+ruckig==0.14.0

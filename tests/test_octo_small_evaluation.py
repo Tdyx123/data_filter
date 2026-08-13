@@ -12,6 +12,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import octo_small_libero.evaluate as evaluate_cli
+import octo_small_libero.evaluation as evaluation_module
 from octo_small_libero.evaluation import (
     ACTION_HORIZON,
     BDDL_VERSION,
@@ -435,6 +437,212 @@ def test_chunk_rollout_records_first_success_and_stops_when_all_succeed():
     ]
 
 
+def test_video_selection_uses_earliest_episode_ids_per_result():
+    episodes = [
+        {"episode_id": 8, "success": False},
+        {"episode_id": 4, "success": True},
+        {"episode_id": 1, "success": False},
+        {"episode_id": 3, "success": True},
+        {"episode_id": 6, "success": False},
+    ]
+
+    selected = evaluation_module._select_video_episodes(episodes, limit=2)
+
+    assert [episode["episode_id"] for episode in selected] == [1, 3, 4, 6]
+
+
+def test_video_action_limit_keeps_complete_success_and_failure_episodes():
+    assert evaluation_module._video_action_limit({"success": True, "steps": 345}) == 345
+    assert evaluation_module._video_action_limit({"success": False, "steps": 960}) == 960
+    assert evaluation_module._video_action_limit({"success": False, "steps": 8}) == 8
+
+
+class _ReplayVideoEnvironment:
+    def __init__(self):
+        self.closed = False
+        self.seed_values = []
+        self.step_count = 0
+        self.success_after = None
+
+    @staticmethod
+    def _observations(value):
+        return np.asarray(
+            [
+                {
+                    "agentview_image": np.full(
+                        (4, 4, 3),
+                        value,
+                        dtype=np.uint8,
+                    )
+                }
+            ],
+            dtype=object,
+        )
+
+    def reset(self):
+        self.step_count = 0
+
+    def seed(self, value):
+        self.seed_values.append(value)
+
+    def set_init_state(self, values):
+        init_state_id = int(np.asarray(values)[0, 0])
+        self.success_after = 2 if init_state_id == 1 else None
+        return self._observations(0)
+
+    def step(self, actions):
+        assert np.asarray(actions).shape == (1, 7)
+        self.step_count += 1
+        return (
+            self._observations(self.step_count),
+            np.zeros(1),
+            np.zeros(1, dtype=bool),
+            np.asarray([{}], dtype=object),
+        )
+
+    def check_success(self):
+        return [self.success_after is not None and self.step_count >= self.success_after]
+
+    def close(self):
+        self.closed = True
+
+
+def test_replay_selected_videos_writes_complete_stratified_outputs(
+    tmp_path,
+    monkeypatch,
+):
+    import octo_small_libero.evaluation as evaluation
+
+    environment = _ReplayVideoEnvironment()
+    monkeypatch.setattr(
+        evaluation,
+        "make_vector_environment_with_backoff",
+        lambda task, num_envs, auto_reduce: (environment, 1),
+    )
+    written_frames = {}
+
+    def write_video(path, frames, *, fps):
+        materialized = list(frames)
+        written_frames[path.relative_to(path.parents[2])] = materialized
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"video")
+
+    monkeypatch.setattr(evaluation, "_write_video", write_video)
+    settings = EvaluationSettings(
+        output_dir=tmp_path / "results",
+        save_videos_path=tmp_path / "videos",
+        episodes=3,
+        num_envs=1,
+        max_steps=960,
+        settle_steps=0,
+        record_videos=1,
+        overwrite=True,
+    )
+    task = LiberoTask(
+        task_id=5,
+        name="task",
+        language="do the task",
+        bddl_file=tmp_path / "task.bddl",
+        init_states_file=tmp_path / "task.init",
+        init_states_sha256="sha256",
+        init_states_git_blob="blob",
+        init_states=np.asarray([[0.0], [1.0], [2.0]], dtype=np.float32),
+    )
+    episodes = [
+        {
+            "episode_id": 1,
+            "init_state_id": 1,
+            "seed": EXPECTED_EVALUATION_SEEDS[0],
+            "success": True,
+            "steps": 2,
+            "first_success_step": 2,
+            "termination": "success",
+        },
+        {
+            "episode_id": 0,
+            "init_state_id": 0,
+            "seed": EXPECTED_EVALUATION_SEEDS[0],
+            "success": False,
+            "steps": 105,
+            "first_success_step": None,
+            "termination": "max_steps",
+        },
+    ]
+    action_trajectories = {
+        0: [np.zeros(7, dtype=np.float32) for _ in range(105)],
+        1: [np.zeros(7, dtype=np.float32) for _ in range(2)],
+    }
+
+    paths = evaluation_module._record_replay_videos(
+        settings,
+        task=task,
+        statistics=_statistics(tmp_path),
+        episodes=episodes,
+        action_trajectories=action_trajectories,
+    )
+
+    assert {Path(path).relative_to(settings.save_videos_path) for path in paths} == {
+        Path("failure/episode-000.mp4"),
+        Path("success/episode-001.mp4"),
+    }
+    assert sorted(len(frames) for frames in written_frames.values()) == [3, 106]
+    assert environment.seed_values == [
+        EXPECTED_EVALUATION_SEEDS[0],
+        EXPECTED_EVALUATION_SEEDS[0] + 1,
+    ]
+    assert environment.closed is True
+
+
+def test_replay_frames_rejects_a_success_that_does_not_reproduce():
+    environment = _ReplayVideoEnvironment()
+    environment.success_after = None
+    observations = environment._observations(0)
+    actions = [np.zeros(7, dtype=np.float32) for _ in range(2)]
+
+    with pytest.raises(EvaluationError, match="did not reproduce success"):
+        list(
+            evaluation_module._replay_episode_frames(
+                environment,
+                observations,
+                actions,
+                expected_success=True,
+            )
+        )
+
+
+def test_video_settings_require_path_and_positive_limit(tmp_path):
+    evaluation_module._validate_video_settings(EvaluationSettings())
+    evaluation_module._validate_video_settings(
+        EvaluationSettings(save_videos_path=tmp_path / "videos", record_videos=1)
+    )
+
+    with pytest.raises(EvaluationError, match="requires save_videos_path"):
+        evaluation_module._validate_video_settings(EvaluationSettings(record_videos=1))
+    with pytest.raises(EvaluationError, match="must be positive"):
+        evaluation_module._validate_video_settings(
+            EvaluationSettings(save_videos_path=tmp_path / "videos", record_videos=0)
+        )
+
+
+def test_existing_generated_videos_require_overwrite(tmp_path):
+    video = tmp_path / "videos" / "success" / "episode-000.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"old")
+
+    with pytest.raises(EvaluationError, match="use --overwrite"):
+        evaluation_module._check_video_targets(
+            EvaluationSettings(save_videos_path=tmp_path / "videos", record_videos=1)
+        )
+
+    evaluation_module._check_video_targets(
+        EvaluationSettings(
+            save_videos_path=tmp_path / "videos",
+            record_videos=1,
+            overwrite=True,
+        )
+    )
+
+
 def test_evaluation_cli_defaults_and_checkpoint_arguments():
     parser = build_parser()
     arguments = parser.parse_args(
@@ -463,6 +671,113 @@ def test_evaluation_cli_defaults_and_checkpoint_arguments():
         assert str(seed) in help_text
 
 
+def test_evaluation_cli_defaults_video_limit_when_path_is_enabled(monkeypatch):
+    captured = {}
+
+    def fake_evaluate(settings, *, preflight_only):
+        captured["settings"] = settings
+        captured["preflight_only"] = preflight_only
+        return {"status": "complete"}
+
+    monkeypatch.setattr(evaluate_cli, "evaluate_checkpoint", fake_evaluate)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "octo-small-libero-evaluate",
+            "--save-videos-path",
+            "/tmp/libero-videos",
+            "--smoke-test",
+        ],
+    )
+
+    evaluate_cli.main()
+
+    assert captured["settings"].save_videos_path == Path("/tmp/libero-videos")
+    assert captured["settings"].record_videos == 1
+    assert captured["preflight_only"] is False
+
+
+def test_evaluation_cli_requires_video_path_for_record_limit(monkeypatch):
+    called = False
+
+    def fake_evaluate(settings, *, preflight_only):
+        nonlocal called
+        called = True
+        return {"status": "complete"}
+
+    monkeypatch.setattr(evaluate_cli, "evaluate_checkpoint", fake_evaluate)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["octo-small-libero-evaluate", "--record-videos", "2"],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        evaluate_cli.main()
+
+    assert raised.value.code == 2
+    assert called is False
+
+
+def test_evaluation_cli_rejects_duplicate_video_paths(monkeypatch, capsys):
+    called = False
+
+    def fake_evaluate(settings, *, preflight_only):
+        nonlocal called
+        called = True
+        return {"status": "complete"}
+
+    monkeypatch.setattr(evaluate_cli, "evaluate_checkpoint", fake_evaluate)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "octo-small-libero-evaluate",
+            "--save-videos-path",
+            "/tmp/first",
+            "--save-videos-path=/tmp/second",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        evaluate_cli.main()
+
+    assert raised.value.code == 2
+    assert called is False
+    assert "--save-videos-path may only be specified once" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("limit", ["0", "-1"])
+def test_evaluation_cli_requires_positive_video_limit(monkeypatch, capsys, limit):
+    called = False
+
+    def fake_evaluate(settings, *, preflight_only):
+        nonlocal called
+        called = True
+        return {"status": "complete"}
+
+    monkeypatch.setattr(evaluate_cli, "evaluate_checkpoint", fake_evaluate)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "octo-small-libero-evaluate",
+            "--save-videos-path",
+            "/tmp/libero-videos",
+            "--record-videos",
+            limit,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        evaluate_cli.main()
+
+    assert raised.value.code == 2
+    assert called is False
+    assert "--record-videos must be positive" in capsys.readouterr().err
+
+
 def test_evaluation_protocol_uses_three_fixed_seeds_and_balanced_episodes():
     settings = EvaluationSettings(episodes=150, num_envs=50)
 
@@ -473,12 +788,10 @@ def test_evaluation_protocol_uses_three_fixed_seeds_and_balanced_episodes():
         validate_settings(EvaluationSettings(episodes=149, num_envs=50))
 
     with pytest.raises(EvaluationError, match="fixed evaluation seeds"):
-        validate_settings(
-            EvaluationSettings(episodes=150, num_envs=50, seeds=(3, 4, 5))
-        )
+        validate_settings(EvaluationSettings(episodes=150, num_envs=50, seeds=(3, 4, 5)))
 
 
-def test_evaluate_checkpoint_repeats_initial_states_for_each_fixed_seed(
+def test_evaluate_checkpoint_repeats_states_and_delegates_video_replay(
     tmp_path,
     monkeypatch,
 ):
@@ -515,12 +828,14 @@ def test_evaluate_checkpoint_repeats_initial_states_for_each_fixed_seed(
         checkpoint=checkpoint.requested_path,
         statistics=statistics.path,
         output_dir=tmp_path / "results",
+        save_videos_path=tmp_path / "videos",
         episodes=6,
         num_envs=2,
         max_steps=1,
         settle_steps=0,
         device="cpu",
         precision="fp32",
+        record_videos=1,
     )
 
     class FakeEnvironment:
@@ -597,6 +912,26 @@ def test_evaluate_checkpoint_repeats_initial_states_for_each_fixed_seed(
         "make_vector_environment_with_backoff",
         lambda *args, **kwargs: (environment, settings.num_envs),
     )
+    recorded_replay = {}
+
+    def record_replay_videos(
+        replay_settings,
+        *,
+        task,
+        statistics,
+        episodes,
+        action_trajectories,
+    ):
+        recorded_replay["settings"] = replay_settings
+        recorded_replay["task"] = task
+        recorded_replay["statistics"] = statistics
+        recorded_replay["episodes"] = list(episodes)
+        recorded_replay["action_trajectories"] = {
+            episode_id: list(actions) for episode_id, actions in action_trajectories.items()
+        }
+        return [str(settings.save_videos_path / "success" / "episode-000.mp4")]
+
+    monkeypatch.setattr(evaluation, "_record_replay_videos", record_replay_videos)
 
     report = evaluate_checkpoint(settings)
     episode_rows = [
@@ -608,10 +943,7 @@ def test_evaluate_checkpoint_repeats_initial_states_for_each_fixed_seed(
 
     assert tuple(policy.generator_seeds) == EXPECTED_EVALUATION_SEEDS
     assert tuple(environment.seeds) == EXPECTED_EVALUATION_SEEDS
-    assert [
-        (row["episode_id"], row["init_state_id"], row["seed"])
-        for row in episode_rows
-    ] == [
+    assert [(row["episode_id"], row["init_state_id"], row["seed"]) for row in episode_rows] == [
         (0, 0, 3471197683),
         (1, 1, 3471197683),
         (2, 0, 1232873419),
@@ -625,6 +957,16 @@ def test_evaluate_checkpoint_repeats_initial_states_for_each_fixed_seed(
         1.0,
         1.0,
     ]
+    assert recorded_replay["settings"] is settings
+    assert recorded_replay["task"] is task
+    assert recorded_replay["statistics"] is statistics
+    assert len(recorded_replay["episodes"]) == 6
+    assert set(recorded_replay["action_trajectories"]) == set(range(6))
+    assert all(
+        len(actions) == ACTION_HORIZON
+        for actions in recorded_replay["action_trajectories"].values()
+    )
+    assert report["videos"] == [str(settings.save_videos_path / "success" / "episode-000.mp4")]
 
 
 def test_libero_source_checkout_layout_is_added_to_import_path(tmp_path, monkeypatch):
@@ -865,10 +1207,7 @@ def test_vector_environment_uses_official_libero_robosuite_stack(
                 "camera_widths": 128,
             },
         ]
-        assert all(
-            item._octo_startup_failure is None
-            for item in environment.environments
-        )
+        assert all(item._octo_startup_failure is None for item in environment.environments)
     finally:
         environment.close()
 
@@ -911,10 +1250,7 @@ def test_libero_subprocess_worker_bootstrap_is_idempotent():
     assert libero_venv._worker is _run_libero_subprocess_worker_with_gymnasium
     assert libero_venv.CloudpickleWrapper is _LiberoWorkerCloudpickleWrapper
     assert libero_venv._octo_small_libero_original_worker is original_worker
-    assert (
-        libero_venv._octo_small_libero_original_cloudpickle_wrapper
-        is original_wrapper
-    )
+    assert libero_venv._octo_small_libero_original_cloudpickle_wrapper is original_wrapper
     assert not _install_libero_subprocess_worker_bootstrap(libero_venv)
 
 

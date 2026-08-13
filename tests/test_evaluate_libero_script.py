@@ -163,6 +163,38 @@ def test_indexes_all_matches_default_and_honors_custom_output_root(tmp_path):
     ]
 
 
+def test_video_root_is_partitioned_by_task_and_forwards_per_result_limit(tmp_path):
+    completed, calls = _run_script(
+        tmp_path,
+        "--indexes",
+        "0,1",
+        "--save-videos-path=/tmp/libero-videos",
+        "--record-videos",
+        "3",
+    )
+
+    assert completed.returncode == 0
+    assert [_option(call, "--save-videos-path") for call in calls] == [
+        "/tmp/libero-videos/task-0",
+        "/tmp/libero-videos/task-1",
+    ]
+    assert [_option(call, "--record-videos") for call in calls] == ["3", "3"]
+
+
+def test_video_path_defaults_to_one_recording_per_result(tmp_path):
+    completed, calls = _run_script(
+        tmp_path,
+        "--indexes",
+        "5",
+        "--save-videos-path",
+        "/tmp/libero-videos",
+    )
+
+    assert completed.returncode == 0
+    assert _option(calls[0], "--save-videos-path") == "/tmp/libero-videos/task-5"
+    assert _option(calls[0], "--record-videos") == "1"
+
+
 def test_explicit_task_name_preserves_single_task_output_semantics(tmp_path):
     completed, calls = _run_script(
         tmp_path,
@@ -178,6 +210,23 @@ def test_explicit_task_name_preserves_single_task_output_semantics(tmp_path):
     assert _option(calls[0], "--task-name") == "custom_task"
     assert _option(calls[0], "--output-dir") == "/tmp/one-task"
     assert "--smoke-test" in calls[0]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("--record-videos", "2"),
+        ("--save-videos-path", ""),
+        ("--save-videos-path", "/tmp/a", "--save-videos-path", "/tmp/b"),
+        ("--save-videos-path", "/tmp/a", "--record-videos", "0"),
+    ],
+)
+def test_invalid_video_options_fail_before_python_is_started(tmp_path, arguments):
+    completed, calls = _run_script(tmp_path, *arguments)
+
+    assert completed.returncode != 0
+    assert calls == []
+    assert "error:" in completed.stderr
 
 
 @pytest.mark.parametrize(
