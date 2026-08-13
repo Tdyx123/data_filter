@@ -95,6 +95,12 @@ def build_parser() -> argparse.ArgumentParser:
                 metavar="FLOAT",
                 help="override selection ratio in (0, 1] and ignore configured budget",
             )
+            child.add_argument(
+                "--quota-mode",
+                choices=("proportional", "none"),
+                default=None,
+                help="override task quota mode and isolate the selection output",
+            )
     validate = subparsers.add_parser("validate")
     validate.add_argument("--output-dir", required=True)
     validate.add_argument("--config", default=None)
@@ -117,6 +123,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command in {"select", "run"} and args.selection_ratio is not None:
         config["selection"]["ratio"] = args.selection_ratio
         config["selection"]["budget"] = None
+    if args.command in {"select", "run"} and args.quota_mode is not None:
+        config["selection"]["quota_mode"] = args.quota_mode
+        if args.quota_mode == "none":
+            config["selection"]["minimum_per_task"] = 0
     if args.command == "scan":
         root, _, clips, _ = scan_stage(config, output_dir=args.output_dir, force=args.force)
         print(f"relcore_output={root} clips={len(clips)}")
@@ -140,6 +150,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             output_dir=args.output_dir,
             force=args.force,
             selection_output_ratio=args.selection_ratio,
+            selection_output_quota_mode=args.quota_mode,
             reliability_metrics=args.reliability_metrics,
             prototype_gain_metrics=args.prototype_gain_metrics,
         )
@@ -150,6 +161,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             output_dir=args.output_dir,
             force=args.force,
             selection_output_ratio=args.selection_ratio,
+            selection_output_quota_mode=args.quota_mode,
             reliability_metrics=args.reliability_metrics,
             prototype_gain_metrics=args.prototype_gain_metrics,
         )

@@ -250,6 +250,7 @@ def test_run_pipeline_publishes_aligned_outputs_and_reuses_complete_cache(
     assert all("marginal_gain" in row for row in manifest_rows)
 
     run_manifest = json.loads((result / "run_manifest.json").read_text())
+    assert run_manifest["selection_output_quota_mode"] is None
     assert run_manifest["reliability_mask"] == 15
     assert run_manifest["prototype_gain_metrics"] == [
         "transition",
@@ -573,6 +574,59 @@ def test_ratio_scoped_select_rejects_output_ratio_that_differs_from_config(tmp_p
         )
 
 
+def test_quota_scoped_selects_coexist_with_each_other_and_legacy_output(
+    tmp_path: Path,
+) -> None:
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    proportional_config = _config(tmp_path)
+    legacy_result = run_pipeline(
+        proportional_config,
+        visual_encoder=PipelineVisualEncoder(),
+    )
+    proportional_result = run_pipeline(
+        proportional_config,
+        selection_output_quota_mode="proportional",
+        visual_encoder=PipelineVisualEncoder(),
+    )
+
+    global_config = _config(tmp_path)
+    global_config["selection"]["quota_mode"] = "none"
+    global_config["selection"]["minimum_per_task"] = 0
+    global_result = run_pipeline(
+        global_config,
+        selection_output_quota_mode="none",
+        visual_encoder=PipelineVisualEncoder(),
+    )
+
+    assert legacy_result == global_result.parent / "select-r15-g7"
+    assert proportional_result == global_result.parent / "select-r15-g7-quota-proportional"
+    assert global_result == global_result.parent / "select-r15-g7-quota-none"
+    assert legacy_result.is_dir()
+    assert proportional_result.is_dir()
+    run_manifest = json.loads((global_result / "run_manifest.json").read_text())
+    assert run_manifest["selection_output_quota_mode"] == "none"
+    assert run_manifest["stage_directories"]["select"] == "select-r15-g7-quota-none"
+    report = json.loads((global_result / "selection_report.json").read_text())
+    assert report["quota_mode"] == "none"
+    assert report["task_quotas"] is None
+    assert validate_output(global_result, config=global_config) == {
+        "status": "valid",
+        "selected_clips": 2,
+    }
+
+
+def test_quota_scoped_select_rejects_mode_that_differs_from_config(tmp_path: Path) -> None:
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+
+    with pytest.raises(ValueError, match="selection_output_quota_mode must match"):
+        select_stage(
+            config,
+            selection_output_quota_mode="none",
+            visual_encoder=PipelineVisualEncoder(),
+        )
+
+
 def test_global_selection_reports_actual_tasks_without_hard_quotas(tmp_path: Path):
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     config = _config(tmp_path)
@@ -719,6 +773,83 @@ def test_validate_rejects_tampered_stage_directory(tmp_path: Path):
 
     with pytest.raises(ValueError, match="stage_directories"):
         validate_output(result)
+
+
+def test_validate_accepts_legacy_manifest_without_quota_scope(tmp_path: Path) -> None:
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    manifest_path = result / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.pop("selection_output_quota_mode")
+    write_json(manifest_path, manifest)
+
+    assert validate_output(result, config=config) == {
+        "status": "valid",
+        "selected_clips": 2,
+    }
+
+
+def test_validate_rejects_tampered_quota_scope(tmp_path: Path) -> None:
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    manifest_path = result / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["selection_output_quota_mode"] = "none"
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="stage_directories"):
+        validate_output(result)
+
+
+def test_validate_rejects_non_string_quota_scope(tmp_path: Path) -> None:
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    manifest_path = result / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["selection_output_quota_mode"] = ["none"]
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="selection_output_quota_mode"):
+        validate_output(result)
+
+
+def test_validate_rejects_quota_scope_that_differs_from_report(tmp_path: Path) -> None:
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    config["selection"]["quota_mode"] = "none"
+    config["selection"]["minimum_per_task"] = 0
+    result = run_pipeline(
+        config,
+        selection_output_quota_mode="none",
+        visual_encoder=PipelineVisualEncoder(),
+    )
+    report_path = result / "selection_report.json"
+    report = json.loads(report_path.read_text())
+    report["quota_mode"] = "proportional"
+    report["task_quotas"] = report["task_counts"]
+    write_json(report_path, report)
+
+    with pytest.raises(ValueError, match="quota mode.*run manifest"):
+        validate_output(result)
+
+
+def test_validate_rejects_report_quota_mode_that_differs_from_config(
+    tmp_path: Path,
+) -> None:
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=PipelineVisualEncoder())
+    report_path = result / "selection_report.json"
+    report = json.loads(report_path.read_text())
+    report["quota_mode"] = "none"
+    report["task_quotas"] = None
+    write_json(report_path, report)
+
+    with pytest.raises(ValueError, match="quota mode.*supplied config"):
+        validate_output(result, config=config)
 
 
 def test_validate_rejects_tampered_graph_metrics(tmp_path: Path):

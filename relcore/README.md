@@ -68,8 +68,28 @@ python -m relcore run --config relcore/config_libero90.yaml \
   --selection-ratio 0.20 --force
 ```
 
-`validate` 接受具体的 `select-r<可靠性掩码>-g<增益掩码>[-topXpct]/` 目录，并从其中的
-manifest 定位共享输出根目录下的 scan、encode 和匹配的 graph。
+`select` 和 `run` 还可通过 `--quota-mode proportional|none` 覆盖任务份额模式。
+`proportional` 使用现有的按任务候选容量分配硬份额；`none` 让全部候选片段进行全局竞争，
+不施加逐任务硬份额。显式选择 `none` 时，命令会将本次有效配置中的
+`selection.minimum_per_task` 自动设为 `0`；显式选择 `proportional` 时保留配置文件中的
+最小份额。未传参数时完全沿用配置文件与原有输出目录。
+
+```bash
+python -m relcore run --config relcore/config_libero90.yaml \
+  --quota-mode proportional
+python -m relcore run --config relcore/config_libero90.yaml \
+  --quota-mode none
+```
+
+显式模式在选择目录末尾追加 `-quota-proportional` 或 `-quota-none`，所以上述结果可以
+同时保存在 `select-r15-g7-quota-proportional/` 和 `select-r15-g7-quota-none/`。
+与 motion-primitives 和比例组合时，目录顺序固定为
+`select-r15-g7-motion-primitives-top20pct-quota-none/`。
+
+`validate` 接受具体的
+`select-r<可靠性掩码>-g<增益掩码>[-topXpct][-quota-<模式>]/` 目录，并从其中的
+manifest 定位共享输出根目录下的 scan、encode 和匹配的 graph。无限额模式的
+`selection_report.json` 将 `task_quotas` 记为 `null`，`task_counts` 仍记录实际选择数量。
 
 ## 按任务随机 Top K% 基线
 
@@ -285,13 +305,13 @@ NUMEXPR_NUM_THREADS=1 python -m relcore select \
 
 共享输出根目录始终保留 `scan/`、`encode/` 和一个或多个 `graph-<可靠性掩码>/`。
 最终结果位于 `select-r<可靠性掩码>-g<增益掩码>/`；显式传入 `--selection-ratio`
-时追加 `-topXpct`。每个选择目录包含：
+时追加 `-topXpct`，显式传入 `--quota-mode` 时再追加 `-quota-<模式>`。每个选择目录包含：
 
 - `selected_manifest.jsonl`：按选择顺序记录 LeRobot `episode_id` 与 inclusive
   `start_step/end_step`；
 - `all_clips.parquet`：全部候选、可靠性、原型、选择状态和最终边际；
 - `selection_report.json`：目标分解、实际任务计数、可选任务额度和分支结果；
-- `run_manifest.json`：可靠性/原型增益指标、双掩码、阶段目录和阶段指纹；
+- `run_manifest.json`：可靠性/原型增益指标、双掩码、显式任务份额模式、阶段目录和阶段指纹；
 - `resolved_config.yaml`、`environment.json`：`run` 写入的配置与运行环境。
 
 `encode/` 只保存聚合后的 embeddings、关系特征、状态/动作序列、视觉进展、归一化与

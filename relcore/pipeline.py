@@ -97,6 +97,7 @@ def selection_directory_name(
     prototype_method: str = "kmeans",
     *,
     prototype_gain_metrics: Sequence[str] = PROTOTYPE_GAIN_METRICS,
+    quota_mode: str | None = None,
 ) -> str:
     prefix = (
         f"select-r{reliability_metric_mask(reliability_metrics)}"
@@ -104,10 +105,14 @@ def selection_directory_name(
     )
     if prototype_method != "kmeans":
         prefix = f"{prefix}-motion-primitives"
-    if ratio is None:
-        return prefix
-    percent_tag = format(float(ratio) * 100.0, ".12g").replace(".", "p")
-    return f"{prefix}-top{percent_tag}pct"
+    if ratio is not None:
+        percent_tag = format(float(ratio) * 100.0, ".12g").replace(".", "p")
+        prefix = f"{prefix}-top{percent_tag}pct"
+    if quota_mode is not None:
+        if quota_mode not in {"proportional", "none"}:
+            raise ValueError("quota_mode must be proportional or none")
+        prefix = f"{prefix}-quota-{quota_mode}"
+    return prefix
 
 
 def _tasks_hash(config: Mapping[str, Any]) -> str:
@@ -735,6 +740,7 @@ def select_stage(
     force: bool = False,
     visual_encoder: VisualEncoder | None = None,
     selection_output_ratio: float | None = None,
+    selection_output_quota_mode: str | None = None,
     reliability_metrics: Sequence[str] = RELIABILITY_METRICS,
     prototype_gain_metrics: Sequence[str] = PROTOTYPE_GAIN_METRICS,
 ) -> Path:
@@ -748,6 +754,18 @@ def select_stage(
     )
     if scoped_ratio is not None and scoped_ratio != float(resolved["selection"]["ratio"]):
         raise ValueError("selection_output_ratio must match selection.ratio")
+    scoped_quota_mode = (
+        str(selection_output_quota_mode)
+        if selection_output_quota_mode is not None
+        else None
+    )
+    if scoped_quota_mode is not None and scoped_quota_mode not in {"proportional", "none"}:
+        raise ValueError("selection_output_quota_mode must be proportional or none")
+    if (
+        scoped_quota_mode is not None
+        and scoped_quota_mode != str(resolved["selection"]["quota_mode"])
+    ):
+        raise ValueError("selection_output_quota_mode must match selection.quota_mode")
     seed_everything(int(resolved["seed"]))
     root, adapter, clips, graph, graph_fingerprint = graph_stage(
         resolved,
@@ -772,6 +790,7 @@ def select_stage(
         scoped_ratio,
         prototype_method,
         prototype_gain_metrics=gain_metrics,
+        quota_mode=scoped_quota_mode,
     )
     destination = root / selection_directory
     stage_directories = {
@@ -885,6 +904,7 @@ def select_stage(
             "prototype_gain_mask": gain_mask,
             "prototype_method": prototype_method,
             "selection_output_ratio": scoped_ratio,
+            "selection_output_quota_mode": scoped_quota_mode,
             "stage_directories": stage_directories,
             "stage_fingerprints": {
                 stage: _manifest_fingerprint(root / directory / "manifest.json")
@@ -902,6 +922,7 @@ def run_pipeline(
     force: bool = False,
     visual_encoder: VisualEncoder | None = None,
     selection_output_ratio: float | None = None,
+    selection_output_quota_mode: str | None = None,
     reliability_metrics: Sequence[str] = RELIABILITY_METRICS,
     prototype_gain_metrics: Sequence[str] = PROTOTYPE_GAIN_METRICS,
 ) -> Path:
@@ -914,6 +935,7 @@ def run_pipeline(
         force=force,
         visual_encoder=visual_encoder,
         selection_output_ratio=selection_output_ratio,
+        selection_output_quota_mode=selection_output_quota_mode,
         reliability_metrics=reliability_metrics,
         prototype_gain_metrics=prototype_gain_metrics,
     )
@@ -984,6 +1006,12 @@ def validate_output(
             scoped_ratio = float(scoped_ratio)
         except (TypeError, ValueError) as error:
             raise ValueError("run manifest selection_output_ratio is invalid") from error
+    scoped_quota_mode = run_manifest.get("selection_output_quota_mode")
+    if scoped_quota_mode is not None and (
+        not isinstance(scoped_quota_mode, str)
+        or scoped_quota_mode not in {"proportional", "none"}
+    ):
+        raise ValueError("run manifest selection_output_quota_mode is invalid")
     expected_directories = {
         "scan": "scan",
         "encode": "encode",
@@ -993,6 +1021,7 @@ def validate_output(
             scoped_ratio,
             prototype_method,
             prototype_gain_metrics=gain_metrics,
+            quota_mode=scoped_quota_mode,
         ),
     }
     stage_directories = run_manifest.get("stage_directories")
@@ -1207,10 +1236,14 @@ def validate_output(
             raise ValueError("global selected task counts do not match selected clips")
     else:
         raise ValueError(f"unknown selection quota mode: {quota_mode}")
+    if scoped_quota_mode is not None and quota_mode != scoped_quota_mode:
+        raise ValueError("selection report quota mode does not match the run manifest")
     if config is not None:
         resolved = resolve_config(config)
         if str(resolved["prototypes"]["method"]) != prototype_method:
             raise ValueError("run prototype_method does not match the supplied config")
+        if quota_mode != str(resolved["selection"]["quota_mode"]):
+            raise ValueError("selection report quota mode does not match the supplied config")
         resolved["output"]["directory"] = str(root)
         adapter = create_dataset(resolved["dataset"])
         expected_scan = _fingerprint(
