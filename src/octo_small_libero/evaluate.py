@@ -36,8 +36,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=150,
         help=(
-            "Total episodes across the fixed seeds 0, 1, and 2; must be divisible "
-            "by 3 (default: 150, or 50 initial states per seed)"
+            "Total episodes across the fixed seeds 3471197683, 1232873419, and "
+            "1448008435; must be divisible by 3 (default: 150, or 50 initial "
+            "states per seed)"
         ),
     )
     parser.add_argument("--num-envs", type=int, default=50)

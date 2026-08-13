@@ -41,7 +41,7 @@ All remaining arguments are forwarded unchanged to:
 Use that module's --help for evaluator options such as --checkpoint, --base-model,
 --episodes, --num-envs, --max-steps, --device, --preflight-only, and --smoke-test.
 The default protocol runs 150 episodes per task: 50 fixed initial states under
-each of the fixed seeds 0, 1, and 2.
+each of the fixed seeds 3471197683, 1232873419, and 1448008435.
 
 LIBERO-10 task mapping:
 EOF

@@ -507,9 +507,9 @@ bash scripts/evaluate_libero_octo_small.sh \
 EGL、驱动或渲染子进程启动失败时使用退出码 `3`，多任务 launcher 会立即停止
 整批任务，错误同时记录在当前任务的 `failure.json`。
 
-评测固定使用随机种子 `0`、`1`、`2`，每个种子都依次使用相同的 LIBERO-10
-初始状态，并采用 20 个稳定步、8 步 action chunk 和 960 步上限。`--episodes`
-表示三个种子的总 episode 数，必须能被 3 整除。
+评测固定使用随机种子 `3471197683`、`1232873419`、`1448008435`，每个种子都
+依次使用相同的 LIBERO-10 初始状态，并采用 20 个稳定步、8 步 action chunk 和
+960 步上限。`--episodes` 表示三个种子的总 episode 数，必须能被 3 整除。
 默认的 `results.json` 与 `episodes.jsonl` 分别写入
 `outputs/octo_small_libero_eval/task-0/` 到 `task-9/`；已有正式结果默认不会被
 覆盖，必须显式传入 `--overwrite`。默认每个任务评测 150 episodes（50 个固定

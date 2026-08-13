@@ -61,6 +61,9 @@ from octo_small_libero.evaluation import (
 from octo_small_libero.evaluate import build_parser
 
 
+EXPECTED_EVALUATION_SEEDS = (3471197683, 1232873419, 1448008435)
+
+
 class _RecordingOffscreenEnvironment:
     calls = []
 
@@ -455,12 +458,15 @@ def test_evaluation_cli_defaults_and_checkpoint_arguments():
     assert arguments.auto_reduce_num_envs is True
     assert arguments.max_steps == 960
     assert arguments.preflight_only is False
+    help_text = parser.format_help()
+    for seed in EXPECTED_EVALUATION_SEEDS:
+        assert str(seed) in help_text
 
 
 def test_evaluation_protocol_uses_three_fixed_seeds_and_balanced_episodes():
     settings = EvaluationSettings(episodes=150, num_envs=50)
 
-    assert settings.seeds == (0, 1, 2)
+    assert settings.seeds == EXPECTED_EVALUATION_SEEDS
     validate_settings(settings)
 
     with pytest.raises(EvaluationError, match="divisible by 3"):
@@ -600,18 +606,18 @@ def test_evaluate_checkpoint_repeats_initial_states_for_each_fixed_seed(
         .splitlines()
     ]
 
-    assert policy.generator_seeds == [0, 1, 2]
-    assert environment.seeds == [0, 1, 2]
+    assert tuple(policy.generator_seeds) == EXPECTED_EVALUATION_SEEDS
+    assert tuple(environment.seeds) == EXPECTED_EVALUATION_SEEDS
     assert [
         (row["episode_id"], row["init_state_id"], row["seed"])
         for row in episode_rows
     ] == [
-        (0, 0, 0),
-        (1, 1, 0),
-        (2, 0, 1),
-        (3, 1, 1),
-        (4, 0, 2),
-        (5, 1, 2),
+        (0, 0, 3471197683),
+        (1, 1, 3471197683),
+        (2, 0, 1232873419),
+        (3, 1, 1232873419),
+        (4, 0, 1448008435),
+        (5, 1, 1448008435),
     ]
     assert report["summary"]["completed_episodes"] == 6
     assert [summary["success_rate"] for summary in report["summary"]["by_seed"]] == [
@@ -1329,7 +1335,7 @@ def test_result_schema_contains_protocol_outcome_and_runtime(tmp_path):
             {
                 "episode_id": 0,
                 "init_state_id": 0,
-                "seed": 0,
+                "seed": 3471197683,
                 "success": False,
                 "steps": 8,
                 "first_success_step": None,
@@ -1338,7 +1344,7 @@ def test_result_schema_contains_protocol_outcome_and_runtime(tmp_path):
             {
                 "episode_id": 1,
                 "init_state_id": 0,
-                "seed": 1,
+                "seed": 1232873419,
                 "success": True,
                 "steps": 4,
                 "first_success_step": 4,
@@ -1347,7 +1353,7 @@ def test_result_schema_contains_protocol_outcome_and_runtime(tmp_path):
             {
                 "episode_id": 2,
                 "init_state_id": 0,
-                "seed": 2,
+                "seed": 1448008435,
                 "success": False,
                 "steps": 8,
                 "first_success_step": None,
@@ -1367,21 +1373,21 @@ def test_result_schema_contains_protocol_outcome_and_runtime(tmp_path):
     assert report["summary"]["success_rate"] == pytest.approx(1 / 3)
     assert report["summary"]["by_seed"] == [
         {
-            "seed": 0,
+            "seed": 3471197683,
             "completed_episodes": 1,
             "successes": 0,
             "failures": 1,
             "success_rate": 0.0,
         },
         {
-            "seed": 1,
+            "seed": 1232873419,
             "completed_episodes": 1,
             "successes": 1,
             "failures": 0,
             "success_rate": 1.0,
         },
         {
-            "seed": 2,
+            "seed": 1448008435,
             "completed_episodes": 1,
             "successes": 0,
             "failures": 1,

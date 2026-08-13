@@ -8,6 +8,9 @@ import numpy as np
 import pytest
 
 
+EXPECTED_EVALUATION_SEEDS = (3471197683, 1232873419, 1448008435)
+
+
 def _evaluation():
     return importlib.import_module("qwen3_vl_groot.libero_evaluation")
 
@@ -407,7 +410,7 @@ def test_qwen_evaluation_repeats_fixed_states_and_writes_qwen_report(tmp_path, m
 
         def predict_action_chunk(self, observations, language, *, generator):
             assert language == task.language
-            assert generator in (0, 1, 2)
+            assert generator in EXPECTED_EVALUATION_SEEDS
             return np.zeros((len(observations), 8, 7), dtype=np.float32)
 
     environment = FakeEnvironment()
@@ -440,18 +443,18 @@ def test_qwen_evaluation_repeats_fixed_states_and_writes_qwen_report(tmp_path, m
     ]
 
     assert multiprocessing.get_start_method() == "spawn"
-    assert policy.generator_seeds == [0, 1, 2]
-    assert environment.seeds == [0, 1, 2]
+    assert tuple(policy.generator_seeds) == EXPECTED_EVALUATION_SEEDS
+    assert tuple(environment.seeds) == EXPECTED_EVALUATION_SEEDS
     assert [
         (row["episode_id"], row["init_state_id"], row["seed"])
         for row in episode_rows
     ] == [
-        (0, 0, 0),
-        (1, 1, 0),
-        (2, 0, 1),
-        (3, 1, 1),
-        (4, 0, 2),
-        (5, 1, 2),
+        (0, 0, 3471197683),
+        (1, 1, 3471197683),
+        (2, 0, 1232873419),
+        (3, 1, 1232873419),
+        (4, 0, 1448008435),
+        (5, 1, 1448008435),
     ]
     assert report["route"] == "qwen3-vl-groot-libero-checkpoint-eval"
     assert report["checkpoint"]["weights_sha256"] == checkpoint.weights_sha256

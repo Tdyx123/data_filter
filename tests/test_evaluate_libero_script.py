@@ -239,6 +239,8 @@ def test_help_lists_every_task_without_starting_python(tmp_path):
     assert completed.returncode == 0
     assert calls == []
     assert "--indexes LIST" in completed.stdout
+    for seed in (3471197683, 1232873419, 1448008435):
+        assert str(seed) in completed.stdout
     for index, task in enumerate(TASKS):
         assert f"{index}  {task}" in completed.stdout
 
