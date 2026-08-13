@@ -10,7 +10,7 @@ import pyarrow.parquet as pq
 import pytest
 import yaml
 
-from cocore.pipeline import run_pipeline, validate_output
+from cocore.pipeline import encode_stage, run_pipeline, validate_output
 from trajectory_data import (
     DatasetAdapter,
     EpisodeData,
@@ -81,6 +81,12 @@ class CocoreVisualEncoder:
         return np.stack([values + 1.0, values + 2.0, values + 4.0], axis=1)
 
 
+class ReverseOrderCocorePipelineAdapter(CocorePipelineAdapter):
+    def __init__(self, config: Mapping[str, object]) -> None:
+        super().__init__(config)
+        self._records = tuple(reversed(self._records))
+
+
 def _config(tmp_path: Path, relation: str = "cooccurrence") -> dict[str, object]:
     return {
         "seed": 7,
@@ -97,12 +103,40 @@ def _config(tmp_path: Path, relation: str = "cooccurrence") -> dict[str, object]
         "objective": {"relation": relation, "relation_weight": 1.0},
         "selection": {
             "ratio": 0.5,
-            "budget": None,
+            "budget": 6,
             "max_refreshes": 2,
         },
         "runtime": {"num_workers": 0, "max_episodes": None, "resume": True},
         "output": {"directory": str(tmp_path / "cocore-output")},
     }
+
+
+def test_encode_stage_publishes_cocore_visual_half_artifact(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    root = tmp_path / "cocore-encode"
+
+    result_root, _, encoded = encode_stage(
+        _config(tmp_path),
+        output_dir=root,
+        visual_encoder=CocoreVisualEncoder(),
+    )
+
+    assert result_root == root
+    stored = np.load(root / "encode" / "visual_half_embeddings.npy")
+    np.testing.assert_array_equal(stored, encoded.visual_half_embeddings)
+    assert stored.shape == (6, 2, 3)
+    np.testing.assert_array_equal(
+        stored[0],
+        np.asarray([[4.5, 5.5, 7.5], [11.5, 12.5, 14.5]], dtype=np.float32),
+    )
+    manifest = json.loads((root / "encode" / "manifest.json").read_text())
+    assert manifest["producer"] == "cocore"
+    assert manifest["visual_half_embedding_dim"] == 3
+    assert manifest["clip_length"] == 15
+    assert manifest["clip_stride"] == 15
+    assert manifest["clip_anchors"] == [0, 7, 14]
+    assert manifest["visual_half_windows"] == [[0, 8], [7, 15]]
+    assert manifest["visual_half_encoding"] == "mean"
 
 
 @pytest.mark.parametrize("relation", ["cooccurrence", "sequence"])
@@ -119,12 +153,34 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert result == root / f"select-{relation}-w1-top50pct"
     assert (root / "scan" / "manifest.json").is_file()
     assert (root / "encode" / "manifest.json").is_file()
+    assert (root / "encode" / "visual_half_embeddings.npy").is_file()
     assert (root / "graph-12-motion-primitives" / "prototype_catalog.json").is_file()
+    assert (root / "graph-12-motion-primitives" / "prototype_centers.npy").is_file()
+    assert (root / "graph-12-motion-primitives" / "half_action_labels.npy").is_file()
     for directory in ("scan", "encode", "graph-12-motion-primitives"):
         manifest = json.loads((root / directory / "manifest.json").read_text())
         assert manifest["producer"] == "cocore"
-        assert manifest["cocore_version"] == "0.4.0"
+        assert manifest["cocore_version"] == "0.6.0"
+    catalog = json.loads(
+        (root / "graph-12-motion-primitives" / "prototype_catalog.json").read_text()
+    )
+    assert catalog["schema_version"] == 3
+    assert catalog["strategy"] == "action_halves_then_visual_mean_kmeans"
+    assert catalog["total_labels"] == 12
+    assert catalog["leaf_prototypes"]
+    half_action_labels = np.load(
+        root / "graph-12-motion-primitives" / "half_action_labels.npy"
+    )
+    assert half_action_labels.shape == (6, 2)
+    assert half_action_labels.dtype.kind == "U"
+    centers = np.load(root / "graph-12-motion-primitives" / "prototype_centers.npy")
+    assert centers.shape[1] == 3
     nodes = np.load(root / "graph-12-motion-primitives" / "nodes.npz")
+    assert {"prototype_action_weights", "prototype_distance_weights"} <= set(nodes.files)
+    np.testing.assert_allclose(
+        nodes["prototype_weights"],
+        nodes["prototype_action_weights"] * nodes["prototype_distance_weights"],
+    )
     np.testing.assert_allclose(
         nodes["reliability"],
         np.maximum(nodes["support"] ** 0.5 * nodes["progress"] ** 0.5, 0.05),
@@ -136,16 +192,34 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     ]
     all_rows = pq.read_table(result / "all_clips.parquet").to_pylist()
     report = json.loads((result / "selection_report.json").read_text())
-    assert len(selected) == 3
+    assert len(selected) == 6
     assert len(all_rows) == 6
     assert {row["selection_phase"] for row in selected} == {"coverage_seed", "heap"}
     assert all(
         {"selection_step", "selection_score_delta", "heap_refreshes"} <= row.keys()
         for row in selected
     )
-    assert all({"support", "progress", "reliability", "prototype_labels"} <= row.keys() for row in all_rows)
+    assert all(
+        {
+            "support",
+            "progress",
+            "reliability",
+            "prototype_labels",
+            "prototype_action_labels",
+            "prototype_cluster_ids",
+            "prototype_action_weights",
+            "prototype_distance_weights",
+            "primary_action_label",
+        }
+        <= row.keys()
+        for row in all_rows
+    )
+    assert all("::" in label for row in all_rows for label in row["prototype_labels"])
+    assert all("prototype_half_indices" not in row for row in all_rows)
+    assert all("prototype_half_indices" not in row for row in selected)
     assert report["relation_type"] == relation
     assert report["relation_weight"] == 1.0
+    assert report["prototype_schema_version"] == 3
     assert report["objective"]["total"] == (
         report["objective"]["weighted_relation"]
         - report["objective"]["redundancy"]
@@ -157,16 +231,17 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
         "max_refreshes": 2,
     }
     assert report["heap"] == {
-        "initial_size": 5,
+        "initial_size": len(all_rows) - report["initial_set_size"],
         "total_refreshes": sum(row["heap_refreshes"] for row in selected),
         "capped_selections": sum(row["heap_refreshes"] == 2 for row in selected),
         "max_refreshes_observed": max(row["heap_refreshes"] for row in selected),
     }
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.4.0"
+    assert run_manifest["cocore_version"] == "0.6.0"
     assert run_manifest["relation_type"] == relation
     assert run_manifest["relation_weight"] == 1.0
+    assert run_manifest["prototype_schema_version"] == 3
     assert run_manifest["algorithm"] == report["algorithm"]
     select_manifest = json.loads((result / "manifest.json").read_text())
     assert select_manifest["relation_type"] == relation
@@ -174,7 +249,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     resolved = yaml.safe_load((result / "resolved_config.yaml").read_text())
     assert resolved["output"]["directory"] == str(root)
     assert resolved["objective"] == {"relation": relation, "relation_weight": 1.0}
-    assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 3}
+    assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 6}
 
     report["relation_type"] = "sequence" if relation == "cooccurrence" else "cooccurrence"
     (result / "selection_report.json").write_text(json.dumps(report))
@@ -212,6 +287,154 @@ def test_validate_rejects_tampered_relation_objective(tmp_path: Path) -> None:
         validate_output(result, config=config)
 
 
+def test_validate_rejects_tampered_hierarchical_weight_product(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    nodes_path = result.parent / "graph-12-motion-primitives" / "nodes.npz"
+    with np.load(nodes_path) as stored:
+        nodes = {name: stored[name].copy() for name in stored.files}
+    nodes["prototype_action_weights"][0, 0] *= np.float32(0.5)
+    np.savez(nodes_path, **nodes)
+
+    with pytest.raises(ValueError, match="hierarchical prototype weight product"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_tampered_hierarchical_catalog(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    catalog_path = result.parent / "graph-12-motion-primitives" / "prototype_catalog.json"
+    catalog = json.loads(catalog_path.read_text())
+    catalog["leaf_prototypes"][0]["label"] = "wrong"
+    catalog_path.write_text(json.dumps(catalog))
+
+    with pytest.raises(ValueError, match="hierarchical prototype label"):
+        validate_output(result, config=config)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("requested_clusters", 999, "cluster formula"),
+        ("top_m", 999, "Top-M formula"),
+        ("actual_clusters", 999, "leaf count"),
+        ("distance_q10", -1.0, "distance quantiles"),
+    ],
+)
+def test_validate_recomputes_hierarchical_catalog_diagnostics(
+    tmp_path: Path,
+    field: str,
+    value: int | float,
+    message: str,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    catalog_path = result.parent / "graph-12-motion-primitives" / "prototype_catalog.json"
+    catalog = json.loads(catalog_path.read_text())
+    category = next(
+        category
+        for category in catalog["action_categories"]
+        if category["retained"] and category["bucket_size"] > 0
+    )
+    category[field] = value
+    catalog_path.write_text(json.dumps(catalog))
+
+    with pytest.raises(ValueError, match=message):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_tampered_hierarchical_output_row(tmp_path: Path) -> None:
+    import pyarrow as pa
+
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    all_path = result / "all_clips.parquet"
+    rows = pq.read_table(all_path).to_pylist()
+    rows[0]["prototype_distance_weights"][0] = 0.9
+    pq.write_table(pa.Table.from_pylist(rows), all_path)
+
+    with pytest.raises(ValueError, match="hierarchical prototype row"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_missing_hierarchical_centers(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    (result.parent / "graph-12-motion-primitives" / "prototype_centers.npy").unlink()
+
+    with pytest.raises(ValueError, match="invalid stage artifacts: graph"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_tampered_visual_half_embeddings(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    path = result.parent / "encode" / "visual_half_embeddings.npy"
+    values = np.load(path)
+    values[0, 0] = np.asarray([100.0, -10.0, 3.0], dtype=np.float32)
+    np.save(path, values)
+
+    with pytest.raises(ValueError, match="hierarchical"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_missing_visual_half_embeddings_as_encode_artifact(
+    tmp_path: Path,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    (result.parent / "encode" / "visual_half_embeddings.npy").unlink()
+
+    with pytest.raises(ValueError, match="invalid stage artifacts: encode"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_tampered_visual_prototype_center(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    path = result.parent / "graph-12-motion-primitives" / "prototype_centers.npy"
+    centers = np.load(path)
+    centers[0] = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+    np.save(path, centers)
+
+    with pytest.raises(ValueError, match="hierarchical"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_tampered_half_action_labels(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    path = result.parent / "graph-12-motion-primitives" / "half_action_labels.npy"
+    labels = np.load(path)
+    labels[0, 0] = "stop"
+    np.save(path, labels)
+
+    with pytest.raises(ValueError, match="half action"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_tampered_selected_hierarchical_row(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    selected_path = result / "selected_manifest.jsonl"
+    rows = [json.loads(line) for line in selected_path.read_text().splitlines()]
+    rows[0]["primary_action_label"] = "wrong"
+    selected_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    with pytest.raises(ValueError, match="selected hierarchical prototype row"):
+        validate_output(result, config=config)
+
+
 def test_validate_rejects_wrong_relation_directory(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
@@ -244,9 +467,21 @@ def test_sequence_and_cooccurrence_outputs_can_coexist(tmp_path: Path) -> None:
     assert sequence.is_dir()
     assert validate_output(cooccurrence, config=_config(tmp_path, "cooccurrence")) == {
         "status": "valid",
-        "selected_clips": 3,
+        "selected_clips": 6,
     }
     assert validate_output(sequence, config=_config(tmp_path, "sequence")) == {
         "status": "valid",
-        "selected_clips": 3,
+        "selected_clips": 6,
     }
+
+
+def test_validate_aligns_sorted_output_rows_by_sample_id(tmp_path: Path) -> None:
+    register_dataset_adapter(
+        "cocore_pipeline_reverse_synthetic", ReverseOrderCocorePipelineAdapter
+    )
+    config = _config(tmp_path)
+    config["dataset"]["type"] = "cocore_pipeline_reverse_synthetic"
+
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+
+    assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 6}

@@ -17,7 +17,6 @@ from relcore.config import resolve_config as resolve_relcore_config
 
 _SHARED_SECTIONS = (
     "dataset",
-    "clip",
     "visual",
     "normalization",
     "relation",
@@ -40,6 +39,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "output": {"directory": "outputs/cocore/libero90"},
 }
 DEFAULT_CONFIG["prototypes"]["method"] = "motion_primitives"
+for _obsolete_prototype_field in ("count", "top_r", "temperature"):
+    DEFAULT_CONFIG["prototypes"].pop(_obsolete_prototype_field, None)
 
 
 def _merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -53,6 +54,8 @@ def _merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    if "clip" in config:
+        raise ValueError("cocore clip configuration was removed; windows are fixed to 15/15")
     configured_objective = config.get("objective")
     if isinstance(configured_objective, Mapping) and "cooccurrence_weight" in configured_objective:
         raise ValueError(
@@ -77,6 +80,14 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     configured_method = config.get("prototypes", {}).get("method") if isinstance(
         config.get("prototypes"), Mapping
     ) else None
+    configured_prototypes = config.get("prototypes")
+    if isinstance(configured_prototypes, Mapping):
+        obsolete = {"count", "top_r", "temperature"} & configured_prototypes.keys()
+        if obsolete:
+            names = ", ".join(sorted(obsolete))
+            raise ValueError(
+                f"cocore prototypes {names} were removed; K/M are fixed by action proportion"
+            )
     if configured_method not in {None, "motion_primitives"}:
         raise ValueError("cocore prototypes.method must be motion_primitives")
     configured_metrics = config.get("reliability_metrics")
@@ -116,7 +127,11 @@ def to_relcore_config(resolved: Mapping[str, Any]) -> dict[str, Any]:
     translated = copy.deepcopy(RELCORE_DEFAULT_CONFIG)
     translated["seed"] = int(resolved.get("seed", 42))
     for section in _SHARED_SECTIONS:
-        translated[section] = copy.deepcopy(resolved[section])
+        if section == "prototypes":
+            translated[section].update(copy.deepcopy(resolved[section]))
+        else:
+            translated[section] = copy.deepcopy(resolved[section])
+    translated["clip"] = {"length": 15, "stride": 15}
     translated["prototypes"]["method"] = "motion_primitives"
     translated["selection"]["ratio"] = float(resolved["selection"]["ratio"])
     translated["selection"]["budget"] = resolved["selection"].get("budget")

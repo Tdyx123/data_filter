@@ -1,8 +1,29 @@
 # Cocore：运动原语关系筛选
 
 Cocore 从 LeRobot v2 LIBERO episode 中选择固定预算的 15 帧片段。它复用 RelCore
-的两遍编码、关系 embedding、运动原语软分配和稀疏图构建，但拥有独立配置、缓存与
-输出根目录。
+的通用编码组件和稀疏图能力，但独立管理编码流水线、两级动作原型、配置、缓存与输出
+产物。
+
+每个 15 帧片段固定拆为共享中间帧的前半 `[0..7]` 和后半 `[7..14]`。一次图像遍历和
+一次视觉模型前向同时生成原有关系 embedding，以及两个半片段各自 8 帧视觉特征的直接
+均值。关系 embedding 继续用于可靠性和相似图；纯视觉均值只用于二级动作聚类。
+
+动作原型分为两级。一级直接分类每个片段的 `[0→7]` 和 `[7→14]` 两个动作，因此动作
+占比的统计母体固定为 `2 * 片段数`，不再对 episode 做逐时步 horizon 采样。一级严格
+保留半片段占比 `p > 0.005` 的动作，并分别软化前后半的低频标签。二级将每个半片段与
+自己的一级动作对齐，在动作桶内使用 L2 归一化后的视觉均值和一级软权重执行加权
+MiniBatchKMeans：
+
+```text
+K = min(bucket_size, floor(3 + 2 * log2(200p)))
+M = min(K, floor(2 + 1.5 * log2(200p)))
+```
+
+桶内全部半片段到全部 K 个中心的欧氏距离共同确定 10%/90% 分位点；距离权重从 1 线性
+反向映射到 0.3，并截断在 `[0.3, 1]`。每个半片段保留距离权重最大的 M 个子簇，最终
+原型权重等于一级动作权重乘以距离权重。结果合回 15 帧图节点时，前后半命中同一叶
+原型只保留组合权重较大的结果，平局固定以前半优先。低频 `stop` 继续作为单一 fallback
+原型。
 
 可靠性固定为 `sqrt(support * progress)`。初始集合为每个可达运动原语选择
 `reliability * assignment` 最大的片段并取并集，使所有原型 coverage 达到全池最大值。
@@ -54,7 +75,16 @@ python -m cocore run --config cocore/config_libero90.yaml
 objective:
   relation: cooccurrence  # 或 sequence
   relation_weight: 1.0
+
+prototypes:
+  method: motion_primitives
+  batch_size: 4096
+  max_iter: 100
 ```
+
+片段长度与步长是 Cocore 固定算法的一部分，均为 15；配置中不再接受 `clip` section。
+二级 K/M、Top-M 和距离权重范围是 Cocore 固定算法，不接受 RelCore 的
+`count`、`top_r` 或 `temperature` 配置。
 
 可在运行时覆盖选择比例、关系类型与关系权重：
 
@@ -76,13 +106,19 @@ RelCore 的 `--reliability-metrics`、`--prototype-method` 或
 python -m cocore run --config cocore/config_debug.yaml --force
 ```
 
-Cocore 0.4.0 修改了两项关系指标的语义并更新了选择指纹。0.3.0 生成的同名选择缓存
-不能继续复用或校验；保留原输出目录时需要通过 `--force` 重新生成。
+Cocore 0.6.0 引入独立编码流水线、半片段视觉均值二级聚类和 catalog v3。0.5.x 及更早
+版本生成的 encode、graph 和 selection 缓存不能继续复用或校验；保留原输出目录时需要
+通过 `--force` 重新生成。
 
 ## 输出与校验
 
 输出根目录包含 `scan/`、`encode/`、`graph-12-motion-primitives/` 和一个或多个
 `select-<关系>-w<权重>-top<比例>pct/`。选择目录包含：
+
+- graph 目录中的 `prototype_catalog.json` 与 `prototype_centers.npy`：动作类别、
+  半片段二级聚类诊断和按叶原型 ID 对齐的视觉中心；
+- encode 目录中的 `visual_half_embeddings.npy`：`[片段, 前后半, 视觉维度]` 的 8 帧
+  均值；graph 目录中的 `half_action_labels.npy` 是离线强校验使用的内部原始动作标签；
 
 - `selected_manifest.jsonl`：训练入口可直接消费的片段清单；
 - `all_clips.parquet`：全池 support、progress、reliability、运动原语与选择诊断；
@@ -98,4 +134,6 @@ python -m cocore validate \
   --config cocore/config_libero90.yaml
 ```
 
-第一版只支持本仓库约定的 8 维 LIBERO `observation.state`，不会退回 KMeans。
+当前版本只支持本仓库约定的 8 维 LIBERO `observation.state`；一级动作不会退回全局
+KMeans，二级聚类固定依赖半片段视觉均值。selection 的 parquet/JSONL 不导出内部前后
+半来源字段。

@@ -14,10 +14,6 @@ dataset:
     vector_observations: [observation.state]
     image_observations: [observation.images.image]
 
-clip:
-  length: 15
-  stride: 15
-
 visual:
   encoder: clip
   model: /data/dwb/models/clip-vit-base-patch32
@@ -43,11 +39,8 @@ quality:
 
 prototypes:
   method: motion_primitives
-  count: 64
   batch_size: 4096
   max_iter: 100
-  top_r: 3
-  temperature: 0.1
 
 graph:
   knn: 32

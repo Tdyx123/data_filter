@@ -11,7 +11,8 @@ Cocore 的编码、运动原语、关系目标或惰性最大堆算法，而是�
 - LeRobot `v2.0`、WidowX、5 Hz；
 - 只读取 `observation.images.image_0`、8 维 `observation.state` 和 7 维 `action`；
 - 排除任务名为空的 episode，再应用 `--max-episodes`；
-- 固定使用 15 帧片段、步长 15 和 Cocore 运动原语；
+- 固定使用 15 帧片段、步长 15 和 Cocore 两级动作原型；一级占比直接统计片段的前后
+  两半，二级原型使用各半 8 帧的视觉均值，并在对应一级动作桶内单独聚类；
 - 全局选择，不施加逐任务配额。
 
 Bridge 为 5 Hz，因此 15 帧片段覆盖约 3 秒，现有运动原语的 7–8 帧比较跨度约为
@@ -67,7 +68,10 @@ outputs/cocore_bridge_v2/bridge_orig_1.0.0
 其中包含 `scan/`、`encode/`、`graph-12-motion-primitives/` 和
 `select-<relation>-w<weight>-top<ratio>pct/`。选择目录继续提供
 `selected_manifest.jsonl`、`all_clips.parquet`、`selection_report.json`、
-`manifest.json` 和 `run_manifest.json`；manifest 的生产者仍为 `cocore`。
+`manifest.json` 和 `run_manifest.json`；encode 目录额外提供
+`visual_half_embeddings.npy`，graph 目录提供分层 `prototype_catalog.json`、
+`prototype_centers.npy` 和内部校验用 `half_action_labels.npy`。manifest 的生产者仍为
+`cocore`。
 
 验证时必须重复传入生成该选择结果时使用的目标与比例。验证只读取 artifact，不访问
 源数据集：

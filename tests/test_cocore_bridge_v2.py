@@ -247,7 +247,7 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
             "image_observations": ["observation.images.image_0"],
         },
     }
-    assert config["clip"] == {"length": 15, "stride": 15}
+    assert "clip" not in config
     assert config["prototypes"]["method"] == "motion_primitives"
     assert config["objective"] == {"relation": "sequence", "relation_weight": 1.5}
     assert config["selection"]["ratio"] == 0.2
@@ -627,6 +627,7 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(tmp_path: Pat
     config["runtime"]["num_workers"] = 0
     config["quality"]["knn"] = 2
     config["graph"]["knn"] = 2
+    config["selection"]["budget"] = 6
 
     result = run_pipeline(config, output_dir=output, visual_encoder=DummyVisualEncoder())
 
@@ -647,8 +648,8 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(tmp_path: Pat
         json.loads(line)
         for line in (result / "selected_manifest.jsonl").read_text().splitlines()
     ]
-    assert len(selected) == 3
+    assert len(selected) == 6
     assert validate_output(result, config=config) == {
         "status": "valid",
-        "selected_clips": 3,
+        "selected_clips": 6,
     }

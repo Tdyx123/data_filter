@@ -55,6 +55,29 @@ def test_config_rejects_removed_cooccurrence_weight_with_migration_message() -> 
         )
 
 
+def test_config_rejects_clip_section_because_cocore_uses_fixed_windows() -> None:
+    with pytest.raises(ValueError, match="clip.*fixed.*15"):
+        resolve_config(
+            {
+                **_objective(),
+                "clip": {"length": 15, "stride": 15},
+            }
+        )
+
+
+@pytest.mark.parametrize("obsolete", ["count", "top_r", "temperature"])
+def test_config_rejects_flat_prototype_controls_replaced_by_action_formulas(
+    obsolete: str,
+) -> None:
+    with pytest.raises(ValueError, match="fixed by action proportion"):
+        resolve_config(
+            {
+                **_objective(),
+                "prototypes": {"method": "motion_primitives", obsolete: 3},
+            }
+        )
+
+
 @pytest.mark.parametrize("max_refreshes", [0, -1, 1.5, True])
 def test_config_rejects_non_positive_or_non_integer_max_refreshes(max_refreshes) -> None:
     with pytest.raises(ValueError, match="selection.max_refreshes"):
@@ -145,7 +168,9 @@ def test_main_applies_cli_overrides_to_run_pipeline(monkeypatch, capsys) -> None
 def test_shipped_configs_resolve_to_fixed_cocore_contract(path: str) -> None:
     config = load_config(path)
 
+    assert "clip" not in config
     assert config["prototypes"]["method"] == "motion_primitives"
+    assert set(config["prototypes"]) == {"method", "batch_size", "max_iter"}
     assert config["reliability_metrics"] == ["support", "progress"]
     assert config["objective"] == {
         "relation": "cooccurrence",
