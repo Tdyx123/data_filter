@@ -17,9 +17,35 @@ class InvalidExperiment(ValueError):
     """Raised when one experiment does not contain ten valid completed results."""
 
 
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def parse_task_success_rate(path: Path) -> float:
-    value = json.loads(path.read_text(encoding="utf-8"))
-    return float(value["summary"]["success_rate"])
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        status = value["status"]
+        episodes = value["protocol"]["episodes"]
+        completed = value["summary"]["completed_episodes"]
+        rate = value["summary"]["success_rate"]
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise InvalidExperiment(f"cannot read a valid result at {path}") from error
+
+    if status != "complete":
+        raise InvalidExperiment(f"result is not complete at {path}")
+    if not _is_int(episodes) or episodes <= 0:
+        raise InvalidExperiment(f"invalid protocol.episodes at {path}")
+    if not _is_int(completed) or completed < 0 or completed != episodes:
+        raise InvalidExperiment(f"incomplete episodes at {path}")
+    if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+        raise InvalidExperiment(f"invalid summary.success_rate at {path}")
+    try:
+        result = float(rate)
+    except (OverflowError, ValueError) as error:
+        raise InvalidExperiment(f"invalid summary.success_rate at {path}") from error
+    if not math.isfinite(result) or not 0.0 <= result <= 1.0:
+        raise InvalidExperiment(f"invalid summary.success_rate at {path}")
+    return result
 
 
 def summarize_experiment(path: Path) -> float:
