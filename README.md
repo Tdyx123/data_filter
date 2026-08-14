@@ -74,7 +74,8 @@ Octo 路线固定使用独立 Python 3.10 环境：
 python3.10 -m venv .venv-octo-pytorch
 source .venv-octo-pytorch/bin/activate
 python -m pip install --upgrade pip
-pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.4.1
+pip install --index-url https://download.pytorch.org/whl/cu121 \
+  torch==2.4.1 torchvision==0.19.1
 pip install -r requirements-octo-pytorch.txt
 ```
 
@@ -122,6 +123,50 @@ PYTHONPATH=src pytest -q \
   tests/test_octo_small_pytorch.py \
   -k two_step_cpu_smoke
 ```
+
+#### BridgeData V2 四卡微调
+
+Octo-small 可直接读取默认的
+`/data/dwb/datasets/bridge_orig_1.0.0_lerobo`，无需转换或复制数据。独立入口只使用
+`observation.images.image_0` 作为主相机、8 维 `observation.state` 和 7 维
+`action`；空语言 episode 会被排除。第七维抓手动作是 `[0,1]` 连续值（接受
+`[-1e-5, 1+1e-5]` 的浮点容差并裁剪回 `[0,1]`），按 `2*x-1` 映射到
+`[-1,+1]` 且不参与统计标准化；非有限值或明显越界值会触发包含 episode ID 的数据
+校验错误。管线不伪造 wrist 图像。
+
+先运行只读预检，再执行两步 smoke test 或正式训练；`--output-dir` 始终必填：
+
+```bash
+bash scripts/train_bridge_octo_small_4x4090.sh \
+  --output-dir outputs/octo_small_bridge_preflight \
+  --preflight-only
+
+bash scripts/train_bridge_octo_small_4x4090.sh \
+  --output-dir outputs/octo_small_bridge_smoke \
+  --smoke-test
+
+bash scripts/train_bridge_octo_small_4x4090.sh \
+  --output-dir outputs/octo_small_bridge
+```
+
+默认使用 GPU `0,1,2,3`、每卡 micro-batch 8、梯度累积 4、全局 batch 128、
+10,000 optimizer steps、400 步 warmup、峰值学习率 `3e-4` 和 BF16。预检会验证
+LeRobot v2/WidowX/5 Hz/AV1、特征和统计维度、源数据计数，并解码有效 episode 的
+首、中、尾样本。自定义路径和续训示例：
+
+```bash
+bash scripts/train_bridge_octo_small_4x4090.sh \
+  --dataset-path /path/to/bridge_lerobot_v2 \
+  --model-path /path/to/octo-small-pytorch \
+  --gpu-ids 0,1,2,3 \
+  --output-dir outputs/octo_small_bridge \
+  --resume latest
+```
+
+首版使用全部 38,660 条非空语言 episode（1,305,714 帧），不划分验证集，也不接收
+Cocore/RelCore 筛选清单或运行 SimplerEnv 评测。训练输出沿用 Octo 的配置、数据和
+模型 manifest、metrics、latest/best checkpoint 指针；续训会恢复采样顺序和随机数
+状态。
 
 #### 转换 LIBERO
 

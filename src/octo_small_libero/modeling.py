@@ -8,8 +8,13 @@ def load_pytorch_model(
     checkpoint_path: str | Path,
     *,
     device: Any = "cpu",
+    observation_tokenizers: tuple[str, ...] = ("primary", "wrist"),
 ) -> tuple[Any, Any]:
     """Load the self-contained PyTorch Octo-small model and tokenizer."""
     from .torch_model import OctoSmallPolicy
 
-    return OctoSmallPolicy.from_pretrained(checkpoint_path, device=device)
+    return OctoSmallPolicy.from_pretrained(
+        checkpoint_path,
+        device=device,
+        observation_tokenizers=observation_tokenizers,
+    )

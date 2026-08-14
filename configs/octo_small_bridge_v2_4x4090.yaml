@@ -1,0 +1,54 @@
+paths:
+  model: /data/dwb/models/octo-small-pytorch
+  dataset: /data/dwb/datasets/bridge_orig_1.0.0_lerobo
+
+data:
+  dataset_name: bridge_orig_1.0.0
+  image_obs_keys:
+    primary: observation.images.image_0
+  state_obs_keys: [observation.state]
+  action_key: action
+  state_dim: 8
+  action_dim: 7
+  window_size: 1
+  action_horizon: 8
+  absolute_action_mask: [false, false, false, false, false, false, true]
+  action_normalization_mask: [true, true, true, true, true, true, false]
+  resize:
+    primary: [256, 256]
+  empty_task_policy: exclude
+  expected_counts:
+    source_episodes: 53192
+    retained_episodes: 38660
+    excluded_empty_task_episodes: 14532
+    retained_frames: 1305714
+
+model:
+  required_observation_tokenizers: [primary]
+  use_proprio: true
+  action_head: diffusion
+  finetuning_mode: full
+
+train:
+  seed: 42
+  gpu_count: 4
+  gpu_ids: [0, 1, 2, 3]
+  batch_size: 128
+  micro_batch_size_per_gpu: 8
+  gradient_accumulation_steps: 4
+  max_steps: 10000
+  num_workers_per_rank: 4
+  prefetch_factor: 2
+  episode_cache_size: 2
+  precision: bf16
+  learning_rate:
+    name: cosine
+    init_value: 0.0
+    peak_value: 3.0e-4
+    warmup_steps: 400
+    end_value: 0.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  log_every_steps: 100
+  save_every_steps: 1000
+

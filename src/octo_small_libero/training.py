@@ -241,6 +241,18 @@ def _should_save_checkpoint(*, step: int, max_steps: int, save_every: int) -> bo
     return step % save_every == 0 or step == max_steps
 
 
+def _capture_rank_runtime_state(sampler: Any) -> dict[str, Any]:
+    import torch
+
+    return {
+        "sampler": sampler.state_dict(),
+        "python_rng": random.getstate(),
+        "numpy_rng": np.random.get_state(),
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+    }
+
+
 def _save_checkpoint(
     *,
     output: Path,
@@ -252,6 +264,7 @@ def _save_checkpoint(
     sampler: Any,
     config: dict[str, Any],
     selection_signature: str | None = None,
+    rank_runtime_states: list[dict[str, Any]] | None = None,
 ) -> Path:
     import torch
     from safetensors.torch import save_model
@@ -273,15 +286,22 @@ def _save_checkpoint(
     temporary.mkdir()
     unwrapped = model.module if hasattr(model, "module") else model
     save_model(unwrapped, str(temporary / "model.safetensors"))
+    if rank_runtime_states is None:
+        rank_runtime_states = [_capture_rank_runtime_state(sampler)]
+    if not rank_runtime_states:
+        raise RuntimeError("rank_runtime_states must contain at least one rank")
+    rank_zero_runtime = rank_runtime_states[0]
     state = {
         "step": step,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
-        "sampler": sampler.state_dict(),
-        "python_rng": random.getstate(),
-        "numpy_rng": np.random.get_state(),
-        "torch_rng": torch.get_rng_state(),
-        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "rank_runtime_states": rank_runtime_states,
+        # Keep rank-zero aliases readable by older tooling.
+        "sampler": rank_zero_runtime["sampler"],
+        "python_rng": rank_zero_runtime["python_rng"],
+        "numpy_rng": rank_zero_runtime["numpy_rng"],
+        "torch_rng": rank_zero_runtime["torch_rng"],
+        "cuda_rng": rank_zero_runtime["cuda_rng"],
         "config": {key: value for key, value in config.items() if not key.startswith("_")},
         "selection_signature": selection_signature,
     }
@@ -327,6 +347,8 @@ def _load_training_state(
     sampler: Any,
     device: Any,
     selection_signature: str | None = None,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> int:
     import torch
     from safetensors.torch import load_model
@@ -349,12 +371,28 @@ def _load_training_state(
     scheduler.load_state_dict(state["scheduler"])
     step = int(state["step"])
     _realign_scheduler_learning_rate(scheduler, step)
-    sampler.load_state_dict(state["sampler"])
-    random.setstate(state["python_rng"])
-    np.random.set_state(state["numpy_rng"])
-    torch.set_rng_state(state["torch_rng"])
-    if torch.cuda.is_available() and state["cuda_rng"] is not None:
-        torch.cuda.set_rng_state_all(state["cuda_rng"])
+    runtime_states = state.get("rank_runtime_states")
+    if runtime_states is None:
+        runtime = state
+    else:
+        if len(runtime_states) != world_size:
+            raise RuntimeError(
+                f"Resume checkpoint has runtime state for {len(runtime_states)} ranks, "
+                f"current WORLD_SIZE is {world_size}"
+            )
+        if rank < 0 or rank >= world_size:
+            raise RuntimeError(f"Invalid rank {rank} for WORLD_SIZE={world_size}")
+        runtime = runtime_states[rank]
+    sampler.load_state_dict(runtime["sampler"])
+    random.setstate(runtime["python_rng"])
+    np.random.set_state(runtime["numpy_rng"])
+    torch.set_rng_state(runtime["torch_rng"])
+    if torch.cuda.is_available() and runtime["cuda_rng"] is not None:
+        cuda_rng = runtime["cuda_rng"]
+        if isinstance(cuda_rng, list):
+            torch.cuda.set_rng_state_all(cuda_rng)
+        else:
+            torch.cuda.set_rng_state(cuda_rng, device=device)
     return step
 
 
@@ -364,19 +402,36 @@ def _write_json(path: Path, value: Any) -> None:
         handle.write("\n")
 
 
+def _initialize_distributed_process_group(
+    distributed: Any,
+    *,
+    world_size: int,
+    device: Any,
+) -> None:
+    if world_size > 1 and not distributed.is_initialized():
+        distributed.init_process_group(backend="nccl", device_id=device)
+
+
 def train(
     config: dict[str, Any],
     paths: dict[str, Path],
     *,
     resume: str | None = None,
+    training_data_builder: Any | None = None,
+    dataset_manifest_builder: Any | None = None,
+    observation_tokenizers: tuple[str, ...] = ("primary", "wrist"),
 ) -> None:
     import torch
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel
     from tqdm import tqdm
 
-    from .data import make_training_dataset
     from .modeling import load_pytorch_model
+
+    if training_data_builder is None:
+        from .data import make_training_dataset
+
+        training_data_builder = make_training_dataset
 
     if not torch.cuda.is_available():
         raise RuntimeError("Octo-small production training requires CUDA")
@@ -390,8 +445,11 @@ def train(
         )
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+    _initialize_distributed_process_group(
+        dist,
+        world_size=world_size,
+        device=device,
+    )
 
     seed = int(config["train"]["seed"])
     random.seed(seed + rank)
@@ -399,9 +457,13 @@ def train(
     torch.manual_seed(seed + rank)
     torch.cuda.manual_seed_all(seed + rank)
 
-    model, tokenizer = load_pytorch_model(paths["model"], device=device)
+    model, tokenizer = load_pytorch_model(
+        paths["model"],
+        device=device,
+        observation_tokenizers=observation_tokenizers,
+    )
     model.train()
-    train_data = make_training_dataset(
+    train_data = training_data_builder(
         config,
         paths,
         tokenizer=tokenizer,
@@ -446,15 +508,20 @@ def train(
             key: value for key, value in config.items() if not key.startswith("_")
         }
         _write_json(output / "finetune_config.json", clean_config)
-        _write_json(
-            output / "dataset_manifest.json",
-            build_dataset_manifest(
+        if dataset_manifest_builder is None:
+            dataset_manifest = build_dataset_manifest(
                 config,
                 paths,
                 target_selection=train_data.target_selection,
                 prior_selection=train_data.prior_selection,
-            ),
-        )
+            )
+        else:
+            dataset_manifest = dataset_manifest_builder(
+                config,
+                paths,
+                training_data=train_data,
+            )
+        _write_json(output / "dataset_manifest.json", dataset_manifest)
         checkpoint_report = inspect_octo_checkpoint(paths["model"])
         model_manifest = {
             "base_model": str(paths["model"]),
@@ -481,6 +548,8 @@ def train(
             sampler=train_data.batch_sampler,
             device=device,
             selection_signature=selection_signature,
+            rank=rank,
+            world_size=world_size,
         )
     data_iterator = iter(train_data.dataloader)
     accumulation_steps = int(config["train"]["gradient_accumulation_steps"])
@@ -504,6 +573,8 @@ def train(
         sampled: Counter[str] = Counter()
         for accumulation in range(accumulation_steps):
             batch = next(data_iterator)
+            if hasattr(train_data.batch_sampler, "mark_batch_consumed"):
+                train_data.batch_sampler.mark_batch_consumed()
             sampled.update(str(value) for value in batch["dataset_name"])
             batch = _move_to_device(batch, device)
             synchronizes = accumulation + 1 == accumulation_steps
@@ -560,6 +631,19 @@ def train(
         if should_save:
             if world_size > 1:
                 dist.barrier()
+            local_runtime_state = _capture_rank_runtime_state(
+                train_data.batch_sampler
+            )
+            if world_size > 1:
+                rank_runtime_states: list[dict[str, Any] | None] = [
+                    None
+                ] * world_size
+                dist.all_gather_object(rank_runtime_states, local_runtime_state)
+                gathered_runtime_states = [
+                    state for state in rank_runtime_states if state is not None
+                ]
+            else:
+                gathered_runtime_states = [local_runtime_state]
             if rank == 0:
                 mean_train_loss = float(
                     (checkpoint_loss_total / checkpoint_loss_steps).cpu()
@@ -574,6 +658,7 @@ def train(
                     sampler=train_data.batch_sampler,
                     config=config,
                     selection_signature=selection_signature,
+                    rank_runtime_states=gathered_runtime_states,
                 )
             if world_size > 1:
                 dist.barrier()

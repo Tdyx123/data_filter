@@ -1,10 +1,14 @@
 import json
+import random
+import sys
 from types import SimpleNamespace
 
 import pytest
+import numpy as np
 
 torch = pytest.importorskip("torch")
 
+from octo_small_libero import training as octo_training  # noqa: E402
 from octo_small_libero.data import (  # noqa: E402
     BalancedDistributedBatchSampler,
     training_selection_sha256,
@@ -74,6 +78,121 @@ def _step_checkpoint_directories(checkpoints):
     )
 
 
+class FakeDistributed:
+    def __init__(self, *, initialized=False):
+        self.initialized = initialized
+        self.init_calls = []
+
+    def is_initialized(self):
+        return self.initialized
+
+    def init_process_group(self, **kwargs):
+        self.init_calls.append(kwargs)
+
+
+def test_distributed_process_group_binds_the_current_cuda_device():
+    distributed = FakeDistributed()
+    device = torch.device("cuda", 3)
+
+    octo_training._initialize_distributed_process_group(
+        distributed,
+        world_size=4,
+        device=device,
+    )
+
+    assert distributed.init_calls == [
+        {"backend": "nccl", "device_id": device}
+    ]
+
+
+def test_single_process_does_not_initialize_a_distributed_process_group():
+    distributed = FakeDistributed()
+
+    octo_training._initialize_distributed_process_group(
+        distributed,
+        world_size=1,
+        device=torch.device("cuda", 0),
+    )
+
+    assert distributed.init_calls == []
+
+
+def test_initialized_distributed_process_group_is_not_initialized_again():
+    distributed = FakeDistributed(initialized=True)
+
+    octo_training._initialize_distributed_process_group(
+        distributed,
+        world_size=4,
+        device=torch.device("cuda", 0),
+    )
+
+    assert distributed.init_calls == []
+
+
+def test_train_sets_the_local_device_before_initializing_the_process_group(
+    monkeypatch,
+):
+    class StopAfterProcessGroupInitialization(RuntimeError):
+        pass
+
+    events = []
+    cuda_device = object()
+    fake_modeling = SimpleNamespace(
+        load_pytorch_model=lambda *args, **kwargs: pytest.fail(
+            "model loading must happen after process-group initialization"
+        )
+    )
+    monkeypatch.setitem(sys.modules, "octo_small_libero.modeling", fake_modeling)
+    monkeypatch.setitem(sys.modules, "tqdm", SimpleNamespace(tqdm=pytest.fail))
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("RANK", "2")
+    monkeypatch.setenv("LOCAL_RANK", "3")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(octo_training.random, "seed", lambda seed: None)
+    monkeypatch.setattr(octo_training.np.random, "seed", lambda seed: None)
+    monkeypatch.setattr(torch, "manual_seed", lambda seed: None)
+    monkeypatch.setattr(torch.cuda, "manual_seed_all", lambda seed: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "set_device",
+        lambda local_rank: events.append(("set_device", local_rank)),
+    )
+
+    def make_device(device_type, local_rank):
+        events.append(("device", device_type, local_rank))
+        return cuda_device
+
+    def stop_after_process_group_initialization(
+        distributed,
+        *,
+        world_size,
+        device,
+    ):
+        del distributed
+        events.append(("initialize", world_size, device))
+        raise StopAfterProcessGroupInitialization
+
+    monkeypatch.setattr(torch, "device", make_device)
+    monkeypatch.setattr(
+        octo_training,
+        "_initialize_distributed_process_group",
+        stop_after_process_group_initialization,
+    )
+
+    with pytest.raises(StopAfterProcessGroupInitialization):
+        octo_training.train(
+            {"train": {"gpu_count": 4, "seed": 7}},
+            {"model": object()},
+            training_data_builder=pytest.fail,
+        )
+
+    assert events == [
+        ("set_device", 3),
+        ("device", "cuda", 3),
+        ("initialize", 4, cuda_device),
+    ]
+
+
 def test_tiny_pytorch_octo_two_step_cpu_smoke_and_frozen_text_encoder():
     text = TinyTextEncoder(16)
     model = OctoSmallPolicy(text, _tiny_config())
@@ -95,6 +214,27 @@ def test_tiny_pytorch_octo_two_step_cpu_smoke_and_frozen_text_encoder():
     assert all(torch.isfinite(torch.tensor(losses)))
     assert all(parameter.grad is None for parameter in model.text_encoder.parameters())
     assert not model.text_encoder.training
+
+
+def test_tiny_pytorch_octo_single_camera_forward_freezes_wrist_parameters():
+    model = OctoSmallPolicy(TinyTextEncoder(16), _tiny_config())
+    model.set_observation_tokenizers(("primary",))
+    batch = _tiny_batch()
+    del batch["image_wrist"]
+
+    output = model(batch)
+    output["loss"].backward()
+
+    assert torch.isfinite(output["loss"])
+    assert model.primary_encoder.stem[0].weight.grad is not None
+    wrist_parameters = [
+        parameter
+        for name, parameter in model.named_parameters()
+        if name.startswith("wrist_")
+    ]
+    assert wrist_parameters
+    assert all(not parameter.requires_grad for parameter in wrist_parameters)
+    assert all(parameter.grad is None for parameter in wrist_parameters)
 
 
 def test_tiny_pytorch_octo_diffusion_sampling_shape():
@@ -358,6 +498,59 @@ def test_checkpoint_resume_rejects_changed_target_or_prior_selection(tmp_path):
             device="cpu",
             selection_signature="task-6-top10-selection",
         )
+
+
+def test_checkpoint_resume_restores_the_current_rank_rng_state(tmp_path):
+    model = OctoSmallPolicy(TinyTextEncoder(16), _tiny_config())
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=1.0e-3,
+    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    sampler = BalancedDistributedBatchSampler(
+        (20, 20), local_batch_size=4, seed=3, num_batches=3
+    )
+    rank_states = []
+    for seed in (11, 29):
+        rank_states.append(
+            {
+                "sampler": sampler.state_dict(),
+                "python_rng": random.Random(seed).getstate(),
+                "numpy_rng": np.random.RandomState(seed).get_state(),
+                "torch_rng": torch.Generator().manual_seed(seed).get_state(),
+                "cuda_rng": None,
+            }
+        )
+    checkpoint = _save_checkpoint(
+        output=tmp_path,
+        step=1,
+        mean_train_loss=1.0,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        sampler=sampler,
+        config={"train": {"seed": 3}},
+        rank_runtime_states=rank_states,
+    )
+
+    random.seed(99)
+    np.random.seed(99)
+    torch.manual_seed(99)
+    _load_training_state(
+        checkpoint,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        sampler=sampler,
+        device="cpu",
+        rank=1,
+        world_size=2,
+    )
+
+    assert random.random() == pytest.approx(random.Random(29).random())
+    assert np.random.rand() == pytest.approx(np.random.RandomState(29).rand())
+    expected_generator = torch.Generator().manual_seed(29)
+    torch.testing.assert_close(torch.rand(1), torch.rand(1, generator=expected_generator))
 
 
 def test_training_selection_signature_covers_target_and_prior():

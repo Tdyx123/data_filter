@@ -337,6 +337,9 @@ class LeRobotDatasetAdapter(DatasetAdapter):
                 )
             )
         self._episodes = tuple(records)
+        self._episodes_by_id = {
+            episode.episode_id: episode for episode in self._episodes
+        }
         self._excluded_empty_task_episodes = excluded_empty
         if any(episode.length <= 0 for episode in self._episodes):
             raise DatasetValidationError("LeRobot episodes must contain at least one frame")
@@ -522,6 +525,20 @@ class LeRobotDatasetAdapter(DatasetAdapter):
             load_images=load_images,
         )
 
+    def load_episode(
+        self,
+        record: EpisodeRecord,
+        *,
+        load_images: bool = True,
+    ) -> EpisodeData:
+        """Load one record already present in this adapter's validated index."""
+
+        if self._episodes_by_id.get(record.episode_id) != record:
+            raise ValueError(f"unknown or mismatched episode record {record.episode_id}")
+        return _load_lerobot_episode(
+            self._worker_payload(record, load_images=load_images)
+        )
+
     def iter_episode_subset(
         self,
         records: Sequence[EpisodeRecord],
@@ -530,12 +547,11 @@ class LeRobotDatasetAdapter(DatasetAdapter):
         load_images: bool = True,
     ) -> Iterator[EpisodeData]:
         requested = tuple(records)
-        expected = {record.episode_id: record for record in self._episodes}
         requested_ids = [record.episode_id for record in requested]
         if len(set(requested_ids)) != len(requested_ids):
             raise ValueError("episode subset contains duplicate episode ids")
         for record in requested:
-            if expected.get(record.episode_id) != record:
+            if self._episodes_by_id.get(record.episode_id) != record:
                 raise ValueError(f"unknown or mismatched episode record {record.episode_id}")
         yield from self._iter_records(
             requested,

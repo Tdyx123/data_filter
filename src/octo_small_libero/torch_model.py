@@ -328,7 +328,7 @@ class DiffusionActionHead(nn.Module):
 
 
 class OctoSmallPolicy(nn.Module):
-    """Language-conditioned, two-camera Octo-small policy implemented in PyTorch."""
+    """Language-conditioned Octo-small policy implemented in PyTorch."""
 
     def __init__(self, text_encoder: nn.Module, config: OctoSmallConfig | None = None):
         super().__init__()
@@ -392,6 +392,22 @@ class OctoSmallPolicy(nn.Module):
         )
         self.transformer = BlockTransformer(self.config)
         self.action_head = DiffusionActionHead(self.config)
+        self.observation_tokenizers = ("primary", "wrist")
+
+    def set_observation_tokenizers(self, tokenizers: tuple[str, ...]) -> None:
+        """Select available image modalities and freeze parameters for omitted ones."""
+
+        selected = tuple(dict.fromkeys(str(value) for value in tokenizers))
+        unknown = sorted(set(selected) - {"primary", "wrist"})
+        if unknown:
+            raise ValueError(f"Unknown observation tokenizers: {unknown}")
+        if "primary" not in selected:
+            raise ValueError("Octo-small requires the primary observation tokenizer")
+        self.observation_tokenizers = selected
+        wrist_enabled = "wrist" in selected
+        for name, parameter in self.named_parameters():
+            if name.startswith("wrist_"):
+                parameter.requires_grad_(wrist_enabled)
 
     def train(self, mode: bool = True) -> "OctoSmallPolicy":
         super().train(mode)
@@ -444,21 +460,29 @@ class OctoSmallPolicy(nn.Module):
         language = language + self.language_pos_embedding[:, : language.shape[1]]
 
         primary = self.primary_encoder(self._with_zero_goal(batch["image_primary"]))
-        wrist = self.wrist_encoder(self._with_zero_goal(batch["image_wrist"]))
         if primary.shape[1] != self.config.primary_tokens:
             raise ValueError(
                 f"Primary encoder produced {primary.shape[1]} tokens; "
                 f"expected {self.config.primary_tokens}"
             )
-        if wrist.shape[1] != self.config.wrist_tokens:
-            raise ValueError(
-                f"Wrist encoder produced {wrist.shape[1]} tokens; "
-                f"expected {self.config.wrist_tokens}"
-            )
         primary = self.primary_projection(primary).unsqueeze(1)
-        wrist = self.wrist_projection(wrist).unsqueeze(1)
         primary = primary + self.primary_pos_embedding[:, :1]
-        wrist = wrist + self.wrist_pos_embedding[:, :1]
+
+        observation_groups = [primary]
+        if "wrist" in self.observation_tokenizers:
+            if "image_wrist" not in batch:
+                raise ValueError(
+                    "image_wrist is required when the wrist observation tokenizer is enabled"
+                )
+            wrist = self.wrist_encoder(self._with_zero_goal(batch["image_wrist"]))
+            if wrist.shape[1] != self.config.wrist_tokens:
+                raise ValueError(
+                    f"Wrist encoder produced {wrist.shape[1]} tokens; "
+                    f"expected {self.config.wrist_tokens}"
+                )
+            wrist = self.wrist_projection(wrist).unsqueeze(1)
+            wrist = wrist + self.wrist_pos_embedding[:, :1]
+            observation_groups.append(wrist)
 
         proprio = batch["proprio"].unsqueeze(-1)
         proprio = self.proprio_projection(proprio)
@@ -467,7 +491,7 @@ class OctoSmallPolicy(nn.Module):
             primary.shape[0], -1, -1, -1
         )
 
-        observation_groups = [primary, wrist, proprio]
+        observation_groups.append(proprio)
         observation_tokens = sum(values.shape[2] for values in observation_groups)
         timestep = torch.cat([*observation_groups, readout], dim=2).flatten(1, 2)
         sequence = torch.cat([language, timestep], dim=1)
@@ -505,6 +529,7 @@ class OctoSmallPolicy(nn.Module):
         model_path: str | Path,
         *,
         device: str | torch.device = "cpu",
+        observation_tokenizers: tuple[str, ...] = ("primary", "wrist"),
     ) -> tuple["OctoSmallPolicy", Any]:
         try:
             from safetensors.torch import load_model
@@ -527,6 +552,7 @@ class OctoSmallPolicy(nn.Module):
             strict=True,
             device=str(device),
         )
+        model.set_observation_tokenizers(observation_tokenizers)
         model.to(device)
         tokenizer = AutoTokenizer.from_pretrained(text_root, local_files_only=True)
         return model, tokenizer
