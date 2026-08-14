@@ -1428,6 +1428,11 @@ def validate_output(
         "raw_action_label",
     )
     for selected_row, all_row in zip(selected_rows, selected_from_all, strict=True):
+        if any(
+            field in selected_row
+            for field in ("prototype_action_weights", "prototype_distance_weights")
+        ):
+            raise ValueError("selected row contains obsolete schema-3 prototype field")
         if any(selected_row.get(field) != all_row.get(field) for field in hierarchical_fields):
             raise ValueError("selected hierarchical prototype row metadata mismatch")
     clips, graph, _ = _load_graph(root)

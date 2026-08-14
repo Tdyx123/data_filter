@@ -329,6 +329,8 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert report["relation_weight"] == 1.0
     assert all("prototype_action_weights" not in row for row in all_rows)
     assert all("prototype_distance_weights" not in row for row in all_rows)
+    assert all("prototype_action_weights" not in row for row in selected)
+    assert all("prototype_distance_weights" not in row for row in selected)
     assert report["prototype_schema_version"] == 4
     assert report["prototype_strategy"] == "trajectory_action_subset_then_visual_softmax"
     assert report["objective"]["total"] == (
@@ -584,6 +586,26 @@ def test_validate_rejects_tampered_selected_hierarchical_row(tmp_path: Path) -> 
     selected_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
 
     with pytest.raises(ValueError, match="selected hierarchical prototype row"):
+        validate_output(result, config=config)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["prototype_action_weights", "prototype_distance_weights"],
+)
+def test_validate_rejects_obsolete_schema_three_field_in_selected_row(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    selected_path = result / "selected_manifest.jsonl"
+    rows = [json.loads(line) for line in selected_path.read_text().splitlines()]
+    rows[0][field] = [1.0]
+    selected_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    with pytest.raises(ValueError, match="obsolete schema-3 prototype field"):
         validate_output(result, config=config)
 
 
