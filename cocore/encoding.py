@@ -1,4 +1,4 @@
-"""Cocore-owned Quality-style fragment and half-clip visual encoding."""
+"""Cocore-owned Quality-style fragment and full-clip visual encoding."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
 
 CLIP_LENGTH = 15
 CLIP_STRIDE = 15
-HALF_WINDOWS = ((0, 8), (7, 15))
 
 
 def _sha256(path: Path) -> str:
@@ -84,17 +83,13 @@ class CocoreNumericNormalizers:
         epsilon: float = 1.0e-8,
     ) -> "CocoreNumericNormalizers":
         actions: list[np.ndarray] = []
-        observations: dict[str, list[np.ndarray]] = {
-            str(key): [] for key in vector_keys
-        }
+        observations: dict[str, list[np.ndarray]] = {str(key): [] for key in vector_keys}
         for action_values, observation_values in episodes:
             actions.append(np.asarray(action_values, dtype=np.float32))
             for key in observations:
                 if key not in observation_values:
                     raise ValueError(f"episode is missing vector observation {key!r}")
-                observations[key].append(
-                    np.asarray(observation_values[key], dtype=np.float32)
-                )
+                observations[key].append(np.asarray(observation_values[key], dtype=np.float32))
         action_lower, action_upper = _robust_bounds(
             actions,
             low=quantile_low,
@@ -175,9 +170,7 @@ class CocorePCAProjector:
         fit_data = standardized
         if max_samples and len(fit_data) > int(max_samples):
             rng = np.random.default_rng(self.seed)
-            indices = np.sort(
-                rng.choice(len(fit_data), size=int(max_samples), replace=False)
-            )
+            indices = np.sort(rng.choice(len(fit_data), size=int(max_samples), replace=False))
             fit_data = fit_data[indices]
         components = min(
             self.output_dim,
@@ -189,24 +182,18 @@ class CocorePCAProjector:
 
             model = PCA(
                 n_components=components,
-                svd_solver=(
-                    "randomized" if components < min(fit_data.shape) else "full"
-                ),
+                svd_solver=("randomized" if components < min(fit_data.shape) else "full"),
                 random_state=self.seed,
             )
             model.fit(fit_data)
             self.components_ = model.components_.astype(np.float32)
-            self.explained_variance_ratio_ = model.explained_variance_ratio_.astype(
-                np.float32
-            )
+            self.explained_variance_ratio_ = model.explained_variance_ratio_.astype(np.float32)
         except ImportError:
             _, singular, right = np.linalg.svd(fit_data, full_matrices=False)
             self.components_ = right[:components].astype(np.float32)
             variance = singular**2
             total = float(variance.sum()) or 1.0
-            self.explained_variance_ratio_ = (
-                variance[:components] / total
-            ).astype(np.float32)
+            self.explained_variance_ratio_ = (variance[:components] / total).astype(np.float32)
         return self
 
     def transform(self, features: np.ndarray) -> np.ndarray:
@@ -258,10 +245,7 @@ def reference_windows(length: int) -> list[tuple[int, int]]:
     if count == 1:
         return [(0, CLIP_LENGTH - 1)]
     final_start = length - CLIP_LENGTH
-    starts = [
-        _round_half_up_ratio(index * final_start, count - 1)
-        for index in range(count)
-    ]
+    starts = [_round_half_up_ratio(index * final_start, count - 1) for index in range(count)]
     if len(starts) != len(set(starts)):
         raise ValueError(f"reference sampling produced duplicate starts for length={length}")
     return [(start, start + CLIP_LENGTH - 1) for start in starts]
@@ -277,9 +261,9 @@ def temporal_pool(sequence: np.ndarray) -> np.ndarray:
         raise ValueError(f"expected non-empty [time, dim] sequence, got {values.shape}")
     if not np.all(np.isfinite(values)):
         raise ValueError("temporal sequence contains NaN or infinity")
-    return np.concatenate(
-        [values.mean(axis=0), values.std(axis=0), values.max(axis=0)]
-    ).astype(np.float32)
+    return np.concatenate([values.mean(axis=0), values.std(axis=0), values.max(axis=0)]).astype(
+        np.float32
+    )
 
 
 def visual_fragment_feature(frame_features: np.ndarray) -> np.ndarray:
@@ -287,14 +271,10 @@ def visual_fragment_feature(frame_features: np.ndarray) -> np.ndarray:
 
     values = np.asarray(frame_features, dtype=np.float32)
     if values.ndim != 2 or values.shape[0] != CLIP_LENGTH:
-        raise ValueError(
-            f"visual fragment features must have shape [15, dim], got {values.shape}"
-        )
+        raise ValueError(f"visual fragment features must have shape [15, dim], got {values.shape}")
     if not np.all(np.isfinite(values)):
         raise ValueError("visual fragment features contain NaN or infinity")
-    return np.concatenate([values.sum(axis=0), values[-1] - values[0]]).astype(
-        np.float32
-    )
+    return np.concatenate([values.sum(axis=0), values[-1] - values[0]]).astype(np.float32)
 
 
 def _l2_normalize_rows(features: np.ndarray, *, epsilon: float = 1.0e-8) -> np.ndarray:
@@ -330,25 +310,25 @@ def fuse_fragment_features(
         or len(progress_values) != row_count
     ):
         raise ValueError("fused fragment features must have aligned sample rows")
-    fused_raw = np.concatenate(
-        [visual, states, actions, progress_values[:, None]], axis=1
-    ).astype(np.float32)
+    fused_raw = np.concatenate([visual, states, actions, progress_values[:, None]], axis=1).astype(
+        np.float32
+    )
     return fused_raw, _l2_normalize_rows(fused_raw)
 
 
-def visual_half_means(frame_features: np.ndarray) -> np.ndarray:
-    """Average frames 0..7 and 7..14 of one fixed 15-frame clip."""
+def visual_clip_mean(frame_features: np.ndarray) -> np.ndarray:
+    """Return the L2-normalized mean of one fixed 15-frame clip."""
 
     values = np.asarray(frame_features, dtype=np.float32)
     if values.ndim != 2 or values.shape[0] != CLIP_LENGTH or values.shape[1] == 0:
-        raise ValueError(
-            "visual clip features must have shape [15, positive dimensions]"
-        )
+        raise ValueError("visual clip features must have shape [15, positive dimensions]")
     if not np.all(np.isfinite(values)):
         raise ValueError("visual clip features must be finite")
-    return np.stack(
-        [values[start:end].mean(axis=0) for start, end in HALF_WINDOWS]
-    ).astype(np.float32)
+    mean = values.mean(axis=0)
+    norm = float(np.linalg.norm(mean))
+    if not np.isfinite(norm) or norm <= 1.0e-8:
+        raise ValueError("visual clip mean must have a finite positive norm")
+    return (mean / norm).astype(np.float32)
 
 
 @dataclass(frozen=True)
@@ -364,7 +344,7 @@ class FrameEmbeddingEntry:
 class CocoreEncodedClips:
     clips: list[ClipRecord]
     embeddings: np.ndarray
-    visual_half_embeddings: np.ndarray
+    visual_clip_embeddings: np.ndarray
     state_sequences: np.ndarray
     action_sequences: np.ndarray
     visual_progress: np.ndarray
@@ -378,7 +358,7 @@ class CocoreEncodedClips:
 class CocoreEncodedArtifact:
     clips: list[ClipRecord]
     embeddings: np.ndarray
-    visual_half_embeddings: np.ndarray
+    visual_clip_embeddings: np.ndarray
     state_sequences: np.ndarray
     action_sequences: np.ndarray
     visual_progress: np.ndarray
@@ -399,21 +379,15 @@ def _validate_episode_metadata(
     pass_name: str,
 ) -> None:
     if episode.episode_id in seen or episode.episode_id not in expected:
-        raise ValueError(
-            f"unexpected or duplicate {pass_name} episode {episode.episode_id}"
-        )
+        raise ValueError(f"unexpected or duplicate {pass_name} episode {episode.episode_id}")
     seen.add(episode.episode_id)
     record = expected[episode.episode_id]
     if episode.length != record.length:
         raise ValueError(f"episode {episode.episode_id}: metadata length mismatch")
     if (episode.task_index, episode.task_name) != (record.task_index, record.task_name):
         raise ValueError(f"episode {episode.episode_id}: task metadata mismatch")
-    if not np.array_equal(
-        episode.frame_indices, np.arange(episode.length, dtype=np.int64)
-    ):
-        raise ValueError(
-            f"episode {episode.episode_id} frame indices must be contiguous from zero"
-        )
+    if not np.array_equal(episode.frame_indices, np.arange(episode.length, dtype=np.int64)):
+        raise ValueError(f"episode {episode.episode_id} frame indices must be contiguous from zero")
 
 
 def encode_cocore_dataset(
@@ -463,21 +437,19 @@ def encode_cocore_dataset(
     clips_by_episode: dict[int, list[tuple[int, ClipRecord]]] = {}
     for index, clip in enumerate(clips):
         clips_by_episode.setdefault(clip.episode_id, []).append((index, clip))
-    usable_records = [record for record in records if record.episode_id in clips_by_episode]
-    usable_by_id = _records_by_id(usable_records)
     union_windows = {
         record.episode_id: sorted(
             {
                 (clip.start_step, clip.end_step)
-                for _, clip in clips_by_episode[record.episode_id]
+                for _, clip in clips_by_episode.get(record.episode_id, ())
             }
             | set(reference_windows(record.length))
         )
-        for record in usable_records
+        for record in records
     }
     union_order = [
         (record.episode_id, start, end)
-        for record in usable_records
+        for record in records
         for start, end in union_windows[record.episode_id]
     ]
 
@@ -486,7 +458,7 @@ def encode_cocore_dataset(
         raise FileExistsError(f"frame cache directory must be empty: {cache_root}")
     cache_root.mkdir(parents=True, exist_ok=True)
     raw_visual: dict[tuple[int, int, int], np.ndarray] = {}
-    half_visual_by_index: dict[int, np.ndarray] = {}
+    clip_visual_by_index: dict[int, np.ndarray] = {}
     state_by_index: dict[int, np.ndarray] = {}
     action_by_index: dict[int, np.ndarray] = {}
     position_by_index: dict[int, float] = {}
@@ -497,13 +469,13 @@ def encode_cocore_dataset(
     feature_dim: int | None = None
     for completed, episode in enumerate(
         adapter.iter_episode_subset(
-            usable_records,
+            records,
             num_workers=num_workers,
             load_images=True,
         ),
         start=1,
     ):
-        _validate_episode_metadata(episode, usable_by_id, image_seen, "image")
+        _validate_episode_metadata(episode, records_by_id, image_seen, "image")
         if image_key not in episode.observations:
             raise ValueError(f"episode {episode.episode_id} is missing image {image_key!r}")
         frame_features = np.asarray(
@@ -515,14 +487,10 @@ def encode_cocore_dataset(
             or frame_features.shape[1] == 0
             or not np.all(np.isfinite(frame_features))
         ):
-            raise ValueError(
-                f"episode {episode.episode_id}: visual feature length mismatch"
-            )
+            raise ValueError(f"episode {episode.episode_id}: visual feature length mismatch")
         feature_dim = frame_features.shape[1] if feature_dim is None else feature_dim
         if frame_features.shape[1] != feature_dim:
-            raise ValueError(
-                f"episode {episode.episode_id}: visual feature dimension changed"
-            )
+            raise ValueError(f"episode {episode.episode_id}: visual feature dimension changed")
         filename = f"ep{episode.episode_id:06d}.npy"
         frame_path = cache_root / filename
         np.save(frame_path, frame_features)
@@ -540,12 +508,12 @@ def encode_cocore_dataset(
             raw_visual[(episode.episode_id, start, end)] = visual_fragment_feature(
                 frame_features[start : end + 1]
             )
-        for clip_index, clip in clips_by_episode[episode.episode_id]:
+        for clip_index, clip in clips_by_episode.get(episode.episode_id, ()):
             window = slice(clip.start_step, clip.end_step + 1)
             visual = frame_features[window]
             state = normalized_state[window]
             action = normalized_action[window]
-            half_visual_by_index[clip_index] = visual_half_means(visual)
+            clip_visual_by_index[clip_index] = visual_clip_mean(visual)
             state_by_index[clip_index] = state
             action_by_index[clip_index] = action
             position_by_index[clip_index] = float(clip.start_step) / float(episode.length)
@@ -556,17 +524,16 @@ def encode_cocore_dataset(
                 np.linalg.norm(normalized_visual[-1] - normalized_visual[0])
             )
         if progress_interval > 0 and (
-            completed % progress_interval == 0 or completed == len(usable_records)
+            completed % progress_interval == 0 or completed == len(records)
         ):
             print(
-                "cocore_encode "
-                f"completed={completed} remaining={len(usable_records) - completed}",
+                f"cocore_encode completed={completed} remaining={len(records) - completed}",
                 file=sys.stderr,
                 flush=True,
             )
-    if image_seen != set(usable_by_id):
+    if image_seen != set(records_by_id):
         raise ValueError("image pass did not yield every indexed episode exactly once")
-    if len(half_visual_by_index) != len(clips):
+    if len(clip_visual_by_index) != len(clips):
         raise ValueError("encoded clip count does not match clip index")
     if set(raw_visual) != set(union_order):
         raise ValueError("encoded visual union does not match expected fragment windows")
@@ -580,19 +547,16 @@ def encode_cocore_dataset(
     union_index = {key: index for index, key in enumerate(union_order)}
     candidate_visual = union_projected[
         np.asarray(
-            [
-                union_index[(clip.episode_id, clip.start_step, clip.end_step)]
-                for clip in clips
-            ],
+            [union_index[(clip.episode_id, clip.start_step, clip.end_step)] for clip in clips],
             dtype=np.int64,
         )
     ]
-    state_sequences = np.stack(
-        [state_by_index[index] for index in range(len(clips))]
-    ).astype(np.float32)
-    action_sequences = np.stack(
-        [action_by_index[index] for index in range(len(clips))]
-    ).astype(np.float32)
+    state_sequences = np.stack([state_by_index[index] for index in range(len(clips))]).astype(
+        np.float32
+    )
+    action_sequences = np.stack([action_by_index[index] for index in range(len(clips))]).astype(
+        np.float32
+    )
     _, embeddings = fuse_fragment_features(
         candidate_visual,
         np.stack([temporal_pool(values) for values in state_sequences]),
@@ -605,8 +569,8 @@ def encode_cocore_dataset(
     return CocoreEncodedClips(
         clips=clips,
         embeddings=embeddings,
-        visual_half_embeddings=np.stack(
-            [half_visual_by_index[index] for index in range(len(clips))]
+        visual_clip_embeddings=np.stack(
+            [clip_visual_by_index[index] for index in range(len(clips))]
         ).astype(np.float32),
         state_sequences=state_sequences,
         action_sequences=action_sequences,
@@ -616,6 +580,6 @@ def encode_cocore_dataset(
         ),
         numeric_normalizers=normalizers,
         visual_projector=projector,
-        frame_embeddings=[frame_entries[record.episode_id] for record in usable_records],
+        frame_embeddings=[frame_entries[record.episode_id] for record in records],
         union_fragment_count=len(union_order),
     )

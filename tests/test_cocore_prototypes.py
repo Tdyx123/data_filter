@@ -1,12 +1,96 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterator, Sequence
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from cocore import prototypes
+from relcore.schemas import ClipRecord
+from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
+
+
+class _TrajectoryPrototypeAdapter(DatasetAdapter):
+    def __init__(self) -> None:
+        self._records = (
+            EpisodeRecord(0, 47, 0, "forward training"),
+            EpisodeRecord(1, 47, 0, "right training"),
+            EpisodeRecord(2, 15, 0, "union candidate"),
+        )
+
+    @property
+    def vector_observation_keys(self) -> tuple[str, ...]:
+        return ("observation.state",)
+
+    @property
+    def image_observation_keys(self) -> tuple[str, ...]:
+        return ("observation.images.image",)
+
+    def episodes(self) -> Sequence[EpisodeRecord]:
+        return self._records
+
+    def iter_episodes(
+        self,
+        *,
+        num_workers: int = 0,
+        max_episodes: int | None = None,
+        load_images: bool = True,
+    ) -> Iterator[EpisodeData]:
+        del num_workers, load_images
+        records = self._records[:max_episodes] if max_episodes else self._records
+        for record in records:
+            steps = np.arange(record.length, dtype=np.float32)
+            states = np.zeros((record.length, 8), dtype=np.float32)
+            if record.episode_id == 0:
+                states[:, 0] = steps * np.float32(0.01)
+            elif record.episode_id == 1:
+                states[:, 1] = steps * np.float32(-0.01)
+            else:
+                states[:, 0] = np.minimum(steps, 7.0) * np.float32(0.02)
+                states[:, 1] = np.maximum(steps - 7.0, 0.0) * np.float32(-0.02)
+            yield EpisodeData(
+                episode_id=record.episode_id,
+                timestamps=steps.astype(np.float64) / 10.0,
+                frame_indices=np.arange(record.length, dtype=np.int64),
+                observations={"observation.state": states},
+                actions=np.zeros((record.length, 2), dtype=np.float32),
+                task_index=record.task_index,
+                task_name=record.task_name,
+            )
+
+    def fingerprint(self) -> str:
+        return "trajectory-prototype-test-v1"
+
+
+def _write_frame_caches(root: Path, adapter: _TrajectoryPrototypeAdapter) -> None:
+    root.mkdir()
+    for record in adapter.episodes():
+        steps = np.arange(record.length, dtype=np.float32)
+        features = np.stack(
+            [
+                np.ones(record.length, dtype=np.float32),
+                np.float32(record.episode_id + 1) + steps / np.float32(100.0),
+            ],
+            axis=1,
+        )
+        np.save(root / f"ep{record.episode_id:06d}.npy", features)
+
+
+def _candidate_clip() -> ClipRecord:
+    return ClipRecord(
+        sample_id="ep000002_chunk_000000_000014",
+        episode_id=2,
+        task_index=0,
+        task_name="union candidate",
+        start_step=0,
+        end_step=14,
+        length=15,
+        previous_sample_id=None,
+        next_sample_id=None,
+    )
 
 
 def test_action_catalog_retains_counts_at_fixed_and_fractional_thresholds() -> None:
@@ -19,12 +103,8 @@ def test_action_catalog_retains_counts_at_fixed_and_fractional_thresholds() -> N
         total_labels=8_201,
     )
 
-    fixed_by_label = {
-        category.label: category for category in fixed.action_categories
-    }
-    fractional_by_label = {
-        category.label: category for category in fractional.action_categories
-    }
+    fixed_by_label = {category.label: category for category in fixed.action_categories}
+    fractional_by_label = {category.label: category for category in fractional.action_categories}
     assert fixed_by_label["move forward"].retained is True
     assert fractional_by_label["move forward"].retained is True
     assert fractional_by_label["move backward"].retained is False
@@ -48,9 +128,9 @@ def test_action_catalog_accepts_pure_stop_data_below_the_count_floor() -> None:
     assert category.raw_count == 3
     assert category.raw_proportion == pytest.approx(1.0)
     assert category.retained is False
-    assert tuple(
-        (parent.label, parent.probability) for parent in category.parents
-    ) == (("stop", 1.0),)
+    assert tuple((parent.label, parent.probability) for parent in category.parents) == (
+        ("stop", 1.0),
+    )
     assert catalog.action_labels == ("stop",)
 
 
@@ -111,9 +191,7 @@ def test_action_catalog_records_raw_values_and_parent_assignments() -> None:
     assert rare.raw_proportion == pytest.approx(0.05)
     assert rare.action_id is None
     assert rare.retained is False
-    assert tuple(
-        (parent.label, parent.probability) for parent in rare.parents
-    ) == (
+    assert tuple((parent.label, parent.probability) for parent in rare.parents) == (
         ("move right, tilt up", pytest.approx(4.0 / 9.0)),
         ("move forward right", pytest.approx(3.0 / 9.0)),
         ("move forward, tilt up", pytest.approx(2.0 / 9.0)),
@@ -135,10 +213,13 @@ def test_action_helpers_reject_unknown_motion_labels(label: str) -> None:
 
 
 def test_canonical_clip_action_unions_deduplicates_and_uses_semantic_order() -> None:
-    assert prototypes.canonical_clip_action(
-        "open gripper, move left up, tilt down",
-        "move forward left, rotate clockwise, open gripper",
-    ) == "move forward left up, tilt down, rotate clockwise, open gripper"
+    assert (
+        prototypes.canonical_clip_action(
+            "open gripper, move left up, tilt down",
+            "move forward left, rotate clockwise, open gripper",
+        )
+        == "move forward left up, tilt down, rotate clockwise, open gripper"
+    )
     assert prototypes.canonical_clip_action("stop", "stop") == "stop"
 
 
@@ -224,9 +305,7 @@ def test_action_catalog_serializes_schema_four_strategy_and_metadata() -> None:
         total_labels=100,
     )
     forward = next(
-        category
-        for category in catalog.action_categories
-        if category.label == "move forward"
+        category for category in catalog.action_categories if category.label == "move forward"
     )
     updated_forward = replace(
         forward,
@@ -265,9 +344,7 @@ def test_action_catalog_serializes_schema_four_strategy_and_metadata() -> None:
     }
     assert payload["total_raw_actions"] == 100
     forward_payload = next(
-        category
-        for category in payload["action_categories"]
-        if category["label"] == "move forward"
+        category for category in payload["action_categories"] if category["label"] == "move forward"
     )
     assert forward_payload["raw_count"] == 40
     assert forward_payload["raw_proportion"] == pytest.approx(0.4)
@@ -290,3 +367,123 @@ def test_action_catalog_serializes_schema_four_strategy_and_metadata() -> None:
             "center_id": 0,
         }
     ]
+
+
+def test_full_trajectory_builder_uses_weighted_parent_buckets_and_all_centers(
+    tmp_path: Path,
+) -> None:
+    adapter = _TrajectoryPrototypeAdapter()
+    cache = tmp_path / "frame_embeddings"
+    _write_frame_caches(cache, adapter)
+    clip = _candidate_clip()
+    candidate_frames = np.load(cache / "ep000002.npy", allow_pickle=False)
+    candidate_mean = candidate_frames.mean(axis=0)
+    candidate_mean /= np.linalg.norm(candidate_mean)
+
+    result = prototypes.build_hierarchical_motion_prototypes(
+        adapter,
+        [clip],
+        candidate_mean[None, :],
+        frame_cache_dir=cache,
+        batch_size=32,
+        max_iter=50,
+        seed=23,
+        max_episodes=None,
+        num_workers=0,
+    )
+
+    assert result.clip_action_labels.dtype.kind == "U"
+    assert result.clip_action_labels.shape == (1,)
+    assert result.clip_action_labels.tolist() == ["move forward right"]
+    by_label = {category.label: category for category in result.catalog.action_categories}
+    assert by_label["move forward"].raw_count == 42
+    assert by_label["move right"].raw_count == 42
+    assert by_label["move forward right"].raw_count == 4
+    assert by_label["move forward"].effective_mass == pytest.approx(44.0)
+    assert by_label["move right"].effective_mass == pytest.approx(44.0)
+    assert by_label["move forward"].requested_centers == 6
+    assert by_label["move right"].requested_centers == 6
+    assert by_label["move forward"].actual_centers == 6
+    assert by_label["move right"].actual_centers == 6
+    assert result.prototypes.centers is not None
+    assert result.prototypes.centers.shape == (12, 2)
+    assert result.prototypes.indices.shape == (1, 12)
+    assert set(result.prototypes.indices[0]) == set(range(12))
+    assert np.all(result.prototypes.weights[0] > 0.0)
+    np.testing.assert_allclose(result.prototypes.weights.sum(axis=1), 1.0)
+    forward_leaf_ids = {
+        leaf.prototype_id
+        for leaf in result.catalog.leaf_prototypes
+        if leaf.action_label == "move forward"
+    }
+    right_leaf_ids = {
+        leaf.prototype_id
+        for leaf in result.catalog.leaf_prototypes
+        if leaf.action_label == "move right"
+    }
+    assert len(forward_leaf_ids) == 6
+    assert len(right_leaf_ids) == 6
+    assert sum(
+        weight
+        for leaf_id, weight in zip(
+            result.prototypes.indices[0],
+            result.prototypes.weights[0],
+            strict=True,
+        )
+        if leaf_id in forward_leaf_ids
+    ) == pytest.approx(0.5)
+    assert sum(
+        weight
+        for leaf_id, weight in zip(
+            result.prototypes.indices[0],
+            result.prototypes.weights[0],
+            strict=True,
+        )
+        if leaf_id in right_leaf_ids
+    ) == pytest.approx(0.5)
+
+
+def test_full_trajectory_builder_rejects_missing_frame_cache(tmp_path: Path) -> None:
+    adapter = _TrajectoryPrototypeAdapter()
+    cache = tmp_path / "frame_embeddings"
+    _write_frame_caches(cache, adapter)
+    (cache / "ep000001.npy").unlink()
+    candidate = np.asarray([[1.0, 0.0]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="missing frame embedding cache"):
+        prototypes.build_hierarchical_motion_prototypes(
+            adapter,
+            [_candidate_clip()],
+            candidate,
+            frame_cache_dir=cache,
+            batch_size=32,
+            max_iter=50,
+            seed=23,
+            max_episodes=None,
+            num_workers=0,
+        )
+
+
+def test_full_trajectory_builder_rejects_data_without_valid_windows(
+    tmp_path: Path,
+) -> None:
+    class _ShortAdapter(_TrajectoryPrototypeAdapter):
+        def __init__(self) -> None:
+            self._records = (EpisodeRecord(0, 7, 0, "short"),)
+
+    adapter = _ShortAdapter()
+    cache = tmp_path / "frame_embeddings"
+    _write_frame_caches(cache, adapter)
+
+    with pytest.raises(ValueError, match="no valid trajectory windows"):
+        prototypes.build_hierarchical_motion_prototypes(
+            adapter,
+            [],
+            np.empty((0, 2), dtype=np.float32),
+            frame_cache_dir=cache,
+            batch_size=32,
+            max_iter=50,
+            seed=23,
+            max_episodes=None,
+            num_workers=0,
+        )
