@@ -11,10 +11,53 @@ from qwen3_vl_groot.config import (
     save_resolved_config,
     validate_config,
 )
+from libero_lerobot.selection import resolve_prior_selection
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 QWEN35_CONFIG = PROJECT_ROOT / "configs" / "qwen3_5_0_8b_groot_libero_4x4090.yaml"
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml",
+        QWEN35_CONFIG,
+    ],
+)
+def test_qwen_libero_configs_default_to_full_prior_dataset(config_path):
+    config = load_config(config_path)
+
+    assert config["data"]["prior_selection"] == {
+        "scores": "/data/dwb/libero90_sqcn/filter/top10pct/scores.csv",
+        "top_percent": None,
+        "prefiltered": False,
+        "relcore_manifest": None,
+        "quality_filter_scores": None,
+    }
+    assert resolve_prior_selection(config, {}) is None
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml",
+        QWEN35_CONFIG,
+    ],
+)
+def test_qwen_libero_configs_allow_explicit_prefiltered_override(config_path):
+    config = apply_overrides(
+        load_config(config_path),
+        {"prior_prefiltered_scores": "/data/custom/selected.csv"},
+    )
+
+    assert config["data"]["prior_selection"] == {
+        "scores": "/data/custom/selected.csv",
+        "top_percent": None,
+        "prefiltered": True,
+        "relcore_manifest": None,
+        "quality_filter_scores": None,
+    }
 
 
 @pytest.mark.parametrize(
@@ -92,6 +135,7 @@ def test_libero_config_rejects_conflicting_prior_selection_modes():
     config = load_config(
         PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
     )
+    config["data"]["prior_selection"]["prefiltered"] = True
     config["data"]["prior_selection"]["relcore_manifest"] = "/tmp/selected.jsonl"
 
     with pytest.raises(ConfigError, match="prior selection mode"):

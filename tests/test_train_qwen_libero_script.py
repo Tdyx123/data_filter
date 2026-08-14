@@ -2,6 +2,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LIBERO_SCRIPT = (
@@ -49,7 +51,7 @@ def _fake_python_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
     return environment, calls
 
 
-def test_libero_script_uses_only_libero_config_and_injects_one_to_one_defaults(tmp_path):
+def test_libero_script_uses_only_libero_config_and_full_prior_by_default(tmp_path):
     environment, calls = _fake_python_environment(tmp_path)
 
     subprocess.run(
@@ -76,7 +78,7 @@ def test_libero_script_uses_only_libero_config_and_injects_one_to_one_defaults(t
     assert "--all-tasks" in arguments
     weight_index = arguments.index("--sample-weights")
     assert arguments[weight_index + 1 : weight_index + 3] == ["1", "1"]
-    assert arguments[arguments.index("--prior-prefiltered-scores") + 1] == SQCN_SCORES
+    assert "--prior-prefiltered-scores" not in arguments
     assert arguments[arguments.index("--lora-learning-rate") + 1] == "5e-6"
     assert arguments[arguments.index("--action-head-learning-rate") + 1] == "2e-4"
 
@@ -227,7 +229,9 @@ def test_libero_script_preserves_explicit_weights_and_prior_mode(tmp_path):
     assert "--prior-prefiltered-scores" not in arguments
 
 
-def test_qwen35_libero_script_uses_independent_config_and_default_mixture(tmp_path):
+def test_qwen35_libero_script_uses_independent_config_and_full_prior_by_default(
+    tmp_path,
+):
     environment, calls = _fake_python_environment(tmp_path)
 
     subprocess.run(
@@ -254,10 +258,9 @@ def test_qwen35_libero_script_uses_independent_config_and_default_mixture(tmp_pa
     assert "--all-tasks" in arguments
     weight_index = arguments.index("--sample-weights")
     assert arguments[weight_index + 1 : weight_index + 3] == ["1", "1"]
-    assert arguments[arguments.index("--prior-prefiltered-scores") + 1] == SQCN_SCORES
+    assert "--prior-prefiltered-scores" not in arguments
     assert arguments[arguments.index("--lora-learning-rate") + 1] == "5e-6"
     assert arguments[arguments.index("--action-head-learning-rate") + 1] == "2e-4"
-    assert arguments.index("--output-dir") > arguments.index("--prior-prefiltered-scores")
     assert arguments[-1] == "--preflight-only"
 
 
@@ -314,7 +317,34 @@ def test_qwen35_libero_preserves_explicit_weights_and_prior(tmp_path):
     assert "--prior-prefiltered-scores" not in arguments
 
 
-def test_cyclic_libero_script_injects_schedule_and_preserves_defaults(tmp_path):
+@pytest.mark.parametrize("script", [LIBERO_SCRIPT, QWEN35_LIBERO_SCRIPT])
+def test_qwen_libero_scripts_forward_explicit_prefiltered_scores_once(
+    tmp_path,
+    script,
+):
+    environment, calls = _fake_python_environment(tmp_path)
+
+    subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--prior-prefiltered-scores",
+            SQCN_SCORES,
+            "--output-dir",
+            "outputs/libero-prefiltered",
+            "--preflight-only",
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        check=True,
+    )
+
+    arguments = calls.read_text(encoding="utf-8").splitlines()
+    assert arguments.count("--prior-prefiltered-scores") == 1
+    assert arguments[arguments.index("--prior-prefiltered-scores") + 1] == SQCN_SCORES
+
+
+def test_cyclic_libero_script_uses_full_prior_and_preserves_schedule_defaults(tmp_path):
     environment, calls = _fake_python_environment(tmp_path)
 
     subprocess.run(
@@ -334,7 +364,7 @@ def test_cyclic_libero_script_injects_schedule_and_preserves_defaults(tmp_path):
     assert "--all-tasks" in arguments
     weight_index = arguments.index("--sample-weights")
     assert arguments[weight_index + 1 : weight_index + 3] == ["1", "1"]
-    assert arguments[arguments.index("--prior-prefiltered-scores") + 1] == SQCN_SCORES
+    assert "--prior-prefiltered-scores" not in arguments
     assert arguments[arguments.index("--lora-freeze-steps") + 1] == "5000"
     assert arguments[arguments.index("--lora-cycle-steps") + 1] == "100"
     assert arguments[arguments.index("--lora-active-steps") + 1] == "10"

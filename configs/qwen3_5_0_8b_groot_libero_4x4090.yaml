@@ -13,7 +13,7 @@ data:
   prior_selection:
     scores: /data/dwb/libero90_sqcn/filter/top10pct/scores.csv
     top_percent: null
-    prefiltered: true
+    prefiltered: false
     relcore_manifest: null
     quality_filter_scores: null
   image_key: observation.images.image
