@@ -498,7 +498,7 @@ def test_full_trajectory_builder_uses_weighted_parent_buckets_and_all_centers(
     ) == pytest.approx(0.5)
 
 
-def test_full_trajectory_builder_bounds_every_kmeans_update_by_batch_size(
+def test_full_trajectory_builder_allows_k_above_batch_size_and_bounds_updates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -510,7 +510,8 @@ def test_full_trajectory_builder_bounds_every_kmeans_update_by_batch_size(
     candidate_frames = np.load(cache / "ep000002.npy", allow_pickle=False)
     candidate_mean = candidate_frames.mean(axis=0)
     candidate_mean /= np.linalg.norm(candidate_mean)
-    observed_batch_rows: list[int] = []
+    initialization_rows: list[int] = []
+    update_rows: list[int] = []
     real_fit = MiniBatchKMeans.fit
     real_partial_fit = MiniBatchKMeans.partial_fit
 
@@ -520,7 +521,7 @@ def test_full_trajectory_builder_bounds_every_kmeans_update_by_batch_size(
         labels: object = None,
         sample_weight: np.ndarray | None = None,
     ) -> MiniBatchKMeans:
-        observed_batch_rows.append(len(features))
+        initialization_rows.append(len(features))
         return real_fit(self, features, labels, sample_weight=sample_weight)
 
     def recording_partial_fit(
@@ -529,26 +530,30 @@ def test_full_trajectory_builder_bounds_every_kmeans_update_by_batch_size(
         labels: object = None,
         sample_weight: np.ndarray | None = None,
     ) -> MiniBatchKMeans:
-        observed_batch_rows.append(len(features))
+        update_rows.append(len(features))
         return real_partial_fit(self, features, labels, sample_weight=sample_weight)
 
     monkeypatch.setattr(MiniBatchKMeans, "fit", recording_fit)
     monkeypatch.setattr(MiniBatchKMeans, "partial_fit", recording_partial_fit)
 
-    prototypes.build_hierarchical_motion_prototypes(
+    result = prototypes.build_hierarchical_motion_prototypes(
         adapter,
         [_candidate_clip()],
         candidate_mean[None, :],
         frame_cache_dir=cache,
-        batch_size=8,
+        batch_size=4,
         max_iter=50,
         seed=23,
         max_episodes=None,
         num_workers=0,
     )
 
-    assert observed_batch_rows
-    assert max(observed_batch_rows) <= 8
+    by_label = {category.label: category for category in result.catalog.action_categories}
+    assert by_label["move forward"].requested_centers == 6
+    assert by_label["move right"].requested_centers == 6
+    assert initialization_rows == [6, 6]
+    assert update_rows
+    assert max(update_rows) <= 4
 
 
 def test_full_trajectory_builder_sorts_the_definitive_stored_probabilities(

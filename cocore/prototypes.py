@@ -616,7 +616,10 @@ def build_hierarchical_motion_prototypes(
             updated_categories[action_id] = replace(category, effective_mass=0.0)
             continue
         clusters = cluster_count_for_mass(mass)
-        capacity = min(int(batch_size), member_counts[action_id])
+        capacity = min(
+            member_counts[action_id],
+            max(int(batch_size), clusters),
+        )
         if clusters <= 0 or clusters > capacity:
             raise ValueError("invalid KMeans inputs")
         requested_centers[action_id] = clusters
