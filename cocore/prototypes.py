@@ -419,13 +419,12 @@ def _squared_distances(values: np.ndarray, centers: np.ndarray) -> np.ndarray:
     return squared
 
 
-def _fit_action_cluster_model(
+def _initialize_action_cluster_model(
     embeddings: np.ndarray,
     sample_weights: np.ndarray,
     *,
     clusters: int,
     batch_size: int,
-    max_iter: int,
     seed: int,
 ):
     values = np.asarray(embeddings, dtype=np.float32)
@@ -449,11 +448,11 @@ def _fit_action_cluster_model(
     model = MiniBatchKMeans(
         n_clusters=int(clusters),
         batch_size=batch_size,
-        max_iter=max_iter,
+        max_iter=1,
         random_state=seed,
         n_init=10,
     )
-    model.fit(values, sample_weight=weights)
+    model.partial_fit(values, sample_weight=weights)
     centers = np.asarray(model.cluster_centers_, dtype=np.float32)
     if centers.shape != (int(clusters), values.shape[1]) or not np.all(np.isfinite(centers)):
         raise ValueError("invalid KMeans outputs")
@@ -646,12 +645,11 @@ def build_hierarchical_motion_prototypes(
                 cursor += take
                 initial_counts[action_id] = filled
             if filled == capacity:
-                models[action_id] = _fit_action_cluster_model(
+                models[action_id] = _initialize_action_cluster_model(
                     initial_values[action_id],
                     initial_weights[action_id],
                     clusters=requested_centers[action_id],
                     batch_size=int(batch_size),
-                    max_iter=int(max_iter),
                     seed=int(seed) + action_id,
                 )
         if action_id in models:
@@ -665,33 +663,40 @@ def build_hierarchical_motion_prototypes(
                 cursor = end
 
     cache_root = Path(frame_cache_dir)
-    cache_seen: set[int] = set()
-    for episode in adapter.iter_episodes(
-        num_workers=num_workers,
-        max_episodes=max_episodes,
-        load_images=False,
-    ):
-        states = _validated_states(episode, expected, cache_seen, pass_name="cache")
-        record = expected[episode.episode_id]
-        window_visuals = _episode_window_visuals(
-            cache_root,
-            record,
-            embedding_dim=candidate_values.shape[1],
-        )
-        if len(window_visuals) != max(len(states) - 7, 0):
-            raise ValueError(f"episode {episode.episode_id}: state/cache length mismatch")
-        memberships = _episode_parent_memberships(
-            states,
-            categories_by_label,
-            tuple(categories_by_id),
-            primitive_config,
-        )
-        for action_id, (rows, weights) in memberships.items():
-            update_action_model(action_id, window_visuals[rows], weights)
-    if cache_seen != set(expected):
-        raise ValueError("cache pass did not yield every indexed episode exactly once")
-    if set(models) != set(requested_centers):
-        raise ValueError("invalid KMeans inputs")
+    for epoch in range(int(max_iter)):
+        cache_seen: set[int] = set()
+        for episode in adapter.iter_episodes(
+            num_workers=num_workers,
+            max_episodes=max_episodes,
+            load_images=False,
+        ):
+            states = _validated_states(
+                episode,
+                expected,
+                cache_seen,
+                pass_name=f"cache epoch {epoch + 1}",
+            )
+            record = expected[episode.episode_id]
+            window_visuals = _episode_window_visuals(
+                cache_root,
+                record,
+                embedding_dim=candidate_values.shape[1],
+            )
+            if len(window_visuals) != max(len(states) - 7, 0):
+                raise ValueError(f"episode {episode.episode_id}: state/cache length mismatch")
+            memberships = _episode_parent_memberships(
+                states,
+                categories_by_label,
+                tuple(categories_by_id),
+                primitive_config,
+            )
+            for action_id in sorted(memberships):
+                rows, weights = memberships[action_id]
+                update_action_model(action_id, window_visuals[rows], weights)
+        if cache_seen != set(expected):
+            raise ValueError("cache pass did not yield every indexed episode exactly once")
+        if set(models) != set(requested_centers):
+            raise ValueError("invalid KMeans inputs")
 
     centers: list[np.ndarray] = []
     leaves: list[LeafPrototype] = []

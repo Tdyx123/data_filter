@@ -282,6 +282,70 @@ def _validate_frame_embedding_cache(
         raise ValueError("cocore frame embedding episodes do not match the scan index")
 
 
+def _validate_visual_clip_embedding_cache(
+    encode_root: Path,
+    clips: list[ClipRecord],
+) -> None:
+    path = encode_root / "visual_clip_embeddings.npy"
+    try:
+        visual_clips = np.load(path, allow_pickle=False, mmap_mode="r")
+    except (OSError, ValueError) as error:
+        raise ValueError("cocore visual clip embedding cache could not be loaded") from error
+    if (
+        visual_clips.dtype != np.dtype(np.float32)
+        or visual_clips.ndim != 2
+        or visual_clips.shape[0] != len(clips)
+        or visual_clips.shape[1] == 0
+    ):
+        raise ValueError("cocore visual clip embedding shape or dtype is invalid")
+    for start in range(0, len(visual_clips), 4096):
+        block = visual_clips[start : start + 4096]
+        if not np.all(np.isfinite(block)):
+            raise ValueError("cocore visual clip embedding contains NaN or infinity")
+        norms = np.linalg.norm(block, axis=1)
+        if not np.all(np.isfinite(norms)) or np.any(norms <= 1.0e-8):
+            raise ValueError("cocore visual clip embedding has a non-positive norm")
+        if not np.allclose(norms, 1.0, rtol=1.0e-5, atol=1.0e-6):
+            raise ValueError("cocore visual clip embeddings must be L2-normalized")
+
+    clips_by_episode: dict[int, list[tuple[int, ClipRecord]]] = {}
+    for clip_index, clip in enumerate(clips):
+        if clip.length != 15 or clip.end_step - clip.start_step + 1 != 15 or clip.start_step < 0:
+            raise ValueError("cocore visual clip boundary is invalid")
+        clips_by_episode.setdefault(clip.episode_id, []).append((clip_index, clip))
+
+    for episode_id in sorted(clips_by_episode):
+        frame_path = encode_root / "frame_embeddings" / f"ep{episode_id:06d}.npy"
+        try:
+            frame_values = np.load(frame_path, allow_pickle=False, mmap_mode="r")
+        except (OSError, ValueError) as error:
+            raise ValueError("cocore visual clip frame cache could not be loaded") from error
+        if (
+            frame_values.dtype != np.dtype(np.float32)
+            or frame_values.ndim != 2
+            or frame_values.shape[1] != visual_clips.shape[1]
+        ):
+            raise ValueError("cocore visual clip frame cache shape or dtype is invalid")
+        for clip_index, clip in clips_by_episode[episode_id]:
+            if clip.end_step >= len(frame_values):
+                raise ValueError("cocore visual clip boundary exceeds frame cache")
+            window = frame_values[clip.start_step : clip.end_step + 1]
+            if window.shape != (15, visual_clips.shape[1]) or not np.all(np.isfinite(window)):
+                raise ValueError("cocore visual clip frame window is invalid")
+            mean = window.mean(axis=0)
+            norm = float(np.linalg.norm(mean))
+            if not math.isfinite(norm) or norm <= 1.0e-8:
+                raise ValueError("cocore visual clip frame mean has a non-positive norm")
+            expected = (mean / norm).astype(np.float32)
+            if not np.allclose(
+                visual_clips[clip_index],
+                expected,
+                rtol=1.0e-6,
+                atol=1.0e-7,
+            ):
+                raise ValueError("visual clip embeddings do not match frame cache")
+
+
 def scan_stage(
     config: Mapping[str, Any],
     *,
@@ -388,6 +452,12 @@ def encode_stage(
             raise FileExistsError(
                 f"cocore frame embedding cache is incompatible: {destination}; pass --force"
             ) from error
+        try:
+            _validate_visual_clip_embedding_cache(destination, clips)
+        except ValueError as error:
+            raise FileExistsError(
+                f"cocore visual clip embedding cache is incompatible: {destination}; pass --force"
+            ) from error
         frame_cache_valid = True
     publish_stage(
         destination,
@@ -401,6 +471,7 @@ def encode_stage(
         destination,
         expected_episodes=expected_frame_episodes,
     )
+    _validate_visual_clip_embedding_cache(destination, clips)
     return (
         root,
         adapter,
@@ -1327,6 +1398,7 @@ def validate_output(
         root / "encode",
         expected_episodes=[(int(row["episode_id"]), int(row["length"])) for row in episode_rows],
     )
+    _validate_visual_clip_embedding_cache(root / "encode", scan_clips)
     if config is None:
         resolved_path = result / "resolved_config.yaml"
         if not resolved_path.is_file():

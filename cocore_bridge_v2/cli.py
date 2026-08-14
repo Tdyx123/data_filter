@@ -81,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=_selection_ratio,
         default=DEFAULT_SELECTION_RATIO,
     )
+    validate.add_argument("--max-episodes", type=_positive_int, default=None)
     return parser
 
 

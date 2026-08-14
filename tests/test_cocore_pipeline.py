@@ -10,7 +10,9 @@ import pyarrow.parquet as pq
 import pytest
 import yaml
 
-from cocore.pipeline import encode_stage, run_pipeline, validate_output
+from cocore import pipeline as cocore_pipeline
+from cocore.pipeline import encode_stage, graph_stage, run_pipeline, validate_output
+from relcore.schemas import ClipRecord
 from trajectory_data import (
     DatasetAdapter,
     EpisodeData,
@@ -206,6 +208,55 @@ def test_encode_stage_publishes_normalized_visual_clip_artifact(tmp_path: Path) 
         visual_encoder=FailingCocoreVisualEncoder(),
     )
     assert CocorePipelineAdapter.load_images_calls == [False, False, True]
+
+
+@pytest.mark.parametrize(
+    ("corruption", "message"),
+    [
+        ("shape", "shape or dtype"),
+        ("nonfinite", "NaN or infinity"),
+        ("zero_norm", "non-positive norm"),
+        ("frame_boundary", "boundary exceeds frame cache"),
+    ],
+)
+def test_visual_clip_cache_validation_rejects_malformed_semantics(
+    tmp_path: Path,
+    corruption: str,
+    message: str,
+) -> None:
+    encode_root = tmp_path / "encode"
+    frame_root = encode_root / "frame_embeddings"
+    frame_root.mkdir(parents=True)
+    frames = np.tile(np.asarray([[1.0, 2.0, 4.0]], dtype=np.float32), (15, 1))
+    expected = frames.mean(axis=0)
+    expected /= np.linalg.norm(expected)
+    visual_clips = expected[None, :].astype(np.float32)
+    if corruption == "shape":
+        visual_clips = np.empty((0, 3), dtype=np.float32)
+    elif corruption == "nonfinite":
+        visual_clips[0, 0] = np.nan
+    elif corruption == "zero_norm":
+        visual_clips[0] = 0.0
+    if corruption == "frame_boundary":
+        frames = frames[:-1]
+    np.save(encode_root / "visual_clip_embeddings.npy", visual_clips)
+    np.save(frame_root / "ep000000.npy", frames)
+    clips = [
+        ClipRecord(
+            sample_id="ep000000_chunk_000000_000014",
+            episode_id=0,
+            task_index=0,
+            task_name="clip",
+            start_step=0,
+            end_step=14,
+            length=15,
+            previous_sample_id=None,
+            next_sample_id=None,
+        )
+    ]
+
+    with pytest.raises(ValueError, match=message):
+        cocore_pipeline._validate_visual_clip_embedding_cache(encode_root, clips)
 
 
 def test_encode_stage_caches_every_indexed_episode_including_short_episodes(
@@ -503,7 +554,7 @@ def test_validate_rejects_tampered_visual_clip_embeddings(tmp_path: Path) -> Non
     values[0] = np.roll(values[0], 1)
     np.save(path, values)
 
-    with pytest.raises(ValueError, match="prototype replay"):
+    with pytest.raises(ValueError, match="visual clip embeddings do not match frame cache"):
         validate_output(result, config=config)
 
 
@@ -556,6 +607,22 @@ def test_encode_cache_rejects_corrupt_episode_frame_cache_without_force(
 
     with pytest.raises(FileExistsError, match="frame embedding.*--force"):
         encode_stage(config, visual_encoder=FailingCocoreVisualEncoder())
+
+
+def test_graph_build_rejects_semantically_tampered_visual_clip_cache(
+    tmp_path: Path,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    root, _, _ = encode_stage(config, visual_encoder=CocoreVisualEncoder())
+    path = root / "encode" / "visual_clip_embeddings.npy"
+    values = np.load(path, allow_pickle=False)
+    values[0] = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+    np.save(path, values)
+
+    with pytest.raises(FileExistsError, match="visual clip embedding.*--force"):
+        graph_stage(config, visual_encoder=FailingCocoreVisualEncoder())
+    assert not (root / "graph-13-motion-softmax").exists()
 
 
 def test_validate_rejects_tampered_visual_prototype_center(tmp_path: Path) -> None:

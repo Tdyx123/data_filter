@@ -120,6 +120,50 @@ class _PowerBoundaryAdapter(DatasetAdapter):
         return "power-boundary-prototype-test-v1"
 
 
+class _StreamingMeanAdapter(DatasetAdapter):
+    def __init__(self, *, reverse: bool = False) -> None:
+        records = (
+            EpisodeRecord(0, 27, 0, "zero block"),
+            EpisodeRecord(1, 27, 0, "ten block"),
+        )
+        self._records = tuple(reversed(records)) if reverse else records
+
+    @property
+    def vector_observation_keys(self) -> tuple[str, ...]:
+        return ("observation.state",)
+
+    @property
+    def image_observation_keys(self) -> tuple[str, ...]:
+        return ("observation.images.image",)
+
+    def episodes(self) -> Sequence[EpisodeRecord]:
+        return self._records
+
+    def iter_episodes(
+        self,
+        *,
+        num_workers: int = 0,
+        max_episodes: int | None = None,
+        load_images: bool = True,
+    ) -> Iterator[EpisodeData]:
+        del num_workers, load_images
+        records = self._records[:max_episodes] if max_episodes else self._records
+        for record in records:
+            steps = np.arange(record.length, dtype=np.float32)
+            yield EpisodeData(
+                episode_id=record.episode_id,
+                timestamps=steps.astype(np.float64) / 10.0,
+                frame_indices=np.arange(record.length, dtype=np.int64),
+                observations={"observation.state": np.zeros((record.length, 8), dtype=np.float32)},
+                actions=np.zeros((record.length, 2), dtype=np.float32),
+                task_index=record.task_index,
+                task_name=record.task_name,
+            )
+
+    def fingerprint(self) -> str:
+        return "streaming-mean-prototype-test-v1"
+
+
 def _write_frame_caches(root: Path, adapter: DatasetAdapter) -> None:
     root.mkdir()
     for record in adapter.episodes():
@@ -510,7 +554,7 @@ def test_full_trajectory_builder_allows_k_above_batch_size_and_bounds_updates(
     candidate_frames = np.load(cache / "ep000002.npy", allow_pickle=False)
     candidate_mean = candidate_frames.mean(axis=0)
     candidate_mean /= np.linalg.norm(candidate_mean)
-    initialization_rows: list[int] = []
+    fit_rows: list[int] = []
     update_rows: list[int] = []
     real_fit = MiniBatchKMeans.fit
     real_partial_fit = MiniBatchKMeans.partial_fit
@@ -521,7 +565,7 @@ def test_full_trajectory_builder_allows_k_above_batch_size_and_bounds_updates(
         labels: object = None,
         sample_weight: np.ndarray | None = None,
     ) -> MiniBatchKMeans:
-        initialization_rows.append(len(features))
+        fit_rows.append(len(features))
         return real_fit(self, features, labels, sample_weight=sample_weight)
 
     def recording_partial_fit(
@@ -542,7 +586,7 @@ def test_full_trajectory_builder_allows_k_above_batch_size_and_bounds_updates(
         candidate_mean[None, :],
         frame_cache_dir=cache,
         batch_size=4,
-        max_iter=50,
+        max_iter=3,
         seed=23,
         max_episodes=None,
         num_workers=0,
@@ -551,9 +595,95 @@ def test_full_trajectory_builder_allows_k_above_batch_size_and_bounds_updates(
     by_label = {category.label: category for category in result.catalog.action_categories}
     assert by_label["move forward"].requested_centers == 6
     assert by_label["move right"].requested_centers == 6
-    assert initialization_rows == [6, 6]
+    assert fit_rows == []
     assert update_rows
-    assert max(update_rows) <= 4
+    assert max(update_rows) <= 6
+    assert sum(update_rows) == 92 * 3
+
+
+def test_streaming_kmeans_consumes_every_window_once_per_epoch_without_order_bias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sklearn.cluster import MiniBatchKMeans
+
+    fit_rows: list[int] = []
+    consumed: list[np.ndarray] = []
+    real_fit = MiniBatchKMeans.fit
+    real_partial_fit = MiniBatchKMeans.partial_fit
+
+    def recording_fit(
+        self: MiniBatchKMeans,
+        features: np.ndarray,
+        labels: object = None,
+        sample_weight: np.ndarray | None = None,
+    ) -> MiniBatchKMeans:
+        fit_rows.append(len(features))
+        return real_fit(self, features, labels, sample_weight=sample_weight)
+
+    def recording_partial_fit(
+        self: MiniBatchKMeans,
+        features: np.ndarray,
+        labels: object = None,
+        sample_weight: np.ndarray | None = None,
+    ) -> MiniBatchKMeans:
+        consumed.append(np.asarray(features).copy())
+        return real_partial_fit(self, features, labels, sample_weight=sample_weight)
+
+    def block_visuals(
+        cache_root: Path,
+        record: EpisodeRecord,
+        *,
+        embedding_dim: int,
+    ) -> np.ndarray:
+        del cache_root
+        assert embedding_dim == 1
+        return np.full(
+            (record.length - 7, 1),
+            10.0 if record.episode_id == 1 else 0.0,
+            dtype=np.float32,
+        )
+
+    monkeypatch.setattr(MiniBatchKMeans, "fit", recording_fit)
+    monkeypatch.setattr(MiniBatchKMeans, "partial_fit", recording_partial_fit)
+    monkeypatch.setattr(prototypes, "cluster_count_for_mass", lambda _: 1)
+    monkeypatch.setattr(prototypes, "_episode_window_visuals", block_visuals)
+    clip = ClipRecord(
+        sample_id="ep000000_chunk_000000_000014",
+        episode_id=0,
+        task_index=0,
+        task_name="zero block",
+        start_step=0,
+        end_step=14,
+        length=15,
+        previous_sample_id=None,
+        next_sample_id=None,
+    )
+
+    centers: list[float] = []
+    for reverse in (False, True):
+        consumed.clear()
+        result = prototypes.build_hierarchical_motion_prototypes(
+            _StreamingMeanAdapter(reverse=reverse),
+            [clip],
+            np.asarray([[1.0]], dtype=np.float32),
+            frame_cache_dir=tmp_path,
+            batch_size=2,
+            max_iter=3,
+            seed=23,
+            max_episodes=None,
+            num_workers=0,
+        )
+
+        assert result.prototypes.centers is not None
+        centers.append(float(result.prototypes.centers[0, 0]))
+        all_consumed = np.concatenate(consumed, axis=0)
+        assert all_consumed.shape == (40 * 3, 1)
+        assert np.count_nonzero(all_consumed == 0.0) == 20 * 3
+        assert np.count_nonzero(all_consumed == 10.0) == 20 * 3
+
+    assert fit_rows == []
+    np.testing.assert_allclose(centers, [5.0, 5.0], rtol=0.0, atol=5.0e-6)
 
 
 def test_full_trajectory_builder_sorts_the_definitive_stored_probabilities(

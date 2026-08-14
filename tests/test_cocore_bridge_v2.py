@@ -96,7 +96,11 @@ def _write_av1_video(path: Path, frames: np.ndarray) -> None:
     container.close()
 
 
-def _write_synthetic_bridge_dataset(root: Path) -> None:
+def _write_synthetic_bridge_dataset(
+    root: Path,
+    *,
+    stop_first_valid_episode: bool = False,
+) -> None:
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     meta = root / "meta"
@@ -150,8 +154,9 @@ def _write_synthetic_bridge_dataset(root: Path) -> None:
     for episode_id in (1, 2):
         steps = np.arange(45, dtype=np.float32)
         states = np.zeros((45, 8), dtype=np.float32)
-        states[:, 0] = steps * 0.01
-        states[:, 7] = np.clip(steps / 44.0, 0.0, 1.0)
+        if not (stop_first_valid_episode and episode_id == 1):
+            states[:, 0] = steps * 0.01
+            states[:, 7] = np.clip(steps / 44.0, 0.0, 1.0)
         actions = np.zeros((45, 7), dtype=np.float32)
         actions[:, 0] = 0.01
         actions[:, 6] = states[:, 7]
@@ -389,12 +394,20 @@ def test_every_command_accepts_explicit_relation_and_weight(command: str) -> Non
     arguments = [command]
     if command == "validate":
         arguments += ["--output-dir", "result"]
-    arguments += ["--relation", "cooccurrence", "--relation-weight", "2.5"]
+    arguments += [
+        "--relation",
+        "cooccurrence",
+        "--relation-weight",
+        "2.5",
+        "--max-episodes",
+        "7",
+    ]
 
     parsed = cli.build_parser().parse_args(arguments)
 
     assert parsed.relation == "cooccurrence"
     assert parsed.relation_weight == 2.5
+    assert parsed.max_episodes == 7
     if command in {"select", "run", "validate"}:
         assert parsed.selection_ratio == 0.10
 
@@ -427,14 +440,18 @@ def test_cli_rejects_invalid_selection_ratio(value: str) -> None:
         )
 
 
+@pytest.mark.parametrize("command", ["scan", "validate"])
 @pytest.mark.parametrize("value", ["0", "-1"])
-def test_cli_rejects_non_positive_max_episodes(value: str) -> None:
+def test_cli_rejects_non_positive_max_episodes(command: str, value: str) -> None:
     from cocore_bridge_v2 import cli
 
+    arguments = [command]
+    if command == "validate":
+        arguments += ["--output-dir", "result"]
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(
-            [
-                "scan",
+            arguments
+            + [
                 "--relation",
                 "sequence",
                 "--relation-weight",
@@ -597,12 +614,15 @@ def test_validate_cli_passes_custom_dataset_path_without_preflight(
             "1",
             "--selection-ratio",
             "0.2",
+            "--max-episodes",
+            "11",
         ]
     )
 
     assert received["output_dir"] == str(result_path)
     assert received["config"]["dataset"]["path"] == str(dataset_path)
     assert received["config"]["selection"]["ratio"] == 0.2
+    assert received["config"]["runtime"]["max_episodes"] == 11
     assert json.loads(capsys.readouterr().out) == {
         "selected_clips": 7,
         "status": "valid",
@@ -668,4 +688,60 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(tmp_path: Pat
     assert validate_output(result, config=config) == {
         "status": "valid",
         "selected_clips": 6,
+    }
+
+
+def test_bridge_validate_replays_the_same_max_episode_subset(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from cocore.pipeline import run_pipeline
+    from cocore_bridge_v2 import cli
+    from cocore_bridge_v2.config import build_config
+
+    class DummyVisualEncoder:
+        output_dim = 3
+
+        def encode(self, images: np.ndarray) -> np.ndarray:
+            values = images[:, 0, 0, 0].astype(np.float32)
+            return np.stack([values + 1.0, values + 2.0, values + 4.0], axis=1)
+
+    dataset = tmp_path / "bridge-subset"
+    output = tmp_path / "output-subset"
+    _write_synthetic_bridge_dataset(dataset, stop_first_valid_episode=True)
+    config = build_config(
+        relation="sequence",
+        relation_weight=1.0,
+        selection_ratio=0.5,
+        dataset_path=dataset,
+        max_episodes=1,
+    )
+    config["visual"]["encoder"] = "dummy"
+    config["runtime"]["num_workers"] = 0
+    config["quality"]["knn"] = 2
+    config["graph"]["knn"] = 2
+
+    result = run_pipeline(config, output_dir=output, visual_encoder=DummyVisualEncoder())
+
+    cli.main(
+        [
+            "validate",
+            "--output-dir",
+            str(result),
+            "--dataset-path",
+            str(dataset),
+            "--relation",
+            "sequence",
+            "--relation-weight",
+            "1",
+            "--selection-ratio",
+            "0.5",
+            "--max-episodes",
+            "1",
+        ]
+    )
+
+    assert json.loads(capsys.readouterr().out) == {
+        "selected_clips": 2,
+        "status": "valid",
     }
