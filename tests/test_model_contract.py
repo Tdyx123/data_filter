@@ -62,10 +62,20 @@ class FakeAttention(nn.Module):
         self.o_proj = FakeLoraLinear()
 
 
-class FakeLayer(nn.Module):
+class FakeMlp(nn.Module):
     def __init__(self):
         super().__init__()
+        self.gate_proj = FakeLoraLinear()
+        self.up_proj = FakeLoraLinear()
+        self.down_proj = FakeLoraLinear()
+
+
+class FakeLayer(nn.Module):
+    def __init__(self, *, with_mlp=False):
+        super().__init__()
         self.self_attn = FakeAttention()
+        if with_mlp:
+            self.mlp = FakeMlp()
 
 
 class FakeLinearAttention(nn.Module):
@@ -85,10 +95,12 @@ class FakeLinearLayer(nn.Module):
 
 
 class FakeBackbone(nn.Module):
-    def __init__(self, layers=36):
+    def __init__(self, layers=36, *, with_mlp=False):
         super().__init__()
         self.language_model = nn.Module()
-        self.language_model.layers = nn.ModuleList([FakeLayer() for _ in range(layers)])
+        self.language_model.layers = nn.ModuleList(
+            [FakeLayer(with_mlp=with_mlp) for _ in range(layers)]
+        )
 
 
 class FakeHybridBackbone(nn.Module):
@@ -191,12 +203,34 @@ def _tiny_context_policy(context_forward):
     )
 
 
-def test_all_36_layers_have_all_four_lora_targets():
-    model = FakeBackbone()
+QWEN3_VL_LORA_TARGETS = {
+    "full_attention": ("q_proj", "k_proj", "v_proj", "o_proj"),
+    "linear_attention": (),
+    "mlp": ("gate_proj", "up_proj", "down_proj"),
+}
+
+
+def test_all_36_layers_have_attention_and_mlp_lora_targets():
+    model = FakeBackbone(with_mlp=True)
     coverage = lora_coverage(model)
     assert set(coverage) == set(range(36))
-    assert all(value == {"q_proj", "k_proj", "v_proj", "o_proj"} for value in coverage.values())
-    assert_full_lora_coverage(model)
+    assert all(
+        value
+        == {
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        }
+        for value in coverage.values()
+    )
+    assert_full_lora_coverage(
+        model,
+        targets_by_layer_type=QWEN3_VL_LORA_TARGETS,
+    )
     assert_qwen_freeze_contract(model)
 
 
@@ -205,6 +239,21 @@ def test_missing_projection_is_rejected():
     model.language_model.layers[17].self_attn.o_proj = nn.Linear(4, 4)
     with pytest.raises(RuntimeError, match="layer 17"):
         assert_full_lora_coverage(model)
+
+
+def test_missing_mlp_projection_is_rejected():
+    model = FakeBackbone(with_mlp=True)
+    model.language_model.layers[17].mlp.down_proj = nn.Linear(4, 4)
+
+    with pytest.raises(RuntimeError, match="layer 17"):
+        assert_full_lora_coverage(
+            model,
+            targets_by_layer_type=QWEN3_VL_LORA_TARGETS,
+        )
+
+
+def test_text_mlp_lora_parameters_satisfy_freeze_contract():
+    assert_qwen_freeze_contract(FakeBackbone(with_mlp=True))
 
 
 def test_visual_tower_lora_parameters_are_rejected_by_freeze_contract():
@@ -265,6 +314,18 @@ def test_qwen35_lora_target_pattern_matches_only_text_token_mixers():
     )
     assert not pattern.fullmatch("model.visual.blocks.0.attn.q_proj")
     assert not pattern.fullmatch("model.language_model.layers.0.mlp.up_proj")
+
+
+def test_qwen3_vl_lora_target_pattern_matches_text_attention_and_mlp_only():
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
+    pattern = re.compile(lora_target_pattern(config["model"]))
+
+    assert pattern.fullmatch("model.language_model.layers.0.self_attn.q_proj")
+    assert pattern.fullmatch("model.language_model.layers.35.mlp.gate_proj")
+    assert pattern.fullmatch("model.language_model.layers.12.mlp.up_proj")
+    assert pattern.fullmatch("model.language_model.layers.7.mlp.down_proj")
+    assert not pattern.fullmatch("model.visual.blocks.0.mlp.up_proj")
+    assert not pattern.fullmatch("model.language_model.layers.0.input_layernorm")
 
 
 def test_direct_context_forward_skips_lm_head_and_preserves_lora_gradients():

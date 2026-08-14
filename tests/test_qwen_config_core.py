@@ -18,6 +18,24 @@ QWEN35_CONFIG = PROJECT_ROOT / "configs" / "qwen3_5_0_8b_groot_libero_4x4090.yam
 
 
 @pytest.mark.parametrize(
+    "name",
+    [
+        "bridge_4x4090.yaml",
+        "bridge_8x4090.yaml",
+        "qwen3_vl_4b_groot_libero_4x4090.yaml",
+    ],
+)
+def test_qwen3_vl_configs_enable_attention_and_mlp_lora(name):
+    config = load_config(PROJECT_ROOT / "configs" / name)
+
+    assert normalized_lora_target_modules(config["model"]) == {
+        "full_attention": ("q_proj", "k_proj", "v_proj", "o_proj"),
+        "linear_attention": (),
+        "mlp": ("gate_proj", "up_proj", "down_proj"),
+    }
+
+
+@pytest.mark.parametrize(
     ("key", "value"),
     [
         ("lora_learning_rate", 0.0),
@@ -201,4 +219,25 @@ def test_qwen3_vl_legacy_flat_lora_targets_remain_supported():
     assert normalized_lora_target_modules(config["model"]) == {
         "full_attention": ("q_proj", "k_proj", "v_proj", "o_proj"),
         "linear_attention": (),
+        "mlp": (),
     }
+
+
+def test_qwen3_vl_rejects_partial_mlp_lora_targets():
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
+    config["model"]["lora"]["target_modules"]["mlp"] = ["gate_proj"]
+
+    with pytest.raises(ConfigError, match="requires LoRA MLP targets"):
+        validate_config(config)
+
+
+def test_qwen35_rejects_mlp_lora_targets():
+    config = load_config(QWEN35_CONFIG)
+    config["model"]["lora"]["target_modules"]["mlp"] = [
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ]
+
+    with pytest.raises(ConfigError, match="does not support LoRA MLP targets"):
+        validate_config(config)

@@ -2,8 +2,9 @@
 
 这是一个独立的 BridgeData V2 视觉—语言—动作（VLA）微调项目。它完整加载本地
 Qwen3-VL-4B-Instruct 的 36 层文本模型，或 Qwen3.5-0.8B 的 24 层混合
-DeltaNet/全注意力文本模型，在全部文本 token-mixer 上训练 LoRA，并从随机初始化的
-GROOT 风格 flow-matching DiT 动作头开始训练。视觉塔和主干原始参数始终冻结。
+DeltaNet/全注意力文本模型。Qwen3-VL 在全部文本注意力与 FFN 投影上训练 LoRA，
+Qwen3.5 在全部文本 token-mixer 上训练 LoRA；两者都从随机初始化的 GROOT 风格
+flow-matching DiT 动作头开始训练。视觉塔和主干原始参数始终冻结。
 
 仓库同时包含与训练解耦的通用轨迹数据价值工具
 [TDUS](tdus/README.md)，用于直接从 LeRobot trajectory/chunk 计算 Quality、
@@ -663,7 +664,8 @@ bash scripts/train_libero_qwen3_vl_4b_groot_cyclic_lora_all_tasks_4x4090.sh \
 该入口的第 1–5,000 个 optimizer step 只训练 GR00T 动作头。之后每 100 步的
 前 90 步仍只训练动作头，最后 10 步训练 LoRA 与动作头；例如 5,001–5,090
 只训练动作头，5,091–5,100 训练两者，5,101 步开始下一个周期。这里的“训练
-Qwen”只更新覆盖 36 层注意力投影的 LoRA，Qwen3-VL-4B 原始参数始终冻结。
+Qwen”只更新覆盖 36 层注意力 `q_proj/k_proj/v_proj/o_proj` 与 FFN
+`gate_proj/up_proj/down_proj` 的 LoRA，Qwen3-VL-4B 原始参数始终冻结。
 LoRA 的 warmup 与余弦衰减只统计实际启用 LoRA 的 optimizer step。
 
 默认调度可分别用 `--lora-freeze-steps`、`--lora-cycle-steps` 和

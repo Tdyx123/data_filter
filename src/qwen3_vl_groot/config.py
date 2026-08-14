@@ -27,6 +27,7 @@ BACKBONE_CONTRACTS: dict[str, dict[str, Any]] = {
             "full_attention": ("q_proj", "k_proj", "v_proj", "o_proj"),
             "linear_attention": (),
         },
+        "mlp_lora_targets": ("gate_proj", "up_proj", "down_proj"),
     },
     "qwen3_5": {
         "display_name": "Qwen3.5-0.8B",
@@ -44,6 +45,7 @@ BACKBONE_CONTRACTS: dict[str, dict[str, Any]] = {
                 "out_proj",
             ),
         },
+        "mlp_lora_targets": (),
     },
 }
 
@@ -66,14 +68,16 @@ def normalized_lora_target_modules(
         targets = {
             "full_attention": tuple(raw_targets),
             "linear_attention": (),
+            "mlp": (),
         }
     elif isinstance(raw_targets, dict):
-        unknown = set(raw_targets).difference({"full_attention", "linear_attention"})
+        target_groups = ("full_attention", "linear_attention", "mlp")
+        unknown = set(raw_targets).difference(target_groups)
         if unknown:
             raise ConfigError(f"Unknown model.lora.target_modules groups: {sorted(unknown)}")
         targets = {
             layer_type: tuple(raw_targets.get(layer_type, ()))
-            for layer_type in ("full_attention", "linear_attention")
+            for layer_type in target_groups
         }
     else:
         raise ConfigError("model.lora.target_modules must be a list or mapping")
@@ -227,9 +231,25 @@ def validate_config(config: dict[str, Any]) -> None:
             f"{contract['display_name']} requires model.context_dim={expected_context_dim}"
         )
     targets = normalized_lora_target_modules(model)
-    if targets != contract["lora_targets"]:
+    token_mixer_targets = {
+        layer_type: targets[layer_type]
+        for layer_type in ("full_attention", "linear_attention")
+    }
+    if token_mixer_targets != contract["lora_targets"]:
         raise ConfigError(
             f"{contract['display_name']} requires LoRA targets {contract['lora_targets']}"
+        )
+    mlp_targets = targets["mlp"]
+    supported_mlp_targets = tuple(contract["mlp_lora_targets"])
+    if supported_mlp_targets:
+        if mlp_targets not in ((), supported_mlp_targets):
+            raise ConfigError(
+                f"{contract['display_name']} requires LoRA MLP targets to be empty "
+                f"or {supported_mlp_targets}"
+            )
+    elif mlp_targets:
+        raise ConfigError(
+            f"{contract['display_name']} does not support LoRA MLP targets"
         )
     if model.get("context_forward", "causal_lm") not in {"causal_lm", "backbone"}:
         raise ConfigError(

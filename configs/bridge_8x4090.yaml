@@ -46,6 +46,7 @@ model:
     target_modules:
       full_attention: [q_proj, k_proj, v_proj, o_proj]
       linear_attention: []
+      mlp: [gate_proj, up_proj, down_proj]
   dit:
     hidden_size: 1024
     num_layers: 12
