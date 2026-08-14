@@ -75,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate")
     _add_objective_arguments(validate)
     validate.add_argument("--output-dir", required=True)
+    validate.add_argument("--dataset-path", default=str(DEFAULT_DATASET_PATH))
     validate.add_argument(
         "--selection-ratio",
         type=_selection_ratio,

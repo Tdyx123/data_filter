@@ -1305,6 +1305,12 @@ def validate_output(
             raise ValueError(f"missing stage manifest: {stage}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         stage_manifests[stage] = manifest
+        if stage in {"scan", "encode", "graph"} and (
+            manifest.get("producer") != "cocore"
+            or manifest.get("cocore_version") != __version__
+            or manifest.get("cocore_stage") != stage
+        ):
+            raise ValueError(f"stage manifest metadata is incompatible: {stage}")
         if not cache_is_valid(path, str(manifest.get("fingerprint", "")), stage_required[stage]):
             raise ValueError(f"invalid stage artifacts: {stage}")
         if run_manifest["stage_fingerprints"].get(stage) != manifest["fingerprint"]:

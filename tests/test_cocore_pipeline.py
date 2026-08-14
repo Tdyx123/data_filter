@@ -630,6 +630,37 @@ def test_validate_rejects_schema_three_manifest_explicitly(tmp_path: Path) -> No
         validate_output(result, config=config)
 
 
+@pytest.mark.parametrize(
+    ("stage", "directory"),
+    [
+        ("scan", "scan"),
+        ("encode", "encode"),
+        ("graph", "graph-13-motion-softmax"),
+    ],
+)
+def test_validate_rejects_tampered_stage_manifest_contract(
+    tmp_path: Path,
+    stage: str,
+    directory: str,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    manifest_path = result.parent / directory / "manifest.json"
+    original = json.loads(manifest_path.read_text())
+
+    for field, value in (
+        ("producer", "not-cocore"),
+        ("cocore_version", "0.7.0"),
+        ("cocore_stage", "wrong-stage"),
+    ):
+        tampered = {**original, field: value}
+        manifest_path.write_text(json.dumps(tampered))
+        with pytest.raises(ValueError, match=f"stage manifest metadata.*{stage}"):
+            validate_output(result, config=config)
+        manifest_path.write_text(json.dumps(original))
+
+
 def test_validate_replays_current_adapter_state(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)

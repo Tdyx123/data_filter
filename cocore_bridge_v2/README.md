@@ -82,13 +82,15 @@ graph 目录提供 schema 4 的 `prototype_catalog.json`、`prototype_centers.np
 schema 3 缓存不迁移，也不会被当作 schema 4 读取。升级后必须重新构建 graph 和
 selection；建议使用新的输出目录，或在确认目标后使用 `--force`。
 
-验证时必须重复传入生成该选择结果时使用的目标与比例。验证只读取 artifact，不访问
-源数据集：
+验证时必须重复传入生成该选择结果时使用的目标、比例和数据集路径。Bridge CLI 不执行
+数据 schema preflight，但 Cocore validator 会从该路径重放源 episode 的 state/trajectory，
+并核对 artifact 中的逐帧视觉缓存，因此源数据仍必须可访问：
 
 ```bash
 python -m cocore_bridge_v2 validate \
   --output-dir \
     outputs/cocore_bridge_v2/bridge_orig_1.0.0/select-sequence-w1-top10pct \
+  --dataset-path /data/dwb/datasets/bridge_orig_1.0.0_lerobo \
   --relation sequence --relation-weight 1.0 \
   --selection-ratio 0.10
 ```

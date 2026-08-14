@@ -562,13 +562,14 @@ def test_execution_commands_delegate_to_matching_cocore_stage(
     assert capsys.readouterr().out.strip() == expected.format(root=output)
 
 
-def test_validate_cli_does_not_read_source_dataset(
+def test_validate_cli_passes_custom_dataset_path_without_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     from cocore_bridge_v2 import cli
 
+    dataset_path = tmp_path / "custom-bridge"
     result_path = tmp_path / "select-sequence-w1-top20pct"
     received: dict[str, object] = {}
 
@@ -577,13 +578,19 @@ def test_validate_cli_does_not_read_source_dataset(
         received["config"] = config
         return {"status": "valid", "selected_clips": 7}
 
+    def fail_preflight(_):
+        raise AssertionError("validate must not run preflight")
+
     monkeypatch.setattr(cli, "validate_output", fake_validate_output)
+    monkeypatch.setattr(cli, "validate_bridge_dataset", fail_preflight)
 
     cli.main(
         [
             "validate",
             "--output-dir",
             str(result_path),
+            "--dataset-path",
+            str(dataset_path),
             "--relation",
             "sequence",
             "--relation-weight",
@@ -594,6 +601,7 @@ def test_validate_cli_does_not_read_source_dataset(
     )
 
     assert received["output_dir"] == str(result_path)
+    assert received["config"]["dataset"]["path"] == str(dataset_path)
     assert received["config"]["selection"]["ratio"] == 0.2
     assert json.loads(capsys.readouterr().out) == {
         "selected_clips": 7,
