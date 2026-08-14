@@ -62,21 +62,15 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if "clip" in config:
         raise ValueError("cocore clip configuration was removed; windows are fixed to 15/15")
     if "relation" in config:
-        raise ValueError(
-            "cocore relation encoding configuration was removed; use encoding instead"
-        )
+        raise ValueError("cocore relation encoding configuration was removed; use encoding instead")
     if "normalization" in config:
-        raise ValueError(
-            "cocore normalization configuration was removed; use encoding instead"
-        )
+        raise ValueError("cocore normalization configuration was removed; use encoding instead")
     configured_encoding = config.get("encoding")
     if configured_encoding is not None and not isinstance(configured_encoding, Mapping):
         raise ValueError("cocore encoding must be a mapping")
     configured_objective = config.get("objective")
     if isinstance(configured_objective, Mapping) and "cooccurrence_weight" in configured_objective:
-        raise ValueError(
-            "objective.cooccurrence_weight was removed; use objective.relation_weight"
-        )
+        raise ValueError("objective.cooccurrence_weight was removed; use objective.relation_weight")
     if not isinstance(configured_objective, Mapping) or "relation" not in configured_objective:
         raise ValueError("objective.relation is required")
     if "relation_weight" not in configured_objective:
@@ -93,17 +87,24 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 raise ValueError(
                     f"selection.{name} was removed; lazy heap selection uses max_refreshes"
                 )
-    configured_method = config.get("prototypes", {}).get("method") if isinstance(
-        config.get("prototypes"), Mapping
-    ) else None
     configured_prototypes = config.get("prototypes")
+    if configured_prototypes is not None and not isinstance(configured_prototypes, Mapping):
+        raise ValueError("cocore prototypes must be a mapping")
+    configured_method = (
+        configured_prototypes.get("method") if isinstance(configured_prototypes, Mapping) else None
+    )
     if isinstance(configured_prototypes, Mapping):
         obsolete = {"count", "top_r", "temperature"} & configured_prototypes.keys()
         if obsolete:
             names = ", ".join(sorted(obsolete))
             raise ValueError(
-                f"cocore prototypes {names} were removed; K/M are fixed by action proportion"
+                f"cocore prototypes {names} were removed; action retention, visual K, "
+                "and temperature are fixed by the schema-4 algorithm"
             )
+        unsupported = configured_prototypes.keys() - {"method", "batch_size", "max_iter"}
+        if unsupported:
+            names = ", ".join(sorted(unsupported))
+            raise ValueError(f"cocore prototypes contains unsupported fields: {names}")
     if configured_method not in {None, "motion_primitives"}:
         raise ValueError("cocore prototypes.method must be motion_primitives")
     configured_metrics = config.get("reliability_metrics")
@@ -122,19 +123,13 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     resolved["objective"]["relation_weight"] = weight
     encoding = resolved["encoding"]
     visual_dim = encoding.get("visual_dim")
-    if (
-        isinstance(visual_dim, bool)
-        or not isinstance(visual_dim, Integral)
-        or visual_dim != 128
-    ):
+    if isinstance(visual_dim, bool) or not isinstance(visual_dim, Integral) or visual_dim != 128:
         raise ValueError("cocore encoding.visual_dim must be 128")
     maximum = encoding.get("pca_fit_max_samples")
     if maximum is not None and (
         isinstance(maximum, bool) or not isinstance(maximum, Integral) or maximum <= 0
     ):
-        raise ValueError(
-            "cocore encoding.pca_fit_max_samples must be a positive integer or null"
-        )
+        raise ValueError("cocore encoding.pca_fit_max_samples must be a positive integer or null")
     encoding["pca_fit_max_samples"] = None if maximum is None else int(maximum)
     low_value = encoding.get("quantile_low")
     high_value = encoding.get("quantile_high")

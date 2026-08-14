@@ -1128,6 +1128,7 @@ def select_stage(
             {
                 "status": "complete",
                 "producer": "cocore",
+                "cocore_version": __version__,
                 "fingerprint": fingerprint,
                 "upstream_fingerprint": graph_fingerprint,
                 "stage_directory": directory,
@@ -1343,6 +1344,8 @@ def validate_output(
     select_manifest = json.loads(required["select_manifest"].read_text(encoding="utf-8"))
     if select_manifest.get("producer") != "cocore":
         raise ValueError("selection manifest producer is invalid")
+    if select_manifest.get("cocore_version") != __version__:
+        raise ValueError("selection manifest Cocore version is incompatible")
     selected_rows = [
         json.loads(line)
         for line in required["selected"].read_text(encoding="utf-8").splitlines()

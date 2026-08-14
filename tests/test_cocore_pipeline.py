@@ -263,7 +263,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     for directory in ("scan", "encode", "graph-13-motion-softmax"):
         manifest = json.loads((root / directory / "manifest.json").read_text())
         assert manifest["producer"] == "cocore"
-        assert manifest["cocore_version"] == "0.7.0"
+        assert manifest["cocore_version"] == "0.8.0"
     catalog = json.loads((root / "graph-13-motion-softmax" / "prototype_catalog.json").read_text())
     assert catalog["schema_version"] == 4
     assert catalog["strategy"] == "trajectory_action_subset_then_visual_softmax"
@@ -350,7 +350,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     }
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.7.0"
+    assert run_manifest["cocore_version"] == "0.8.0"
     assert run_manifest["relation_type"] == relation
     assert run_manifest["relation_weight"] == 1.0
     assert run_manifest["prototype_schema_version"] == 4
@@ -358,6 +358,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert run_manifest["stage_directories"]["graph"] == "graph-13-motion-softmax"
     assert run_manifest["algorithm"] == report["algorithm"]
     select_manifest = json.loads((result / "manifest.json").read_text())
+    assert select_manifest["cocore_version"] == "0.8.0"
     assert select_manifest["relation_type"] == relation
     assert select_manifest["relation_weight"] == 1.0
     assert select_manifest["prototype_schema_version"] == 4
@@ -366,6 +367,13 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert resolved["output"]["directory"] == str(root)
     assert resolved["objective"] == {"relation": relation, "relation_weight": 1.0}
     assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 6}
+
+    select_manifest["cocore_version"] = "0.7.0"
+    (result / "manifest.json").write_text(json.dumps(select_manifest))
+    with pytest.raises(ValueError, match="selection manifest Cocore version"):
+        validate_output(result, config=config)
+    select_manifest["cocore_version"] = "0.8.0"
+    (result / "manifest.json").write_text(json.dumps(select_manifest))
 
     report["relation_type"] = "sequence" if relation == "cooccurrence" else "cooccurrence"
     (result / "selection_report.json").write_text(json.dumps(report))

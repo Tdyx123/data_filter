@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import cocore
 from cocore import cli
 from cocore.config import load_config, resolve_config
 from cocore.pipeline import selection_directory_name
@@ -11,6 +12,10 @@ from cocore.pipeline import selection_directory_name
 
 def _objective(relation: str = "cooccurrence", weight: float = 1.0) -> dict[str, object]:
     return {"objective": {"relation": relation, "relation_weight": weight}}
+
+
+def test_package_version_matches_schema_four_release() -> None:
+    assert cocore.__version__ == "0.8.0"
 
 
 def test_config_requires_explicit_relation_and_weight() -> None:
@@ -115,11 +120,24 @@ def test_config_rejects_non_mapping_encoding() -> None:
 def test_config_rejects_flat_prototype_controls_replaced_by_action_formulas(
     obsolete: str,
 ) -> None:
-    with pytest.raises(ValueError, match="fixed by action proportion"):
+    with pytest.raises(ValueError, match="fixed by the schema-4 algorithm"):
         resolve_config(
             {
                 **_objective(),
                 "prototypes": {"method": "motion_primitives", obsolete: 3},
+            }
+        )
+
+
+def test_config_rejects_unknown_prototype_controls() -> None:
+    with pytest.raises(ValueError, match="prototypes.*unsupported_field"):
+        resolve_config(
+            {
+                **_objective(),
+                "prototypes": {
+                    "method": "motion_primitives",
+                    "unsupported_field": 3,
+                },
             }
         )
 
@@ -145,13 +163,9 @@ def test_config_rejects_removed_candidate_pool_options(obsolete: str) -> None:
 
 
 def test_selection_directory_encodes_relation_weight_and_ratio() -> None:
+    assert selection_directory_name("sequence", 1.5, 0.1) == "select-sequence-w1p5-top10pct"
     assert (
-        selection_directory_name("sequence", 1.5, 0.1)
-        == "select-sequence-w1p5-top10pct"
-    )
-    assert (
-        selection_directory_name("cooccurrence", 0.0, 0.125)
-        == "select-cooccurrence-w0-top12p5pct"
+        selection_directory_name("cooccurrence", 0.0, 0.125) == "select-cooccurrence-w0-top12p5pct"
     )
 
 
@@ -210,6 +224,27 @@ def test_main_applies_cli_overrides_to_run_pipeline(monkeypatch, capsys) -> None
     assert capsys.readouterr().out.strip().endswith("select-sequence-w2-top25pct")
 
 
+def test_build_graph_cli_reports_schema_four_graph_directory(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "load_config", lambda _: _objective())
+    monkeypatch.setattr(
+        cli,
+        "graph_stage",
+        lambda config, **kwargs: (
+            Path("outputs/cocore/test"),
+            None,
+            None,
+            type("Graph", (), {"sample_ids": (1, 2)})(),
+            "graph-fingerprint",
+        ),
+    )
+
+    cli.main(["build-graph", "--config", "unused.yaml"])
+
+    assert capsys.readouterr().out.strip() == (
+        "cocore_output=outputs/cocore/test/graph-13-motion-softmax nodes=2"
+    )
+
+
 @pytest.mark.parametrize("path", ["cocore/config_libero90.yaml", "cocore/config_debug.yaml"])
 def test_shipped_configs_resolve_to_fixed_cocore_contract(path: str) -> None:
     config = load_config(path)
@@ -232,10 +267,13 @@ def test_shipped_configs_resolve_to_fixed_cocore_contract(path: str) -> None:
         "relation_weight": 1.0,
     }
     assert config["selection"]["max_refreshes"] == 100
-    assert not {
-        "global_candidates",
-        "prototype_candidates",
-        "similarity_candidates",
-        "random_candidates",
-    } & config["selection"].keys()
+    assert (
+        not {
+            "global_candidates",
+            "prototype_candidates",
+            "similarity_candidates",
+            "random_candidates",
+        }
+        & config["selection"].keys()
+    )
     assert config["output"]["directory"].startswith("outputs/cocore/")

@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from cocore.pipeline import (
+    GRAPH_DIRECTORY,
     encode_stage,
     graph_stage,
     run_pipeline,
@@ -107,10 +108,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(f"cocore_output={root} clips={len(artifact.clips)}")
     elif args.command == "build-graph":
         root, _, _, graph, _ = graph_stage(config, **kwargs)
-        print(
-            f"cocore_output={Path(root) / 'graph-12-motion-primitives'} "
-            f"nodes={len(graph.sample_ids)}"
-        )
+        print(f"cocore_output={Path(root) / GRAPH_DIRECTORY} nodes={len(graph.sample_ids)}")
     elif args.command == "select":
         print(f"cocore_output={select_stage(config, **kwargs)}")
     else:

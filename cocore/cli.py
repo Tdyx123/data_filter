@@ -9,6 +9,7 @@ from typing import Sequence
 
 from .config import load_config
 from .pipeline import (
+    GRAPH_DIRECTORY,
     encode_stage,
     graph_stage,
     run_pipeline,
@@ -44,9 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--force", action="store_true")
         if command in {"select", "run"}:
             child.add_argument("--selection-ratio", type=_selection_ratio, default=None)
-            child.add_argument(
-                "--relation", choices=("sequence", "cooccurrence"), default=None
-            )
+            child.add_argument("--relation", choices=("sequence", "cooccurrence"), default=None)
             child.add_argument("--relation-weight", type=_relation_weight, default=None)
     validate = subparsers.add_parser("validate")
     validate.add_argument("--output-dir", required=True)
@@ -85,7 +84,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(f"cocore_output={root} clips={len(artifact.clips)}")
     elif args.command == "build-graph":
         root, _, _, graph, _ = graph_stage(config, **kwargs)
-        print(f"cocore_output={root / 'graph-12-motion-primitives'} nodes={len(graph.sample_ids)}")
+        print(f"cocore_output={root / GRAPH_DIRECTORY} nodes={len(graph.sample_ids)}")
     elif args.command == "select":
         print(f"cocore_output={select_stage(config, **kwargs)}")
     else:

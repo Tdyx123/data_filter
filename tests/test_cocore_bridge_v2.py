@@ -31,8 +31,7 @@ def _bridge_info() -> dict[str, object]:
         },
     }
     features = {
-        f"observation.images.image_{index}": copy.deepcopy(video_feature)
-        for index in range(4)
+        f"observation.images.image_{index}": copy.deepcopy(video_feature) for index in range(4)
     }
     features.update(
         {
@@ -127,12 +126,9 @@ def _write_synthetic_bridge_dataset(root: Path) -> None:
             "total_chunks": 1,
             "chunks_size": 1000,
             "splits": {"train": "0:3"},
-            "data_path": (
-                "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
-            ),
+            "data_path": ("data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"),
             "video_path": (
-                "videos/chunk-{episode_chunk:03d}/{video_key}/"
-                "episode_{episode_index:06d}.mp4"
+                "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
             ),
         }
     )
@@ -164,9 +160,7 @@ def _write_synthetic_bridge_dataset(root: Path) -> None:
                 "observation.state": pa.array(
                     states.tolist(), type=pa.list_(pa.float32(), list_size=8)
                 ),
-                "action": pa.array(
-                    actions.tolist(), type=pa.list_(pa.float32(), list_size=7)
-                ),
+                "action": pa.array(actions.tolist(), type=pa.list_(pa.float32(), list_size=7)),
                 "timestamp": pa.array(steps / 5.0, type=pa.float32()),
                 "frame_index": pa.array(np.arange(45), type=pa.int64()),
                 "episode_index": pa.array([episode_id] * 45, type=pa.int64()),
@@ -258,13 +252,12 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
         "epsilon": 1.0e-8,
     }
     assert config["prototypes"]["method"] == "motion_primitives"
+    assert set(config["prototypes"]) == {"method", "batch_size", "max_iter"}
     assert config["objective"] == {"relation": "sequence", "relation_weight": 1.5}
     assert config["selection"]["ratio"] == 0.2
     assert config["selection"]["budget"] is None
     assert config["runtime"]["max_episodes"] == 100
-    assert config["output"]["directory"] == (
-        "outputs/cocore_bridge_v2/bridge_orig_1.0.0"
-    )
+    assert config["output"]["directory"] == ("outputs/cocore_bridge_v2/bridge_orig_1.0.0")
     translated = to_relcore_config(config)
     assert translated["selection"]["quota_mode"] == "none"
     assert translated["selection"]["minimum_per_task"] == 0
@@ -509,7 +502,7 @@ def test_scan_cli_preflights_and_delegates_resolved_bridge_config(
             "build-graph",
             "graph_stage",
             lambda root: (root, None, None, SimpleNamespace(sample_ids=(1, 2)), "fingerprint"),
-            "cocore_output={root}/graph-12-motion-primitives nodes=2",
+            "cocore_output={root}/graph-13-motion-softmax nodes=2",
         ),
         (
             "select",
@@ -654,10 +647,16 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(tmp_path: Pat
     ].to_pylist()
     assert scanned_episode_ids == [1, 2]
     selected = [
-        json.loads(line)
-        for line in (result / "selected_manifest.jsonl").read_text().splitlines()
+        json.loads(line) for line in (result / "selected_manifest.jsonl").read_text().splitlines()
     ]
     assert len(selected) == 6
+    select_manifest = json.loads((result / "manifest.json").read_text())
+    run_manifest = json.loads((result / "run_manifest.json").read_text())
+    assert select_manifest["producer"] == "cocore"
+    assert select_manifest["cocore_version"] == "0.8.0"
+    assert run_manifest["producer"] == "cocore"
+    assert run_manifest["cocore_version"] == "0.8.0"
+    assert run_manifest["stage_directories"]["graph"] == "graph-13-motion-softmax"
     assert validate_output(result, config=config) == {
         "status": "valid",
         "selected_clips": 6,

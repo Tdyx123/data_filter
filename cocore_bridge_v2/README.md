@@ -11,8 +11,10 @@ Cocore 的编码、运动原语、关系目标或惰性最大堆算法，而是�
 - LeRobot `v2.0`、WidowX、5 Hz；
 - 只读取 `observation.images.image_0`、8 维 `observation.state` 和 7 维 `action`；
 - 排除任务名为空的 episode，再应用 `--max-episodes`；
-- 固定使用 15 帧片段、步长 15 和 Cocore 两级动作原型；一级占比直接统计片段的前后
-  两半，二级原型使用各半 8 帧的视觉均值，并在对应一级动作桶内单独聚类；
+- 固定使用 15 帧片段、步长 15 和 Cocore schema 4 两级动作原型；原型学习遍历完整
+  轨迹的全部 stride=1 八帧窗口，候选动作则取两个半段原子动作的规范化并集；
+- 低频动作按最大保留子集父类的窗口频次分配，视觉概率在各父动作桶内对全部中心计算
+  `softmax(-d²/0.1)`，最终叶概率为动作概率与视觉概率的乘积；
 - 全局选择，不施加逐任务配额。
 
 Bridge 为 5 Hz，因此 15 帧片段覆盖约 3 秒，现有运动原语的 7–8 帧比较跨度约为
@@ -65,14 +67,20 @@ python -m cocore_bridge_v2 run \
 outputs/cocore_bridge_v2/bridge_orig_1.0.0
 ```
 
-其中包含 `scan/`、`encode/`、`graph-12-motion-primitives/` 和
+其中包含 `scan/`、`encode/`、`graph-13-motion-softmax/` 和
 `select-<relation>-w<weight>-top<ratio>pct/`。选择目录继续提供
 `selected_manifest.jsonl`、`all_clips.parquet`、`selection_report.json`、
 `manifest.json` 和 `run_manifest.json`；encode 目录提供 Quality 融合
 `embeddings.npy`、`visual_pca.npz`、`numeric_normalizers.npz`、按 episode 分片的
-`frame_embeddings/`、对应索引以及 `visual_half_embeddings.npy`。graph 目录提供分层
-`prototype_catalog.json`、`prototype_centers.npy` 和内部校验用
-`half_action_labels.npy`。manifest 的生产者仍为 `cocore`。
+`frame_embeddings/`、对应索引以及候选 15 帧均值
+`visual_clip_embeddings.npy`。逐帧缓存覆盖所有已索引 episode，包括短 episode。
+graph 目录提供 schema 4 的 `prototype_catalog.json`、`prototype_centers.npy` 和内部
+校验用 `clip_action_labels.npy`。选择输出包含最终原型标签、动作标签、概率和
+`raw_action_label`，不包含旧的 action/distance 分解权重。manifest 的生产者仍为
+`cocore`；Cocore 版本为 0.8.0，Bridge 包版本保持 0.1.0。
+
+schema 3 缓存不迁移，也不会被当作 schema 4 读取。升级后必须重新构建 graph 和
+selection；建议使用新的输出目录，或在确认目标后使用 `--force`。
 
 验证时必须重复传入生成该选择结果时使用的目标与比例。验证只读取 artifact，不访问
 源数据集：
@@ -101,6 +109,6 @@ python -m cocore_bridge_v2 scan \
 ```
 
 `encode` 和完整 `run` 会解码 `image_0` AV1 视频并使用单路 CLIP 特征。每个有效
-episode 的完整逐帧特征会写入 encode 缓存，并经 128 维视觉 PCA 与 state/action
+episode（包括不足 15 帧的短 episode）的完整逐帧特征会写入 encode 缓存，并经 128 维视觉 PCA 与 state/action
 时序池化特征融合。生产配置固定从 `/data/dwb/models/clip-vit-base-patch32` 本地加载
 模型，要求 CUDA；不会访问网络，也不会读取 `image_1`、`image_2` 或 `image_3`。
