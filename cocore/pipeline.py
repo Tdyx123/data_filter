@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
+import math
 import platform
 import sys
 import time
-from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping
@@ -15,6 +15,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import yaml
 from scipy import sparse
+from trajectory_data import DatasetAdapter, create_dataset
 
 from relcore.export import write_selection_outputs
 from relcore.graph import build_graph
@@ -42,7 +43,6 @@ from relcore.utils.random import seed_everything
 from cocore import __version__
 from cocore.config import resolve_config, to_relcore_config
 from cocore.encoding import (
-    HALF_WINDOWS,
     CocoreEncodedArtifact,
     CocoreEncodedClips,
     encode_cocore_dataset,
@@ -50,13 +50,13 @@ from cocore.encoding import (
 )
 from cocore.objective import CocoreObjectiveContext
 from cocore.prototypes import (
-    MIN_FREQUENCY,
-    _euclidean_distances,
-    assign_half_actions,
+    MAX_VISUAL_CENTERS,
+    MIN_ACTION_COUNT,
+    MIN_ACTION_FREQUENCY,
+    STATE_THRESHOLD,
+    VISUAL_SOFTMAX_TEMPERATURE,
     build_hierarchical_motion_prototypes,
-    create_action_catalog,
-    distance_soft_weights,
-    requested_cluster_limits,
+    cluster_count_for_mass,
 )
 from cocore.selection import (
     LazyHeapSelector,
@@ -64,9 +64,10 @@ from cocore.selection import (
 )
 
 
-GRAPH_DIRECTORY = "graph-12-motion-primitives"
+GRAPH_DIRECTORY = "graph-13-motion-softmax"
 RELIABILITY_METRICS = ("support", "progress")
-PROTOTYPE_SCHEMA_VERSION = 3
+PROTOTYPE_SCHEMA_VERSION = 4
+PROTOTYPE_STRATEGY = "trajectory_action_subset_then_visual_softmax"
 
 
 def _number_tag(value: float) -> str:
@@ -75,8 +76,7 @@ def _number_tag(value: float) -> str:
 
 def selection_directory_name(relation_type: str, relation_weight: float, ratio: float) -> str:
     return (
-        f"select-{relation_type}-w{_number_tag(relation_weight)}-"
-        f"top{_number_tag(ratio * 100.0)}pct"
+        f"select-{relation_type}-w{_number_tag(relation_weight)}-top{_number_tag(ratio * 100.0)}pct"
     )
 
 
@@ -116,7 +116,7 @@ def _save_cocore_encoded(
     runtime_seconds: float,
 ) -> None:
     np.save(temporary / "embeddings.npy", encoded.embeddings)
-    np.save(temporary / "visual_half_embeddings.npy", encoded.visual_half_embeddings)
+    np.save(temporary / "visual_clip_embeddings.npy", encoded.visual_clip_embeddings)
     np.save(temporary / "state_sequences.npy", encoded.state_sequences)
     np.save(temporary / "action_sequences.npy", encoded.action_sequences)
     np.save(temporary / "visual_progress.npy", encoded.visual_progress)
@@ -185,12 +185,12 @@ def _save_cocore_encoded(
             "encoding": "quality_fusion",
             "visual_embedding_dim": projector.output_dim,
             "embedding_dim": int(encoded.embeddings.shape[1]),
-            "visual_half_embedding_dim": int(encoded.visual_half_embeddings.shape[2]),
+            "visual_clip_embedding_dim": int(encoded.visual_clip_embeddings.shape[1]),
             "clip_length": 15,
             "clip_stride": 15,
             "clip_anchors": [0, 7, 14],
-            "visual_half_windows": [list(window) for window in HALF_WINDOWS],
-            "visual_half_encoding": "mean",
+            "visual_clip_frames": 15,
+            "visual_clip_encoding": "l2_normalized_per_frame_clip_mean",
             "counts": {
                 "candidate_fragments": candidate_count,
                 "reference_fragments": reference_count,
@@ -208,18 +208,12 @@ def _save_cocore_encoded(
 
 def _expected_frame_episodes(
     adapter: object,
-    clips: list[ClipRecord],
     max_episodes: int | None,
 ) -> list[tuple[int, int]]:
     records = list(adapter.episodes())  # type: ignore[attr-defined]
     if max_episodes is not None:
         records = records[:max_episodes]
-    usable_ids = {clip.episode_id for clip in clips}
-    return [
-        (record.episode_id, record.length)
-        for record in records
-        if record.episode_id in usable_ids
-    ]
+    return [(record.episode_id, record.length) for record in records]
 
 
 def _validate_frame_embedding_cache(
@@ -332,7 +326,10 @@ def encode_stage(
             "runtime": {"max_episodes": resolved["runtime"].get("max_episodes")},
             "seed": resolved["seed"],
             "fixed_clip": {"length": 15, "stride": 15},
-            "visual_half_windows": [list(window) for window in HALF_WINDOWS],
+            "visual_clip": {
+                "frames": 15,
+                "encoding": "l2_normalized_per_frame_clip_mean",
+            },
             "visual_model_sha256": model_sha256,
         }
     )
@@ -367,7 +364,7 @@ def encode_stage(
 
     required = (
         "embeddings.npy",
-        "visual_half_embeddings.npy",
+        "visual_clip_embeddings.npy",
         "state_sequences.npy",
         "action_sequences.npy",
         "visual_progress.npy",
@@ -377,7 +374,7 @@ def encode_stage(
     )
     max_episodes_value = resolved["runtime"].get("max_episodes")
     max_episodes = int(max_episodes_value) if max_episodes_value is not None else None
-    expected_frame_episodes = _expected_frame_episodes(adapter, clips, max_episodes)
+    expected_frame_episodes = _expected_frame_episodes(adapter, max_episodes)
     resume = bool(resolved["runtime"].get("resume", True)) and not force
     aggregate_cache_valid = cache_is_valid(destination, fingerprint, required)
     frame_cache_valid = False
@@ -389,8 +386,7 @@ def encode_stage(
             )
         except ValueError as error:
             raise FileExistsError(
-                f"cocore frame embedding cache is incompatible: {destination}; "
-                "pass --force"
+                f"cocore frame embedding cache is incompatible: {destination}; pass --force"
             ) from error
         frame_cache_valid = True
     publish_stage(
@@ -411,7 +407,7 @@ def encode_stage(
         CocoreEncodedArtifact(
             clips=clips,
             embeddings=np.load(destination / "embeddings.npy"),
-            visual_half_embeddings=np.load(destination / "visual_half_embeddings.npy"),
+            visual_clip_embeddings=np.load(destination / "visual_clip_embeddings.npy"),
             state_sequences=np.load(destination / "state_sequences.npy"),
             action_sequences=np.load(destination / "action_sequences.npy"),
             visual_progress=np.load(destination / "visual_progress.npy"),
@@ -449,6 +445,7 @@ def graph_stage(
             "max_episodes": resolved["runtime"].get("max_episodes"),
             "reliability_metrics": list(RELIABILITY_METRICS),
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
+            "prototype_strategy": PROTOTYPE_STRATEGY,
         }
     )
     destination = root / GRAPH_DIRECTORY
@@ -473,7 +470,8 @@ def graph_stage(
         hierarchy = build_hierarchical_motion_prototypes(
             adapter,
             encoded.clips,
-            encoded.visual_half_embeddings,
+            encoded.visual_clip_embeddings,
+            frame_cache_dir=root / "encode" / "frame_embeddings",
             batch_size=int(prototype_config["batch_size"]),
             max_iter=int(prototype_config["max_iter"]),
             seed=int(resolved["seed"]),
@@ -496,17 +494,14 @@ def graph_stage(
             reliability=graph.reliability,
             prototype_indices=graph.prototype_indices,
             prototype_weights=graph.prototype_weights,
-            prototype_action_weights=hierarchy.action_weights,
-            prototype_distance_weights=hierarchy.distance_weights,
             support=reliability.support,
             progress=reliability.progress,
             smoothness=reliability.smoothness,
             noop_ratio=reliability.noop_ratio,
         )
         assert hierarchy.prototypes.centers is not None
-        assert hierarchy.half_action_labels is not None
         np.save(temporary / "prototype_centers.npy", hierarchy.prototypes.centers)
-        np.save(temporary / "half_action_labels.npy", hierarchy.half_action_labels)
+        np.save(temporary / "clip_action_labels.npy", hierarchy.clip_action_labels)
         write_json(temporary / "prototype_catalog.json", hierarchy.catalog.to_dict())
         _save_edge_table(temporary / "sequence_edges.npz", graph.sequence_edges)
         _save_edge_table(temporary / "similarity_edges.npz", graph.similarity_edges)
@@ -525,6 +520,7 @@ def graph_stage(
                 "reliability_metrics": list(RELIABILITY_METRICS),
                 "prototype_method": "motion_primitives",
                 "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
+                "prototype_strategy": PROTOTYPE_STRATEGY,
                 "nodes": len(graph.sample_ids),
                 "sequence_edges": len(graph.sequence_edges.source),
                 "similarity_edges": len(graph.similarity_edges.source),
@@ -539,7 +535,7 @@ def graph_stage(
             "nodes.npz",
             "prototype_catalog.json",
             "prototype_centers.npy",
-            "half_action_labels.npy",
+            "clip_action_labels.npy",
             "sequence_edges.npz",
             "similarity_edges.npz",
             "transition_matrix.npz",
@@ -591,8 +587,20 @@ def _load_clips(path: Path) -> list[ClipRecord]:
     return [ClipRecord(**row) for row in pq.read_table(path).to_pylist()]
 
 
-def _prototype_labels(graph_root: Path) -> tuple[str, ...]:
+def _prototype_catalog(graph_root: Path) -> Mapping[str, Any]:
     payload = json.loads((graph_root / "prototype_catalog.json").read_text(encoding="utf-8"))
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("method") != "motion_primitives"
+        or payload.get("schema_version") != PROTOTYPE_SCHEMA_VERSION
+        or payload.get("strategy") != PROTOTYPE_STRATEGY
+    ):
+        raise ValueError("cocore prototype catalog schema is incompatible")
+    return payload
+
+
+def _prototype_labels(graph_root: Path) -> tuple[str, ...]:
+    payload = _prototype_catalog(graph_root)
     assigned = sorted(
         payload["leaf_prototypes"],
         key=lambda leaf: int(leaf["prototype_id"]),
@@ -601,7 +609,7 @@ def _prototype_labels(graph_root: Path) -> tuple[str, ...]:
 
 
 def _leaf_prototype_metadata(graph_root: Path) -> tuple[Mapping[str, Any], ...]:
-    payload = json.loads((graph_root / "prototype_catalog.json").read_text(encoding="utf-8"))
+    payload = _prototype_catalog(graph_root)
     assigned = sorted(
         payload["leaf_prototypes"],
         key=lambda leaf: int(leaf["prototype_id"]),
@@ -629,376 +637,307 @@ def _load_graph(root: Path) -> tuple[list[ClipRecord], GraphData, Mapping[str, n
     return clips, graph, nodes
 
 
-def _validate_hierarchical_graph_artifacts(root: Path) -> None:
-    graph_root = root / GRAPH_DIRECTORY
-    nodes = np.load(graph_root / "nodes.npz")
-    required = {
-        "prototype_indices",
-        "prototype_weights",
-        "prototype_action_weights",
-        "prototype_distance_weights",
+def _validate_schema_four_catalog(
+    payload: Mapping[str, Any],
+    *,
+    expected_total_raw_actions: int,
+) -> tuple[Mapping[str, Any], ...]:
+    expected_constants = {
+        "state_threshold": STATE_THRESHOLD,
+        "min_action_count": MIN_ACTION_COUNT,
+        "min_action_frequency": MIN_ACTION_FREQUENCY,
+        "max_visual_centers": MAX_VISUAL_CENTERS,
+        "visual_softmax_temperature": VISUAL_SOFTMAX_TEMPERATURE,
+        "cluster_count": "min(16, 1 + floor(log2(effective_mass)))",
     }
-    if not required <= set(nodes.files):
-        raise ValueError("hierarchical prototype node arrays are missing")
-    indices = nodes["prototype_indices"]
-    weights = nodes["prototype_weights"]
-    action_weights = nodes["prototype_action_weights"]
-    distance_weights = nodes["prototype_distance_weights"]
-    if not (
-        indices.ndim == 2
-        and indices.shape == weights.shape == action_weights.shape == distance_weights.shape
-    ):
-        raise ValueError("hierarchical prototype node arrays do not align")
-    if not (
-        np.all(np.isfinite(weights))
-        and np.all(np.isfinite(action_weights))
-        and np.all(np.isfinite(distance_weights))
-    ):
-        raise ValueError("hierarchical prototype node arrays are not finite")
-    if not np.allclose(
-        weights,
-        action_weights * distance_weights,
-        rtol=1.0e-6,
-        atol=1.0e-7,
-    ):
-        raise ValueError("hierarchical prototype weight product mismatch")
-    payload = json.loads((graph_root / "prototype_catalog.json").read_text(encoding="utf-8"))
     if (
         payload.get("method") != "motion_primitives"
         or payload.get("schema_version") != PROTOTYPE_SCHEMA_VERSION
-        or payload.get("strategy") != "action_halves_then_visual_mean_kmeans"
+        or payload.get("strategy") != PROTOTYPE_STRATEGY
+        or payload.get("constants") != expected_constants
         or not isinstance(payload.get("action_categories"), list)
         or not isinstance(payload.get("leaf_prototypes"), list)
     ):
         raise ValueError("hierarchical prototype catalog schema is invalid")
-    action_categories = payload["action_categories"]
+    total = payload.get("total_raw_actions")
+    if isinstance(total, bool) or not isinstance(total, int) or total != expected_total_raw_actions:
+        raise ValueError("hierarchical prototype raw action total is invalid")
+    categories = payload["action_categories"]
     leaves = payload["leaf_prototypes"]
-    if not leaves:
-        raise ValueError("hierarchical prototype catalog has no reachable leaves")
-    total_labels = payload.get("total_labels")
     if (
-        isinstance(total_labels, bool)
-        or not isinstance(total_labels, int)
-        or total_labels < 0
-    ):
-        raise ValueError("hierarchical prototype total label count is invalid")
-    if not all(isinstance(category, Mapping) for category in action_categories) or not all(
-        isinstance(leaf, Mapping) for leaf in leaves
+        not categories
+        or not leaves
+        or not all(isinstance(value, Mapping) for value in (*categories, *leaves))
     ):
         raise ValueError("hierarchical prototype catalog entries are invalid")
-    labels = [category.get("label") for category in action_categories]
+
+    labels = [category.get("label") for category in categories]
+    counts = [category.get("raw_count") for category in categories]
     if (
         any(not isinstance(label, str) or not label for label in labels)
         or len(set(labels)) != len(labels)
+        or labels.count("stop") != 1
     ):
         raise ValueError("hierarchical prototype action labels are invalid")
-    counts = [category.get("count") for category in action_categories]
-    if any(
-        isinstance(count, bool) or not isinstance(count, int) or count < 0
-        for count in counts
-    ) or sum(counts) != total_labels:
+    if (
+        any(isinstance(count, bool) or not isinstance(count, int) or count < 0 for count in counts)
+        or sum(counts) != total
+    ):
         raise ValueError("hierarchical prototype action counts are invalid")
     if list(zip(counts, labels, strict=True)) != sorted(
         zip(counts, labels, strict=True), key=lambda item: (-item[0], item[1])
     ):
         raise ValueError("hierarchical prototype action order is invalid")
 
-    expected_action_id = 0
-    for category in action_categories:
-        count = int(category["count"])
-        expected_proportion = count / total_labels if total_labels else 0.0
-        proportion = category.get("proportion")
+    threshold = max(MIN_ACTION_COUNT, math.ceil(MIN_ACTION_FREQUENCY * total))
+    assigned_labels = [
+        str(category["label"])
+        for category in categories
+        if category["label"] != "stop" and int(category["raw_count"]) >= threshold
+    ] + ["stop"]
+    action_ids = {label: index for index, label in enumerate(assigned_labels)}
+    categories_by_id: dict[int, Mapping[str, Any]] = {}
+    expected_mass_terms: dict[int, list[float]] = {
+        action_id: [] for action_id in action_ids.values()
+    }
+    for category in categories:
+        count = int(category["raw_count"])
+        label = str(category["label"])
+        proportion = category.get("raw_proportion")
+        expected_proportion = count / total if total else 0.0
         if (
             isinstance(proportion, bool)
             or not isinstance(proportion, (int, float))
-            or not np.isfinite(proportion)
-            or not np.isclose(float(proportion), expected_proportion)
+            or not math.isfinite(float(proportion))
+            or not math.isclose(
+                float(proportion), expected_proportion, rel_tol=0.0, abs_tol=1.0e-12
+            )
         ):
             raise ValueError("hierarchical prototype action proportion is invalid")
-        expected_retained = expected_proportion > MIN_FREQUENCY
-        expected_fallback = category["label"] == "stop" and not expected_retained
+        expected_retained = count >= threshold
         if category.get("retained") is not expected_retained:
             raise ValueError("hierarchical prototype retention threshold is invalid")
-        if category.get("fallback") is not expected_fallback:
-            raise ValueError("hierarchical prototype fallback category is invalid")
-        expected_id = expected_action_id if expected_retained or expected_fallback else None
-        if category.get("action_id") != expected_id:
+        expected_action_id = action_ids.get(label)
+        action_id_value = category.get("action_id")
+        if (
+            action_id_value != expected_action_id
+            or isinstance(action_id_value, bool)
+            or (action_id_value is not None and not isinstance(action_id_value, int))
+        ):
             raise ValueError("hierarchical prototype action id is invalid")
-        if expected_id is not None:
-            expected_action_id += 1
+        if expected_action_id is not None:
+            categories_by_id[expected_action_id] = category
+
+        parents = category.get("parents")
+        if not isinstance(parents, list) or not parents:
+            raise ValueError("hierarchical prototype parent assignments are invalid")
+        probability_sum = 0.0
+        for parent in parents:
+            if not isinstance(parent, Mapping):
+                raise ValueError("hierarchical prototype parent assignments are invalid")
+            parent_id = parent.get("action_id")
+            parent_label = parent.get("label")
+            probability = parent.get("probability")
+            if (
+                isinstance(parent_id, bool)
+                or not isinstance(parent_id, int)
+                or parent_id not in expected_mass_terms
+                or parent_label != assigned_labels[parent_id]
+                or isinstance(probability, bool)
+                or not isinstance(probability, (int, float))
+                or not math.isfinite(float(probability))
+                or float(probability) <= 0.0
+            ):
+                raise ValueError("hierarchical prototype parent assignments are invalid")
+            probability_sum += float(probability)
+            expected_mass_terms[parent_id].append(count * float(probability))
+        if not math.isclose(probability_sum, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+            raise ValueError("hierarchical prototype parent probabilities are invalid")
+
+    if sorted(categories_by_id) != list(range(len(categories_by_id))):
+        raise ValueError("hierarchical action ids are not contiguous")
+    for action_id, category in categories_by_id.items():
+        mass = category.get("effective_mass")
+        expected_mass = math.fsum(expected_mass_terms[action_id])
+        if (
+            isinstance(mass, bool)
+            or not isinstance(mass, (int, float))
+            or not math.isfinite(float(mass))
+            or float(mass) < 0.0
+            or not math.isclose(float(mass), expected_mass, rel_tol=0.0, abs_tol=1.0e-10)
+        ):
+            raise ValueError("hierarchical prototype effective mass is invalid")
+        expected_requested = cluster_count_for_mass(expected_mass) if expected_mass > 0.0 else None
+        requested = category.get("requested_centers")
+        if (
+            requested != expected_requested
+            or isinstance(requested, bool)
+            or (requested is not None and not isinstance(requested, int))
+        ):
+            raise ValueError("hierarchical prototype requested center count is invalid")
+        expected_actual = expected_requested or 0
+        actual = category.get("actual_centers")
+        if actual != expected_actual or isinstance(actual, bool) or not isinstance(actual, int):
+            raise ValueError("hierarchical prototype leaf count is invalid")
+    for category in categories:
+        if category.get("action_id") is None and (
+            category.get("effective_mass") is not None
+            or category.get("requested_centers") is not None
+            or category.get("actual_centers") != 0
+            or isinstance(category.get("actual_centers"), bool)
+            or not isinstance(category.get("actual_centers"), int)
+        ):
+            raise ValueError("hierarchical prototype unassigned action metadata is invalid")
 
     if [leaf.get("prototype_id") for leaf in leaves] != list(range(len(leaves))):
         raise ValueError("hierarchical prototype ids are not contiguous")
-    action_by_id = {
-        int(category["action_id"]): category
-        for category in action_categories
-        if category.get("action_id") is not None
-    }
-    if sorted(action_by_id) != list(range(len(action_by_id))):
-        raise ValueError("hierarchical action ids are not contiguous")
-    for leaf in leaves:
-        action_id = leaf.get("action_id")
-        if not isinstance(action_id, int) or action_id not in action_by_id:
-            raise ValueError("hierarchical prototype action id is invalid")
-        action_label = str(action_by_id[action_id].get("label"))
-        if leaf.get("action_label") != action_label:
-            raise ValueError("hierarchical prototype action label mismatch")
-        cluster_id = leaf.get("cluster_id")
-        if not isinstance(cluster_id, int) or cluster_id < 0:
-            raise ValueError("hierarchical prototype cluster id is invalid")
-        expected_label = (
-            "stop::fallback"
-            if leaf.get("fallback") is True
-            else f"{action_label}::cluster_{cluster_id}"
-        )
-        if leaf.get("label") != expected_label:
-            raise ValueError("hierarchical prototype label mismatch")
+    expected_leaf_id = 0
+    for action_id, category in sorted(categories_by_id.items()):
+        actual_centers = int(category["actual_centers"])
+        action_leaves = [leaf for leaf in leaves if leaf.get("action_id") == action_id]
+        if len(action_leaves) != actual_centers:
+            raise ValueError("hierarchical prototype leaf count is invalid")
+        for center_id, leaf in enumerate(action_leaves):
+            action_label = str(category["label"])
+            if (
+                leaf.get("prototype_id") != expected_leaf_id
+                or leaf.get("center_id") != center_id
+                or isinstance(leaf.get("prototype_id"), bool)
+                or not isinstance(leaf.get("prototype_id"), int)
+                or isinstance(leaf.get("action_id"), bool)
+                or not isinstance(leaf.get("action_id"), int)
+                or isinstance(leaf.get("center_id"), bool)
+                or not isinstance(leaf.get("center_id"), int)
+                or leaf.get("action_label") != action_label
+                or leaf.get("label") != f"{action_label}::center_{center_id}"
+            ):
+                raise ValueError("hierarchical prototype label or ordering is invalid")
+            expected_leaf_id += 1
+    if expected_leaf_id != len(leaves):
+        raise ValueError("hierarchical prototype leaf ordering is invalid")
+    return tuple(leaves)
 
-    centers = np.asarray(np.load(graph_root / "prototype_centers.npy"), dtype=np.float32)
-    visual_halves = np.asarray(
-        np.load(root / "encode" / "visual_half_embeddings.npy", mmap_mode="r"),
-        dtype=np.float32,
+
+def _numeric_values_match(actual: object, expected: np.ndarray) -> bool:
+    try:
+        values = np.asarray(actual, dtype=np.float64)
+    except (TypeError, ValueError):
+        return False
+    return values.shape == expected.shape and bool(
+        np.allclose(values, expected, rtol=1.0e-6, atol=1.0e-7)
     )
-    half_action_labels = np.load(graph_root / "half_action_labels.npy")
+
+
+def _validate_hierarchical_graph_artifacts(
+    root: Path,
+    *,
+    adapter: DatasetAdapter,
+    resolved: Mapping[str, Any],
+    clips: list[ClipRecord],
+    expected_total_raw_actions: int,
+) -> None:
+    graph_root = root / GRAPH_DIRECTORY
+    with np.load(graph_root / "nodes.npz") as stored:
+        if not {"prototype_indices", "prototype_weights"} <= set(stored.files):
+            raise ValueError("hierarchical prototype node arrays are missing")
+        if {"prototype_action_weights", "prototype_distance_weights"} & set(stored.files):
+            raise ValueError("schema-3 hierarchical prototype arrays are incompatible")
+        indices = stored["prototype_indices"].copy()
+        weights = stored["prototype_weights"].copy()
     if (
-        visual_halves.ndim != 3
-        or visual_halves.shape[:2] != (indices.shape[0], 2)
-        or visual_halves.shape[2] == 0
-        or not np.all(np.isfinite(visual_halves))
-        or half_action_labels.ndim != 2
-        or half_action_labels.shape != (indices.shape[0], 2)
-        or half_action_labels.dtype.kind not in {"U", "S"}
+        indices.dtype != np.dtype(np.int32)
+        or weights.dtype != np.dtype(np.float32)
+        or indices.ndim != 2
+        or indices.shape != weights.shape
+        or indices.shape[0] != len(clips)
+        or indices.shape[1] == 0
+        or not np.all(np.isfinite(weights))
+    ):
+        raise ValueError("hierarchical prototype node shape or dtype is invalid")
+
+    payload = json.loads((graph_root / "prototype_catalog.json").read_text(encoding="utf-8"))
+    leaves = _validate_schema_four_catalog(
+        payload,
+        expected_total_raw_actions=expected_total_raw_actions,
+    )
+    visual_clips = np.load(root / "encode" / "visual_clip_embeddings.npy", allow_pickle=False)
+    centers = np.load(graph_root / "prototype_centers.npy", allow_pickle=False)
+    clip_action_labels = np.load(graph_root / "clip_action_labels.npy", allow_pickle=False)
+    if (
+        visual_clips.dtype != np.dtype(np.float32)
+        or visual_clips.ndim != 2
+        or visual_clips.shape[0] != len(clips)
+        or visual_clips.shape[1] == 0
+        or not np.all(np.isfinite(visual_clips))
+        or not np.allclose(np.linalg.norm(visual_clips, axis=1), 1.0, rtol=1.0e-5, atol=1.0e-6)
+    ):
+        raise ValueError("visual clip embeddings are invalid")
+    if (
+        centers.dtype != np.dtype(np.float32)
         or centers.ndim != 2
-        or centers.shape != (len(leaves), visual_halves.shape[2])
+        or centers.shape != (len(leaves), visual_clips.shape[1])
         or not np.all(np.isfinite(centers))
     ):
-        raise ValueError("hierarchical half-clip artifacts are invalid")
-    observed_counts = Counter(str(label) for label in half_action_labels.ravel())
-    if observed_counts != Counter(
-        {str(category["label"]): int(category["count"]) for category in action_categories}
-    ):
-        raise ValueError("hierarchical half action counts are invalid")
-    expected_catalog = create_action_catalog(observed_counts, int(half_action_labels.size))
-    expected_categories = [asdict(category) for category in expected_catalog.action_categories]
-    for actual, expected in zip(action_categories, expected_categories, strict=True):
-        for field in ("action_id", "label", "count", "proportion", "retained", "fallback"):
-            if actual.get(field) != expected[field]:
-                raise ValueError("hierarchical half action catalog is invalid")
-    half_indices, half_weights = assign_half_actions(expected_catalog, half_action_labels)
-    normalized_visual = visual_halves / np.maximum(
-        np.linalg.norm(visual_halves, axis=2, keepdims=True), 1.0e-8
-    )
-    padding = indices < 0
+        raise ValueError("hierarchical prototype centers are invalid")
     if (
-        np.any(indices[~padding] >= len(leaves))
-        or np.any(indices[padding] != -1)
-        or np.any(weights[padding] != 0.0)
-        or np.any(action_weights[padding] != 0.0)
-        or np.any(distance_weights[padding] != 0.0)
-        or np.any(weights[~padding] <= 0.0)
-        or np.any(action_weights[~padding] <= 0.0)
-        or np.any(action_weights[~padding] > 1.0)
-        or np.any(distance_weights[~padding] < 0.3)
-        or np.any(distance_weights[~padding] > 1.0)
+        clip_action_labels.ndim != 1
+        or clip_action_labels.shape != (len(clips),)
+        or clip_action_labels.dtype.kind != "U"
+        or any(not str(label) for label in clip_action_labels)
+    ):
+        raise ValueError("hierarchical clip action labels are invalid")
+
+    valid = indices >= 0
+    counts = np.sum(valid, axis=1)
+    expected_valid = np.arange(indices.shape[1])[None, :] < counts[:, None]
+    if (
+        np.any(counts == 0)
+        or not np.array_equal(valid, expected_valid)
+        or np.any(indices[~valid] != -1)
+        or np.any(indices[valid] >= len(leaves))
+        or np.any(weights[~valid] != 0.0)
+        or np.any(weights[valid] <= 0.0)
+        or not np.allclose(
+            np.sum(weights, axis=1, dtype=np.float64),
+            1.0,
+            rtol=0.0,
+            atol=1.0e-7,
+        )
+        or any(
+            len(set(int(value) for value in row[:count])) != int(count)
+            for row, count in zip(indices, counts, strict=True)
+        )
     ):
         raise ValueError("hierarchical prototype assignment arrays are invalid")
-    expected_per_clip: list[dict[int, tuple[float, float, float, int, int, int]]] = [
-        {} for _ in range(len(indices))
-    ]
 
-    def retain_expected(
-        clip_index: int,
-        half_index: int,
-        leaf_id: int,
-        first_weight: float,
-        second_weight: float,
-        action_id: int,
-        cluster_id: int,
-    ) -> None:
-        combined = float(first_weight) * float(second_weight)
-        candidate = (
-            combined,
-            float(first_weight),
-            float(second_weight),
-            action_id,
-            cluster_id,
-            half_index,
-        )
-        existing = expected_per_clip[clip_index].get(leaf_id)
-        if existing is None or combined > existing[0] or (
-            combined == existing[0] and half_index < existing[5]
-        ):
-            expected_per_clip[clip_index][leaf_id] = candidate
-
-    expected_leaf_layout: list[tuple[int, int]] = []
-    for action_id, category in sorted(action_by_id.items()):
-        membership = half_indices == action_id
-        member_map: dict[tuple[int, int], float] = {}
-        for clip_index, half_index, slot in np.argwhere(membership):
-            key = (int(clip_index), int(half_index))
-            member_map[key] = max(
-                member_map.get(key, 0.0),
-                float(half_weights[clip_index, half_index, slot]),
-            )
-        member_positions = sorted(member_map)
-        member_clips = np.asarray(
-            [position[0] for position in member_positions], dtype=np.int64
-        )
-        member_halves = np.asarray(
-            [position[1] for position in member_positions], dtype=np.int64
-        )
-        member_weights = np.asarray(
-            [member_map[position] for position in member_positions], dtype=np.float32
-        )
-        member_values = normalized_visual[member_clips, member_halves]
-        bucket_size = category.get("bucket_size")
-        if (
-            isinstance(bucket_size, bool)
-            or not isinstance(bucket_size, int)
-            or bucket_size != len(member_positions)
-        ):
-            raise ValueError("hierarchical prototype bucket size is invalid")
-        action_leaves = [leaf for leaf in leaves if leaf["action_id"] == action_id]
-        action_leaves.sort(key=lambda leaf: int(leaf["cluster_id"]))
-
-        if category["fallback"]:
-            if (
-                category.get("requested_clusters") is not None
-                or category.get("requested_top_m") is not None
-                or category.get("actual_clusters") != 1
-                or category.get("top_m") != 1
-                or category.get("distance_q10") is not None
-                or category.get("distance_q90") is not None
-                or len(action_leaves) != 1
-                or action_leaves[0].get("cluster_id") != 0
-                or action_leaves[0].get("fallback") is not True
-            ):
-                raise ValueError("hierarchical prototype fallback leaf is invalid")
-            expected_leaf_layout.append((action_id, 0))
-            fallback_leaf_id = int(action_leaves[0]["prototype_id"])
-            expected_center = (
-                np.average(member_values, axis=0, weights=member_weights).astype(np.float32)
-                if len(member_positions)
-                else np.zeros(visual_halves.shape[2], dtype=np.float32)
-            )
-            if not np.allclose(centers[fallback_leaf_id], expected_center):
-                raise ValueError("hierarchical prototype fallback center is invalid")
-            for clip_index, half_index, first_weight in zip(
-                member_clips, member_halves, member_weights, strict=True
-            ):
-                retain_expected(
-                    int(clip_index),
-                    int(half_index),
-                    fallback_leaf_id,
-                    float(first_weight),
-                    1.0,
-                    action_id,
-                    0,
-                )
-            continue
-
-        requested_clusters, requested_top_m = requested_cluster_limits(
-            float(category["proportion"])
-        )
-        if category.get("requested_clusters") != requested_clusters:
-            raise ValueError("hierarchical prototype cluster formula is invalid")
-        if category.get("requested_top_m") != requested_top_m:
-            raise ValueError("hierarchical prototype Top-M formula is invalid")
-        actual_clusters = min(len(member_positions), requested_clusters)
-        top_m = min(actual_clusters, requested_top_m)
-        if category.get("actual_clusters") != actual_clusters:
-            raise ValueError("hierarchical prototype leaf count is invalid")
-        if category.get("top_m") != top_m:
-            raise ValueError("hierarchical prototype Top-M formula is invalid")
-        cluster_ids = [leaf.get("cluster_id") for leaf in action_leaves]
-        if (
-            cluster_ids != list(range(actual_clusters))
-            or any(leaf.get("fallback") is not False for leaf in action_leaves)
-        ):
-            raise ValueError("hierarchical prototype cluster ids or leaf count are invalid")
-        expected_leaf_layout.extend((action_id, cluster_id) for cluster_id in range(actual_clusters))
-
-        if not len(member_positions):
-            if category.get("distance_q10") is not None or category.get("distance_q90") is not None:
-                raise ValueError("hierarchical prototype distance quantiles are invalid")
-            continue
-        action_leaf_ids = np.asarray(
-            [int(leaf["prototype_id"]) for leaf in action_leaves], dtype=np.int64
-        )
-        action_centers = centers[action_leaf_ids]
-        distances = _euclidean_distances(member_values, action_centers)
-        expected_distance_weights, q10, q90 = distance_soft_weights(distances)
-        catalog_q10 = category.get("distance_q10")
-        catalog_q90 = category.get("distance_q90")
-        if (
-            isinstance(catalog_q10, bool)
-            or isinstance(catalog_q90, bool)
-            or not isinstance(catalog_q10, (int, float))
-            or not isinstance(catalog_q90, (int, float))
-            or not np.isfinite(catalog_q10)
-            or not np.isfinite(catalog_q90)
-            or catalog_q10 < 0.0
-            or catalog_q90 < catalog_q10
-            or not np.isclose(float(catalog_q10), q10, rtol=1.0e-6, atol=1.0e-7)
-            or not np.isclose(float(catalog_q90), q90, rtol=1.0e-6, atol=1.0e-7)
-        ):
-            raise ValueError("hierarchical prototype distance quantiles are invalid")
-        best_clusters = np.argsort(
-            -expected_distance_weights, axis=1, kind="stable"
-        )[:, :top_m]
-        leaf_offset = int(action_leaves[0]["prototype_id"])
-        for member_index, (clip_index, half_index, first_weight) in enumerate(
-            zip(member_clips, member_halves, member_weights, strict=True)
-        ):
-            for cluster_id in best_clusters[member_index]:
-                cluster_id = int(cluster_id)
-                retain_expected(
-                    int(clip_index),
-                    int(half_index),
-                    leaf_offset + cluster_id,
-                    float(first_weight),
-                    float(expected_distance_weights[member_index, cluster_id]),
-                    action_id,
-                    cluster_id,
-                )
-
-    actual_leaf_layout = [
-        (int(leaf["action_id"]), int(leaf["cluster_id"])) for leaf in leaves
-    ]
-    if actual_leaf_layout != expected_leaf_layout:
-        raise ValueError("hierarchical prototype leaf ordering is invalid")
-
-    for clip_index, assignments in enumerate(expected_per_clip):
-        expected_rows = sorted(
-            ((leaf_id, *assignment) for leaf_id, assignment in assignments.items()),
-            key=lambda row: (-row[1], row[4], row[5]),
-        )
-        valid_slots = np.flatnonzero(indices[clip_index] >= 0)
-        if len(valid_slots) != len(expected_rows):
-            raise ValueError("hierarchical prototype Top-M assignments are invalid")
-        for slot, expected in zip(valid_slots, expected_rows, strict=True):
-            leaf_id, combined, first_weight, second_weight, _, _, _ = expected
-            if (
-                int(indices[clip_index, slot]) != leaf_id
-                or not np.isclose(weights[clip_index, slot], combined)
-                or not np.isclose(action_weights[clip_index, slot], first_weight)
-                or not np.isclose(distance_weights[clip_index, slot], second_weight)
-            ):
-                raise ValueError("hierarchical half-clip assignments are invalid")
-
-    for category in action_categories:
-        if category.get("action_id") is not None:
-            continue
-        if (
-            category.get("bucket_size") != 0
-            or category.get("requested_clusters") is not None
-            or category.get("actual_clusters") != 0
-            or category.get("requested_top_m") is not None
-            or category.get("top_m") != 0
-            or category.get("distance_q10") is not None
-            or category.get("distance_q90") is not None
-        ):
-            raise ValueError("hierarchical prototype unassigned action diagnostics are invalid")
+    prototype_config = resolved["prototypes"]
+    replay = build_hierarchical_motion_prototypes(
+        adapter,
+        clips,
+        visual_clips,
+        frame_cache_dir=root / "encode" / "frame_embeddings",
+        batch_size=int(prototype_config["batch_size"]),
+        max_iter=int(prototype_config["max_iter"]),
+        seed=int(resolved["seed"]),
+        max_episodes=resolved["runtime"].get("max_episodes"),
+        num_workers=int(resolved["runtime"].get("num_workers", 0)),
+    )
+    replay_centers = replay.prototypes.centers
+    if replay_centers is None:
+        raise ValueError("hierarchical prototype replay produced no centers")
+    if payload != replay.catalog.to_dict():
+        raise ValueError("hierarchical prototype catalog does not match prototype replay")
+    if not np.array_equal(clip_action_labels, replay.clip_action_labels):
+        raise ValueError("hierarchical clip action labels do not match prototype replay")
+    if not np.allclose(centers, replay_centers, rtol=1.0e-6, atol=1.0e-7):
+        raise ValueError("hierarchical prototype centers do not match prototype replay")
+    if not np.array_equal(indices, replay.prototypes.indices) or not np.allclose(
+        weights,
+        replay.prototypes.weights,
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    ):
+        raise ValueError("hierarchical prototype assignments do not match prototype replay")
 
 
 def _selection_rows(
@@ -1009,6 +948,7 @@ def _selection_rows(
     result,
     context: CocoreObjectiveContext,
     leaf_metadata: tuple[Mapping[str, Any], ...],
+    clip_action_labels: np.ndarray,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     positions = {index: position for position, index in enumerate(result.selected_indices)}
     all_rows: list[dict[str, Any]] = []
@@ -1019,10 +959,7 @@ def _selection_rows(
         labels = [graph.prototype_labels[int(value)] for value in prototype_indices]
         metadata = [leaf_metadata[int(value)] for value in prototype_indices]
         action_labels = [str(value["action_label"]) for value in metadata]
-        cluster_ids = [int(value["cluster_id"]) for value in metadata]
-        assignment_count = len(prototype_indices)
-        action_weights = nodes["prototype_action_weights"][index, :assignment_count]
-        distance_weights = nodes["prototype_distance_weights"][index, :assignment_count]
+        cluster_ids = [int(value["center_id"]) for value in metadata]
         position = positions.get(index)
         row = {
             **asdict(clip),
@@ -1035,11 +972,10 @@ def _selection_rows(
             "prototype_weights": [float(value) for value in prototype_weights],
             "prototype_action_labels": action_labels,
             "prototype_cluster_ids": cluster_ids,
-            "prototype_action_weights": [float(value) for value in action_weights],
-            "prototype_distance_weights": [float(value) for value in distance_weights],
             "primary_prototype_label": labels[0],
             "prototype_labels": labels,
             "primary_action_label": action_labels[0],
+            "raw_action_label": str(clip_action_labels[index]),
             "selection_order": position + 1 if position is not None else None,
             "selection_phase": result.selection_phases[position] if position is not None else None,
             "selection_step": result.selection_steps[position] if position is not None else None,
@@ -1094,6 +1030,8 @@ def select_stage(
             "selection": resolved["selection"],
             "seed": resolved["seed"],
             "algorithm": algorithm,
+            "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
+            "prototype_strategy": PROTOTYPE_STRATEGY,
         }
     )
 
@@ -1112,6 +1050,9 @@ def select_stage(
         )
         result = selector.select(budget, initial_indices=coverage_seed.selected_indices)
         graph_nodes = np.load(root / GRAPH_DIRECTORY / "nodes.npz")
+        clip_action_labels = np.load(
+            root / GRAPH_DIRECTORY / "clip_action_labels.npy", allow_pickle=False
+        )
         selected_rows, all_rows = _selection_rows(
             resolved,
             clips,
@@ -1120,6 +1061,7 @@ def select_stage(
             result,
             context,
             _leaf_prototype_metadata(root / GRAPH_DIRECTORY),
+            clip_action_labels,
         )
         final_coverage = context.prototype_mass[
             np.asarray(result.selected_indices, dtype=np.int64)
@@ -1130,9 +1072,7 @@ def select_stage(
             )
             for task in sorted({int(value) for value in graph.task_indices})
         }
-        scan_manifest = json.loads(
-            (root / "scan" / "manifest.json").read_text(encoding="utf-8")
-        )
+        scan_manifest = json.loads((root / "scan" / "manifest.json").read_text(encoding="utf-8"))
         report = {
             "producer": "cocore",
             "number_of_episodes": int(scan_manifest["episodes"]),
@@ -1143,6 +1083,7 @@ def select_stage(
             "reliability_metrics": list(RELIABILITY_METRICS),
             "prototype_method": "motion_primitives",
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
+            "prototype_strategy": PROTOTYPE_STRATEGY,
             "initial_set_size": len(coverage_seed.selected_indices),
             "coverage": {
                 "target": [float(value) for value in coverage_seed.target_coverage],
@@ -1196,6 +1137,9 @@ def select_stage(
                 "relation_type": relation_type,
                 "relation_weight": relation_weight,
                 "algorithm": algorithm,
+                "prototype_method": "motion_primitives",
+                "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
+                "prototype_strategy": PROTOTYPE_STRATEGY,
             },
         )
 
@@ -1214,9 +1158,9 @@ def select_stage(
         "select": directory,
     }
     stage_fingerprints = {
-        stage: json.loads(
-            (root / stage_directory / "manifest.json").read_text(encoding="utf-8")
-        )["fingerprint"]
+        stage: json.loads((root / stage_directory / "manifest.json").read_text(encoding="utf-8"))[
+            "fingerprint"
+        ]
         for stage, stage_directory in stage_directories.items()
     }
     write_json(
@@ -1235,6 +1179,7 @@ def select_stage(
             "reliability_metrics": list(RELIABILITY_METRICS),
             "prototype_method": "motion_primitives",
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
+            "prototype_strategy": PROTOTYPE_STRATEGY,
             "selection_ratio": ratio,
             "relation_type": relation_type,
             "relation_weight": relation_weight,
@@ -1302,6 +1247,8 @@ def validate_output(
         raise ValueError("cocore run manifest version is incompatible")
     if run_manifest.get("prototype_schema_version") != PROTOTYPE_SCHEMA_VERSION:
         raise ValueError("cocore prototype schema version is incompatible")
+    if run_manifest.get("prototype_strategy") != PROTOTYPE_STRATEGY:
+        raise ValueError("cocore prototype strategy is incompatible")
     algorithm = run_manifest.get("algorithm")
     if not isinstance(algorithm, Mapping) or algorithm.get("type") != "lazy_max_heap":
         raise ValueError("cocore run manifest algorithm is invalid")
@@ -1329,7 +1276,7 @@ def validate_output(
         "scan": ("episodes.parquet", "clips.parquet", "normalization.npz"),
         "encode": (
             "embeddings.npy",
-            "visual_half_embeddings.npy",
+            "visual_clip_embeddings.npy",
             "state_sequences.npy",
             "action_sequences.npy",
             "visual_progress.npy",
@@ -1341,7 +1288,7 @@ def validate_output(
             "nodes.npz",
             "prototype_catalog.json",
             "prototype_centers.npy",
-            "half_action_labels.npy",
+            "clip_action_labels.npy",
             "sequence_edges.npz",
             "similarity_edges.npz",
             "transition_matrix.npz",
@@ -1349,30 +1296,50 @@ def validate_output(
         ),
         "select": ("selected_manifest.jsonl", "all_clips.parquet", "selection_report.json"),
     }
+    stage_manifests: dict[str, Mapping[str, Any]] = {}
     for stage, directory in expected_directories.items():
         path = root / directory
         manifest_path = path / "manifest.json"
         if not manifest_path.is_file():
             raise ValueError(f"missing stage manifest: {stage}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        stage_manifests[stage] = manifest
         if not cache_is_valid(path, str(manifest.get("fingerprint", "")), stage_required[stage]):
             raise ValueError(f"invalid stage artifacts: {stage}")
         if run_manifest["stage_fingerprints"].get(stage) != manifest["fingerprint"]:
             raise ValueError(f"run/stage fingerprint mismatch: {stage}")
+    if (
+        stage_manifests["graph"].get("prototype_schema_version") != PROTOTYPE_SCHEMA_VERSION
+        or stage_manifests["graph"].get("prototype_strategy") != PROTOTYPE_STRATEGY
+        or stage_manifests["graph"].get("stage_directory") != GRAPH_DIRECTORY
+    ):
+        raise ValueError("graph manifest prototype schema is incompatible")
     scan_clips = _load_clips(root / "scan" / "clips.parquet")
     episode_rows = pq.read_table(root / "scan" / "episodes.parquet").to_pylist()
-    episode_lengths = {
-        int(row["episode_id"]): int(row["length"]) for row in episode_rows
-    }
-    ordered_episode_ids = list(dict.fromkeys(clip.episode_id for clip in scan_clips))
     _validate_frame_embedding_cache(
         root / "encode",
-        expected_episodes=[
-            (episode_id, episode_lengths[episode_id])
-            for episode_id in ordered_episode_ids
-        ],
+        expected_episodes=[(int(row["episode_id"]), int(row["length"])) for row in episode_rows],
     )
-    _validate_hierarchical_graph_artifacts(root)
+    if config is None:
+        resolved_path = result / "resolved_config.yaml"
+        if not resolved_path.is_file():
+            raise ValueError("cocore validation requires configuration for prototype replay")
+        stored_config = yaml.safe_load(resolved_path.read_text(encoding="utf-8")) or {}
+        if not isinstance(stored_config, Mapping):
+            raise ValueError("stored cocore configuration is invalid")
+        validation_config = stored_config
+    else:
+        validation_config = config
+    replay_resolved = resolve_config(validation_config)
+    replay_resolved["output"]["directory"] = str(root)
+    replay_adapter = create_dataset(replay_resolved["dataset"])
+    _validate_hierarchical_graph_artifacts(
+        root,
+        adapter=replay_adapter,
+        resolved=replay_resolved,
+        clips=scan_clips,
+        expected_total_raw_actions=sum(max(int(row["length"]) - 7, 0) for row in episode_rows),
+    )
     select_manifest = json.loads(required["select_manifest"].read_text(encoding="utf-8"))
     if select_manifest.get("producer") != "cocore":
         raise ValueError("selection manifest producer is invalid")
@@ -1389,6 +1356,12 @@ def validate_output(
         raise ValueError("selection report relation type mismatch")
     if report.get("prototype_schema_version") != PROTOTYPE_SCHEMA_VERSION:
         raise ValueError("selection report prototype schema version mismatch")
+    if (
+        select_manifest.get("prototype_schema_version") != PROTOTYPE_SCHEMA_VERSION
+        or select_manifest.get("prototype_strategy") != PROTOTYPE_STRATEGY
+        or report.get("prototype_strategy") != PROTOTYPE_STRATEGY
+    ):
+        raise ValueError("selection prototype schema metadata mismatch")
     if not np.isclose(float(report.get("relation_weight", np.nan)), weight):
         raise ValueError("selection report relation weight mismatch")
     if select_manifest.get("relation_type") != relation_type:
@@ -1403,6 +1376,9 @@ def validate_output(
         raise ValueError("all_clips.parquet is not sorted by sample_id")
     leaf_metadata = _leaf_prototype_metadata(root / GRAPH_DIRECTORY)
     nodes = np.load(root / GRAPH_DIRECTORY / "nodes.npz")
+    clip_action_labels = np.load(
+        root / GRAPH_DIRECTORY / "clip_action_labels.npy", allow_pickle=False
+    )
     clip_index_by_id = {
         clip.sample_id: index
         for index, clip in enumerate(_load_clips(root / "scan" / "clips.parquet"))
@@ -1414,30 +1390,23 @@ def validate_output(
         assigned_indices, assigned_weights = valid_prototype_assignments(
             nodes["prototype_indices"][index], nodes["prototype_weights"][index]
         )
-        count = len(assigned_indices)
         expected_labels = [leaf_metadata[int(value)]["label"] for value in assigned_indices]
-        expected_actions = [
-            leaf_metadata[int(value)]["action_label"] for value in assigned_indices
-        ]
+        expected_actions = [leaf_metadata[int(value)]["action_label"] for value in assigned_indices]
         expected_clusters = [
-            int(leaf_metadata[int(value)]["cluster_id"]) for value in assigned_indices
+            int(leaf_metadata[int(value)]["center_id"]) for value in assigned_indices
         ]
         if (
             row.get("prototype_indices") != [int(value) for value in assigned_indices]
-            or not np.allclose(row.get("prototype_weights"), assigned_weights)
+            or not _numeric_values_match(row.get("prototype_weights"), assigned_weights)
             or row.get("prototype_labels") != expected_labels
             or row.get("prototype_action_labels") != expected_actions
             or row.get("prototype_cluster_ids") != expected_clusters
-            or not np.allclose(
-                row.get("prototype_action_weights"),
-                nodes["prototype_action_weights"][index, :count],
-            )
-            or not np.allclose(
-                row.get("prototype_distance_weights"),
-                nodes["prototype_distance_weights"][index, :count],
-            )
+            or "prototype_action_weights" in row
+            or "prototype_distance_weights" in row
+            or row.get("primary_prototype") != int(assigned_indices[0])
             or row.get("primary_prototype_label") != expected_labels[0]
             or row.get("primary_action_label") != expected_actions[0]
+            or row.get("raw_action_label") != str(clip_action_labels[index])
         ):
             raise ValueError("hierarchical prototype row metadata mismatch")
     selected_from_all = sorted(
@@ -1453,11 +1422,10 @@ def validate_output(
         "prototype_labels",
         "prototype_action_labels",
         "prototype_cluster_ids",
-        "prototype_action_weights",
-        "prototype_distance_weights",
         "primary_prototype",
         "primary_prototype_label",
         "primary_action_label",
+        "raw_action_label",
     )
     for selected_row, all_row in zip(selected_rows, selected_from_all, strict=True):
         if any(selected_row.get(field) != all_row.get(field) for field in hierarchical_fields):
@@ -1511,9 +1479,7 @@ def validate_output(
             recorded_gain, gain, rtol=1.0e-7, atol=1.0e-8
         ):
             raise ValueError("selection score delta does not match the objective")
-        if not np.isclose(
-            float(row.get("marginal_gain", np.nan)), gain, rtol=1.0e-7, atol=1.0e-8
-        ):
+        if not np.isclose(float(row.get("marginal_gain", np.nan)), gain, rtol=1.0e-7, atol=1.0e-8):
             raise ValueError("selected marginal gain does not match the objective")
         context.add_candidate(state, index)
 
@@ -1544,7 +1510,9 @@ def validate_output(
 
     expected_heap = {
         "initial_size": (
-            0 if initial_set_size == len(selected_rows) else len(graph.sample_ids) - initial_set_size
+            0
+            if initial_set_size == len(selected_rows)
+            else len(graph.sample_ids) - initial_set_size
         ),
         "total_refreshes": sum(refresh_counts),
         "capped_selections": sum(value == max_refreshes for value in refresh_counts),

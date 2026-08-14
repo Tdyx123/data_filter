@@ -21,6 +21,7 @@ from trajectory_data import (
 
 class CocorePipelineAdapter(DatasetAdapter):
     load_images_calls: ClassVar[list[bool]] = []
+    motion_sign: ClassVar[float] = 1.0
 
     def __init__(self, _: Mapping[str, object]) -> None:
         self._records = (
@@ -52,7 +53,7 @@ class CocorePipelineAdapter(DatasetAdapter):
         for record in records:
             steps = np.arange(record.length, dtype=np.float32)
             states = np.zeros((record.length, 8), dtype=np.float32)
-            states[:, 0] = steps * 0.04
+            states[:, 0] = steps * 0.04 * self.motion_sign
             observations = {"observation.state": states}
             if load_images:
                 pixels = np.mod(steps + record.episode_id * 37, 255).astype(np.uint8)
@@ -105,6 +106,12 @@ class ReverseOrderCocorePipelineAdapter(CocorePipelineAdapter):
         self._records = tuple(reversed(self._records))
 
 
+class ShortEpisodeCocorePipelineAdapter(CocorePipelineAdapter):
+    def __init__(self, config: Mapping[str, object]) -> None:
+        super().__init__(config)
+        self._records = (*self._records, EpisodeRecord(2, 5, 2, "short task"))
+
+
 def _config(tmp_path: Path, relation: str = "cooccurrence") -> dict[str, object]:
     return {
         "seed": 7,
@@ -135,7 +142,7 @@ def _config(tmp_path: Path, relation: str = "cooccurrence") -> dict[str, object]
     }
 
 
-def test_encode_stage_publishes_cocore_visual_half_artifact(tmp_path: Path) -> None:
+def test_encode_stage_publishes_normalized_visual_clip_artifact(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     CocorePipelineAdapter.load_images_calls.clear()
     root = tmp_path / "cocore-encode"
@@ -151,12 +158,14 @@ def test_encode_stage_publishes_cocore_visual_half_artifact(tmp_path: Path) -> N
     embeddings = np.load(root / "encode" / "embeddings.npy")
     assert embeddings.shape == (6, 159)
     np.testing.assert_allclose(np.linalg.norm(embeddings, axis=1), 1.0, atol=1.0e-6)
-    stored = np.load(root / "encode" / "visual_half_embeddings.npy")
-    np.testing.assert_array_equal(stored, encoded.visual_half_embeddings)
-    assert stored.shape == (6, 2, 3)
-    np.testing.assert_array_equal(
+    stored = np.load(root / "encode" / "visual_clip_embeddings.npy")
+    np.testing.assert_array_equal(stored, encoded.visual_clip_embeddings)
+    assert stored.shape == (6, 3)
+    np.testing.assert_allclose(np.linalg.norm(stored, axis=1), 1.0, atol=1.0e-6)
+    np.testing.assert_allclose(
         stored[0],
-        np.asarray([[4.5, 5.5, 7.5], [11.5, 12.5, 14.5]], dtype=np.float32),
+        np.asarray([8.0, 9.0, 11.0], dtype=np.float32) / np.sqrt(266.0),
+        atol=1.0e-7,
     )
     manifest = json.loads((root / "encode" / "manifest.json").read_text())
     index = json.loads((root / "encode" / "frame_embeddings_index.json").read_text())
@@ -172,12 +181,12 @@ def test_encode_stage_publishes_cocore_visual_half_artifact(tmp_path: Path) -> N
         "encoded_episodes": 2,
         "encoded_frames": 90,
     }
-    assert manifest["visual_half_embedding_dim"] == 3
+    assert manifest["visual_clip_embedding_dim"] == 3
     assert manifest["clip_length"] == 15
     assert manifest["clip_stride"] == 15
     assert manifest["clip_anchors"] == [0, 7, 14]
-    assert manifest["visual_half_windows"] == [[0, 8], [7, 15]]
-    assert manifest["visual_half_encoding"] == "mean"
+    assert manifest["visual_clip_frames"] == 15
+    assert manifest["visual_clip_encoding"] == "l2_normalized_per_frame_clip_mean"
     assert [entry["episode_id"] for entry in index["episodes"]] == [0, 1]
     assert [entry["frames"] for entry in index["episodes"]] == [45, 45]
     for entry in index["episodes"]:
@@ -197,6 +206,26 @@ def test_encode_stage_publishes_cocore_visual_half_artifact(tmp_path: Path) -> N
         visual_encoder=FailingCocoreVisualEncoder(),
     )
     assert CocorePipelineAdapter.load_images_calls == [False, False, True]
+
+
+def test_encode_stage_caches_every_indexed_episode_including_short_episodes(
+    tmp_path: Path,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_short", ShortEpisodeCocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["dataset"]["type"] = "cocore_pipeline_short"
+
+    root, _, encoded = encode_stage(config, visual_encoder=CocoreVisualEncoder())
+
+    assert len(encoded.clips) == 6
+    index = json.loads((root / "encode" / "frame_embeddings_index.json").read_text())
+    assert [(entry["episode_id"], entry["frames"]) for entry in index["episodes"]] == [
+        (0, 45),
+        (1, 45),
+        (2, 5),
+    ]
+    result = run_pipeline(config, visual_encoder=FailingCocoreVisualEncoder())
+    assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 6}
 
 
 def test_interrupted_encode_does_not_publish_partial_frame_cache(tmp_path: Path) -> None:
@@ -227,33 +256,40 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert result == root / f"select-{relation}-w1-top50pct"
     assert (root / "scan" / "manifest.json").is_file()
     assert (root / "encode" / "manifest.json").is_file()
-    assert (root / "encode" / "visual_half_embeddings.npy").is_file()
-    assert (root / "graph-12-motion-primitives" / "prototype_catalog.json").is_file()
-    assert (root / "graph-12-motion-primitives" / "prototype_centers.npy").is_file()
-    assert (root / "graph-12-motion-primitives" / "half_action_labels.npy").is_file()
-    for directory in ("scan", "encode", "graph-12-motion-primitives"):
+    assert (root / "encode" / "visual_clip_embeddings.npy").is_file()
+    assert (root / "graph-13-motion-softmax" / "prototype_catalog.json").is_file()
+    assert (root / "graph-13-motion-softmax" / "prototype_centers.npy").is_file()
+    assert (root / "graph-13-motion-softmax" / "clip_action_labels.npy").is_file()
+    for directory in ("scan", "encode", "graph-13-motion-softmax"):
         manifest = json.loads((root / directory / "manifest.json").read_text())
         assert manifest["producer"] == "cocore"
         assert manifest["cocore_version"] == "0.7.0"
-    catalog = json.loads(
-        (root / "graph-12-motion-primitives" / "prototype_catalog.json").read_text()
-    )
-    assert catalog["schema_version"] == 3
-    assert catalog["strategy"] == "action_halves_then_visual_mean_kmeans"
-    assert catalog["total_labels"] == 12
+    catalog = json.loads((root / "graph-13-motion-softmax" / "prototype_catalog.json").read_text())
+    assert catalog["schema_version"] == 4
+    assert catalog["strategy"] == "trajectory_action_subset_then_visual_softmax"
+    assert catalog["total_raw_actions"] == 76
+    assert catalog["constants"] == {
+        "state_threshold": 0.03,
+        "min_action_count": 40,
+        "min_action_frequency": 0.005,
+        "max_visual_centers": 16,
+        "visual_softmax_temperature": 0.1,
+        "cluster_count": "min(16, 1 + floor(log2(effective_mass)))",
+    }
     assert catalog["leaf_prototypes"]
-    half_action_labels = np.load(
-        root / "graph-12-motion-primitives" / "half_action_labels.npy"
-    )
-    assert half_action_labels.shape == (6, 2)
-    assert half_action_labels.dtype.kind == "U"
-    centers = np.load(root / "graph-12-motion-primitives" / "prototype_centers.npy")
+    clip_action_labels = np.load(root / "graph-13-motion-softmax" / "clip_action_labels.npy")
+    assert clip_action_labels.shape == (6,)
+    assert clip_action_labels.dtype.kind == "U"
+    assert set(clip_action_labels) == {"move forward"}
+    centers = np.load(root / "graph-13-motion-softmax" / "prototype_centers.npy")
     assert centers.shape[1] == 3
-    nodes = np.load(root / "graph-12-motion-primitives" / "nodes.npz")
-    assert {"prototype_action_weights", "prototype_distance_weights"} <= set(nodes.files)
+    nodes = np.load(root / "graph-13-motion-softmax" / "nodes.npz")
+    assert "prototype_action_weights" not in nodes.files
+    assert "prototype_distance_weights" not in nodes.files
     np.testing.assert_allclose(
-        nodes["prototype_weights"],
-        nodes["prototype_action_weights"] * nodes["prototype_distance_weights"],
+        nodes["prototype_weights"].sum(axis=1),
+        1.0,
+        atol=1.0e-7,
     )
     np.testing.assert_allclose(
         nodes["reliability"],
@@ -261,8 +297,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
         rtol=1.0e-6,
     )
     selected = [
-        json.loads(line)
-        for line in (result / "selected_manifest.jsonl").read_text().splitlines()
+        json.loads(line) for line in (result / "selected_manifest.jsonl").read_text().splitlines()
     ]
     all_rows = pq.read_table(result / "all_clips.parquet").to_pylist()
     report = json.loads((result / "selection_report.json").read_text())
@@ -281,9 +316,8 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
             "prototype_labels",
             "prototype_action_labels",
             "prototype_cluster_ids",
-            "prototype_action_weights",
-            "prototype_distance_weights",
             "primary_action_label",
+            "raw_action_label",
         }
         <= row.keys()
         for row in all_rows
@@ -293,10 +327,12 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert all("prototype_half_indices" not in row for row in selected)
     assert report["relation_type"] == relation
     assert report["relation_weight"] == 1.0
-    assert report["prototype_schema_version"] == 3
+    assert all("prototype_action_weights" not in row for row in all_rows)
+    assert all("prototype_distance_weights" not in row for row in all_rows)
+    assert report["prototype_schema_version"] == 4
+    assert report["prototype_strategy"] == "trajectory_action_subset_then_visual_softmax"
     assert report["objective"]["total"] == (
-        report["objective"]["weighted_relation"]
-        - report["objective"]["redundancy"]
+        report["objective"]["weighted_relation"] - report["objective"]["redundancy"]
     )
     assert report["objective"]["weighted_relation"] == report["objective"]["relation"]
     assert report["coverage"]["target"] == report["coverage"]["achieved"]
@@ -315,11 +351,15 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert run_manifest["cocore_version"] == "0.7.0"
     assert run_manifest["relation_type"] == relation
     assert run_manifest["relation_weight"] == 1.0
-    assert run_manifest["prototype_schema_version"] == 3
+    assert run_manifest["prototype_schema_version"] == 4
+    assert run_manifest["prototype_strategy"] == ("trajectory_action_subset_then_visual_softmax")
+    assert run_manifest["stage_directories"]["graph"] == "graph-13-motion-softmax"
     assert run_manifest["algorithm"] == report["algorithm"]
     select_manifest = json.loads((result / "manifest.json").read_text())
     assert select_manifest["relation_type"] == relation
     assert select_manifest["relation_weight"] == 1.0
+    assert select_manifest["prototype_schema_version"] == 4
+    assert select_manifest["prototype_strategy"] == ("trajectory_action_subset_then_visual_softmax")
     resolved = yaml.safe_load((result / "resolved_config.yaml").read_text())
     assert resolved["output"]["directory"] == str(root)
     assert resolved["objective"] == {"relation": relation, "relation_weight": 1.0}
@@ -361,17 +401,17 @@ def test_validate_rejects_tampered_relation_objective(tmp_path: Path) -> None:
         validate_output(result, config=config)
 
 
-def test_validate_rejects_tampered_hierarchical_weight_product(tmp_path: Path) -> None:
+def test_validate_rejects_tampered_normalized_leaf_weights_by_replay(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    nodes_path = result.parent / "graph-12-motion-primitives" / "nodes.npz"
+    nodes_path = result.parent / "graph-13-motion-softmax" / "nodes.npz"
     with np.load(nodes_path) as stored:
         nodes = {name: stored[name].copy() for name in stored.files}
-    nodes["prototype_action_weights"][0, 0] *= np.float32(0.5)
+    nodes["prototype_weights"][0] = np.roll(nodes["prototype_weights"][0], 1)
     np.savez(nodes_path, **nodes)
 
-    with pytest.raises(ValueError, match="hierarchical prototype weight product"):
+    with pytest.raises(ValueError, match="prototype replay"):
         validate_output(result, config=config)
 
 
@@ -379,7 +419,7 @@ def test_validate_rejects_tampered_hierarchical_catalog(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    catalog_path = result.parent / "graph-12-motion-primitives" / "prototype_catalog.json"
+    catalog_path = result.parent / "graph-13-motion-softmax" / "prototype_catalog.json"
     catalog = json.loads(catalog_path.read_text())
     catalog["leaf_prototypes"][0]["label"] = "wrong"
     catalog_path.write_text(json.dumps(catalog))
@@ -391,10 +431,9 @@ def test_validate_rejects_tampered_hierarchical_catalog(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("requested_clusters", 999, "cluster formula"),
-        ("top_m", 999, "Top-M formula"),
-        ("actual_clusters", 999, "leaf count"),
-        ("distance_q10", -1.0, "distance quantiles"),
+        ("requested_centers", 999, "requested center"),
+        ("actual_centers", 999, "leaf count"),
+        ("effective_mass", -1.0, "effective mass"),
     ],
 )
 def test_validate_recomputes_hierarchical_catalog_diagnostics(
@@ -406,12 +445,12 @@ def test_validate_recomputes_hierarchical_catalog_diagnostics(
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    catalog_path = result.parent / "graph-12-motion-primitives" / "prototype_catalog.json"
+    catalog_path = result.parent / "graph-13-motion-softmax" / "prototype_catalog.json"
     catalog = json.loads(catalog_path.read_text())
     category = next(
         category
         for category in catalog["action_categories"]
-        if category["retained"] and category["bucket_size"] > 0
+        if category["retained"] and category["effective_mass"] > 0
     )
     category[field] = value
     catalog_path.write_text(json.dumps(catalog))
@@ -428,7 +467,7 @@ def test_validate_rejects_tampered_hierarchical_output_row(tmp_path: Path) -> No
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
     all_path = result / "all_clips.parquet"
     rows = pq.read_table(all_path).to_pylist()
-    rows[0]["prototype_distance_weights"][0] = 0.9
+    rows[0]["raw_action_label"] = "stop"
     pq.write_table(pa.Table.from_pylist(rows), all_path)
 
     with pytest.raises(ValueError, match="hierarchical prototype row"):
@@ -439,32 +478,32 @@ def test_validate_rejects_missing_hierarchical_centers(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    (result.parent / "graph-12-motion-primitives" / "prototype_centers.npy").unlink()
+    (result.parent / "graph-13-motion-softmax" / "prototype_centers.npy").unlink()
 
     with pytest.raises(ValueError, match="invalid stage artifacts: graph"):
         validate_output(result, config=config)
 
 
-def test_validate_rejects_tampered_visual_half_embeddings(tmp_path: Path) -> None:
+def test_validate_rejects_tampered_visual_clip_embeddings(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    path = result.parent / "encode" / "visual_half_embeddings.npy"
+    path = result.parent / "encode" / "visual_clip_embeddings.npy"
     values = np.load(path)
-    values[0, 0] = np.asarray([100.0, -10.0, 3.0], dtype=np.float32)
+    values[0] = np.roll(values[0], 1)
     np.save(path, values)
 
-    with pytest.raises(ValueError, match="hierarchical"):
+    with pytest.raises(ValueError, match="prototype replay"):
         validate_output(result, config=config)
 
 
-def test_validate_rejects_missing_visual_half_embeddings_as_encode_artifact(
+def test_validate_rejects_missing_visual_clip_embeddings_as_encode_artifact(
     tmp_path: Path,
 ) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    (result.parent / "encode" / "visual_half_embeddings.npy").unlink()
+    (result.parent / "encode" / "visual_clip_embeddings.npy").unlink()
 
     with pytest.raises(ValueError, match="invalid stage artifacts: encode"):
         validate_output(result, config=config)
@@ -513,25 +552,25 @@ def test_validate_rejects_tampered_visual_prototype_center(tmp_path: Path) -> No
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    path = result.parent / "graph-12-motion-primitives" / "prototype_centers.npy"
+    path = result.parent / "graph-13-motion-softmax" / "prototype_centers.npy"
     centers = np.load(path)
     centers[0] = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
     np.save(path, centers)
 
-    with pytest.raises(ValueError, match="hierarchical"):
+    with pytest.raises(ValueError, match="prototype (center|replay)"):
         validate_output(result, config=config)
 
 
-def test_validate_rejects_tampered_half_action_labels(tmp_path: Path) -> None:
+def test_validate_rejects_tampered_clip_action_labels(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    path = result.parent / "graph-12-motion-primitives" / "half_action_labels.npy"
+    path = result.parent / "graph-13-motion-softmax" / "clip_action_labels.npy"
     labels = np.load(path)
-    labels[0, 0] = "stop"
+    labels[0] = "stop"
     np.save(path, labels)
 
-    with pytest.raises(ValueError, match="half action"):
+    with pytest.raises(ValueError, match="clip action"):
         validate_output(result, config=config)
 
 
@@ -546,6 +585,32 @@ def test_validate_rejects_tampered_selected_hierarchical_row(tmp_path: Path) -> 
 
     with pytest.raises(ValueError, match="selected hierarchical prototype row"):
         validate_output(result, config=config)
+
+
+def test_validate_rejects_schema_three_manifest_explicitly(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    run_path = result / "run_manifest.json"
+    manifest = json.loads(run_path.read_text())
+    manifest["prototype_schema_version"] = 3
+    run_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="prototype schema version is incompatible"):
+        validate_output(result, config=config)
+
+
+def test_validate_replays_current_adapter_state(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+
+    CocorePipelineAdapter.motion_sign = -1.0
+    try:
+        with pytest.raises(ValueError, match="prototype replay"):
+            validate_output(result, config=config)
+    finally:
+        CocorePipelineAdapter.motion_sign = 1.0
 
 
 def test_validate_rejects_wrong_relation_directory(tmp_path: Path) -> None:
@@ -589,9 +654,7 @@ def test_sequence_and_cooccurrence_outputs_can_coexist(tmp_path: Path) -> None:
 
 
 def test_validate_aligns_sorted_output_rows_by_sample_id(tmp_path: Path) -> None:
-    register_dataset_adapter(
-        "cocore_pipeline_reverse_synthetic", ReverseOrderCocorePipelineAdapter
-    )
+    register_dataset_adapter("cocore_pipeline_reverse_synthetic", ReverseOrderCocorePipelineAdapter)
     config = _config(tmp_path)
     config["dataset"]["type"] = "cocore_pipeline_reverse_synthetic"
 
