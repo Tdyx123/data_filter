@@ -315,6 +315,25 @@ def _records_by_id(records: Sequence[EpisodeRecord]) -> dict[int, EpisodeRecord]
     return result
 
 
+def _action_bucket_statistics(
+    catalog: ActionCatalog,
+) -> tuple[dict[int, int], dict[int, float]]:
+    action_ids = {
+        int(category.action_id)
+        for category in catalog.action_categories
+        if category.action_id is not None
+    }
+    member_counts = {action_id: 0 for action_id in action_ids}
+    mass_terms: dict[int, list[float]] = {action_id: [] for action_id in action_ids}
+    for category in catalog.action_categories:
+        for parent in category.parents:
+            if parent.action_id not in action_ids:
+                raise ValueError(f"missing parent assignments for action {category.label!r}")
+            member_counts[parent.action_id] += category.raw_count
+            mass_terms[parent.action_id].append(category.raw_count * parent.probability)
+    return member_counts, {action_id: math.fsum(mass_terms[action_id]) for action_id in action_ids}
+
+
 def _validated_states(
     episode: EpisodeData,
     expected: Mapping[int, EpisodeRecord],
@@ -400,7 +419,7 @@ def _squared_distances(values: np.ndarray, centers: np.ndarray) -> np.ndarray:
     return squared
 
 
-def _fit_action_clusters(
+def _fit_action_cluster_model(
     embeddings: np.ndarray,
     sample_weights: np.ndarray,
     *,
@@ -408,7 +427,7 @@ def _fit_action_clusters(
     batch_size: int,
     max_iter: int,
     seed: int,
-) -> np.ndarray:
+):
     values = np.asarray(embeddings, dtype=np.float32)
     weights = np.asarray(sample_weights, dtype=np.float64)
     if (
@@ -438,16 +457,44 @@ def _fit_action_clusters(
     centers = np.asarray(model.cluster_centers_, dtype=np.float32)
     if centers.shape != (int(clusters), values.shape[1]) or not np.all(np.isfinite(centers)):
         raise ValueError("invalid KMeans outputs")
-    assigned = np.argmin(_squared_distances(values, centers), axis=1)
-    masses = np.bincount(assigned, weights=weights, minlength=int(clusters))
-    order = sorted(
-        range(int(clusters)),
-        key=lambda index: (
-            -float(masses[index]),
-            tuple(float(coordinate) for coordinate in centers[index]),
-        ),
-    )
-    return centers[np.asarray(order, dtype=np.int64)]
+    return model
+
+
+def _episode_parent_memberships(
+    states: np.ndarray,
+    categories_by_label: Mapping[str, ActionCategory],
+    action_ids: Sequence[int],
+    primitive_config: object,
+) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    local_rows: dict[int, list[int]] = {action_id: [] for action_id in action_ids}
+    local_weights: dict[int, list[float]] = {action_id: [] for action_id in action_ids}
+    for timestep in range(max(len(states) - 7, 0)):
+        raw_label = classify_motion_primitive(
+            states[timestep], states[timestep + 7], primitive_config
+        )
+        category = categories_by_label.get(raw_label)
+        if category is None or not category.parents:
+            raise ValueError(f"missing parent assignments for action {raw_label!r}")
+        probability_sum = sum(parent.probability for parent in category.parents)
+        if not math.isclose(probability_sum, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+            raise ValueError(f"non-normalized parent assignments for action {raw_label!r}")
+        for parent in category.parents:
+            if (
+                parent.action_id not in local_rows
+                or not math.isfinite(parent.probability)
+                or parent.probability <= 0.0
+            ):
+                raise ValueError(f"missing parent assignments for action {raw_label!r}")
+            local_rows[parent.action_id].append(timestep)
+            local_weights[parent.action_id].append(parent.probability)
+    return {
+        action_id: (
+            np.asarray(local_rows[action_id], dtype=np.int64),
+            np.asarray(local_weights[action_id], dtype=np.float64),
+        )
+        for action_id in action_ids
+        if local_rows[action_id]
+    }
 
 
 def build_hierarchical_motion_prototypes(
@@ -554,9 +601,66 @@ def build_hierarchical_motion_prototypes(
     }
     if sorted(categories_by_id) != list(range(len(categories_by_id))):
         raise ValueError("action ids must be contiguous")
-    feature_chunks: dict[int, list[np.ndarray]] = {action_id: [] for action_id in categories_by_id}
-    weight_chunks: dict[int, list[np.ndarray]] = {action_id: [] for action_id in categories_by_id}
-    effective_mass = {action_id: 0.0 for action_id in categories_by_id}
+    member_counts, effective_mass = _action_bucket_statistics(catalog)
+
+    requested_centers: dict[int, int] = {}
+    models: dict[int, object] = {}
+    initial_values: dict[int, np.ndarray] = {}
+    initial_weights: dict[int, np.ndarray] = {}
+    initial_counts: dict[int, int] = {}
+    updated_categories: dict[int, ActionCategory] = {}
+    for action_id in sorted(categories_by_id):
+        category = categories_by_id[action_id]
+        mass = float(effective_mass[action_id])
+        if member_counts[action_id] == 0:
+            updated_categories[action_id] = replace(category, effective_mass=0.0)
+            continue
+        clusters = cluster_count_for_mass(mass)
+        capacity = min(int(batch_size), member_counts[action_id])
+        if clusters <= 0 or clusters > capacity:
+            raise ValueError("invalid KMeans inputs")
+        requested_centers[action_id] = clusters
+        initial_values[action_id] = np.empty(
+            (capacity, candidate_values.shape[1]), dtype=np.float32
+        )
+        initial_weights[action_id] = np.empty(capacity, dtype=np.float64)
+        initial_counts[action_id] = 0
+
+    def update_action_model(
+        action_id: int,
+        member_values: np.ndarray,
+        member_weights: np.ndarray,
+    ) -> None:
+        cursor = 0
+        if action_id not in models:
+            filled = initial_counts[action_id]
+            capacity = len(initial_weights[action_id])
+            take = min(capacity - filled, len(member_values))
+            if take:
+                initial_values[action_id][filled : filled + take] = member_values[:take]
+                initial_weights[action_id][filled : filled + take] = member_weights[:take]
+                filled += take
+                cursor += take
+                initial_counts[action_id] = filled
+            if filled == capacity:
+                models[action_id] = _fit_action_cluster_model(
+                    initial_values[action_id],
+                    initial_weights[action_id],
+                    clusters=requested_centers[action_id],
+                    batch_size=int(batch_size),
+                    max_iter=int(max_iter),
+                    seed=int(seed) + action_id,
+                )
+        if action_id in models:
+            model = models[action_id]
+            while cursor < len(member_values):
+                end = min(cursor + int(batch_size), len(member_values))
+                model.partial_fit(
+                    member_values[cursor:end],
+                    sample_weight=member_weights[cursor:end],
+                )
+                cursor = end
+
     cache_root = Path(frame_cache_dir)
     cache_seen: set[int] = set()
     for episode in adapter.iter_episodes(
@@ -573,63 +677,70 @@ def build_hierarchical_motion_prototypes(
         )
         if len(window_visuals) != max(len(states) - 7, 0):
             raise ValueError(f"episode {episode.episode_id}: state/cache length mismatch")
-        local_rows: dict[int, list[int]] = {action_id: [] for action_id in categories_by_id}
-        local_weights: dict[int, list[float]] = {action_id: [] for action_id in categories_by_id}
-        for timestep in range(len(window_visuals)):
-            raw_label = classify_motion_primitive(
-                states[timestep], states[timestep + 7], primitive_config
-            )
-            category = categories_by_label.get(raw_label)
-            if category is None or not category.parents:
-                raise ValueError(f"missing parent assignments for action {raw_label!r}")
-            probability_sum = sum(parent.probability for parent in category.parents)
-            if not math.isclose(probability_sum, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
-                raise ValueError(f"non-normalized parent assignments for action {raw_label!r}")
-            for parent in category.parents:
-                if (
-                    parent.action_id not in categories_by_id
-                    or not math.isfinite(parent.probability)
-                    or parent.probability <= 0.0
-                ):
-                    raise ValueError(f"missing parent assignments for action {raw_label!r}")
-                local_rows[parent.action_id].append(timestep)
-                local_weights[parent.action_id].append(parent.probability)
-                effective_mass[parent.action_id] += parent.probability
-        for action_id in categories_by_id:
-            if local_rows[action_id]:
-                feature_chunks[action_id].append(
-                    window_visuals[np.asarray(local_rows[action_id], dtype=np.int64)]
-                )
-                weight_chunks[action_id].append(
-                    np.asarray(local_weights[action_id], dtype=np.float64)
-                )
+        memberships = _episode_parent_memberships(
+            states,
+            categories_by_label,
+            tuple(categories_by_id),
+            primitive_config,
+        )
+        for action_id, (rows, weights) in memberships.items():
+            update_action_model(action_id, window_visuals[rows], weights)
     if cache_seen != set(expected):
         raise ValueError("cache pass did not yield every indexed episode exactly once")
+    if set(models) != set(requested_centers):
+        raise ValueError("invalid KMeans inputs")
 
     centers: list[np.ndarray] = []
     leaves: list[LeafPrototype] = []
     leaf_ids_by_action: dict[int, np.ndarray] = {}
     centers_by_action: dict[int, np.ndarray] = {}
-    updated_categories: dict[int, ActionCategory] = {}
+    assigned_masses = {
+        action_id: np.zeros(requested_centers[action_id], dtype=np.float64)
+        for action_id in requested_centers
+    }
+    ordering_seen: set[int] = set()
+    for episode in adapter.iter_episodes(
+        num_workers=num_workers,
+        max_episodes=max_episodes,
+        load_images=False,
+    ):
+        states = _validated_states(episode, expected, ordering_seen, pass_name="ordering")
+        record = expected[episode.episode_id]
+        window_visuals = _episode_window_visuals(
+            cache_root,
+            record,
+            embedding_dim=candidate_values.shape[1],
+        )
+        memberships = _episode_parent_memberships(
+            states,
+            categories_by_label,
+            tuple(categories_by_id),
+            primitive_config,
+        )
+        for action_id, (rows, weights) in memberships.items():
+            action_centers = np.asarray(models[action_id].cluster_centers_, dtype=np.float32)
+            assigned = np.argmin(_squared_distances(window_visuals[rows], action_centers), axis=1)
+            assigned_masses[action_id] += np.bincount(
+                assigned,
+                weights=weights,
+                minlength=requested_centers[action_id],
+            )
+    if ordering_seen != set(expected):
+        raise ValueError("ordering pass did not yield every indexed episode exactly once")
+
     for action_id in sorted(categories_by_id):
         category = categories_by_id[action_id]
-        mass = float(effective_mass[action_id])
-        if not feature_chunks[action_id]:
-            updated_categories[action_id] = replace(category, effective_mass=0.0)
+        if action_id not in models:
             continue
-        member_values = np.concatenate(feature_chunks[action_id], axis=0)
-        member_weights = np.concatenate(weight_chunks[action_id], axis=0)
-        requested_centers = cluster_count_for_mass(mass)
-        if requested_centers <= 0 or requested_centers > len(member_values):
-            raise ValueError("invalid KMeans inputs")
-        action_centers = _fit_action_clusters(
-            member_values,
-            member_weights,
-            clusters=requested_centers,
-            batch_size=int(batch_size),
-            max_iter=int(max_iter),
-            seed=int(seed) + action_id,
+        unordered_centers = np.asarray(models[action_id].cluster_centers_, dtype=np.float32)
+        order = sorted(
+            range(len(unordered_centers)),
+            key=lambda index: (
+                -float(assigned_masses[action_id][index]),
+                tuple(float(coordinate) for coordinate in unordered_centers[index]),
+            ),
         )
+        action_centers = unordered_centers[np.asarray(order, dtype=np.int64)]
         action_leaf_ids: list[int] = []
         for center_id, center in enumerate(action_centers):
             prototype_id = len(leaves)
@@ -648,8 +759,8 @@ def build_hierarchical_motion_prototypes(
         centers_by_action[action_id] = action_centers
         updated_categories[action_id] = replace(
             category,
-            effective_mass=mass,
-            requested_centers=requested_centers,
+            effective_mass=float(effective_mass[action_id]),
+            requested_centers=requested_centers[action_id],
             actual_centers=len(action_centers),
         )
 
@@ -716,6 +827,17 @@ def build_hierarchical_motion_prototypes(
             prototype_weights[clip_index, slot] = np.float32(weight)
         row_sum = float(np.sum(prototype_weights[clip_index], dtype=np.float64))
         prototype_weights[clip_index, 0] += np.float32(1.0 - row_sum)
+        definitive_order = sorted(
+            range(len(assignments)),
+            key=lambda slot: (
+                -float(prototype_weights[clip_index, slot]),
+                int(prototype_indices[clip_index, slot]),
+            ),
+        )
+        valid_indices = prototype_indices[clip_index, : len(assignments)].copy()
+        valid_weights = prototype_weights[clip_index, : len(assignments)].copy()
+        prototype_indices[clip_index, : len(assignments)] = valid_indices[definitive_order]
+        prototype_weights[clip_index, : len(assignments)] = valid_weights[definitive_order]
     if len(clips) and (
         np.any((prototype_indices < 0) != (prototype_weights == 0.0))
         or not np.allclose(

@@ -65,7 +65,62 @@ class _TrajectoryPrototypeAdapter(DatasetAdapter):
         return "trajectory-prototype-test-v1"
 
 
-def _write_frame_caches(root: Path, adapter: _TrajectoryPrototypeAdapter) -> None:
+class _PowerBoundaryAdapter(DatasetAdapter):
+    def __init__(self) -> None:
+        self._records = (
+            EpisodeRecord(0, 47, 0, "forward"),
+            EpisodeRecord(1, 52, 0, "right"),
+            EpisodeRecord(2, 33, 0, "tilt up rare"),
+            EpisodeRecord(3, 32, 0, "tilt down rare"),
+        )
+
+    @property
+    def vector_observation_keys(self) -> tuple[str, ...]:
+        return ("observation.state",)
+
+    @property
+    def image_observation_keys(self) -> tuple[str, ...]:
+        return ("observation.images.image",)
+
+    def episodes(self) -> Sequence[EpisodeRecord]:
+        return self._records
+
+    def iter_episodes(
+        self,
+        *,
+        num_workers: int = 0,
+        max_episodes: int | None = None,
+        load_images: bool = True,
+    ) -> Iterator[EpisodeData]:
+        del num_workers, load_images
+        records = self._records[:max_episodes] if max_episodes else self._records
+        for record in records:
+            steps = np.arange(record.length, dtype=np.float32)
+            states = np.zeros((record.length, 8), dtype=np.float32)
+            if record.episode_id == 0:
+                states[:, 0] = steps * np.float32(0.01)
+            elif record.episode_id == 1:
+                states[:, 1] = steps * np.float32(-0.01)
+            else:
+                states[:, 0] = steps * np.float32(0.01)
+                states[:, 1] = steps * np.float32(-0.01)
+                tilt_sign = 1.0 if record.episode_id == 2 else -1.0
+                states[:, 4] = steps * np.float32(0.01 * tilt_sign)
+            yield EpisodeData(
+                episode_id=record.episode_id,
+                timestamps=steps.astype(np.float64) / 10.0,
+                frame_indices=np.arange(record.length, dtype=np.int64),
+                observations={"observation.state": states},
+                actions=np.zeros((record.length, 2), dtype=np.float32),
+                task_index=record.task_index,
+                task_name=record.task_name,
+            )
+
+    def fingerprint(self) -> str:
+        return "power-boundary-prototype-test-v1"
+
+
+def _write_frame_caches(root: Path, adapter: DatasetAdapter) -> None:
     root.mkdir()
     for record in adapter.episodes():
         steps = np.arange(record.length, dtype=np.float32)
@@ -441,6 +496,149 @@ def test_full_trajectory_builder_uses_weighted_parent_buckets_and_all_centers(
         )
         if leaf_id in right_leaf_ids
     ) == pytest.approx(0.5)
+
+
+def test_full_trajectory_builder_bounds_every_kmeans_update_by_batch_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sklearn.cluster import MiniBatchKMeans
+
+    adapter = _TrajectoryPrototypeAdapter()
+    cache = tmp_path / "frame_embeddings"
+    _write_frame_caches(cache, adapter)
+    candidate_frames = np.load(cache / "ep000002.npy", allow_pickle=False)
+    candidate_mean = candidate_frames.mean(axis=0)
+    candidate_mean /= np.linalg.norm(candidate_mean)
+    observed_batch_rows: list[int] = []
+    real_fit = MiniBatchKMeans.fit
+    real_partial_fit = MiniBatchKMeans.partial_fit
+
+    def recording_fit(
+        self: MiniBatchKMeans,
+        features: np.ndarray,
+        labels: object = None,
+        sample_weight: np.ndarray | None = None,
+    ) -> MiniBatchKMeans:
+        observed_batch_rows.append(len(features))
+        return real_fit(self, features, labels, sample_weight=sample_weight)
+
+    def recording_partial_fit(
+        self: MiniBatchKMeans,
+        features: np.ndarray,
+        labels: object = None,
+        sample_weight: np.ndarray | None = None,
+    ) -> MiniBatchKMeans:
+        observed_batch_rows.append(len(features))
+        return real_partial_fit(self, features, labels, sample_weight=sample_weight)
+
+    monkeypatch.setattr(MiniBatchKMeans, "fit", recording_fit)
+    monkeypatch.setattr(MiniBatchKMeans, "partial_fit", recording_partial_fit)
+
+    prototypes.build_hierarchical_motion_prototypes(
+        adapter,
+        [_candidate_clip()],
+        candidate_mean[None, :],
+        frame_cache_dir=cache,
+        batch_size=8,
+        max_iter=50,
+        seed=23,
+        max_episodes=None,
+        num_workers=0,
+    )
+
+    assert observed_batch_rows
+    assert max(observed_batch_rows) <= 8
+
+
+def test_full_trajectory_builder_sorts_the_definitive_stored_probabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _TrajectoryPrototypeAdapter()
+    cache = tmp_path / "frame_embeddings"
+    _write_frame_caches(cache, adapter)
+    candidate_frames = np.load(cache / "ep000002.npy", allow_pickle=False)
+    candidate_mean = candidate_frames.mean(axis=0)
+    candidate_mean /= np.linalg.norm(candidate_mean)
+
+    def uniform_probabilities(values: np.ndarray, centers: np.ndarray) -> np.ndarray:
+        return np.full(
+            (len(values), len(centers)),
+            1.0 / len(centers),
+            dtype=np.float64,
+        )
+
+    monkeypatch.setattr(
+        prototypes,
+        "visual_center_probabilities",
+        uniform_probabilities,
+    )
+
+    result = prototypes.build_hierarchical_motion_prototypes(
+        adapter,
+        [_candidate_clip()],
+        candidate_mean[None, :],
+        frame_cache_dir=cache,
+        batch_size=32,
+        max_iter=50,
+        seed=23,
+        max_episodes=None,
+        num_workers=0,
+    )
+
+    stored = list(
+        zip(
+            result.prototypes.indices[0].tolist(),
+            result.prototypes.weights[0].tolist(),
+            strict=True,
+        )
+    )
+    assert stored == sorted(stored, key=lambda item: (-item[1], item[0]))
+    assert sum(weight for _, weight in stored) == pytest.approx(1.0, abs=1.0e-7)
+
+
+def test_full_trajectory_builder_uses_stable_mass_at_a_power_of_two(
+    tmp_path: Path,
+) -> None:
+    adapter = _PowerBoundaryAdapter()
+    cache = tmp_path / "frame_embeddings"
+    _write_frame_caches(cache, adapter)
+    candidate_frames = np.load(cache / "ep000000.npy", allow_pickle=False)
+    candidate_mean = candidate_frames[:15].mean(axis=0)
+    candidate_mean /= np.linalg.norm(candidate_mean)
+    clip = ClipRecord(
+        sample_id="ep000000_chunk_000000_000014",
+        episode_id=0,
+        task_index=0,
+        task_name="forward",
+        start_step=0,
+        end_step=14,
+        length=15,
+        previous_sample_id=None,
+        next_sample_id=None,
+    )
+
+    result = prototypes.build_hierarchical_motion_prototypes(
+        adapter,
+        [clip],
+        candidate_mean[None, :],
+        frame_cache_dir=cache,
+        batch_size=32,
+        max_iter=50,
+        seed=23,
+        max_episodes=None,
+        num_workers=0,
+    )
+
+    forward = next(
+        category
+        for category in result.catalog.action_categories
+        if category.label == "move forward"
+    )
+    assert forward.effective_mass == 64.0
+    assert forward.requested_centers == 7
+    assert forward.actual_centers == 7
 
 
 def test_full_trajectory_builder_rejects_missing_frame_cache(tmp_path: Path) -> None:
