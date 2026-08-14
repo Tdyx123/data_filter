@@ -21,13 +21,12 @@ visual:
   batch_size: 64
   device: auto
 
-normalization:
-  epsilon: 1.0e-6
-
-relation:
-  projection_dim: 32
-  output_dim: 256
-  lags: [0, 1, 2, 4]
+encoding:
+  visual_dim: 128
+  pca_fit_max_samples: null
+  quantile_low: 0.01
+  quantile_high: 0.99
+  epsilon: 1.0e-8
 
 quality:
   knn: 10

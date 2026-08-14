@@ -68,10 +68,11 @@ outputs/cocore_bridge_v2/bridge_orig_1.0.0
 其中包含 `scan/`、`encode/`、`graph-12-motion-primitives/` 和
 `select-<relation>-w<weight>-top<ratio>pct/`。选择目录继续提供
 `selected_manifest.jsonl`、`all_clips.parquet`、`selection_report.json`、
-`manifest.json` 和 `run_manifest.json`；encode 目录额外提供
-`visual_half_embeddings.npy`，graph 目录提供分层 `prototype_catalog.json`、
-`prototype_centers.npy` 和内部校验用 `half_action_labels.npy`。manifest 的生产者仍为
-`cocore`。
+`manifest.json` 和 `run_manifest.json`；encode 目录提供 Quality 融合
+`embeddings.npy`、`visual_pca.npz`、`numeric_normalizers.npz`、按 episode 分片的
+`frame_embeddings/`、对应索引以及 `visual_half_embeddings.npy`。graph 目录提供分层
+`prototype_catalog.json`、`prototype_centers.npy` 和内部校验用
+`half_action_labels.npy`。manifest 的生产者仍为 `cocore`。
 
 验证时必须重复传入生成该选择结果时使用的目标与比例。验证只读取 artifact，不访问
 源数据集：
@@ -99,6 +100,7 @@ python -m cocore_bridge_v2 scan \
   --output-dir outputs/cocore_bridge_v2/bridge-smoke-100
 ```
 
-`encode` 和完整 `run` 会解码 `image_0` AV1 视频并使用单路 CLIP 特征。生产配置固定
-从 `/data/dwb/models/clip-vit-base-patch32` 本地加载模型，要求 CUDA；不会访问网络，
-也不会读取 `image_1`、`image_2` 或 `image_3`。
+`encode` 和完整 `run` 会解码 `image_0` AV1 视频并使用单路 CLIP 特征。每个有效
+episode 的完整逐帧特征会写入 encode 缓存，并经 128 维视觉 PCA 与 state/action
+时序池化特征融合。生产配置固定从 `/data/dwb/models/clip-vit-base-patch32` 本地加载
+模型，要求 CUDA；不会访问网络，也不会读取 `image_1`、`image_2` 或 `image_3`。

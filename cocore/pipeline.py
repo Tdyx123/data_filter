@@ -18,7 +18,6 @@ from scipy import sparse
 
 from relcore.export import write_selection_outputs
 from relcore.graph import build_graph
-from relcore.features.normalization import RobustNormalizer
 from relcore.features.visual_encoder import (
     DummyVisualEncoder,
     FrozenClipEncoder,
@@ -33,6 +32,7 @@ from relcore.schemas import ClipRecord, EdgeTable, GraphData
 from relcore.utils.io import (
     cache_is_valid,
     directory_sha256,
+    file_sha256,
     publish_stage,
     stable_hash,
     write_json,
@@ -46,6 +46,7 @@ from cocore.encoding import (
     CocoreEncodedArtifact,
     CocoreEncodedClips,
     encode_cocore_dataset,
+    reference_windows,
 )
 from cocore.objective import CocoreObjectiveContext
 from cocore.prototypes import (
@@ -115,28 +116,63 @@ def _save_cocore_encoded(
     runtime_seconds: float,
 ) -> None:
     np.save(temporary / "embeddings.npy", encoded.embeddings)
-    np.save(temporary / "raw_relations.npy", encoded.raw_relations)
     np.save(temporary / "visual_half_embeddings.npy", encoded.visual_half_embeddings)
     np.save(temporary / "state_sequences.npy", encoded.state_sequences)
     np.save(temporary / "action_sequences.npy", encoded.action_sequences)
     np.save(temporary / "visual_progress.npy", encoded.visual_progress)
-    np.savez(
-        temporary / "normalization.npz",
-        state_median=encoded.state_normalizer.median,
-        state_iqr=encoded.state_normalizer.iqr,
-        action_median=encoded.action_normalizer.median,
-        action_iqr=encoded.action_normalizer.iqr,
+    normalizers = encoded.numeric_normalizers
+    state_lower = np.concatenate(
+        [normalizers.observation_bounds[key][0] for key in normalizers.vector_keys]
     )
-    np.savez(
-        temporary / "projection_matrices.npz",
-        **encoded.relation_encoder.projection_matrices,
+    state_upper = np.concatenate(
+        [normalizers.observation_bounds[key][1] for key in normalizers.vector_keys]
     )
+    offsets = [0]
+    for key in normalizers.vector_keys:
+        offsets.append(offsets[-1] + len(normalizers.observation_bounds[key][0]))
     np.savez(
-        temporary / "relation_pca.npz",
-        mean=encoded.relation_projector.mean_,
-        scale=encoded.relation_projector.scale_,
-        components=encoded.relation_projector.components_,
+        temporary / "numeric_normalizers.npz",
+        vector_keys=np.asarray(normalizers.vector_keys),
+        vector_offsets=np.asarray(offsets, dtype=np.int64),
+        state_lower=state_lower,
+        state_upper=state_upper,
+        action_lower=normalizers.action_lower,
+        action_upper=normalizers.action_upper,
+        quantile_low=np.asarray(normalizers.quantile_low, dtype=np.float64),
+        quantile_high=np.asarray(normalizers.quantile_high, dtype=np.float64),
+        epsilon=np.asarray(normalizers.epsilon, dtype=np.float64),
     )
+    projector = encoded.visual_projector
+    np.savez(
+        temporary / "visual_pca.npz",
+        mean=projector.mean_,
+        scale=projector.scale_,
+        components=projector.components_,
+        explained_variance_ratio=projector.explained_variance_ratio_,
+    )
+    index_entries = [
+        {
+            "episode_id": entry.episode_id,
+            "path": f"frame_embeddings/{entry.filename}",
+            "frames": entry.frames,
+            "embedding_dim": entry.embedding_dim,
+            "dtype": "float32",
+            "sha256": entry.sha256,
+        }
+        for entry in encoded.frame_embeddings
+    ]
+    write_json(
+        temporary / "frame_embeddings_index.json",
+        {
+            "version": 1,
+            "dtype": "float32",
+            "episodes": index_entries,
+        },
+    )
+    reference_count = sum(
+        len(reference_windows(entry.frames)) for entry in encoded.frame_embeddings
+    )
+    candidate_count = len(encoded.clips)
     write_json(
         temporary / "manifest.json",
         {
@@ -146,6 +182,8 @@ def _save_cocore_encoded(
             "cocore_stage": "encode",
             "fingerprint": fingerprint,
             "clips": len(encoded.clips),
+            "encoding": "quality_fusion",
+            "visual_embedding_dim": projector.output_dim,
             "embedding_dim": int(encoded.embeddings.shape[1]),
             "visual_half_embedding_dim": int(encoded.visual_half_embeddings.shape[2]),
             "clip_length": 15,
@@ -153,9 +191,101 @@ def _save_cocore_encoded(
             "clip_anchors": [0, 7, 14],
             "visual_half_windows": [list(window) for window in HALF_WINDOWS],
             "visual_half_encoding": "mean",
+            "counts": {
+                "candidate_fragments": candidate_count,
+                "reference_fragments": reference_count,
+                "overlap_fragments": (
+                    candidate_count + reference_count - encoded.union_fragment_count
+                ),
+                "pca_union_fragments": encoded.union_fragment_count,
+                "encoded_episodes": len(encoded.frame_embeddings),
+                "encoded_frames": sum(entry.frames for entry in encoded.frame_embeddings),
+            },
             "runtime_seconds": runtime_seconds,
         },
     )
+
+
+def _expected_frame_episodes(
+    adapter: object,
+    clips: list[ClipRecord],
+    max_episodes: int | None,
+) -> list[tuple[int, int]]:
+    records = list(adapter.episodes())  # type: ignore[attr-defined]
+    if max_episodes is not None:
+        records = records[:max_episodes]
+    usable_ids = {clip.episode_id for clip in clips}
+    return [
+        (record.episode_id, record.length)
+        for record in records
+        if record.episode_id in usable_ids
+    ]
+
+
+def _validate_frame_embedding_cache(
+    encode_root: Path,
+    *,
+    expected_episodes: list[tuple[int, int]] | None = None,
+) -> None:
+    index_path = encode_root / "frame_embeddings_index.json"
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("cocore frame embedding index is missing or invalid") from error
+    entries = payload.get("episodes")
+    if payload.get("version") != 1 or payload.get("dtype") != "float32":
+        raise ValueError("cocore frame embedding index schema is invalid")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("cocore frame embedding index has no episodes")
+    actual_episodes: list[tuple[int, int]] = []
+    indexed_paths: set[Path] = set()
+    embedding_dim: int | None = None
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise ValueError("cocore frame embedding index entry is invalid")
+        episode_id = entry.get("episode_id")
+        frames = entry.get("frames")
+        dimension = entry.get("embedding_dim")
+        if (
+            isinstance(episode_id, bool)
+            or not isinstance(episode_id, int)
+            or isinstance(frames, bool)
+            or not isinstance(frames, int)
+            or frames <= 0
+            or isinstance(dimension, bool)
+            or not isinstance(dimension, int)
+            or dimension <= 0
+            or entry.get("dtype") != "float32"
+        ):
+            raise ValueError("cocore frame embedding metadata is invalid")
+        relative = Path(str(entry.get("path", "")))
+        expected_relative = Path("frame_embeddings") / f"ep{episode_id:06d}.npy"
+        if relative != expected_relative or relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("cocore frame embedding path is invalid")
+        path = encode_root / relative
+        if path in indexed_paths or not path.is_file():
+            raise ValueError("cocore frame embedding file is missing or duplicated")
+        indexed_paths.add(path)
+        if file_sha256(path) != entry.get("sha256"):
+            raise ValueError("cocore frame embedding hash does not match")
+        try:
+            values = np.load(path, allow_pickle=False, mmap_mode="r")
+        except (OSError, ValueError) as error:
+            raise ValueError("cocore frame embedding file could not be loaded") from error
+        if values.dtype != np.dtype(np.float32) or values.shape != (frames, dimension):
+            raise ValueError("cocore frame embedding shape or dtype is invalid")
+        for start in range(0, frames, 4096):
+            if not np.all(np.isfinite(values[start : start + 4096])):
+                raise ValueError("cocore frame embedding contains NaN or infinity")
+        embedding_dim = dimension if embedding_dim is None else embedding_dim
+        if dimension != embedding_dim:
+            raise ValueError("cocore frame embedding dimension changed across episodes")
+        actual_episodes.append((episode_id, frames))
+    cache_root = encode_root / "frame_embeddings"
+    if not cache_root.is_dir() or set(cache_root.glob("*.npy")) != indexed_paths:
+        raise ValueError("cocore frame embedding file set does not match the index")
+    if expected_episodes is not None and actual_episodes != expected_episodes:
+        raise ValueError("cocore frame embedding episodes do not match the scan index")
 
 
 def scan_stage(
@@ -198,8 +328,7 @@ def encode_stage(
             "upstream": scan_fingerprint,
             "dataset": resolved["dataset"],
             "visual": resolved["visual"],
-            "normalization": resolved["normalization"],
-            "relation": resolved["relation"],
+            "encoding": resolved["encoding"],
             "runtime": {"max_episodes": resolved["runtime"].get("max_episodes")},
             "seed": resolved["seed"],
             "fixed_clip": {"length": 15, "stride": 15},
@@ -208,14 +337,7 @@ def encode_stage(
         }
     )
     destination = root / "encode"
-    normalization = np.load(root / "scan" / "normalization.npz")
-    epsilon = float(resolved["normalization"]["epsilon"])
-    state_normalizer = RobustNormalizer(
-        normalization["state_median"], normalization["state_iqr"], epsilon
-    )
-    action_normalizer = RobustNormalizer(
-        normalization["action_median"], normalization["action_iqr"], epsilon
-    )
+    encoding_config = resolved["encoding"]
 
     def build(temporary: Path) -> None:
         started = time.perf_counter()
@@ -223,16 +345,16 @@ def encode_stage(
         encoded = encode_cocore_dataset(
             adapter,
             encoder,
-            projection_dim=int(resolved["relation"]["projection_dim"]),
-            output_dim=int(resolved["relation"]["output_dim"]),
-            lags=tuple(int(lag) for lag in resolved["relation"]["lags"]),
+            visual_dim=int(encoding_config["visual_dim"]),
+            pca_fit_max_samples=encoding_config.get("pca_fit_max_samples"),
+            quantile_low=float(encoding_config["quantile_low"]),
+            quantile_high=float(encoding_config["quantile_high"]),
+            epsilon=float(encoding_config["epsilon"]),
             seed=int(resolved["seed"]),
-            epsilon=epsilon,
+            frame_cache_dir=temporary / "frame_embeddings",
             num_workers=int(resolved["runtime"].get("num_workers", 0)),
             max_episodes=resolved["runtime"].get("max_episodes"),
             progress_interval=100,
-            action_normalizer=action_normalizer,
-            state_normalizer=state_normalizer,
         )
         if [clip.sample_id for clip in encoded.clips] != [clip.sample_id for clip in clips]:
             raise ValueError("encode clip order does not match scan clip index")
@@ -245,22 +367,43 @@ def encode_stage(
 
     required = (
         "embeddings.npy",
-        "raw_relations.npy",
         "visual_half_embeddings.npy",
         "state_sequences.npy",
         "action_sequences.npy",
         "visual_progress.npy",
-        "normalization.npz",
-        "projection_matrices.npz",
-        "relation_pca.npz",
+        "numeric_normalizers.npz",
+        "visual_pca.npz",
+        "frame_embeddings_index.json",
     )
+    max_episodes_value = resolved["runtime"].get("max_episodes")
+    max_episodes = int(max_episodes_value) if max_episodes_value is not None else None
+    expected_frame_episodes = _expected_frame_episodes(adapter, clips, max_episodes)
+    resume = bool(resolved["runtime"].get("resume", True)) and not force
+    aggregate_cache_valid = cache_is_valid(destination, fingerprint, required)
+    frame_cache_valid = False
+    if resume and aggregate_cache_valid:
+        try:
+            _validate_frame_embedding_cache(
+                destination,
+                expected_episodes=expected_frame_episodes,
+            )
+        except ValueError as error:
+            raise FileExistsError(
+                f"cocore frame embedding cache is incompatible: {destination}; "
+                "pass --force"
+            ) from error
+        frame_cache_valid = True
     publish_stage(
         destination,
         fingerprint=fingerprint,
         required=required,
         force=force,
-        resume=bool(resolved["runtime"].get("resume", True)),
+        resume=resume and frame_cache_valid,
         build=build,
+    )
+    _validate_frame_embedding_cache(
+        destination,
+        expected_episodes=expected_frame_episodes,
     )
     return (
         root,
@@ -1186,14 +1329,13 @@ def validate_output(
         "scan": ("episodes.parquet", "clips.parquet", "normalization.npz"),
         "encode": (
             "embeddings.npy",
-            "raw_relations.npy",
             "visual_half_embeddings.npy",
             "state_sequences.npy",
             "action_sequences.npy",
             "visual_progress.npy",
-            "normalization.npz",
-            "projection_matrices.npz",
-            "relation_pca.npz",
+            "numeric_normalizers.npz",
+            "visual_pca.npz",
+            "frame_embeddings_index.json",
         ),
         "graph": (
             "nodes.npz",
@@ -1217,6 +1359,19 @@ def validate_output(
             raise ValueError(f"invalid stage artifacts: {stage}")
         if run_manifest["stage_fingerprints"].get(stage) != manifest["fingerprint"]:
             raise ValueError(f"run/stage fingerprint mismatch: {stage}")
+    scan_clips = _load_clips(root / "scan" / "clips.parquet")
+    episode_rows = pq.read_table(root / "scan" / "episodes.parquet").to_pylist()
+    episode_lengths = {
+        int(row["episode_id"]): int(row["length"]) for row in episode_rows
+    }
+    ordered_episode_ids = list(dict.fromkeys(clip.episode_id for clip in scan_clips))
+    _validate_frame_embedding_cache(
+        root / "encode",
+        expected_episodes=[
+            (episode_id, episode_lengths[episode_id])
+            for episode_id in ordered_episode_ids
+        ],
+    )
     _validate_hierarchical_graph_artifacts(root)
     select_manifest = json.loads(required["select_manifest"].read_text(encoding="utf-8"))
     if select_manifest.get("producer") != "cocore":

@@ -248,6 +248,15 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
         },
     }
     assert "clip" not in config
+    assert "relation" not in config
+    assert "normalization" not in config
+    assert config["encoding"] == {
+        "visual_dim": 128,
+        "pca_fit_max_samples": None,
+        "quantile_low": 0.01,
+        "quantile_high": 0.99,
+        "epsilon": 1.0e-8,
+    }
     assert config["prototypes"]["method"] == "motion_primitives"
     assert config["objective"] == {"relation": "sequence", "relation_weight": 1.5}
     assert config["selection"]["ratio"] == 0.2

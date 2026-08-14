@@ -25,6 +25,13 @@ def test_config_requires_explicit_relation_and_weight() -> None:
 def test_config_accepts_supported_relations(relation: str) -> None:
     resolved = resolve_config(_objective(relation))
 
+    assert resolved["encoding"] == {
+        "visual_dim": 128,
+        "pca_fit_max_samples": None,
+        "quantile_low": 0.01,
+        "quantile_high": 0.99,
+        "epsilon": 1.0e-8,
+    }
     assert resolved["prototypes"]["method"] == "motion_primitives"
     assert resolved["reliability_metrics"] == ["support", "progress"]
     assert resolved["objective"] == {"relation": relation, "relation_weight": 1.0}
@@ -63,6 +70,45 @@ def test_config_rejects_clip_section_because_cocore_uses_fixed_windows() -> None
                 "clip": {"length": 15, "stride": 15},
             }
         )
+
+
+@pytest.mark.parametrize("obsolete", ["relation", "normalization"])
+def test_config_rejects_removed_encoding_sections_with_migration_message(
+    obsolete: str,
+) -> None:
+    with pytest.raises(ValueError, match=f"{obsolete}.*encoding"):
+        resolve_config(
+            {
+                **_objective(),
+                obsolete: {"epsilon": 1.0e-6},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "encoding",
+    [
+        {"visual_dim": 64},
+        {"visual_dim": 128.5},
+        {"visual_dim": "128"},
+        {"pca_fit_max_samples": 0},
+        {"pca_fit_max_samples": True},
+        {"quantile_low": -0.1},
+        {"quantile_low": 0.5, "quantile_high": 0.5},
+        {"quantile_high": 1.1},
+        {"epsilon": 0.0},
+        {"epsilon": True},
+        {"epsilon": float("nan")},
+    ],
+)
+def test_config_rejects_invalid_quality_style_encoding(encoding: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="encoding"):
+        resolve_config({**_objective(), "encoding": encoding})
+
+
+def test_config_rejects_non_mapping_encoding() -> None:
+    with pytest.raises(ValueError, match="encoding.*mapping"):
+        resolve_config({**_objective(), "encoding": 128})
 
 
 @pytest.mark.parametrize("obsolete", ["count", "top_r", "temperature"])
@@ -169,6 +215,15 @@ def test_shipped_configs_resolve_to_fixed_cocore_contract(path: str) -> None:
     config = load_config(path)
 
     assert "clip" not in config
+    assert "relation" not in config
+    assert "normalization" not in config
+    assert config["encoding"] == {
+        "visual_dim": 128,
+        "pca_fit_max_samples": None,
+        "quantile_low": 0.01,
+        "quantile_high": 0.99,
+        "epsilon": 1.0e-8,
+    }
     assert config["prototypes"]["method"] == "motion_primitives"
     assert set(config["prototypes"]) == {"method", "batch_size", "max_iter"}
     assert config["reliability_metrics"] == ["support", "progress"]

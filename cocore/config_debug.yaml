@@ -12,9 +12,12 @@ dataset:
 visual:
   encoder: dummy
 
-relation:
-  projection_dim: 8
-  output_dim: 32
+encoding:
+  visual_dim: 128
+  pca_fit_max_samples: null
+  quantile_low: 0.01
+  quantile_high: 0.99
+  epsilon: 1.0e-8
 
 prototypes:
   method: motion_primitives

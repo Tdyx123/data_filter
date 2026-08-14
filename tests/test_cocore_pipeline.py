@@ -81,6 +81,24 @@ class CocoreVisualEncoder:
         return np.stack([values + 1.0, values + 2.0, values + 4.0], axis=1)
 
 
+class FailingCocoreVisualEncoder:
+    output_dim = 3
+
+    def encode(self, images: np.ndarray) -> np.ndarray:
+        raise AssertionError(f"visual encoder should not run for {len(images)} cached frames")
+
+
+class InterruptingCocoreVisualEncoder(CocoreVisualEncoder):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def encode(self, images: np.ndarray) -> np.ndarray:
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError("injected cocore CLIP interruption")
+        return super().encode(images)
+
+
 class ReverseOrderCocorePipelineAdapter(CocorePipelineAdapter):
     def __init__(self, config: Mapping[str, object]) -> None:
         super().__init__(config)
@@ -97,7 +115,13 @@ def _config(tmp_path: Path, relation: str = "cooccurrence") -> dict[str, object]
             "use_images": True,
         },
         "visual": {"encoder": "dummy"},
-        "relation": {"projection_dim": 4, "output_dim": 8, "lags": [0, 1, 2, 4]},
+        "encoding": {
+            "visual_dim": 128,
+            "pca_fit_max_samples": None,
+            "quantile_low": 0.01,
+            "quantile_high": 0.99,
+            "epsilon": 1.0e-8,
+        },
         "quality": {"knn": 2},
         "graph": {"knn": 2, "similarity_threshold": 0.8, "cooccurrence_max_gap": 4},
         "objective": {"relation": relation, "relation_weight": 1.0},
@@ -113,6 +137,7 @@ def _config(tmp_path: Path, relation: str = "cooccurrence") -> dict[str, object]
 
 def test_encode_stage_publishes_cocore_visual_half_artifact(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    CocorePipelineAdapter.load_images_calls.clear()
     root = tmp_path / "cocore-encode"
 
     result_root, _, encoded = encode_stage(
@@ -122,6 +147,10 @@ def test_encode_stage_publishes_cocore_visual_half_artifact(tmp_path: Path) -> N
     )
 
     assert result_root == root
+    assert CocorePipelineAdapter.load_images_calls == [False, False, True]
+    embeddings = np.load(root / "encode" / "embeddings.npy")
+    assert embeddings.shape == (6, 159)
+    np.testing.assert_allclose(np.linalg.norm(embeddings, axis=1), 1.0, atol=1.0e-6)
     stored = np.load(root / "encode" / "visual_half_embeddings.npy")
     np.testing.assert_array_equal(stored, encoded.visual_half_embeddings)
     assert stored.shape == (6, 2, 3)
@@ -130,13 +159,58 @@ def test_encode_stage_publishes_cocore_visual_half_artifact(tmp_path: Path) -> N
         np.asarray([[4.5, 5.5, 7.5], [11.5, 12.5, 14.5]], dtype=np.float32),
     )
     manifest = json.loads((root / "encode" / "manifest.json").read_text())
+    index = json.loads((root / "encode" / "frame_embeddings_index.json").read_text())
     assert manifest["producer"] == "cocore"
+    assert manifest["encoding"] == "quality_fusion"
+    assert manifest["visual_embedding_dim"] == 128
+    assert manifest["embedding_dim"] == 159
+    assert manifest["counts"] == {
+        "candidate_fragments": 6,
+        "reference_fragments": 6,
+        "overlap_fragments": 6,
+        "pca_union_fragments": 6,
+        "encoded_episodes": 2,
+        "encoded_frames": 90,
+    }
     assert manifest["visual_half_embedding_dim"] == 3
     assert manifest["clip_length"] == 15
     assert manifest["clip_stride"] == 15
     assert manifest["clip_anchors"] == [0, 7, 14]
     assert manifest["visual_half_windows"] == [[0, 8], [7, 15]]
     assert manifest["visual_half_encoding"] == "mean"
+    assert [entry["episode_id"] for entry in index["episodes"]] == [0, 1]
+    assert [entry["frames"] for entry in index["episodes"]] == [45, 45]
+    for entry in index["episodes"]:
+        frame_path = root / "encode" / entry["path"]
+        frames = np.load(frame_path, allow_pickle=False)
+        assert frames.shape == (entry["frames"], 3)
+        assert frames.dtype == np.float32
+    assert (root / "encode" / "visual_pca.npz").is_file()
+    assert (root / "encode" / "numeric_normalizers.npz").is_file()
+    assert not (root / "encode" / "raw_relations.npy").exists()
+    assert not (root / "encode" / "projection_matrices.npz").exists()
+    assert not (root / "encode" / "relation_pca.npz").exists()
+
+    encode_stage(
+        _config(tmp_path),
+        output_dir=root,
+        visual_encoder=FailingCocoreVisualEncoder(),
+    )
+    assert CocorePipelineAdapter.load_images_calls == [False, False, True]
+
+
+def test_interrupted_encode_does_not_publish_partial_frame_cache(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    root = tmp_path / "interrupted-cocore"
+
+    with pytest.raises(RuntimeError, match="injected cocore CLIP interruption"):
+        encode_stage(
+            _config(tmp_path),
+            output_dir=root,
+            visual_encoder=InterruptingCocoreVisualEncoder(),
+        )
+
+    assert not (root / "encode").exists()
 
 
 @pytest.mark.parametrize("relation", ["cooccurrence", "sequence"])
@@ -160,7 +234,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     for directory in ("scan", "encode", "graph-12-motion-primitives"):
         manifest = json.loads((root / directory / "manifest.json").read_text())
         assert manifest["producer"] == "cocore"
-        assert manifest["cocore_version"] == "0.6.0"
+        assert manifest["cocore_version"] == "0.7.0"
     catalog = json.loads(
         (root / "graph-12-motion-primitives" / "prototype_catalog.json").read_text()
     )
@@ -238,7 +312,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     }
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.6.0"
+    assert run_manifest["cocore_version"] == "0.7.0"
     assert run_manifest["relation_type"] == relation
     assert run_manifest["relation_weight"] == 1.0
     assert run_manifest["prototype_schema_version"] == 3
@@ -394,6 +468,45 @@ def test_validate_rejects_missing_visual_half_embeddings_as_encode_artifact(
 
     with pytest.raises(ValueError, match="invalid stage artifacts: encode"):
         validate_output(result, config=config)
+
+
+@pytest.mark.parametrize("corruption", ["missing", "contents", "dtype", "shape"])
+def test_validate_rejects_corrupt_episode_frame_cache(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    encode_root = result.parent / "encode"
+    index = json.loads((encode_root / "frame_embeddings_index.json").read_text())
+    path = encode_root / index["episodes"][0]["path"]
+    values = np.load(path, allow_pickle=False)
+    if corruption == "missing":
+        path.unlink()
+    elif corruption == "contents":
+        values[0, 0] += np.float32(1.0)
+        np.save(path, values)
+    elif corruption == "dtype":
+        np.save(path, values.astype(np.float64))
+    else:
+        np.save(path, values[:-1])
+
+    with pytest.raises(ValueError, match="frame embedding"):
+        validate_output(result, config=config)
+
+
+def test_encode_cache_rejects_corrupt_episode_frame_cache_without_force(
+    tmp_path: Path,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    root, _, _ = encode_stage(config, visual_encoder=CocoreVisualEncoder())
+    index = json.loads((root / "encode" / "frame_embeddings_index.json").read_text())
+    (root / "encode" / index["episodes"][0]["path"]).unlink()
+
+    with pytest.raises(FileExistsError, match="frame embedding.*--force"):
+        encode_stage(config, visual_encoder=FailingCocoreVisualEncoder())
 
 
 def test_validate_rejects_tampered_visual_prototype_center(tmp_path: Path) -> None:

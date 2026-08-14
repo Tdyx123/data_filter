@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Mapping
-from numbers import Integral
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +18,6 @@ from relcore.config import resolve_config as resolve_relcore_config
 _SHARED_SECTIONS = (
     "dataset",
     "visual",
-    "normalization",
-    "relation",
     "quality",
     "prototypes",
     "graph",
@@ -29,6 +27,13 @@ _SHARED_SECTIONS = (
 DEFAULT_CONFIG: dict[str, Any] = {
     "seed": 42,
     **{section: copy.deepcopy(RELCORE_DEFAULT_CONFIG[section]) for section in _SHARED_SECTIONS},
+    "encoding": {
+        "visual_dim": 128,
+        "pca_fit_max_samples": None,
+        "quantile_low": 0.01,
+        "quantile_high": 0.99,
+        "epsilon": 1.0e-8,
+    },
     "reliability_metrics": ["support", "progress"],
     "objective": {},
     "selection": {
@@ -56,6 +61,17 @@ def _merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
 def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if "clip" in config:
         raise ValueError("cocore clip configuration was removed; windows are fixed to 15/15")
+    if "relation" in config:
+        raise ValueError(
+            "cocore relation encoding configuration was removed; use encoding instead"
+        )
+    if "normalization" in config:
+        raise ValueError(
+            "cocore normalization configuration was removed; use encoding instead"
+        )
+    configured_encoding = config.get("encoding")
+    if configured_encoding is not None and not isinstance(configured_encoding, Mapping):
+        raise ValueError("cocore encoding must be a mapping")
     configured_objective = config.get("objective")
     if isinstance(configured_objective, Mapping) and "cooccurrence_weight" in configured_objective:
         raise ValueError(
@@ -104,6 +120,45 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not math.isfinite(weight) or weight < 0.0:
         raise ValueError("objective.relation_weight must be finite and non-negative")
     resolved["objective"]["relation_weight"] = weight
+    encoding = resolved["encoding"]
+    visual_dim = encoding.get("visual_dim")
+    if (
+        isinstance(visual_dim, bool)
+        or not isinstance(visual_dim, Integral)
+        or visual_dim != 128
+    ):
+        raise ValueError("cocore encoding.visual_dim must be 128")
+    maximum = encoding.get("pca_fit_max_samples")
+    if maximum is not None and (
+        isinstance(maximum, bool) or not isinstance(maximum, Integral) or maximum <= 0
+    ):
+        raise ValueError(
+            "cocore encoding.pca_fit_max_samples must be a positive integer or null"
+        )
+    encoding["pca_fit_max_samples"] = None if maximum is None else int(maximum)
+    low_value = encoding.get("quantile_low")
+    high_value = encoding.get("quantile_high")
+    epsilon_value = encoding.get("epsilon")
+    if any(
+        isinstance(value, bool) or not isinstance(value, Real)
+        for value in (low_value, high_value, epsilon_value)
+    ):
+        raise ValueError("cocore encoding quantiles and epsilon must be numeric")
+    low = float(low_value)
+    high = float(high_value)
+    epsilon = float(epsilon_value)
+    if not 0.0 <= low < high <= 1.0:
+        raise ValueError("cocore encoding quantiles must satisfy 0 <= low < high <= 1")
+    if not math.isfinite(epsilon) or epsilon <= 0.0:
+        raise ValueError("cocore encoding.epsilon must be finite and positive")
+    encoding.update(
+        {
+            "visual_dim": 128,
+            "quantile_low": low,
+            "quantile_high": high,
+            "epsilon": epsilon,
+        }
+    )
     ratio = float(resolved["selection"]["ratio"])
     if not 0.0 < ratio <= 1.0:
         raise ValueError("selection.ratio must be in (0, 1]")

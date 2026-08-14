@@ -1,12 +1,15 @@
 # Cocore：运动原语关系筛选
 
 Cocore 从 LeRobot v2 LIBERO episode 中选择固定预算的 15 帧片段。它复用 RelCore
-的通用编码组件和稀疏图能力，但独立管理编码流水线、两级动作原型、配置、缓存与输出
-产物。
+的片段索引和稀疏图能力，但独立管理 Quality 风格编码流水线、两级动作原型、配置、
+缓存与输出产物；运行时代码不依赖 `quality_filter` 或 `segment_filter_core`。
 
-每个 15 帧片段固定拆为共享中间帧的前半 `[0..7]` 和后半 `[7..14]`。一次图像遍历和
-一次视觉模型前向同时生成原有关系 embedding，以及两个半片段各自 8 帧视觉特征的直接
-均值。关系 embedding 继续用于可靠性和相似图；纯视觉均值只用于二级动作聚类。
+编码先按全数据 1%/99% 分位将 action 和向量 observation 缩放到 `[0,1]`。每个
+episode 只执行一次视觉模型前向；候选与 reference 片段的视觉特征
+`[sum(v0..v14), v14-v0]` 在去重并集上拟合 128 维 PCA，再与 state/action 的
+`mean/std/max` 及 `start/episode_length` 拼接并做行 L2 归一化。该 embedding 用于
+可靠性 support 和相似图。每个片段仍固定拆为共享中间帧的前半 `[0..7]` 和后半
+`[7..14]`，两个半片段各自 8 帧视觉特征的直接均值只用于二级动作聚类。
 
 动作原型分为两级。一级直接分类每个片段的 `[0→7]` 和 `[7→14]` 两个动作，因此动作
 占比的统计母体固定为 `2 * 片段数`，不再对 episode 做逐时步 horizon 采样。一级严格
@@ -72,6 +75,13 @@ python -m cocore run --config cocore/config_libero90.yaml
 配置必须显式声明关系类型与权重：
 
 ```yaml
+encoding:
+  visual_dim: 128
+  pca_fit_max_samples: null
+  quantile_low: 0.01
+  quantile_high: 0.99
+  epsilon: 1.0e-8
+
 objective:
   relation: cooccurrence  # 或 sequence
   relation_weight: 1.0
@@ -82,7 +92,9 @@ prototypes:
   max_iter: 100
 ```
 
-片段长度与步长是 Cocore 固定算法的一部分，均为 15；配置中不再接受 `clip` section。
+片段长度与步长是 Cocore 固定算法的一部分，均为 15；配置中不接受 `clip` section。
+Quality 风格编码取代了旧关系编码，因此不再接受顶层 `relation` 或 `normalization`；
+`encoding.visual_dim` 固定为 128，`pca_fit_max_samples` 可限制 PCA 拟合样本数。
 二级 K/M、Top-M 和距离权重范围是 Cocore 固定算法，不接受 RelCore 的
 `count`、`top_r` 或 `temperature` 配置。
 
@@ -106,9 +118,9 @@ RelCore 的 `--reliability-metrics`、`--prototype-method` 或
 python -m cocore run --config cocore/config_debug.yaml --force
 ```
 
-Cocore 0.6.0 引入独立编码流水线、半片段视觉均值二级聚类和 catalog v3。0.5.x 及更早
-版本生成的 encode、graph 和 selection 缓存不能继续复用或校验；保留原输出目录时需要
-通过 `--force` 重新生成。
+Cocore 0.7.0 将主 embedding 切换为独立实现的 Quality 融合编码，并按 episode
+持久化完整逐帧 CLIP 特征。0.6.x 及更早版本生成的 encode、graph 和 selection 缓存
+不能继续复用或校验；保留原输出目录时需要通过 `--force` 重新生成。
 
 ## 输出与校验
 
@@ -117,6 +129,11 @@ Cocore 0.6.0 引入独立编码流水线、半片段视觉均值二级聚类和 
 
 - graph 目录中的 `prototype_catalog.json` 与 `prototype_centers.npy`：动作类别、
   半片段二级聚类诊断和按叶原型 ID 对齐的视觉中心；
+- encode 目录中的 `embeddings.npy`、`visual_pca.npz` 和
+  `numeric_normalizers.npz`：Quality 融合 embedding 及其可重放参数；
+- encode 目录中的 `frame_embeddings/ep<episode_id>.npy`：每个有效 episode 的完整
+  `[帧数, CLIP 维度]`、`float32` 逐帧特征；`frame_embeddings_index.json` 记录顺序、
+  shape 和 SHA-256；短于 15 帧的 episode 不写入缓存；
 - encode 目录中的 `visual_half_embeddings.npy`：`[片段, 前后半, 视觉维度]` 的 8 帧
   均值；graph 目录中的 `half_action_labels.npy` 是离线强校验使用的内部原始动作标签；
 
@@ -133,6 +150,9 @@ python -m cocore validate \
   --output-dir outputs/cocore/libero90/select-cooccurrence-w1-top10pct \
   --config cocore/config_libero90.yaml
 ```
+
+校验还会逐个检查帧缓存文件集合、shape、dtype、有限值和 SHA-256。编码中断时临时
+缓存会被清理，下次从头执行；只有完整发布的 encode 阶段才会被复用。
 
 当前版本只支持本仓库约定的 8 维 LIBERO `observation.state`；一级动作不会退回全局
 KMeans，二级聚类固定依赖半片段视觉均值。selection 的 parquet/JSONL 不导出内部前后

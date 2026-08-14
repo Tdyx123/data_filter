@@ -1,18 +1,37 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
+from pathlib import Path
 
 import numpy as np
+import pytest
 
-from cocore.encoding import encode_cocore_dataset, visual_half_means
-from relcore.features.encoding import encode_dataset as encode_relcore_dataset
+from cocore.encoding import (
+    CocoreNumericNormalizers,
+    CocorePCAProjector,
+    encode_cocore_dataset,
+    fuse_fragment_features,
+    reference_windows,
+    temporal_pool,
+    visual_fragment_feature,
+    visual_half_means,
+)
+from segment_filter_core.encoding import (
+    NumericNormalizers,
+    PCAProjector,
+    fuse_fragment_features as reference_fuse_fragment_features,
+)
+from segment_filter_core.windows import (
+    candidate_windows,
+    reference_windows as reference_quality_windows,
+)
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
 
 
 class _EncodingAdapter(DatasetAdapter):
     def __init__(self) -> None:
         self._records = (
-            EpisodeRecord(0, 31, 0, "task zero"),
+            EpisodeRecord(0, 46, 0, "task zero"),
             EpisodeRecord(1, 15, 1, "task one"),
         )
         self.load_images_calls: list[bool] = []
@@ -85,38 +104,140 @@ def test_visual_half_means_share_the_middle_frame() -> None:
     )
 
 
-def test_cocore_encoder_matches_relation_encoding_and_adds_visual_halves() -> None:
-    relcore = encode_relcore_dataset(
-        _EncodingAdapter(),
-        _CountingVisualEncoder(),
-        projection_dim=4,
-        output_dim=8,
-        lags=(0, 1, 2, 4),
-        seed=17,
+def test_quality_style_primitives_match_shared_reference() -> None:
+    actions = np.asarray(
+        [[-5.0, 2.0], [0.0, 4.0], [5.0, 8.0], [10.0, 16.0]],
+        dtype=np.float32,
     )
+    observations = {
+        "state.a": np.asarray([[-10.0], [0.0], [10.0], [20.0]], dtype=np.float32),
+        "state.b": np.asarray([1.0, 3.0, 5.0, 9.0], dtype=np.float32),
+    }
+    episodes = [(actions, observations)]
+
+    actual_normalizers = CocoreNumericNormalizers.fit(
+        episodes,
+        ("state.a", "state.b"),
+        quantile_low=0.25,
+        quantile_high=0.75,
+        epsilon=1.0e-8,
+    )
+    reference_normalizers = NumericNormalizers.fit(
+        episodes,
+        ("state.a", "state.b"),
+        quantile_low=0.25,
+        quantile_high=0.75,
+        epsilon=1.0e-8,
+    )
+    np.testing.assert_array_equal(
+        actual_normalizers.action(actions), reference_normalizers.action(actions)
+    )
+    np.testing.assert_array_equal(
+        actual_normalizers.state(observations), reference_normalizers.state(observations)
+    )
+
+    raw = np.arange(42, dtype=np.float32).reshape(7, 6)
+    actual_projector = CocorePCAProjector(output_dim=8, seed=17)
+    reference_projector = PCAProjector(output_dim=8, seed=17)
+    np.testing.assert_allclose(
+        actual_projector.fit_transform(raw, max_samples=5),
+        reference_projector.fit_transform(raw, max_samples=5),
+        atol=1.0e-6,
+    )
+    assert reference_windows(46) == reference_quality_windows(46)
+
+
+def test_quality_style_pca_requires_positive_output_dimension() -> None:
+    with pytest.raises(ValueError, match="output_dim must be positive"):
+        CocorePCAProjector(output_dim=0)
+
+
+def test_cocore_encoder_uses_quality_fusion_and_caches_episode_frames(
+    tmp_path: Path,
+) -> None:
     adapter = _EncodingAdapter()
     visual = _CountingVisualEncoder()
+    cache = tmp_path / "frame_embeddings"
 
     cocore = encode_cocore_dataset(
         adapter,
         visual,
-        projection_dim=4,
-        output_dim=8,
-        lags=(0, 1, 2, 4),
+        visual_dim=128,
+        pca_fit_max_samples=None,
+        quantile_low=0.01,
+        quantile_high=0.99,
+        epsilon=1.0e-8,
         seed=17,
+        frame_cache_dir=cache,
     )
 
     assert adapter.load_images_calls == [False, True]
-    assert visual.episode_lengths == [31, 15]
-    assert [clip.sample_id for clip in cocore.clips] == [
-        clip.sample_id for clip in relcore.clips
+    assert visual.episode_lengths == [46, 15]
+    assert [clip.start_step for clip in cocore.clips] == [0, 15, 30, 31, 0]
+    assert cocore.embeddings.shape == (5, 159)
+    np.testing.assert_allclose(
+        np.linalg.norm(cocore.embeddings, axis=1), 1.0, atol=1.0e-6
+    )
+    assert [(entry.episode_id, entry.frames, entry.embedding_dim) for entry in cocore.frame_embeddings] == [
+        (0, 46, 3),
+        (1, 15, 3),
     ]
-    np.testing.assert_array_equal(cocore.raw_relations, relcore.raw_relations)
-    np.testing.assert_array_equal(cocore.embeddings, relcore.embeddings)
-    np.testing.assert_array_equal(cocore.state_sequences, relcore.state_sequences)
-    np.testing.assert_array_equal(cocore.action_sequences, relcore.action_sequences)
-    np.testing.assert_array_equal(cocore.visual_progress, relcore.visual_progress)
-    assert cocore.visual_half_embeddings.shape == (4, 2, 3)
+    frame_features = {
+        entry.episode_id: np.load(cache / entry.filename, allow_pickle=False)
+        for entry in cocore.frame_embeddings
+    }
+    assert frame_features[0].shape == (46, 3)
+    assert frame_features[0].dtype == np.float32
+    np.testing.assert_array_equal(
+        frame_features[0][0], np.asarray([1.0, 2.0, 4.0], dtype=np.float32)
+    )
+
+    union_raw: list[np.ndarray] = []
+    union_positions: dict[tuple[int, int, int], int] = {}
+    for record in adapter.episodes():
+        windows = sorted(
+            set(candidate_windows(record.length))
+            | set(reference_quality_windows(record.length))
+        )
+        for start, end in windows:
+            union_positions[(record.episode_id, start, end)] = len(union_raw)
+            union_raw.append(
+                visual_fragment_feature(frame_features[record.episode_id][start : end + 1])
+            )
+    visual_projected = PCAProjector(output_dim=128, seed=17).fit_transform(
+        np.stack(union_raw)
+    )
+    candidate_visual = visual_projected[
+        np.asarray(
+            [
+                union_positions[(clip.episode_id, clip.start_step, clip.end_step)]
+                for clip in cocore.clips
+            ]
+        )
+    ]
+    state_pooled = np.stack([temporal_pool(values) for values in cocore.state_sequences])
+    action_pooled = np.stack([temporal_pool(values) for values in cocore.action_sequences])
+    lengths = {record.episode_id: record.length for record in adapter.episodes()}
+    positions = np.asarray(
+        [clip.start_step / lengths[clip.episode_id] for clip in cocore.clips],
+        dtype=np.float32,
+    )
+    _, expected = reference_fuse_fragment_features(
+        candidate_visual,
+        state_pooled,
+        action_pooled,
+        positions,
+    )
+    np.testing.assert_allclose(cocore.embeddings, expected, atol=1.0e-6)
+    _, local_expected = fuse_fragment_features(
+        candidate_visual,
+        state_pooled,
+        action_pooled,
+        positions,
+    )
+    np.testing.assert_array_equal(cocore.embeddings, local_expected)
+
+    assert cocore.visual_half_embeddings.shape == (5, 2, 3)
     np.testing.assert_array_equal(
         cocore.visual_half_embeddings[0],
         np.asarray([[4.5, 5.5, 7.5], [11.5, 12.5, 14.5]], dtype=np.float32),
