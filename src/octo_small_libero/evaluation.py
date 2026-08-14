@@ -1547,7 +1547,6 @@ def _replay_episode_frames(
         raise EvaluationError("Video replay requires exactly one environment")
     yield _frame_from_observation(values[0])
 
-    reproduced_success = False
     for step, action in enumerate(actions, start=1):
         action_array = np.asarray(action, dtype=np.float32)
         if action_array.shape != (ACTION_DIM,):
@@ -1564,20 +1563,16 @@ def _replay_episode_frames(
                 f"LIBERO video replay success shape is {successes.shape}; expected {(1,)}"
             )
         succeeded = bool(successes[0])
-        if succeeded and not expected_success:
-            raise EvaluationError(f"Failed episode reproduced success at step {step}")
-        if succeeded and step != len(actions):
-            raise EvaluationError(
-                f"Successful episode reproduced success early at step {step}; "
-                f"expected step {len(actions)}"
-            )
-        reproduced_success |= succeeded
         values = observation_batch_to_list(observations)
         if len(values) != 1:
             raise EvaluationError("Video replay requires exactly one observation")
+        if succeeded and not expected_success:
+            raise EvaluationError(f"Failed episode reproduced success at step {step}")
         yield _frame_from_observation(values[0])
+        if succeeded:
+            return
 
-    if expected_success and not reproduced_success:
+    if expected_success:
         raise EvaluationError(
             f"Successful episode did not reproduce success after {len(actions)} steps"
         )

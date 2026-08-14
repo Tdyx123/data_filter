@@ -610,6 +610,44 @@ def test_replay_frames_rejects_a_success_that_does_not_reproduce():
         )
 
 
+def test_replay_frames_stop_at_first_reproduced_success():
+    environment = _ReplayVideoEnvironment()
+    environment.success_after = 1
+    observations = environment._observations(0)
+    actions = [np.zeros(7, dtype=np.float32) for _ in range(2)]
+
+    frames = list(
+        evaluation_module._replay_episode_frames(
+            environment,
+            observations,
+            actions,
+            expected_success=True,
+        )
+    )
+
+    assert len(frames) == 2
+    assert np.all(frames[0] == 0)
+    assert np.all(frames[1] == 1)
+    assert environment.step_count == 1
+
+
+def test_replay_frames_reject_success_for_failed_episode():
+    environment = _ReplayVideoEnvironment()
+    environment.success_after = 1
+    observations = environment._observations(0)
+    actions = [np.zeros(7, dtype=np.float32) for _ in range(2)]
+
+    with pytest.raises(EvaluationError, match="Failed episode reproduced success at step 1"):
+        list(
+            evaluation_module._replay_episode_frames(
+                environment,
+                observations,
+                actions,
+                expected_success=False,
+            )
+        )
+
+
 def test_video_settings_require_path_and_positive_limit(tmp_path):
     evaluation_module._validate_video_settings(EvaluationSettings())
     evaluation_module._validate_video_settings(
