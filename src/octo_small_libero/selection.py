@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from libero_lerobot.prefiltered import (
+    DATAMIL_TRAJECTORY_REQUIRED_FIELDS,
     PREFILTERED_REQUIRED_FIELDS,
     PrefilteredPriorSelection,
     PriorSelectionError,
@@ -30,6 +31,7 @@ def resolve_prior_selection(
 
 
 __all__ = [
+    "DATAMIL_TRAJECTORY_REQUIRED_FIELDS",
     "LeRobotV2Metadata",
     "PREFILTERED_REQUIRED_FIELDS",
     "PrefilteredPriorSelection",

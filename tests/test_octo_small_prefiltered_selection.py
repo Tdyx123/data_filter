@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -122,6 +123,47 @@ def test_prefiltered_selection_reads_jsonl_and_ignores_extra_fields(tmp_path):
     assert selection.input_format == "jsonl"
     assert selection.selected_fragments == 2
     assert selection.frame_indices == (*range(2, 11), *range(44, 53))
+
+
+def test_prefiltered_selection_reads_datamil_trajectories_in_source_order(tmp_path):
+    metadata = _metadata(tmp_path)
+    path = tmp_path / "selected_topk0.2.jsonl"
+    rows = [
+        {
+            "trajectory_id": 1,
+            "num_frames": 40,
+            "demo_id": "demo_1",
+            "rank": 1,
+            "score": -0.25,
+            "frame_weight": 1.0,
+        },
+        {
+            "trajectory_id": 0,
+            "num_frames": 40,
+            "demo_id": "demo_0",
+            "rank": 2,
+        },
+    ]
+    path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    selection = _load(path, metadata)
+
+    assert selection.input_format == "jsonl"
+    assert selection.selected_fragments == 2
+    assert selection.selected_episodes == 2
+    assert selection.frame_indices == (*range(40, 80), *range(40))
+    assert selection.training_starts == 80
+    assert selection.source_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    manifest = selection.as_manifest()
+    assert manifest["mode"] == "prefiltered_trajectories"
+    assert manifest["source_schema"] == "datamil_trajectory"
+    assert manifest["required_fields"] == ["trajectory_id", "num_frames"]
+    assert manifest["selected_trajectories"] == 2
+    assert "selected_fragments" not in manifest
+    assert _load(path, metadata).selection_sha256 == selection.selection_sha256
 
 
 def test_prefiltered_selection_accepts_fragments_shorter_than_action_horizon(
@@ -299,4 +341,82 @@ def test_prefiltered_selection_rejects_invalid_files(
     path.write_text(content, encoding="utf-8")
 
     with pytest.raises(selection_module.PriorSelectionError, match=message):
+        _load(path, metadata)
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    [
+        ([{"trajectory_id": 0}], "missing required fields.*num_frames.*line 1"),
+        (
+            [{"trajectory_id": "one", "num_frames": 40}],
+            "invalid integer.*trajectory_id.*line 1",
+        ),
+        (
+            [{"trajectory_id": "0", "num_frames": 40}],
+            "invalid integer.*trajectory_id.*line 1",
+        ),
+        (
+            [{"trajectory_id": 0, "num_frames": "40"}],
+            "invalid integer.*num_frames.*line 1",
+        ),
+        (
+            [{"trajectory_id": 0, "num_frames": True}],
+            "invalid integer.*num_frames.*line 1",
+        ),
+        (
+            [
+                {"trajectory_id": 0, "num_frames": 40},
+                {"trajectory_id": 0, "num_frames": 40},
+            ],
+            "duplicate trajectory_id=0.*line 2",
+        ),
+        (
+            [{"trajectory_id": 9, "num_frames": 40}],
+            "unknown trajectory_id=9.*line 1",
+        ),
+        (
+            [{"trajectory_id": 0, "num_frames": 0}],
+            "num_frames must be positive.*line 1",
+        ),
+        (
+            [{"trajectory_id": 0, "num_frames": 39}],
+            "num_frames=39 does not match episode 0 length=40.*line 1",
+        ),
+        (
+            [
+                {"trajectory_id": 0, "num_frames": 40},
+                {"episode_id": 1, "start_step": 0, "end_step": 39},
+            ],
+            "cannot mix fragment and DataMIL trajectory schemas.*line 2",
+        ),
+    ],
+)
+def test_prefiltered_selection_rejects_invalid_datamil_trajectories(
+    tmp_path,
+    rows,
+    message,
+):
+    metadata = _metadata(tmp_path)
+    path = tmp_path / "invalid_datamil.jsonl"
+    path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(selection_module.PriorSelectionError, match=message):
+        _load(path, metadata)
+
+
+def test_prefiltered_selection_does_not_treat_datamil_csv_as_trajectory_input(
+    tmp_path,
+):
+    metadata = _metadata(tmp_path)
+    path = tmp_path / "selected.csv"
+    path.write_text("trajectory_id,num_frames\n0,40\n", encoding="utf-8")
+
+    with pytest.raises(
+        selection_module.PriorSelectionError,
+        match="prefiltered CSV is missing required fields",
+    ):
         _load(path, metadata)

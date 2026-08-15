@@ -352,6 +352,26 @@ bash scripts/train_libero_octo_small_4x4090.sh \
   --resume latest
 ```
 
+DataMIL 的整轨 Top-K 清单也通过同一个参数传入，但仅支持 JSONL。每行必须包含
+`trajectory_id` 和 `num_frames`；训练端将 `trajectory_id` 映射到同号的 LeRobot
+`episode_index`，并把该 episode 的 `0..num_frames-1` 全部帧作为训练起点。
+`num_frames` 必须与 `libero90/meta/episodes.jsonl` 中记录的 episode 长度完全一致；
+重复轨迹、未知 ID、非正帧数、长度不一致或与片段 schema 混用都会在预检时报错。
+`rank`、`score`、`frame_weight`、`demo_id` 等附加字段被忽略，输入文件不会被改写。
+
+例如，显式使用 DataMIL Top 20% 的整轨选择训练单任务模型：
+
+```bash
+bash scripts/train_libero_octo_small_4x4090.sh \
+  --task-index 5 \
+  --prior-prefiltered-scores /data/dwb/libero_filter/datamil/selected_topk0.2.jsonl \
+  --output-dir outputs/octo_small_libero_task-5_datamil-top20pct
+```
+
+manifest 会把这类输入记录为 `prefiltered_trajectories`，保留原始 JSONL 的绝对
+路径和 SHA256，并记录选中轨迹数、episode 数与展开后的训练起点数。传统
+`episode_id/start_step/end_step` CSV/JSONL 的 manifest 和训练语义保持不变。
+
 #### 批量扫描 TDUS 权重
 
 `weights.jsonl` 中每一行可以作为一组独立的
