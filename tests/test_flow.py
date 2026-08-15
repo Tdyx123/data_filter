@@ -103,6 +103,47 @@ def test_bfloat16_action_head_forward_and_backward_has_consistent_dtypes():
     prediction.float().square().mean().backward()
 
 
+def test_masked_zero_context_padding_is_numerically_equivalent():
+    torch.manual_seed(29)
+    head = tiny_head().eval()
+    with torch.no_grad():
+        for parameter in head.parameters():
+            parameter.normal_(mean=0.0, std=0.05)
+
+    noisy_actions = torch.randn(2, 8, 7)
+    state = torch.randn(2, 8)
+    timestep = torch.rand(2)
+    context = torch.randn(2, 74, 16)
+    context_mask = torch.ones(2, 74, dtype=torch.bool)
+    context_mask[:, 3] = False
+    padded_context = torch.cat(
+        [context, torch.zeros(2, 22, 16)],
+        dim=1,
+    )
+    padded_mask = torch.cat(
+        [context_mask, torch.zeros(2, 22, dtype=torch.bool)],
+        dim=1,
+    )
+
+    with torch.no_grad():
+        original = head(
+            noisy_actions,
+            state,
+            timestep,
+            context,
+            context_mask,
+        )
+        padded = head(
+            noisy_actions,
+            state,
+            timestep,
+            padded_context,
+            padded_mask,
+        )
+
+    torch.testing.assert_close(original, padded, rtol=1.0e-5, atol=1.0e-6)
+
+
 def test_euler_denoise_uses_the_supplied_generator_for_initial_noise():
     torch.manual_seed(19)
     head = tiny_head().eval()

@@ -39,7 +39,7 @@ model:
     action_head_enabled: true
     backend: inductor
     mode: default
-    dynamic: true
+    dynamic: false
     fullgraph: false
   lora:
     rank: 16

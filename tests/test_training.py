@@ -250,4 +250,11 @@ def test_runtime_metadata_records_resolved_attention_and_compile_targets(monkeyp
     assert metadata["context_forward"] == "backbone"
     assert metadata["torch_compile"]["backbone_enabled"] is False
     assert metadata["torch_compile"]["action_head_enabled"] is True
+    assert metadata["torch_compile"]["dynamic"] is False
+    assert metadata["torch_compile"]["action_head_context_buckets"] == [
+        96,
+        192,
+        384,
+        512,
+    ]
     assert metadata["effective_batch_size"] == 64

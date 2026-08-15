@@ -25,6 +25,7 @@ from .data import (
     compute_quantile_stats,
 )
 from .modeling import (
+    ACTION_HEAD_CONTEXT_BUCKETS,
     Qwen3VLGrootPolicy,
     compile_policy_modules,
     resolve_compile_targets,
@@ -121,6 +122,11 @@ def _runtime_metadata(config: dict[str, Any], *, world_size: int) -> dict[str, A
             "mode": compile_config.get("mode"),
             "dynamic": compile_config.get("dynamic"),
             "fullgraph": compile_config.get("fullgraph"),
+            "action_head_context_buckets": (
+                list(ACTION_HEAD_CONTEXT_BUCKETS)
+                if compile_action_head and compile_config.get("dynamic") is False
+                else None
+            ),
         },
         "effective_batch_size": (
             int(train_config["micro_batch_size"])

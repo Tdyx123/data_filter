@@ -395,12 +395,18 @@ class CompileRecorder:
         self.calls.append(kwargs)
 
 
+class CompilePolicyRecorder:
+    def __init__(self):
+        self.backbone = CompileRecorder()
+        self.action_head = CompileRecorder()
+        self.static_context_buckets_enabled = False
+
+    def enable_static_action_head_context_buckets(self):
+        self.static_context_buckets_enabled = True
+
+
 def test_compile_policy_modules_compiles_backbone_and_action_head_in_place():
-    policy = type(
-        "Policy",
-        (),
-        {"backbone": CompileRecorder(), "action_head": CompileRecorder()},
-    )()
+    policy = CompilePolicyRecorder()
     compile_config = {
         "torch_compile": {
             "enabled": True,
@@ -422,11 +428,7 @@ def test_compile_policy_modules_compiles_backbone_and_action_head_in_place():
 
 
 def test_compile_policy_modules_can_compile_only_the_action_head():
-    policy = type(
-        "Policy",
-        (),
-        {"backbone": CompileRecorder(), "action_head": CompileRecorder()},
-    )()
+    policy = CompilePolicyRecorder()
     compile_config = {
         "torch_compile": {
             "enabled": True,
@@ -444,14 +446,11 @@ def test_compile_policy_modules_can_compile_only_the_action_head():
     assert resolve_compile_targets(compile_config) == (False, True)
     assert policy.backbone.calls == []
     assert len(policy.action_head.calls) == 1
+    assert policy.static_context_buckets_enabled is False
 
 
 def test_qwen_libero_default_compiles_only_the_action_head():
-    policy = type(
-        "Policy",
-        (),
-        {"backbone": CompileRecorder(), "action_head": CompileRecorder()},
-    )()
+    policy = CompilePolicyRecorder()
     config = load_config(
         PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
     )
@@ -463,10 +462,142 @@ def test_qwen_libero_default_compiles_only_the_action_head():
         {
             "backend": "inductor",
             "mode": "default",
-            "dynamic": True,
+            "dynamic": False,
             "fullgraph": False,
         }
     ]
+    assert policy.static_context_buckets_enabled is True
+
+
+class RecordingActionHead(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(()))
+        self.compile_calls = []
+        self.context = None
+        self.context_attention_mask = None
+
+    def compile(self, **kwargs):
+        self.compile_calls.append(kwargs)
+
+    def forward(
+        self,
+        noisy_actions,
+        state,
+        timestep,
+        context,
+        context_attention_mask,
+    ):
+        del state, timestep
+        self.context = context.detach().clone()
+        self.context_attention_mask = context_attention_mask.detach().clone()
+        return torch.zeros_like(noisy_actions)
+
+
+def _tiny_action_head_policy(*, compile_action_head=True):
+    config = _tiny_policy_config("backbone")
+    config["model"]["max_context_tokens"] = 512
+    config["model"]["torch_compile"] = {
+        "enabled": False,
+        "backbone_enabled": False,
+        "action_head_enabled": compile_action_head,
+        "backend": "inductor",
+        "mode": "default",
+        "dynamic": False,
+        "fullgraph": False,
+    }
+    policy = Qwen3VLGrootPolicy(
+        backbone=FakePeftBackbone(),
+        processor=FakeProcessor(),
+        stats=QuantileStats(
+            state_q01=np.zeros(8),
+            state_q99=np.ones(8),
+            action_q01=np.zeros(7),
+            action_q99=np.ones(7),
+        ),
+        config=config,
+    )
+    policy.action_head = RecordingActionHead()
+    compile_policy_modules(policy, config["model"])
+    return policy
+
+
+@pytest.mark.parametrize(
+    ("context_tokens", "expected_bucket"),
+    [(74, 96), (90, 96), (97, 192), (193, 384), (385, 512)],
+)
+def test_static_action_head_compile_pads_context_to_bounded_bucket(
+    context_tokens,
+    expected_bucket,
+):
+    policy = _tiny_action_head_policy()
+    context = torch.arange(
+        context_tokens * 16,
+        dtype=torch.float32,
+    ).reshape(1, context_tokens, 16)
+    context_mask = torch.ones(1, context_tokens, dtype=torch.bool)
+    context_mask[:, 1] = False
+
+    policy.flow_loss_from_context(
+        context=context,
+        context_attention_mask=context_mask,
+        state=torch.zeros(1, 8),
+        actions=torch.zeros(1, 8, 7),
+        action_mask=torch.ones(1, 8),
+    )
+
+    recorded = policy.action_head
+    assert recorded.context.shape == (1, expected_bucket, 16)
+    torch.testing.assert_close(recorded.context[:, :context_tokens], context)
+    assert torch.count_nonzero(recorded.context[:, context_tokens:]) == 0
+    torch.testing.assert_close(
+        recorded.context_attention_mask[:, :context_tokens],
+        context_mask,
+    )
+    assert not recorded.context_attention_mask[:, context_tokens:].any()
+
+
+def test_uncompiled_action_head_keeps_original_context_shape():
+    policy = _tiny_action_head_policy(compile_action_head=False)
+    context = torch.randn(1, 74, 16)
+    context_mask = torch.ones(1, 74, dtype=torch.bool)
+
+    policy.flow_loss_from_context(
+        context=context,
+        context_attention_mask=context_mask,
+        state=torch.zeros(1, 8),
+        actions=torch.zeros(1, 8, 7),
+        action_mask=torch.ones(1, 8),
+    )
+
+    assert policy.action_head.context.shape == (1, 74, 16)
+    assert policy.action_head.context_attention_mask.shape == (1, 74)
+    assert policy.action_head.compile_calls == []
+
+
+@pytest.mark.parametrize(
+    ("context_shape", "mask_shape", "message"),
+    [
+        ((1, 74), (1, 74), "context must have shape"),
+        ((1, 74, 16), (1, 74, 1), "context_attention_mask must have shape"),
+        ((2, 74, 16), (1, 74), "batch dimensions differ"),
+        ((1, 74, 16), (1, 73), "sequence dimensions differ"),
+        ((1, 74, 15), (1, 74), "context feature dimension differs"),
+        ((1, 513, 16), (1, 513), "exceeds largest supported"),
+    ],
+)
+def test_static_action_head_context_buckets_validate_context_and_mask_shapes(
+    context_shape,
+    mask_shape,
+    message,
+):
+    policy = _tiny_action_head_policy()
+
+    with pytest.raises(ValueError, match=message):
+        policy._bucket_action_head_context(
+            torch.zeros(context_shape),
+            torch.ones(mask_shape, dtype=torch.bool),
+        )
 
 
 def test_disabling_qwen_gradient_checkpointing_calls_disable():

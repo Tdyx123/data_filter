@@ -39,6 +39,8 @@ _TEXT_LORA_PARAMETER_PATH = re.compile(
     r"(?:self_attn|linear_attn|mlp)\.[^.]+\.lora_"
 )
 
+ACTION_HEAD_CONTEXT_BUCKETS = (96, 192, 384, 512)
+
 
 def _configure_qwen_gradient_checkpointing(
     backbone: nn.Module,
@@ -352,6 +354,8 @@ def compile_policy_modules(policy: Any, model_config: dict[str, Any]) -> None:
     if compile_backbone:
         policy.backbone.compile(**compile_kwargs)
     if compile_action_head:
+        if not compile_kwargs["dynamic"]:
+            policy.enable_static_action_head_context_buckets()
         policy.action_head.compile(**compile_kwargs)
 
 
@@ -377,7 +381,9 @@ class Qwen3VLGrootPolicy(nn.Module):
         self.noise_s = float(flow["noise_s"])
         self.default_denoising_steps = int(flow["denoising_steps"])
         self.max_context_tokens = int(model["max_context_tokens"])
+        self.context_dim = int(model["context_dim"])
         self.context_forward = str(model.get("context_forward", "causal_lm"))
+        self._static_action_head_context_buckets_enabled = False
 
         dit = model["dit"]
         self.action_head = FlowMatchingActionHead(
@@ -473,6 +479,85 @@ class Qwen3VLGrootPolicy(nn.Module):
 
     def action_head_parameters(self) -> list[nn.Parameter]:
         return list(self.action_head.parameters())
+
+    def enable_static_action_head_context_buckets(self) -> None:
+        self._static_action_head_context_buckets_enabled = True
+
+    def _bucket_action_head_context(
+        self,
+        context: torch.Tensor,
+        context_attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if context.ndim != 3:
+            raise ValueError(
+                "context must have shape [batch, sequence, feature], "
+                f"found {tuple(context.shape)}"
+            )
+        if context_attention_mask.ndim != 2:
+            raise ValueError(
+                "context_attention_mask must have shape [batch, sequence], "
+                f"found {tuple(context_attention_mask.shape)}"
+            )
+        if context.shape[0] != context_attention_mask.shape[0]:
+            raise ValueError(
+                "context and context_attention_mask batch dimensions differ: "
+                f"{context.shape[0]} != {context_attention_mask.shape[0]}"
+            )
+        if context.shape[1] != context_attention_mask.shape[1]:
+            raise ValueError(
+                "context and context_attention_mask sequence dimensions differ: "
+                f"{context.shape[1]} != {context_attention_mask.shape[1]}"
+            )
+        if context.shape[2] != self.context_dim:
+            raise ValueError(
+                "context feature dimension differs from model.context_dim: "
+                f"{context.shape[2]} != {self.context_dim}"
+            )
+
+        context_tokens = context.shape[1]
+        bucket = next(
+            (
+                candidate
+                for candidate in ACTION_HEAD_CONTEXT_BUCKETS
+                if candidate >= context_tokens
+            ),
+            None,
+        )
+        if bucket is None:
+            raise ValueError(
+                f"context length {context_tokens} exceeds largest supported "
+                f"action-head context bucket {ACTION_HEAD_CONTEXT_BUCKETS[-1]}"
+            )
+        padding_tokens = bucket - context_tokens
+        if padding_tokens == 0:
+            return context, context_attention_mask
+
+        context_padding = context.new_zeros(
+            context.shape[0],
+            padding_tokens,
+            context.shape[2],
+        )
+        mask_padding = context_attention_mask.new_zeros(
+            context_attention_mask.shape[0],
+            padding_tokens,
+        )
+        return (
+            torch.cat((context, context_padding), dim=1),
+            torch.cat((context_attention_mask, mask_padding), dim=1),
+        )
+
+    def _prepare_action_head_context(
+        self,
+        context: torch.Tensor,
+        context_attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        context = context.to(dtype=self.compute_dtype)
+        if self._static_action_head_context_buckets_enabled:
+            return self._bucket_action_head_context(
+                context,
+                context_attention_mask,
+            )
+        return context, context_attention_mask
 
     def _prepare_context_inputs(
         self,
@@ -575,6 +660,10 @@ class Qwen3VLGrootPolicy(nn.Module):
         actions: torch.Tensor,
         action_mask: torch.Tensor,
     ) -> torch.Tensor:
+        context, context_attention_mask = self._prepare_action_head_context(
+            context,
+            context_attention_mask,
+        )
         state = self.normalize_state(state.to(self.device, dtype=self.compute_dtype))
         actions = self.normalize_action(actions.to(self.device, dtype=self.compute_dtype))
         action_mask = action_mask.to(self.device)
@@ -595,7 +684,7 @@ class Qwen3VLGrootPolicy(nn.Module):
                 noisy,
                 state,
                 timestep,
-                context.to(dtype=self.compute_dtype),
+                context,
                 context_attention_mask,
             )
         return masked_velocity_mse(prediction, velocity, action_mask)
@@ -642,11 +731,15 @@ class Qwen3VLGrootPolicy(nn.Module):
         was_training = self.training
         self.eval()
         context, context_mask = self.encode_context(images, instructions)
+        context, context_mask = self._prepare_action_head_context(
+            context,
+            context_mask,
+        )
         normalized_state = self.normalize_state(states).to(dtype=self.compute_dtype)
         normalized_actions = euler_denoise(
             self.action_head,
             state=normalized_state,
-            context=context.to(dtype=self.compute_dtype),
+            context=context,
             context_attention_mask=context_mask,
             steps=denoising_steps or self.default_denoising_steps,
             noise_s=self.noise_s,

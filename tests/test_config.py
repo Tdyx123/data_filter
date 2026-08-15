@@ -49,7 +49,7 @@ def test_qwen3_vl_4b_configs_disable_checkpointing_and_compile_only_action_head(
         "action_head_enabled": True,
         "backend": "inductor",
         "mode": "default",
-        "dynamic": True,
+        "dynamic": False,
         "fullgraph": False,
     }
     assert resolve_compile_targets(config["model"]) == (False, True)

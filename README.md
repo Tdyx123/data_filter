@@ -743,8 +743,10 @@ bash scripts/train_bridge_4x4090.sh --gpu-ids 0,1,2,3 --deepspeed-stage 3
 
 所有配置默认同时关闭 Qwen 主干与 DiT 动作头的 gradient checkpointing。全部
 Qwen3-VL-4B 配置（Bridge 4 卡、Bridge 8 卡和 Qwen LIBERO）默认使用 PyTorch
-Inductor 仅编译 DiT 动作头；编译采用动态 shape、允许局部 graph break，首次训练
-batch 会产生一次性 TorchInductor 预热延迟。Qwen 主干仍默认不编译，以避开
+Inductor 仅编译 DiT 动作头；编译采用静态 shape、允许局部 graph break，首次训练
+batch 会产生一次性 TorchInductor 预热延迟。进入已编译动作头前，context 会向右
+补零到不小于实际长度的最小桶（96、192、384 或 512 token），对应 attention mask
+补 `false`；有效 token 不会被截断。Qwen 主干仍默认不编译，以避开
 FlashAttention 动态 shape 路径中的 graph break、按层重复编译和 Inductor 编译失败。
 兼容字段 `model.torch_compile.enabled` 保持为 `false`，显式的目标开关优先；可追加
 `--no-compile-action-head` 临时关闭动作头编译，或追加 `--compile-qwen-backbone`
