@@ -40,19 +40,19 @@ def test_default_config_keeps_all_qwen_layers():
         "qwen3_vl_4b_groot_libero_4x4090.yaml",
     ],
 )
-def test_qwen3_vl_4b_configs_disable_checkpointing_and_torch_compile(name):
+def test_qwen3_vl_4b_configs_disable_checkpointing_and_compile_only_action_head(name):
     config = load_config(PROJECT_ROOT / "configs" / name)
     assert config["model"]["gradient_checkpointing"] is False
     assert config["model"]["torch_compile"] == {
         "enabled": False,
         "backbone_enabled": False,
-        "action_head_enabled": False,
+        "action_head_enabled": True,
         "backend": "inductor",
         "mode": "default",
         "dynamic": True,
         "fullgraph": False,
     }
-    assert resolve_compile_targets(config["model"]) == (False, False)
+    assert resolve_compile_targets(config["model"]) == (False, True)
 
 
 def test_four_gpu_config_preserves_effective_batch_64():

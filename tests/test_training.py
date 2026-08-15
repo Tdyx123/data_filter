@@ -238,9 +238,6 @@ def test_runtime_metadata_records_resolved_attention_and_compile_targets(monkeyp
     )
     config["model"]["attn_implementation"] = "eager"
     config["model"]["context_forward"] = "backbone"
-    config["model"]["torch_compile"].update(
-        {"backbone_enabled": False, "action_head_enabled": True}
-    )
     monkeypatch.setattr(
         "qwen3_vl_groot.training._runtime_versions",
         lambda: {"torch": "test"},

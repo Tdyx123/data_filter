@@ -11,6 +11,5 @@ exec "${SCRIPT_DIR}/train_bridge_4x4090.sh" \
   --gradient-accumulation-steps 16 \
   --qwen-context-forward backbone \
   --no-compile-qwen-backbone \
-  --no-compile-action-head \
   --episode-cache-size 2 \
   "$@"

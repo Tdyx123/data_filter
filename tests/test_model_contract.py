@@ -446,7 +446,7 @@ def test_compile_policy_modules_can_compile_only_the_action_head():
     assert len(policy.action_head.calls) == 1
 
 
-def test_qwen_libero_default_skips_compile_for_backbone_and_action_head():
+def test_qwen_libero_default_compiles_only_the_action_head():
     policy = type(
         "Policy",
         (),
@@ -459,7 +459,14 @@ def test_qwen_libero_default_skips_compile_for_backbone_and_action_head():
     compile_policy_modules(policy, config["model"])
 
     assert policy.backbone.calls == []
-    assert policy.action_head.calls == []
+    assert policy.action_head.calls == [
+        {
+            "backend": "inductor",
+            "mode": "default",
+            "dynamic": True,
+            "fullgraph": False,
+        }
+    ]
 
 
 def test_disabling_qwen_gradient_checkpointing_calls_disable():

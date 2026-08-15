@@ -36,7 +36,7 @@ model:
   torch_compile:
     enabled: false
     backbone_enabled: false
-    action_head_enabled: false
+    action_head_enabled: true
     backend: inductor
     mode: default
     dynamic: true

@@ -163,7 +163,7 @@ def test_cyclic_bridge_script_injects_schedule_and_bridge_defaults(tmp_path):
     assert arguments[arguments.index("--gradient-accumulation-steps") + 1] == "16"
     assert arguments[arguments.index("--qwen-context-forward") + 1] == "backbone"
     assert "--no-compile-qwen-backbone" in arguments
-    assert "--no-compile-action-head" in arguments
+    assert "--no-compile-action-head" not in arguments
     assert arguments[arguments.index("--episode-cache-size") + 1] == "2"
 
 
@@ -372,7 +372,7 @@ def test_cyclic_libero_script_uses_full_prior_and_preserves_schedule_defaults(tm
     assert arguments[arguments.index("--gradient-accumulation-steps") + 1] == "16"
     assert arguments[arguments.index("--qwen-context-forward") + 1] == "backbone"
     assert "--no-compile-qwen-backbone" in arguments
-    assert "--no-compile-action-head" in arguments
+    assert "--no-compile-action-head" not in arguments
     assert arguments[arguments.index("--episode-cache-size") + 1] == "2"
 
 
@@ -406,3 +406,28 @@ def test_cyclic_libero_script_allows_explicit_schedule_overrides(tmp_path):
     assert values_for("--lora-freeze-steps") == ["5000", "6000"]
     assert values_for("--lora-cycle-steps") == ["100", "200"]
     assert values_for("--lora-active-steps") == ["10", "20"]
+
+
+@pytest.mark.parametrize("script", [CYCLIC_BRIDGE_SCRIPT, CYCLIC_LIBERO_SCRIPT])
+def test_cyclic_qwen3_vl_4b_scripts_forward_explicit_action_head_disable_once(
+    tmp_path,
+    script,
+):
+    environment, calls = _fake_python_environment(tmp_path)
+
+    subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--no-compile-action-head",
+            "--output-dir",
+            "outputs/cyclic-no-head-compile",
+            "--preflight-only",
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        check=True,
+    )
+
+    arguments = calls.read_text(encoding="utf-8").splitlines()
+    assert arguments.count("--no-compile-action-head") == 1

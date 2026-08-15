@@ -121,6 +121,35 @@ def test_launch_cli_overrides_context_and_independent_compile_targets(tmp_path):
     assert config["data"]["episode_cache_size"] == 16
 
 
+def test_launch_cli_can_disable_default_action_head_compile(tmp_path):
+    parser = build_parser()
+    default_arguments = parser.parse_args(
+        [
+            "launch",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"),
+            "--output-dir",
+            str(tmp_path / "default-run"),
+        ]
+    )
+    disabled_arguments = parser.parse_args(
+        [
+            "launch",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"),
+            "--output-dir",
+            str(tmp_path / "disabled-run"),
+            "--no-compile-action-head",
+        ]
+    )
+
+    default_config = _resolve_config(default_arguments)
+    disabled_config = _resolve_config(disabled_arguments)
+
+    assert default_config["model"]["torch_compile"]["action_head_enabled"] is True
+    assert disabled_config["model"]["torch_compile"]["action_head_enabled"] is False
+
+
 def test_launch_persists_preflight_report_and_can_skip_memory_probe(
     tmp_path,
     monkeypatch,
