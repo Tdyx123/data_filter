@@ -15,7 +15,7 @@ from .config import (
     BACKBONE_CONTRACTS,
     ConfigError,
     backbone_contract,
-    normalized_lora_target_modules,
+    validated_lora_target_modules,
 )
 from .flow import (
     FlowMatchingActionHead,
@@ -32,11 +32,11 @@ class ModelContractError(RuntimeError):
 
 _TEXT_LAYER_PATH = re.compile(
     r"(?:^|\.)language_model\.layers\.(\d+)\."
-    r"(?:self_attn|linear_attn)\.([^.]+)$"
+    r"(?:self_attn|linear_attn|mlp)\.([^.]+)$"
 )
 _TEXT_LORA_PARAMETER_PATH = re.compile(
     r"(?:^|\.)language_model\.layers\.\d+\."
-    r"(?:self_attn|linear_attn)\.[^.]+\.lora_"
+    r"(?:self_attn|linear_attn|mlp)\.[^.]+\.lora_"
 )
 
 
@@ -188,7 +188,7 @@ def inspect_qwen_config(
 
 
 def lora_target_pattern(model_config: dict[str, Any]) -> str:
-    targets = normalized_lora_target_modules(model_config)
+    targets = validated_lora_target_modules(model_config)
     branches = []
     if targets["full_attention"]:
         names = "|".join(re.escape(name) for name in targets["full_attention"])
@@ -196,6 +196,9 @@ def lora_target_pattern(model_config: dict[str, Any]) -> str:
     if targets["linear_attention"]:
         names = "|".join(re.escape(name) for name in targets["linear_attention"])
         branches.append(rf"linear_attn\.(?:{names})")
+    if targets["mlp"]:
+        names = "|".join(re.escape(name) for name in targets["mlp"])
+        branches.append(rf"mlp\.(?:{names})")
     if not branches:
         raise ModelContractError("At least one text LoRA target module is required")
     return rf".*language_model\.layers\.\d+\.(?:{'|'.join(branches)})$"
@@ -246,7 +249,7 @@ def load_qwen_backbone(
     assert_full_lora_coverage(
         backbone,
         layer_types=layer_types,
-        targets_by_layer_type=normalized_lora_target_modules(model_config),
+        targets_by_layer_type=validated_lora_target_modules(model_config),
     )
     assert_qwen_freeze_contract(backbone)
     return backbone, processor
@@ -268,6 +271,7 @@ def assert_full_lora_coverage(
     *,
     expected_layers: int = 36,
     targets: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj"),
+    mlp_targets: tuple[str, ...] = ("gate_proj", "up_proj", "down_proj"),
     layer_types: Sequence[str] | None = None,
     targets_by_layer_type: dict[str, tuple[str, ...]] | None = None,
 ) -> None:
@@ -280,6 +284,7 @@ def assert_full_lora_coverage(
         targets_by_layer_type = {
             "full_attention": tuple(targets),
             "linear_attention": (),
+            "mlp": tuple(mlp_targets),
         }
     coverage = lora_coverage(model)
     missing: list[str] = []
@@ -287,6 +292,7 @@ def assert_full_lora_coverage(
         if layer_type not in targets_by_layer_type:
             raise ModelContractError(f"Missing LoRA target group for {layer_type}")
         expected_targets = set(targets_by_layer_type[layer_type])
+        expected_targets.update(targets_by_layer_type.get("mlp", ()))
         absent = expected_targets.difference(coverage.get(layer, set()))
         if absent:
             missing.append(f"layer {layer}: {sorted(absent)}")
@@ -296,7 +302,7 @@ def assert_full_lora_coverage(
         if len(missing) > 8:
             detail += f"; ... ({len(missing)} layers incomplete)"
         raise ModelContractError(
-            f"LoRA was not installed on every token-mixer projection of all "
+            f"LoRA was not installed on every configured text projection of all "
             f"{expected_layers} text layers. "
             f"{detail}; unexpected layers={unexpected}"
         )
@@ -314,7 +320,7 @@ def assert_qwen_freeze_contract(model: nn.Module) -> None:
     ]
     if violations:
         raise ModelContractError(
-            "Only text token-mixer LoRA parameters may be trainable; violations: "
+            "Only text attention/MLP LoRA parameters may be trainable; violations: "
             + ", ".join(violations[:10])
         )
 

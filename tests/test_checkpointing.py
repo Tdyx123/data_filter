@@ -77,6 +77,11 @@ def test_compact_safetensors_round_trip(tmp_path):
         (target / "policy_config.json").read_text(encoding="utf-8")
     )["config"]
     assert checkpoint_config["model"]["backbone_family"] == "qwen3_vl"
+    assert checkpoint_config["model"]["lora"]["target_modules"] == {
+        "full_attention": ["q_proj", "k_proj", "v_proj", "o_proj"],
+        "linear_attention": [],
+        "mlp": ["gate_proj", "up_proj", "down_proj"],
+    }
     assert checkpoint_config["train"]["lora_learning_rate"] == pytest.approx(1e-5)
     assert checkpoint_config["train"]["head_learning_rate"] == pytest.approx(1e-4)
 

@@ -2,7 +2,7 @@
 
 这是一个独立的 BridgeData V2 视觉—语言—动作（VLA）微调项目。它完整加载本地
 Qwen3-VL-4B-Instruct 的 36 层文本模型，或 Qwen3.5-0.8B 的 24 层混合
-DeltaNet/全注意力文本模型。Qwen3-VL 在全部文本注意力投影上训练 LoRA，
+DeltaNet/全注意力文本模型。Qwen3-VL 在全部文本注意力与 MLP 投影上训练 LoRA，
 Qwen3.5 在全部文本 token-mixer 上训练 LoRA；两者都从随机初始化的 GROOT 风格
 flow-matching DiT 动作头开始训练。视觉塔和主干原始参数始终冻结。
 
@@ -684,8 +684,8 @@ bash scripts/train_libero_qwen3_vl_4b_groot_cyclic_lora_all_tasks_4x4090.sh \
 该入口的第 1–5,000 个 optimizer step 只训练 GR00T 动作头。之后每 100 步的
 前 90 步仍只训练动作头，最后 10 步训练 LoRA 与动作头；例如 5,001–5,090
 只训练动作头，5,091–5,100 训练两者，5,101 步开始下一个周期。这里的“训练
-Qwen”只更新覆盖 36 层注意力 `q_proj/k_proj/v_proj/o_proj` 的 LoRA，
-Qwen3-VL-4B 原始参数始终冻结。
+Qwen”只更新覆盖 36 层注意力 `q_proj/k_proj/v_proj/o_proj` 与 MLP
+`gate_proj/up_proj/down_proj` 的 LoRA，Qwen3-VL-4B 原始参数始终冻结。
 LoRA 的 warmup 与余弦衰减只统计实际启用 LoRA 的 optimizer step。
 
 默认调度可分别用 `--lora-freeze-steps`、`--lora-cycle-steps` 和
@@ -818,9 +818,11 @@ checkpoint。该目录必须包含 `adapter_model.safetensors`、`policy_config.
 Qwen3.5-0.8B 基座，再叠加其中的 LoRA 与 GROOT action head，不解析
 训练输出根目录、`latest.json` 或 `best.json`。
 
-当前版本不迁移包含 `model.lora.target_modules.mlp` 的旧 attention+FFN LoRA
-checkpoint；这类 manifest 会在加载基座和适配器权重前被明确拒绝。需要继续评测
-此类 checkpoint 时，应使用生成它们的旧版本代码。
+当前版本要求 Qwen3-VL-4B checkpoint 的 `model.lora.target_modules` 同时包含完整
+attention 与 MLP 目标，不迁移旧 attention-only LoRA checkpoint；这类 manifest
+会在加载基座和适配器权重前被明确拒绝。Qwen3.5-0.8B checkpoint 的目标结构保持
+不变。需要继续评测旧 attention-only Qwen3-VL-4B checkpoint 时，应使用生成它们
+的旧版本代码。
 
 先对 LIBERO-10 index 5 执行单环境预检：
 

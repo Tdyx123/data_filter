@@ -179,6 +179,12 @@ def resolve_qwen_checkpoint(
     if not isinstance(model_config, Mapping):
         raise EvaluationError("Qwen policy config model section must be a mapping")
     backbone_family = str(model_config.get("backbone_family", "qwen3_vl"))
+    from .config import ConfigError, validated_lora_target_modules
+
+    try:
+        validated_lora_target_modules(dict(model_config))
+    except ConfigError as error:
+        raise EvaluationError(str(error)) from error
     for key in ("train_crop_size", "output_image_size"):
         try:
             size = int(data[key])

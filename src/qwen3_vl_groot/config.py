@@ -26,6 +26,7 @@ BACKBONE_CONTRACTS: dict[str, dict[str, Any]] = {
         "lora_targets": {
             "full_attention": ("q_proj", "k_proj", "v_proj", "o_proj"),
             "linear_attention": (),
+            "mlp": ("gate_proj", "up_proj", "down_proj"),
         },
     },
     "qwen3_5": {
@@ -43,6 +44,7 @@ BACKBONE_CONTRACTS: dict[str, dict[str, Any]] = {
                 "in_proj_a",
                 "out_proj",
             ),
+            "mlp": (),
         },
     },
 }
@@ -66,9 +68,10 @@ def normalized_lora_target_modules(
         targets = {
             "full_attention": tuple(raw_targets),
             "linear_attention": (),
+            "mlp": (),
         }
     elif isinstance(raw_targets, dict):
-        target_groups = ("full_attention", "linear_attention")
+        target_groups = ("full_attention", "linear_attention", "mlp")
         unknown = set(raw_targets).difference(target_groups)
         if unknown:
             raise ConfigError(f"Unknown model.lora.target_modules groups: {sorted(unknown)}")
@@ -87,6 +90,18 @@ def normalized_lora_target_modules(
             raise ConfigError(
                 f"model.lora.target_modules.{layer_type} must not contain duplicates"
             )
+    return targets
+
+
+def validated_lora_target_modules(
+    model_config: dict[str, Any],
+) -> dict[str, tuple[str, ...]]:
+    targets = normalized_lora_target_modules(model_config)
+    contract = backbone_contract(model_config)
+    if targets != contract["lora_targets"]:
+        raise ConfigError(
+            f"{contract['display_name']} requires LoRA targets {contract['lora_targets']}"
+        )
     return targets
 
 
@@ -227,11 +242,7 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ConfigError(
             f"{contract['display_name']} requires model.context_dim={expected_context_dim}"
         )
-    targets = normalized_lora_target_modules(model)
-    if targets != contract["lora_targets"]:
-        raise ConfigError(
-            f"{contract['display_name']} requires LoRA targets {contract['lora_targets']}"
-        )
+    validated_lora_target_modules(model)
     if model.get("context_forward", "causal_lm") not in {"causal_lm", "backbone"}:
         raise ConfigError(
             "model.context_forward must be either causal_lm or backbone"

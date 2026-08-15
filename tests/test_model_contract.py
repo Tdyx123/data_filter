@@ -205,28 +205,57 @@ def _tiny_context_policy(context_forward):
     )
 
 
-def test_all_36_layers_have_all_four_attention_lora_targets():
-    model = FakeBackbone()
+QWEN3_VL_LORA_TARGETS = {
+    "full_attention": ("q_proj", "k_proj", "v_proj", "o_proj"),
+    "linear_attention": (),
+    "mlp": ("gate_proj", "up_proj", "down_proj"),
+}
+
+
+def test_all_36_layers_have_all_attention_and_mlp_lora_targets():
+    model = FakeBackbone(with_mlp=True)
     coverage = lora_coverage(model)
     assert set(coverage) == set(range(36))
     assert all(
-        value == {"q_proj", "k_proj", "v_proj", "o_proj"}
+        value
+        == {
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        }
         for value in coverage.values()
     )
-    assert_full_lora_coverage(model)
+    assert_full_lora_coverage(
+        model,
+        targets_by_layer_type=QWEN3_VL_LORA_TARGETS,
+    )
     assert_qwen_freeze_contract(model)
 
 
 def test_missing_projection_is_rejected():
-    model = FakeBackbone()
+    model = FakeBackbone(with_mlp=True)
     model.language_model.layers[17].self_attn.o_proj = nn.Linear(4, 4)
     with pytest.raises(RuntimeError, match="layer 17"):
         assert_full_lora_coverage(model)
 
 
-def test_text_mlp_lora_parameters_are_rejected_by_freeze_contract():
-    with pytest.raises(RuntimeError, match="mlp"):
-        assert_qwen_freeze_contract(FakeBackbone(with_mlp=True))
+def test_missing_mlp_projection_is_rejected():
+    model = FakeBackbone(with_mlp=True)
+    model.language_model.layers[17].mlp.down_proj = nn.Linear(4, 4)
+
+    with pytest.raises(RuntimeError, match="layer 17"):
+        assert_full_lora_coverage(
+            model,
+            targets_by_layer_type=QWEN3_VL_LORA_TARGETS,
+        )
+
+
+def test_text_mlp_lora_parameters_satisfy_freeze_contract():
+    assert_qwen_freeze_contract(FakeBackbone(with_mlp=True))
 
 
 def test_visual_tower_lora_parameters_are_rejected_by_freeze_contract():
@@ -289,20 +318,20 @@ def test_qwen35_lora_target_pattern_matches_only_text_token_mixers():
     assert not pattern.fullmatch("model.language_model.layers.0.mlp.up_proj")
 
 
-def test_qwen3_vl_lora_target_pattern_matches_text_attention_only():
+def test_qwen3_vl_lora_target_pattern_matches_text_attention_and_mlp_only():
     config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
     pattern = re.compile(lora_target_pattern(config["model"]))
 
     assert pattern.fullmatch("model.language_model.layers.0.self_attn.q_proj")
     assert pattern.fullmatch("model.language_model.layers.35.self_attn.o_proj")
-    assert not pattern.fullmatch("model.language_model.layers.35.mlp.gate_proj")
-    assert not pattern.fullmatch("model.language_model.layers.12.mlp.up_proj")
-    assert not pattern.fullmatch("model.language_model.layers.7.mlp.down_proj")
+    assert pattern.fullmatch("model.language_model.layers.35.mlp.gate_proj")
+    assert pattern.fullmatch("model.language_model.layers.12.mlp.up_proj")
+    assert pattern.fullmatch("model.language_model.layers.7.mlp.down_proj")
     assert not pattern.fullmatch("model.visual.blocks.0.mlp.up_proj")
     assert not pattern.fullmatch("model.language_model.layers.0.input_layernorm")
 
 
-def test_mlp_lora_target_is_rejected_before_loading_the_base_model(
+def test_attention_only_lora_target_is_rejected_before_loading_the_base_model(
     monkeypatch,
 ):
     class FailIfCalled:
@@ -322,13 +351,9 @@ def test_mlp_lora_target_is_rejected_before_loading_the_base_model(
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
     config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
-    config["model"]["lora"]["target_modules"]["mlp"] = [
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    ]
+    config["model"]["lora"]["target_modules"].pop("mlp", None)
 
-    with pytest.raises(ConfigError, match=r"groups: \['mlp'\]"):
+    with pytest.raises(ConfigError, match="Qwen3-VL-4B requires LoRA targets"):
         load_qwen_backbone("/unused/base-model", config["model"])
 
 

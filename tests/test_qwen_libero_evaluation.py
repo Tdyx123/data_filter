@@ -23,7 +23,16 @@ def _write_checkpoint(
     if backbone_family == "qwen3_vl":
         architecture = "Qwen3VLForConditionalGeneration"
         text_config = {"num_hidden_layers": 36, "hidden_size": 2560}
-        model_config = {}
+        model_config = {
+            "backbone_family": "qwen3_vl",
+            "lora": {
+                "target_modules": {
+                    "full_attention": ["q_proj", "k_proj", "v_proj", "o_proj"],
+                    "linear_attention": [],
+                    "mlp": ["gate_proj", "up_proj", "down_proj"],
+                }
+            },
+        }
     elif backbone_family == "qwen3_5":
         architecture = "Qwen3_5ForConditionalGeneration"
         text_config = {
@@ -40,7 +49,21 @@ def _write_checkpoint(
                 )
             ],
         }
-        model_config = {"backbone_family": "qwen3_5"}
+        model_config = {
+            "backbone_family": "qwen3_5",
+            "lora": {
+                "target_modules": {
+                    "full_attention": ["q_proj", "k_proj", "v_proj", "o_proj"],
+                    "linear_attention": [
+                        "in_proj_qkv",
+                        "in_proj_z",
+                        "in_proj_b",
+                        "in_proj_a",
+                        "out_proj",
+                    ],
+                }
+            },
+        }
     else:
         raise ValueError(backbone_family)
     base_model = root / "base-model"
@@ -145,6 +168,27 @@ def test_resolve_qwen_checkpoint_honors_model_override_and_rejects_bad_contract(
     manifest["config"]["data"]["action_horizon"] = 16
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(evaluation.EvaluationError, match="action_horizon=8"):
+        evaluation.resolve_qwen_checkpoint(checkpoint)
+
+
+def test_resolve_qwen_checkpoint_rejects_attention_only_manifest_before_base_model_validation(
+    tmp_path,
+    monkeypatch,
+):
+    evaluation = _evaluation()
+    checkpoint, _ = _write_checkpoint(tmp_path)
+    manifest_path = checkpoint / "policy_config.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["config"]["model"]["lora"]["target_modules"].pop("mlp")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def fail_base_model_validation(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("invalid LoRA manifests must fail before base model validation")
+
+    monkeypatch.setattr(evaluation, "_validate_base_model", fail_base_model_validation)
+
+    with pytest.raises(evaluation.EvaluationError, match="Qwen3-VL-4B requires LoRA targets"):
         evaluation.resolve_qwen_checkpoint(checkpoint)
 
 
