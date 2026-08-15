@@ -10,8 +10,10 @@ import numpy as np
 
 from simpler_bridge.evaluation import (  # noqa: F401
     CONTROL_MODE,
+    MANISKILL2_REAL2SIM_COMMIT,
     OBJECT_EPISODE_IDS,
     POLICY_SEEDS,
+    SIMPLER_ENV_COMMIT,
     SIMPLER_TASKS,
     SimplerEvaluationError,
     SimplerInfrastructureError,

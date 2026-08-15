@@ -127,6 +127,9 @@ def test_octo_simpler_requirements_and_readme_use_the_dedicated_runtime():
     requirements = (PROJECT_ROOT / "requirements-octo-simpler-eval.txt").read_text(
         encoding="utf-8"
     )
+    build_constraints = (
+        PROJECT_ROOT / "requirements-octo-simpler-build.txt"
+    ).read_text(encoding="utf-8")
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
 
     for requirement in (
@@ -138,8 +141,12 @@ def test_octo_simpler_requirements_and_readme_use_the_dedicated_runtime():
         "safetensors==0.4.5",
         "sentencepiece==0.2.0",
         "sapien==2.2.2",
+        "setuptools==75.8.0",
     ):
         assert requirement in requirements
+    assert "scikit-build-core==0.9.10" in build_constraints
+    assert "pybind11==2.13.6" in build_constraints
+    assert "--build-constraints requirements-octo-simpler-build.txt" in readme
     assert "Octo-small Bridge 的 SimplerEnv 四任务闭环评测" in readme
     assert "scripts/evaluate_simpler_octo_small.sh" in readme
     assert "/data/dwb/octo_small_bridge_v2/checkpoints/step-00020000" in readme

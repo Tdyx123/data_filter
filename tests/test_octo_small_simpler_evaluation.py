@@ -97,6 +97,7 @@ def test_bridge_statistics_and_octo_adapter_preserve_gripper_semantics(tmp_path)
         np.broadcast_to([1, 2, 3, 4, 5, 6], (1, 8, 6)),
     )
     np.testing.assert_allclose(actions[..., 6], 0.75)
+    assert policy.protocol_metadata()["precision"] == "fp32"
 
 
 def test_bridge_statistics_reject_invalid_shapes_and_negative_std(tmp_path):
@@ -239,11 +240,31 @@ def test_octo_simpler_runtime_contract_is_python310_and_model_specific():
     assert versions["torch"] == "2.4.1"
     assert versions["transformers"] == "4.44.2"
     assert versions["sapien"] == "2.2.2"
+    assert versions["setuptools"] == "75.8.0"
     assert validate_runtime_contract(
         version_info=(3, 10),
         package_versions=versions,
         device="cpu",
     ) == versions
+
+    cuda_versions = {
+        **versions,
+        "torch": "2.4.1+cu121",
+        "torchvision": "0.19.1+cu121",
+    }
+    assert validate_runtime_contract(
+        version_info=(3, 10),
+        package_versions=cuda_versions,
+        device="cpu",
+    ) == cuda_versions
+
+    incompatible_versions = {**cuda_versions, "torch": "2.4.1.post1+cu121"}
+    with pytest.raises(Exception, match="requires torch==2.4.1"):
+        validate_runtime_contract(
+            version_info=(3, 10),
+            package_versions=incompatible_versions,
+            device="cpu",
+        )
 
     try:
         validate_runtime_contract(

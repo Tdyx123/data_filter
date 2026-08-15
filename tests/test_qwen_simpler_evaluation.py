@@ -15,6 +15,17 @@ def _evaluation():
     return importlib.import_module("qwen3_vl_groot.simpler_evaluation")
 
 
+def test_qwen_module_reexports_shared_source_commit_constants():
+    evaluation = _evaluation()
+    from simpler_bridge import evaluation as shared_evaluation
+
+    assert evaluation.SIMPLER_ENV_COMMIT == shared_evaluation.SIMPLER_ENV_COMMIT
+    assert (
+        evaluation.MANISKILL2_REAL2SIM_COMMIT
+        == shared_evaluation.MANISKILL2_REAL2SIM_COMMIT
+    )
+
+
 def test_task_selection_expands_the_official_widowx_protocol():
     evaluation = _evaluation()
 

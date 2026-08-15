@@ -1,5 +1,6 @@
 # Dedicated Python 3.10/3.11 environment for Octo-small + SimplerEnv.
-# Install the CUDA 12.1 PyTorch wheels first as documented in README.md.
+# Install with requirements-octo-simpler-build.txt as the build constraint;
+# ruckig 0.14.0 does not constrain its legacy build backend versions itself.
 numpy==1.24.3
 torch==2.4.1
 torchvision==0.19.1
@@ -9,6 +10,7 @@ safetensors==0.4.5
 sentencepiece==0.2.0
 Pillow==10.4.0
 packaging==24.2
+setuptools==75.8.0
 
 # Pinned SimplerEnv / ManiSkill2_real2sim runtime dependencies.
 scipy==1.12.0

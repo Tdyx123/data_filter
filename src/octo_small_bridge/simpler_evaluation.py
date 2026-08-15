@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 import numpy as np
+from packaging.version import InvalidVersion, Version
 
 from simpler_bridge.evaluation import SimplerEvaluationError
 
@@ -30,6 +31,7 @@ OCTO_SIMPLER_RUNTIME_PACKAGE_VERSIONS = {
     "safetensors": "0.4.5",
     "sentencepiece": "0.2.0",
     "Pillow": "10.4.0",
+    "setuptools": "75.8.0",
     "scipy": "1.12.0",
     "gymnasium": "0.29.1",
     "sapien": "2.2.2",
@@ -176,7 +178,13 @@ def validate_runtime_contract(
     normalized = {str(name): str(version) for name, version in package_versions.items()}
     for name, expected in OCTO_SIMPLER_RUNTIME_PACKAGE_VERSIONS.items():
         actual = normalized.get(name)
-        if actual != expected:
+        matches = actual == expected
+        if not matches and actual is not None and name in {"torch", "torchvision"}:
+            try:
+                matches = Version(actual).public == expected
+            except InvalidVersion:
+                matches = False
+        if not matches:
             raise SimplerEvaluationError(
                 f"Octo SimplerEnv evaluation requires {name}=={expected}; "
                 f"found {actual or 'not installed'}"
@@ -328,6 +336,7 @@ class OctoBridgeSimplerPolicy:
             "diffusion_steps": DIFFUSION_STEPS,
             "gripper_threshold": self.gripper_threshold,
             "observation_tokenizers": ["primary"],
+            "precision": self.precision,
             "statistics": self.statistics.as_dict(),
         }
 

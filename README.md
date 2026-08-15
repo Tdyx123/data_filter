@@ -920,12 +920,16 @@ Octo-small 使用与 Qwen 相同的固定 WidowX 协议和 SimplerEnv/ManiSkill2
 5.x 环境中运行 Octo checkpoint：
 
 ```bash
-python3.10 -m venv .venv-octo-simpler
-.venv-octo-simpler/bin/pip install \
+uv venv --python /usr/bin/python3.10 .venv-octo-simpler
+uv pip install --python .venv-octo-simpler/bin/python \
   torch==2.4.1 torchvision==0.19.1 \
   --index-url https://download.pytorch.org/whl/cu121
-.venv-octo-simpler/bin/pip install -r requirements-octo-simpler-eval.txt
+uv pip install --python .venv-octo-simpler/bin/python \
+  -r requirements-octo-simpler-eval.txt \
+  --build-constraints requirements-octo-simpler-build.txt
 ```
+
+构建约束只固定 `ruckig==0.14.0` 所需的旧版构建后端，不会安装进评测运行时。
 
 checkpoint 只包含微调权重，因此 checkpoint、基础模型和训练时使用的 Bridge
 统计文件都是必填参数。先用独立输出目录运行四任务预检：
@@ -966,8 +970,8 @@ bash scripts/evaluate_simpler_octo_small.sh \
 ```
 
 评测只启用 primary 图像 tokenizer，使用 Bridge stats 标准化 proprio、反标准化前六维
-动作，并保持训练时的 `[-1,+1]` 抓手语义。默认不录像；输出文件、覆盖保护和退出码与
-Qwen SimplerEnv 入口一致。
+动作，并保持训练时的 `[-1,+1]` 抓手语义（以 0 为开合阈值）。默认不录像；输出文件、
+覆盖保护和退出码与 Qwen SimplerEnv 入口一致。
 
 ## 测试
 
