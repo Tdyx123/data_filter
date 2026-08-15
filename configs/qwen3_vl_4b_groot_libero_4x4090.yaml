@@ -44,6 +44,8 @@ model:
   gradient_checkpointing: false
   torch_compile:
     enabled: false
+    backbone_enabled: false
+    action_head_enabled: false
     backend: inductor
     mode: default
     dynamic: true

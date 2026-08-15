@@ -741,12 +741,12 @@ bash scripts/train_bridge_4x4090.sh --gpu-ids 0,1,2,3 --deepspeed-stage 3
 训练只保存 LoRA 和动作头权重，不保存优化器、scheduler、随机状态或 DeepSpeed
 分片，因此不支持 `--resume` 断点续训。
 
-所有配置默认同时关闭 Qwen 主干与 DiT 动作头的 gradient checkpointing。Bridge
-4 卡和 8 卡配置使用 PyTorch Inductor 原地编译两个模块；编译采用动态 shape、允许
-局部 graph break，首次训练调用以及第 2,000 步 LoRA 解冻后可能出现一次性编译
-延迟。Qwen LIBERO 配置默认关闭 `torch.compile`，避免 Qwen3-VL FlashAttention
-路径中的 graph break 和按层重复编译；需要自行评估吞吐时，可将
-`model.torch_compile.enabled` 改回 `true`。
+所有配置默认同时关闭 Qwen 主干与 DiT 动作头的 gradient checkpointing。全部
+Qwen3-VL-4B 配置（Bridge 4 卡、Bridge 8 卡和 Qwen LIBERO）也默认关闭两个模块的
+`torch.compile`，避免 Qwen3-VL FlashAttention 动态 shape 路径中的 graph break、
+按层重复编译和 Inductor 编译失败。需要自行评估吞吐时，可追加
+`--compile-qwen-backbone` 或 `--compile-action-head` 分别开启对应模块，同时传入两个
+参数即可编译两者。Qwen3.5-0.8B 使用独立配置，其默认行为不受此设置影响。
 
 完整参数见：
 

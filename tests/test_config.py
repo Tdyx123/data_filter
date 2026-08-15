@@ -9,7 +9,11 @@ from qwen3_vl_groot.config import (
     load_config,
     validate_config,
 )
-from qwen3_vl_groot.modeling import ModelContractError, inspect_qwen_config
+from qwen3_vl_groot.modeling import (
+    ModelContractError,
+    inspect_qwen_config,
+    resolve_compile_targets,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,17 +32,27 @@ def test_default_config_keeps_all_qwen_layers():
     assert "keep_last_checkpoints" not in config["train"]
 
 
-@pytest.mark.parametrize("name", ["bridge_4x4090.yaml", "bridge_8x4090.yaml"])
-def test_bridge_configs_disable_checkpointing_and_enable_torch_compile(name):
+@pytest.mark.parametrize(
+    "name",
+    [
+        "bridge_4x4090.yaml",
+        "bridge_8x4090.yaml",
+        "qwen3_vl_4b_groot_libero_4x4090.yaml",
+    ],
+)
+def test_qwen3_vl_4b_configs_disable_checkpointing_and_torch_compile(name):
     config = load_config(PROJECT_ROOT / "configs" / name)
     assert config["model"]["gradient_checkpointing"] is False
     assert config["model"]["torch_compile"] == {
-        "enabled": True,
+        "enabled": False,
+        "backbone_enabled": False,
+        "action_head_enabled": False,
         "backend": "inductor",
         "mode": "default",
         "dynamic": True,
         "fullgraph": False,
     }
+    assert resolve_compile_targets(config["model"]) == (False, False)
 
 
 def test_four_gpu_config_preserves_effective_batch_64():
