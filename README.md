@@ -913,6 +913,62 @@ bash scripts/evaluate_simpler_qwen.sh \
 预检写 `preflight.json`，失败写 `failure.json`。已有输出不会覆盖，需显式传
 `--overwrite`。
 
+### Octo-small Bridge 的 SimplerEnv 四任务闭环评测
+
+Octo-small 使用与 Qwen 相同的固定 WidowX 协议和 SimplerEnv/ManiSkill2_real2sim
+源码版本，但必须使用独立的 Python 3.10/3.11 环境。不要在 Qwen 的 Transformers
+5.x 环境中运行 Octo checkpoint：
+
+```bash
+python3.10 -m venv .venv-octo-simpler
+.venv-octo-simpler/bin/pip install \
+  torch==2.4.1 torchvision==0.19.1 \
+  --index-url https://download.pytorch.org/whl/cu121
+.venv-octo-simpler/bin/pip install -r requirements-octo-simpler-eval.txt
+```
+
+checkpoint 只包含微调权重，因此 checkpoint、基础模型和训练时使用的 Bridge
+统计文件都是必填参数。先用独立输出目录运行四任务预检：
+
+```bash
+bash scripts/evaluate_simpler_octo_small.sh \
+  --python .venv-octo-simpler/bin/python \
+  --checkpoint /data/dwb/octo_small_bridge_v2/checkpoints/step-00020000 \
+  --base-model /data/dwb/models/octo-small-pytorch \
+  --statistics /data/dwb/datasets/bridge_orig_1.0.0_lerobo/meta/stats.json \
+  --output-dir outputs/octo_small_bridge_simpler_preflight \
+  --preflight-only
+```
+
+预检通过后，每任务运行 seed 0、object episode 0、最多 8 步的 smoke test：
+
+```bash
+bash scripts/evaluate_simpler_octo_small.sh \
+  --python .venv-octo-simpler/bin/python \
+  --checkpoint /data/dwb/octo_small_bridge_v2/checkpoints/step-00020000 \
+  --base-model /data/dwb/models/octo-small-pytorch \
+  --statistics /data/dwb/datasets/bridge_orig_1.0.0_lerobo/meta/stats.json \
+  --output-dir outputs/octo_small_bridge_simpler_smoke \
+  --smoke-test
+```
+
+不传 `--smoke-test` 时，默认串行运行 `spoon`、`carrot`、`stack`、`eggplant`，
+每个任务执行 object episode `0..23` 与策略种子 `0,2,4` 的组合，共 288 回合：
+
+```bash
+bash scripts/evaluate_simpler_octo_small.sh \
+  --python .venv-octo-simpler/bin/python \
+  --checkpoint /data/dwb/octo_small_bridge_v2/checkpoints/step-00020000 \
+  --base-model /data/dwb/models/octo-small-pytorch \
+  --statistics /data/dwb/datasets/bridge_orig_1.0.0_lerobo/meta/stats.json \
+  --tasks all \
+  --output-dir outputs/octo_small_bridge_simpler_eval
+```
+
+评测只启用 primary 图像 tokenizer，使用 Bridge stats 标准化 proprio、反标准化前六维
+动作，并保持训练时的 `[-1,+1]` 抓手语义。默认不录像；输出文件、覆盖保护和退出码与
+Qwen SimplerEnv 入口一致。
+
 ## 测试
 
 ```bash
@@ -920,6 +976,10 @@ pytest
 pytest -m real_data
 pytest -q tests/test_qwen_simpler_evaluation.py tests/test_evaluate_simpler_qwen_script.py
 bash -n scripts/evaluate_simpler_qwen.sh
+pytest -q tests/test_simpler_bridge_evaluation.py \
+  tests/test_octo_small_simpler_evaluation.py \
+  tests/test_evaluate_simpler_octo_small_script.py
+bash -n scripts/evaluate_simpler_octo_small.sh
 ```
 
 真实 4/8 卡 smoke test 必须在能访问 NVIDIA 驱动的训练机运行。
