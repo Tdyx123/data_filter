@@ -27,7 +27,6 @@ def test_default_config_keeps_all_qwen_layers():
     assert config["model"]["lora"]["target_modules"] == {
         "full_attention": ["q_proj", "k_proj", "v_proj", "o_proj"],
         "linear_attention": [],
-        "mlp": ["gate_proj", "up_proj", "down_proj"],
     }
     assert "keep_last_checkpoints" not in config["train"]
 

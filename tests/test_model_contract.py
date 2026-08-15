@@ -1,5 +1,6 @@
 from pathlib import Path
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 import re
 
 import pytest
@@ -14,12 +15,13 @@ from qwen3_vl_groot.modeling import (  # noqa: E402
     assert_full_lora_coverage,
     assert_qwen_freeze_contract,
     compile_policy_modules,
+    load_qwen_backbone,
     lora_target_pattern,
     lora_coverage,
     resolve_compile_targets,
     select_attention_implementation,
 )
-from qwen3_vl_groot.config import load_config  # noqa: E402
+from qwen3_vl_groot.config import ConfigError, load_config  # noqa: E402
 from qwen3_vl_groot.inference import BridgePolicy  # noqa: E402
 from qwen3_vl_groot.normalization import QuantileStats  # noqa: E402
 
@@ -203,34 +205,15 @@ def _tiny_context_policy(context_forward):
     )
 
 
-QWEN3_VL_LORA_TARGETS = {
-    "full_attention": ("q_proj", "k_proj", "v_proj", "o_proj"),
-    "linear_attention": (),
-    "mlp": ("gate_proj", "up_proj", "down_proj"),
-}
-
-
-def test_all_36_layers_have_attention_and_mlp_lora_targets():
-    model = FakeBackbone(with_mlp=True)
+def test_all_36_layers_have_all_four_attention_lora_targets():
+    model = FakeBackbone()
     coverage = lora_coverage(model)
     assert set(coverage) == set(range(36))
     assert all(
-        value
-        == {
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        }
+        value == {"q_proj", "k_proj", "v_proj", "o_proj"}
         for value in coverage.values()
     )
-    assert_full_lora_coverage(
-        model,
-        targets_by_layer_type=QWEN3_VL_LORA_TARGETS,
-    )
+    assert_full_lora_coverage(model)
     assert_qwen_freeze_contract(model)
 
 
@@ -241,19 +224,9 @@ def test_missing_projection_is_rejected():
         assert_full_lora_coverage(model)
 
 
-def test_missing_mlp_projection_is_rejected():
-    model = FakeBackbone(with_mlp=True)
-    model.language_model.layers[17].mlp.down_proj = nn.Linear(4, 4)
-
-    with pytest.raises(RuntimeError, match="layer 17"):
-        assert_full_lora_coverage(
-            model,
-            targets_by_layer_type=QWEN3_VL_LORA_TARGETS,
-        )
-
-
-def test_text_mlp_lora_parameters_satisfy_freeze_contract():
-    assert_qwen_freeze_contract(FakeBackbone(with_mlp=True))
+def test_text_mlp_lora_parameters_are_rejected_by_freeze_contract():
+    with pytest.raises(RuntimeError, match="mlp"):
+        assert_qwen_freeze_contract(FakeBackbone(with_mlp=True))
 
 
 def test_visual_tower_lora_parameters_are_rejected_by_freeze_contract():
@@ -316,16 +289,47 @@ def test_qwen35_lora_target_pattern_matches_only_text_token_mixers():
     assert not pattern.fullmatch("model.language_model.layers.0.mlp.up_proj")
 
 
-def test_qwen3_vl_lora_target_pattern_matches_text_attention_and_mlp_only():
+def test_qwen3_vl_lora_target_pattern_matches_text_attention_only():
     config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
     pattern = re.compile(lora_target_pattern(config["model"]))
 
     assert pattern.fullmatch("model.language_model.layers.0.self_attn.q_proj")
-    assert pattern.fullmatch("model.language_model.layers.35.mlp.gate_proj")
-    assert pattern.fullmatch("model.language_model.layers.12.mlp.up_proj")
-    assert pattern.fullmatch("model.language_model.layers.7.mlp.down_proj")
+    assert pattern.fullmatch("model.language_model.layers.35.self_attn.o_proj")
+    assert not pattern.fullmatch("model.language_model.layers.35.mlp.gate_proj")
+    assert not pattern.fullmatch("model.language_model.layers.12.mlp.up_proj")
+    assert not pattern.fullmatch("model.language_model.layers.7.mlp.down_proj")
     assert not pattern.fullmatch("model.visual.blocks.0.mlp.up_proj")
     assert not pattern.fullmatch("model.language_model.layers.0.input_layernorm")
+
+
+def test_mlp_lora_target_is_rejected_before_loading_the_base_model(
+    monkeypatch,
+):
+    class FailIfCalled:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            del cls, args, kwargs
+            raise AssertionError("model loaders must not run for an invalid LoRA target")
+
+    fake_peft = ModuleType("peft")
+    fake_peft.LoraConfig = object
+    fake_peft.TaskType = SimpleNamespace(CAUSAL_LM=object())
+    fake_peft.get_peft_model = lambda *args, **kwargs: None
+    fake_transformers = ModuleType("transformers")
+    fake_transformers.AutoModelForImageTextToText = FailIfCalled
+    fake_transformers.AutoProcessor = FailIfCalled
+    monkeypatch.setitem(sys.modules, "peft", fake_peft)
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
+    config["model"]["lora"]["target_modules"]["mlp"] = [
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ]
+
+    with pytest.raises(ConfigError, match=r"groups: \['mlp'\]"):
+        load_qwen_backbone("/unused/base-model", config["model"])
 
 
 def test_direct_context_forward_skips_lm_head_and_preserves_lora_gradients():
