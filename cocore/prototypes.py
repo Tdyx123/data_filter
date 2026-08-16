@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping, Sequence
 import math
+import time
 from dataclasses import asdict, dataclass, replace
 from numbers import Integral, Real
 from pathlib import Path
@@ -15,6 +16,8 @@ from libero_motion_primitives import classify_motion_primitive, make_libero_conf
 from relcore.graph.prototypes import PrototypeData
 from relcore.schemas import ClipRecord
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
+
+from cocore.timing import TimingCallback
 
 
 MIN_ACTION_COUNT = 400
@@ -489,6 +492,7 @@ def build_hierarchical_motion_prototypes(
     seed: int,
     max_episodes: int | None,
     num_workers: int,
+    timing_callback: TimingCallback | None = None,
 ) -> HierarchicalPrototypeResult:
     """Learn exact action buckets and assign one nearest visual leaf per clip half."""
 
@@ -521,6 +525,7 @@ def build_hierarchical_motion_prototypes(
     if STATE_KEY not in adapter.vector_observation_keys:
         raise ValueError(f"motion_primitives requires vector observation {STATE_KEY!r}")
 
+    action_scan_started = time.perf_counter()
     records = list(adapter.episodes())
     if max_episodes is not None:
         records = records[:max_episodes]
@@ -606,6 +611,12 @@ def build_hierarchical_motion_prototypes(
         )
         initial_counts[action_id] = 0
 
+    if timing_callback is not None:
+        timing_callback(
+            "graph.prototypes.action_scan",
+            time.perf_counter() - action_scan_started,
+        )
+
     def update_action_model(
         action_id: int,
         member_values: np.ndarray,
@@ -634,6 +645,7 @@ def build_hierarchical_motion_prototypes(
                 model.partial_fit(member_values[cursor:end])
                 cursor = end
 
+    kmeans_started = time.perf_counter()
     cache_root = Path(frame_cache_dir)
     for epoch in range(int(max_iter)):
         cache_seen: set[int] = set()
@@ -669,6 +681,10 @@ def build_hierarchical_motion_prototypes(
         if set(models) != set(requested_centers):
             raise ValueError("invalid KMeans inputs")
 
+    if timing_callback is not None:
+        timing_callback("graph.prototypes.kmeans", time.perf_counter() - kmeans_started)
+
+    center_statistics_started = time.perf_counter()
     centers: list[np.ndarray] = []
     leaves: list[LeafPrototype] = []
     leaf_ids_by_action: dict[int, np.ndarray] = {}
@@ -769,6 +785,13 @@ def build_hierarchical_motion_prototypes(
         ),
         leaf_prototypes=tuple(leaves),
     )
+    if timing_callback is not None:
+        timing_callback(
+            "graph.prototypes.center_statistics",
+            time.perf_counter() - center_statistics_started,
+        )
+
+    candidate_assignment_started = time.perf_counter()
     retained_counts = {
         category.label: category.raw_count
         for category in refined_catalog.action_categories
@@ -829,7 +852,7 @@ def build_hierarchical_motion_prototypes(
     ):
         raise ValueError("invalid hard-nearest prototype output")
 
-    return HierarchicalPrototypeResult(
+    result = HierarchicalPrototypeResult(
         prototypes=PrototypeData(
             centers=np.stack(centers).astype(np.float32),
             indices=prototype_indices,
@@ -841,3 +864,9 @@ def build_hierarchical_motion_prototypes(
             [candidate_labels[index] for index in range(len(clips))], dtype=np.str_
         ),
     )
+    if timing_callback is not None:
+        timing_callback(
+            "graph.prototypes.candidate_assignment",
+            time.perf_counter() - candidate_assignment_started,
+        )
+    return result

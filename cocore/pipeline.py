@@ -62,7 +62,7 @@ from cocore.selection import (
     LazyHeapSelector,
     build_max_coverage_seed,
 )
-from cocore.timing import emit_completed_timing
+from cocore.timing import emit_completed_timing, timed_step
 
 
 GRAPH_DIRECTORY = "graph-14-motion-hard-nearest"
@@ -543,42 +543,46 @@ def graph_stage(
     def build(temporary: Path) -> None:
         started = time.perf_counter()
         quality_config = resolved["quality"]
-        reliability = compute_reliability(
-            encoded.embeddings,
-            encoded.state_sequences,
-            encoded.action_sequences,
-            encoded.visual_progress,
-            knn=int(quality_config["knn"]),
-            gripper_progress_weight=float(quality_config["gripper_progress_weight"]),
-            visual_progress_weight=float(quality_config["visual_progress_weight"]),
-            noop_threshold=float(quality_config["noop_threshold"]),
-            gripper_action_index=int(quality_config["gripper_action_index"]),
-            min_reliability=float(quality_config["min_reliability"]),
-            reliability_metrics=RELIABILITY_METRICS,
-        )
+        with timed_step("graph.reliability", emit_completed_timing):
+            reliability = compute_reliability(
+                encoded.embeddings,
+                encoded.state_sequences,
+                encoded.action_sequences,
+                encoded.visual_progress,
+                knn=int(quality_config["knn"]),
+                gripper_progress_weight=float(quality_config["gripper_progress_weight"]),
+                visual_progress_weight=float(quality_config["visual_progress_weight"]),
+                noop_threshold=float(quality_config["noop_threshold"]),
+                gripper_action_index=int(quality_config["gripper_action_index"]),
+                min_reliability=float(quality_config["min_reliability"]),
+                reliability_metrics=RELIABILITY_METRICS,
+            )
         prototype_config = resolved["prototypes"]
-        hierarchy = build_hierarchical_motion_prototypes(
-            adapter,
-            encoded.clips,
-            encoded.visual_half_embeddings,
-            frame_cache_dir=root / "encode" / "frame_embeddings",
-            batch_size=int(prototype_config["batch_size"]),
-            max_iter=int(prototype_config["max_iter"]),
-            seed=int(resolved["seed"]),
-            max_episodes=resolved["runtime"].get("max_episodes"),
-            num_workers=int(resolved["runtime"].get("num_workers", 0)),
-        )
+        with timed_step("graph.prototypes", emit_completed_timing):
+            hierarchy = build_hierarchical_motion_prototypes(
+                adapter,
+                encoded.clips,
+                encoded.visual_half_embeddings,
+                frame_cache_dir=root / "encode" / "frame_embeddings",
+                batch_size=int(prototype_config["batch_size"]),
+                max_iter=int(prototype_config["max_iter"]),
+                seed=int(resolved["seed"]),
+                max_episodes=resolved["runtime"].get("max_episodes"),
+                num_workers=int(resolved["runtime"].get("num_workers", 0)),
+                timing_callback=emit_completed_timing,
+            )
         graph_config = resolved["graph"]
-        graph = build_graph(
-            encoded.clips,
-            encoded.embeddings,
-            reliability.reliability,
-            hierarchy.prototypes,
-            knn=int(graph_config["knn"]),
-            similarity_threshold=float(graph_config["similarity_threshold"]),
-            cooccurrence_max_gap=int(graph_config["cooccurrence_max_gap"]),
-            normalize_prototype_relations=False,
-        )
+        with timed_step("graph.sparse_graph", emit_completed_timing):
+            graph = build_graph(
+                encoded.clips,
+                encoded.embeddings,
+                reliability.reliability,
+                hierarchy.prototypes,
+                knn=int(graph_config["knn"]),
+                similarity_threshold=float(graph_config["similarity_threshold"]),
+                cooccurrence_max_gap=int(graph_config["cooccurrence_max_gap"]),
+                normalize_prototype_relations=False,
+            )
         np.savez(
             temporary / "nodes.npz",
             task_indices=graph.task_indices,
@@ -619,7 +623,8 @@ def graph_stage(
             },
         )
 
-    publish_stage(
+    stage_started = time.perf_counter()
+    built = publish_stage(
         destination,
         fingerprint=fingerprint,
         required=(
@@ -636,6 +641,8 @@ def graph_stage(
         resume=bool(resolved["runtime"].get("resume", True)),
         build=build,
     )
+    if built:
+        emit_completed_timing("graph", time.perf_counter() - stage_started)
     nodes = np.load(destination / "nodes.npz")
     graph = GraphData(
         sample_ids=[clip.sample_id for clip in encoded.clips],

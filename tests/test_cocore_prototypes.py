@@ -538,6 +538,39 @@ def test_full_trajectory_builder_trains_exact_buckets_and_labels_each_half_once(
     assert assigned_actions == {"move forward", "move right"}
 
 
+def test_full_trajectory_builder_reports_aggregate_step_timings(tmp_path: Path) -> None:
+    adapter = _TrajectoryPrototypeAdapter()
+    cache = tmp_path / "frame_embeddings"
+    _write_frame_caches(cache, adapter)
+    candidate_frames = np.load(cache / "ep000002.npy", allow_pickle=False)
+    candidate_halves = np.stack(
+        [candidate_frames[:8].mean(axis=0), candidate_frames[7:].mean(axis=0)]
+    )
+    candidate_halves /= np.linalg.norm(candidate_halves, axis=1, keepdims=True)
+    events: list[tuple[str, float]] = []
+
+    prototypes.build_hierarchical_motion_prototypes(
+        adapter,
+        [_candidate_clip()],
+        candidate_halves[None, :, :],
+        frame_cache_dir=cache,
+        batch_size=32,
+        max_iter=2,
+        seed=23,
+        max_episodes=None,
+        num_workers=0,
+        timing_callback=lambda step, seconds: events.append((step, seconds)),
+    )
+
+    assert [step for step, _ in events] == [
+        "graph.prototypes.action_scan",
+        "graph.prototypes.kmeans",
+        "graph.prototypes.center_statistics",
+        "graph.prototypes.candidate_assignment",
+    ]
+    assert all(seconds >= 0.0 for _, seconds in events)
+
+
 @pytest.mark.parametrize(
     ("candidate_visual", "expected_action"),
     [

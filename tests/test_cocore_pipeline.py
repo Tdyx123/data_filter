@@ -690,6 +690,31 @@ def test_graph_build_rejects_semantically_tampered_visual_half_cache(
     assert not (root / "graph-14-motion-hard-nearest").exists()
 
 
+def test_graph_stage_reports_aggregate_and_prototype_step_timings(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+
+    graph_stage(_config(tmp_path), visual_encoder=CocoreVisualEncoder())
+
+    steps = [
+        line.split(" step=", 1)[1].split(" ", 1)[0]
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith("cocore_timing")
+    ]
+    assert steps[-8:] == [
+        "graph.reliability",
+        "graph.prototypes.action_scan",
+        "graph.prototypes.kmeans",
+        "graph.prototypes.center_statistics",
+        "graph.prototypes.candidate_assignment",
+        "graph.prototypes",
+        "graph.sparse_graph",
+        "graph",
+    ]
+
+
 def test_validate_rejects_tampered_visual_prototype_center(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
