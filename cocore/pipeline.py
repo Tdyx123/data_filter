@@ -12,22 +12,19 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 from scipy import sparse
-from trajectory_data import DatasetAdapter, create_dataset
+from trajectory_data import DatasetAdapter, EpisodeRecord, create_dataset
 
 from relcore.export import write_selection_outputs
-from relcore.graph import build_graph
 from relcore.features.visual_encoder import (
     DummyVisualEncoder,
     FrozenClipEncoder,
     VisualEncoder,
 )
 from relcore.graph.prototypes import valid_prototype_assignments
-from relcore.pipeline import (
-    scan_stage as relcore_scan_stage,
-)
 from relcore.scoring import compute_reliability
 from relcore.schemas import ClipRecord, EdgeTable, GraphData
 from relcore.utils.io import (
@@ -41,13 +38,14 @@ from relcore.utils.io import (
 from relcore.utils.random import seed_everything
 
 from cocore import __version__
-from cocore.config import resolve_config, to_relcore_config
+from cocore.config import resolve_config
 from cocore.encoding import (
     CocoreEncodedArtifact,
     CocoreEncodedClips,
     encode_cocore_dataset,
-    reference_windows,
 )
+from cocore.graph import SEQUENCE_ADJACENCY, build_graph
+from cocore.index import CLIP_LENGTH, WINDOW_POLICY, build_clip_records
 from cocore.objective import CocoreObjectiveContext
 from cocore.prototypes import (
     MAX_VISUAL_CENTERS,
@@ -87,17 +85,9 @@ def _output_root(config: Mapping[str, Any], output_dir: str | Path | None) -> Pa
     ).expanduser()
 
 
-def _mark_shared_stage(root: Path, directory: str, stage: str) -> None:
-    manifest_path = root / directory / "manifest.json"
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    payload.update(
-        {
-            "producer": "cocore",
-            "cocore_version": __version__,
-            "cocore_stage": stage,
-        }
-    )
-    write_json(manifest_path, payload)
+def _write_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pylist(rows), path)
 
 
 def _make_visual_encoder(config: Mapping[str, Any]) -> VisualEncoder:
@@ -170,9 +160,6 @@ def _save_cocore_encoded(
             "episodes": index_entries,
         },
     )
-    reference_count = sum(
-        len(reference_windows(entry.frames)) for entry in encoded.frame_embeddings
-    )
     candidate_count = len(encoded.clips)
     write_json(
         temporary / "manifest.json",
@@ -187,18 +174,14 @@ def _save_cocore_encoded(
             "visual_embedding_dim": projector.output_dim,
             "embedding_dim": int(encoded.embeddings.shape[1]),
             "visual_half_embedding_dim": int(encoded.visual_half_embeddings.shape[2]),
-            "clip_length": 15,
-            "clip_stride": 15,
+            "clip_length": CLIP_LENGTH,
+            "window_policy": WINDOW_POLICY,
             "clip_anchors": [0, 7, 14],
             "visual_half_windows": [[0, 8], [7, 15]],
             "visual_half_encoding": "l2_normalized_eight_frame_mean",
             "counts": {
                 "candidate_fragments": candidate_count,
-                "reference_fragments": reference_count,
-                "overlap_fragments": (
-                    candidate_count + reference_count - encoded.union_fragment_count
-                ),
-                "pca_union_fragments": encoded.union_fragment_count,
+                "pca_fit_fragments": encoded.pca_fit_fragment_count,
                 "encoded_episodes": len(encoded.frame_embeddings),
                 "encoded_frames": sum(entry.frames for entry in encoded.frame_embeddings),
             },
@@ -354,24 +337,71 @@ def scan_stage(
     force: bool = False,
 ) -> tuple[Path, object, list[ClipRecord], str]:
     resolved = resolve_config(config)
-    translated = to_relcore_config(resolved)
-    started = time.perf_counter()
-    built = False
-
-    def mark_built() -> None:
-        nonlocal built
-        built = True
-
-    result = relcore_scan_stage(
-        translated,
-        output_dir=output_dir,
-        force=force,
-        on_built=mark_built,
+    root = _output_root(resolved, output_dir)
+    adapter = create_dataset(resolved["dataset"])
+    if len(adapter.image_observation_keys) != 1:
+        raise ValueError("cocore requires exactly one configured image observation")
+    if not adapter.vector_observation_keys:
+        raise ValueError("cocore requires at least one vector observation")
+    max_episodes_value = resolved["runtime"].get("max_episodes")
+    max_episodes = int(max_episodes_value) if max_episodes_value is not None else None
+    episodes = list(adapter.episodes())
+    if max_episodes is not None:
+        episodes = episodes[:max_episodes]
+    clips = build_clip_records(episodes)
+    fingerprint = stable_hash(
+        {
+            "producer": "cocore",
+            "version": __version__,
+            "stage": "scan",
+            "adapter": adapter.fingerprint(),
+            "dataset": resolved["dataset"],
+            "runtime": {"max_episodes": max_episodes},
+            "window_policy": WINDOW_POLICY,
+            "clip_length": CLIP_LENGTH,
+        }
     )
-    _mark_shared_stage(result[0], "scan", "scan")
+    destination = root / "scan"
+    skipped_short = [
+        record.episode_id for record in episodes if record.length < CLIP_LENGTH
+    ]
+
+    def build(temporary: Path) -> None:
+        started = time.perf_counter()
+        _write_parquet(temporary / "episodes.parquet", [asdict(record) for record in episodes])
+        _write_parquet(temporary / "clips.parquet", [asdict(clip) for clip in clips])
+        write_json(
+            temporary / "manifest.json",
+            {
+                "status": "complete",
+                "producer": "cocore",
+                "cocore_version": __version__,
+                "cocore_stage": "scan",
+                "fingerprint": fingerprint,
+                "episodes": len(episodes),
+                "scanned_episodes": len(episodes),
+                "clips": len(clips),
+                "dataset_summary": adapter.dataset_summary(),
+                "skipped_short_episodes": skipped_short,
+                "skipped_short_episode_count": len(skipped_short),
+                "window_policy": WINDOW_POLICY,
+                "clip_length": CLIP_LENGTH,
+                "runtime_seconds": time.perf_counter() - started,
+            },
+        )
+
+    started = time.perf_counter()
+    built = publish_stage(
+        destination,
+        fingerprint=fingerprint,
+        required=("episodes.parquet", "clips.parquet"),
+        force=force,
+        resume=bool(resolved["runtime"].get("resume", True)),
+        build=build,
+    )
     if built:
         emit_completed_timing("scan", time.perf_counter() - started)
-    return result
+    return root, adapter, _load_clips(destination / "clips.parquet"), fingerprint
 
 
 def encode_stage(
@@ -404,7 +434,8 @@ def encode_stage(
             "encoding": resolved["encoding"],
             "runtime": {"max_episodes": resolved["runtime"].get("max_episodes")},
             "seed": resolved["seed"],
-            "fixed_clip": {"length": 15, "stride": 15},
+            "window_policy": WINDOW_POLICY,
+            "clip_length": CLIP_LENGTH,
             "visual_halves": {
                 "windows": [[0, 8], [7, 15]],
                 "encoding": "l2_normalized_eight_frame_mean",
@@ -536,6 +567,7 @@ def graph_stage(
             "reliability_metrics": list(RELIABILITY_METRICS),
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
             "prototype_strategy": PROTOTYPE_STRATEGY,
+            "sequence_adjacency": SEQUENCE_ADJACENCY,
         }
     )
     destination = root / GRAPH_DIRECTORY
@@ -616,6 +648,7 @@ def graph_stage(
                 "prototype_method": "motion_primitives",
                 "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
                 "prototype_strategy": PROTOTYPE_STRATEGY,
+                "sequence_adjacency": SEQUENCE_ADJACENCY,
                 "nodes": len(graph.sample_ids),
                 "sequence_edges": len(graph.sequence_edges.source),
                 "similarity_edges": len(graph.similarity_edges.source),
@@ -1286,6 +1319,8 @@ def select_stage(
             "prototype_method": "motion_primitives",
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
             "prototype_strategy": PROTOTYPE_STRATEGY,
+            "window_policy": WINDOW_POLICY,
+            "sequence_adjacency": SEQUENCE_ADJACENCY,
             "selection_ratio": ratio,
             "relation_type": relation_type,
             "relation_weight": relation_weight,
@@ -1355,6 +1390,10 @@ def validate_output(
         raise ValueError("cocore prototype schema version is incompatible")
     if run_manifest.get("prototype_strategy") != PROTOTYPE_STRATEGY:
         raise ValueError("cocore prototype strategy is incompatible")
+    if run_manifest.get("window_policy") != WINDOW_POLICY:
+        raise ValueError("cocore run manifest window policy is incompatible")
+    if run_manifest.get("sequence_adjacency") != SEQUENCE_ADJACENCY:
+        raise ValueError("cocore run manifest sequence adjacency is incompatible")
     algorithm = run_manifest.get("algorithm")
     if not isinstance(algorithm, Mapping) or algorithm.get("type") != "lazy_max_heap":
         raise ValueError("cocore run manifest algorithm is invalid")
@@ -1379,7 +1418,7 @@ def validate_output(
     if run_manifest.get("stage_directories") != expected_directories:
         raise ValueError("run manifest stage directories are invalid")
     stage_required = {
-        "scan": ("episodes.parquet", "clips.parquet", "normalization.npz"),
+        "scan": ("episodes.parquet", "clips.parquet"),
         "encode": (
             "embeddings.npy",
             "visual_half_embeddings.npy",
@@ -1424,10 +1463,30 @@ def validate_output(
         stage_manifests["graph"].get("prototype_schema_version") != PROTOTYPE_SCHEMA_VERSION
         or stage_manifests["graph"].get("prototype_strategy") != PROTOTYPE_STRATEGY
         or stage_manifests["graph"].get("stage_directory") != GRAPH_DIRECTORY
+        or stage_manifests["graph"].get("sequence_adjacency") != SEQUENCE_ADJACENCY
     ):
         raise ValueError("graph manifest prototype schema is incompatible")
+    if any(
+        stage_manifests[stage].get("window_policy") != WINDOW_POLICY
+        or stage_manifests[stage].get("clip_length") != CLIP_LENGTH
+        for stage in ("scan", "encode")
+    ):
+        raise ValueError("cocore stage window policy is incompatible")
     scan_clips = _load_clips(root / "scan" / "clips.parquet")
     episode_rows = pq.read_table(root / "scan" / "episodes.parquet").to_pylist()
+    expected_clips = build_clip_records(
+        [
+            EpisodeRecord(
+                episode_id=int(row["episode_id"]),
+                length=int(row["length"]),
+                task_index=int(row["task_index"]),
+                task_name=str(row["task_name"]),
+            )
+            for row in episode_rows
+        ]
+    )
+    if scan_clips != expected_clips:
+        raise ValueError("scan clips do not match Cocore near-uniform candidate windows")
     _validate_frame_embedding_cache(
         root / "encode",
         expected_episodes=[(int(row["episode_id"]), int(row["length"])) for row in episode_rows],

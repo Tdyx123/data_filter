@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import ClassVar
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import yaml
@@ -158,7 +159,7 @@ def test_encode_stage_publishes_normalized_visual_half_artifact(tmp_path: Path) 
     )
 
     assert result_root == root
-    assert CocorePipelineAdapter.load_images_calls == [False, False, True]
+    assert CocorePipelineAdapter.load_images_calls == [False, True]
     embeddings = np.load(root / "encode" / "embeddings.npy")
     assert embeddings.shape == (28, 159)
     np.testing.assert_allclose(np.linalg.norm(embeddings, axis=1), 1.0, atol=1.0e-6)
@@ -180,15 +181,14 @@ def test_encode_stage_publishes_normalized_visual_half_artifact(tmp_path: Path) 
     assert manifest["embedding_dim"] == 159
     assert manifest["counts"] == {
         "candidate_fragments": 28,
-        "reference_fragments": 18,
-        "overlap_fragments": 6,
-        "pca_union_fragments": 40,
+        "pca_fit_fragments": 28,
         "encoded_episodes": 2,
         "encoded_frames": 414,
     }
     assert manifest["visual_half_embedding_dim"] == 3
     assert manifest["clip_length"] == 15
-    assert manifest["clip_stride"] == 15
+    assert manifest["window_policy"] == "near_uniform_full_coverage"
+    assert "clip_stride" not in manifest
     assert manifest["clip_anchors"] == [0, 7, 14]
     assert manifest["visual_half_windows"] == [[0, 8], [7, 15]]
     assert manifest["visual_half_encoding"] == "l2_normalized_eight_frame_mean"
@@ -201,6 +201,7 @@ def test_encode_stage_publishes_normalized_visual_half_artifact(tmp_path: Path) 
         assert frames.dtype == np.float32
     assert (root / "encode" / "visual_pca.npz").is_file()
     assert (root / "encode" / "numeric_normalizers.npz").is_file()
+    assert not (root / "scan" / "normalization.npz").exists()
     assert not (root / "encode" / "raw_relations.npy").exists()
     assert not (root / "encode" / "projection_matrices.npz").exists()
     assert not (root / "encode" / "relation_pca.npz").exists()
@@ -210,7 +211,7 @@ def test_encode_stage_publishes_normalized_visual_half_artifact(tmp_path: Path) 
         output_dir=root,
         visual_encoder=FailingCocoreVisualEncoder(),
     )
-    assert CocorePipelineAdapter.load_images_calls == [False, False, True]
+    assert CocorePipelineAdapter.load_images_calls == [False, True]
 
 
 def test_encode_stage_reports_new_build_but_not_cache_hit(
@@ -363,7 +364,10 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     for directory in ("scan", "encode", "graph-14-motion-hard-nearest"):
         manifest = json.loads((root / directory / "manifest.json").read_text())
         assert manifest["producer"] == "cocore"
-        assert manifest["cocore_version"] == "0.9.0"
+        assert manifest["cocore_version"] == "0.10.0"
+    scan_manifest = json.loads((root / "scan" / "manifest.json").read_text())
+    assert scan_manifest["window_policy"] == "near_uniform_full_coverage"
+    assert scan_manifest["clip_length"] == 15
     catalog = json.loads(
         (root / "graph-14-motion-hard-nearest" / "prototype_catalog.json").read_text()
     )
@@ -392,6 +396,14 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     centers = np.load(root / "graph-14-motion-hard-nearest" / "prototype_centers.npy")
     assert centers.shape[1] == 3
     nodes = np.load(root / "graph-14-motion-hard-nearest" / "nodes.npz")
+    sequence_edges = np.load(
+        root / "graph-14-motion-hard-nearest" / "sequence_edges.npz"
+    )
+    assert len(sequence_edges["source"]) == 26
+    graph_manifest = json.loads(
+        (root / "graph-14-motion-hard-nearest" / "manifest.json").read_text()
+    )
+    assert graph_manifest["sequence_adjacency"] == "ordered_candidates"
     assert "prototype_action_weights" not in nodes.files
     assert "prototype_distance_weights" not in nodes.files
     assert np.all(nodes["prototype_weights"].sum(axis=1) > 0.0)
@@ -455,7 +467,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     }
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.9.0"
+    assert run_manifest["cocore_version"] == "0.10.0"
     assert run_manifest["relation_type"] == relation
     assert run_manifest["relation_weight"] == 1.0
     assert run_manifest["prototype_schema_version"] == 5
@@ -464,8 +476,10 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     )
     assert run_manifest["stage_directories"]["graph"] == "graph-14-motion-hard-nearest"
     assert run_manifest["algorithm"] == report["algorithm"]
+    assert run_manifest["window_policy"] == "near_uniform_full_coverage"
+    assert run_manifest["sequence_adjacency"] == "ordered_candidates"
     select_manifest = json.loads((result / "manifest.json").read_text())
-    assert select_manifest["cocore_version"] == "0.9.0"
+    assert select_manifest["cocore_version"] == "0.10.0"
     assert select_manifest["relation_type"] == relation
     assert select_manifest["relation_weight"] == 1.0
     assert select_manifest["prototype_schema_version"] == 5
@@ -481,7 +495,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     (result / "manifest.json").write_text(json.dumps(select_manifest))
     with pytest.raises(ValueError, match="selection manifest Cocore version"):
         validate_output(result, config=config)
-    select_manifest["cocore_version"] = "0.9.0"
+    select_manifest["cocore_version"] = "0.10.0"
     (result / "manifest.json").write_text(json.dumps(select_manifest))
 
     report["relation_type"] = "sequence" if relation == "cooccurrence" else "cooccurrence"
@@ -888,6 +902,54 @@ def test_validate_rejects_tampered_stage_manifest_contract(
         with pytest.raises(ValueError, match=f"stage manifest metadata.*{stage}"):
             validate_output(result, config=config)
         manifest_path.write_text(json.dumps(original))
+
+
+@pytest.mark.parametrize(
+    ("directory", "field", "value", "message"),
+    [
+        ("scan", "window_policy", "legacy_stride", "window policy"),
+        ("encode", "window_policy", "legacy_stride", "window policy"),
+        (
+            "graph-14-motion-hard-nearest",
+            "sequence_adjacency",
+            "contiguous",
+            "graph manifest prototype schema",
+        ),
+    ],
+)
+def test_validate_rejects_tampered_window_and_sequence_policies(
+    tmp_path: Path,
+    directory: str,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    manifest_path = result.parent / directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest[field] = value
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match=message):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_scan_clips_that_do_not_match_uniform_replay(
+    tmp_path: Path,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    clips_path = result.parent / "scan" / "clips.parquet"
+    rows = pq.read_table(clips_path).to_pylist()
+    rows[1]["start_step"] += 1
+    rows[1]["end_step"] += 1
+    pq.write_table(pa.Table.from_pylist(rows), clips_path)
+
+    with pytest.raises(ValueError, match="near-uniform candidate windows"):
+        validate_output(result, config=config)
 
 
 def test_validate_replays_current_adapter_state(tmp_path: Path) -> None:

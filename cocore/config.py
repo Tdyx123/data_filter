@@ -60,7 +60,10 @@ def _merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
 
 def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if "clip" in config:
-        raise ValueError("cocore clip configuration was removed; windows are fixed to 15/15")
+        raise ValueError(
+            "cocore clip configuration was removed; candidates use fixed near-uniform "
+            "15-frame windows"
+        )
     if "relation" in config:
         raise ValueError("cocore relation encoding configuration was removed; use encoding instead")
     if "normalization" in config:

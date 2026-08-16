@@ -10,16 +10,12 @@ from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 
-from relcore.data.index import build_clip_records
 from relcore.features.visual_encoder import VisualEncoder
 from relcore.schemas import ClipRecord
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
 
+from cocore.index import CLIP_LENGTH, build_clip_records
 from cocore.timing import TimingCallback, timed_step
-
-
-CLIP_LENGTH = 15
-CLIP_STRIDE = 15
 
 
 def _sha256(path: Path) -> str:
@@ -220,39 +216,6 @@ class CocorePCAProjector:
         return self.fit(features, max_samples=max_samples).transform(features)
 
 
-def _round_half_up_ratio(numerator: int, denominator: int) -> int:
-    if numerator < 0 or denominator <= 0:
-        raise ValueError("half-up rounding requires a non-negative ratio")
-    return (2 * numerator + denominator) // (2 * denominator)
-
-
-def _reference_sample_count(length: int) -> int:
-    if length < CLIP_LENGTH:
-        return 0
-    if length < 30:
-        return 1
-    if length <= 90:
-        return _round_half_up_ratio(length, 15)
-    if length <= 180:
-        return _round_half_up_ratio(length, 30) + 3
-    return _round_half_up_ratio(length, 60) + 6
-
-
-def reference_windows(length: int) -> list[tuple[int, int]]:
-    """Return Quality-compatible reference fragments for one episode."""
-
-    count = _reference_sample_count(length)
-    if count == 0:
-        return []
-    if count == 1:
-        return [(0, CLIP_LENGTH - 1)]
-    final_start = length - CLIP_LENGTH
-    starts = [_round_half_up_ratio(index * final_start, count - 1) for index in range(count)]
-    if len(starts) != len(set(starts)):
-        raise ValueError(f"reference sampling produced duplicate starts for length={length}")
-    return [(start, start + CLIP_LENGTH - 1) for start in starts]
-
-
 def temporal_pool(sequence: np.ndarray) -> np.ndarray:
     """Concatenate mean, standard deviation, and maximum over time."""
 
@@ -353,7 +316,7 @@ class CocoreEncodedClips:
     numeric_normalizers: CocoreNumericNormalizers
     visual_projector: CocorePCAProjector
     frame_embeddings: list[FrameEmbeddingEntry]
-    union_fragment_count: int
+    pca_fit_fragment_count: int
 
 
 @dataclass(frozen=True)
@@ -414,7 +377,7 @@ def encode_cocore_dataset(
     if max_episodes is not None:
         records = records[:max_episodes]
     records_by_id = _records_by_id(records)
-    clips = build_clip_records(records, length=CLIP_LENGTH, stride=CLIP_STRIDE)
+    clips = build_clip_records(records)
     if not clips:
         raise ValueError("dataset contains no complete clips")
 
@@ -442,20 +405,17 @@ def encode_cocore_dataset(
         clips_by_episode: dict[int, list[tuple[int, ClipRecord]]] = {}
         for index, clip in enumerate(clips):
             clips_by_episode.setdefault(clip.episode_id, []).append((index, clip))
-        union_windows = {
-            record.episode_id: sorted(
-                {
-                    (clip.start_step, clip.end_step)
-                    for _, clip in clips_by_episode.get(record.episode_id, ())
-                }
-                | set(reference_windows(record.length))
-            )
+        candidate_windows = {
+            record.episode_id: [
+                (clip.start_step, clip.end_step)
+                for _, clip in clips_by_episode.get(record.episode_id, ())
+            ]
             for record in records
         }
-        union_order = [
+        candidate_order = [
             (record.episode_id, start, end)
             for record in records
-            for start, end in union_windows[record.episode_id]
+            for start, end in candidate_windows[record.episode_id]
         ]
 
         cache_root = Path(frame_cache_dir)
@@ -509,7 +469,7 @@ def encode_cocore_dataset(
 
             normalized_state = normalizers.state(episode.observations)
             normalized_action = normalizers.action(episode.actions)
-            for start, end in union_windows[episode.episode_id]:
+            for start, end in candidate_windows[episode.episode_id]:
                 raw_visual[(episode.episode_id, start, end)] = visual_fragment_feature(
                     frame_features[start : end + 1]
                 )
@@ -540,20 +500,23 @@ def encode_cocore_dataset(
             raise ValueError("image pass did not yield every indexed episode exactly once")
         if len(half_visual_by_index) != len(clips):
             raise ValueError("encoded clip count does not match clip index")
-        if set(raw_visual) != set(union_order):
-            raise ValueError("encoded visual union does not match expected fragment windows")
+        if set(raw_visual) != set(candidate_order):
+            raise ValueError("encoded visual features do not match candidate fragment windows")
 
     with timed_step("encode.pca_fusion", timing_callback):
-        visual_raw = np.stack([raw_visual[key] for key in union_order])
+        visual_raw = np.stack([raw_visual[key] for key in candidate_order])
         projector = CocorePCAProjector(output_dim=visual_dim, seed=seed)
-        union_projected = projector.fit_transform(
+        candidate_projected = projector.fit_transform(
             visual_raw,
             max_samples=pca_fit_max_samples,
         )
-        union_index = {key: index for index, key in enumerate(union_order)}
-        candidate_visual = union_projected[
+        candidate_index = {key: index for index, key in enumerate(candidate_order)}
+        candidate_visual = candidate_projected[
             np.asarray(
-                [union_index[(clip.episode_id, clip.start_step, clip.end_step)] for clip in clips],
+                [
+                    candidate_index[(clip.episode_id, clip.start_step, clip.end_step)]
+                    for clip in clips
+                ],
                 dtype=np.int64,
             )
         ]
@@ -587,5 +550,5 @@ def encode_cocore_dataset(
             numeric_normalizers=normalizers,
             visual_projector=projector,
             frame_embeddings=[frame_entries[record.episode_id] for record in records],
-            union_fragment_count=len(union_order),
+            pca_fit_fragment_count=len(candidate_order),
         )
