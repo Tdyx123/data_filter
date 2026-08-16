@@ -297,7 +297,20 @@ def test_octo_simpler_cli_requires_all_model_paths_and_defaults_to_full_protocol
     assert arguments.output_dir == Path("outputs/octo_small_bridge_simpler_eval")
     assert arguments.device == "cuda:0"
     assert arguments.precision == "bf16"
-    assert arguments.action_horizon == 8
+    assert arguments.action_horizon == 1
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--checkpoint",
+                "/models/step-00020000",
+                "--base-model",
+                "/models/octo-small-pytorch",
+                "--statistics",
+                "/data/bridge/meta/stats.json",
+                "--action-horizon",
+                "8",
+            ]
+        )
     assert arguments.smoke_test is False
     with pytest.raises(SystemExit):
         parser.parse_args(["--checkpoint", "/models/step-00020000"])

@@ -48,7 +48,7 @@ class SimplerRunSettings:
     output_dir: Path
     tasks: tuple[SimplerTaskSpec, ...] = ()
     device: str = "cuda:0"
-    action_horizon: int = 8
+    action_horizon: int = 1
     policy_seeds: tuple[int, ...] = POLICY_SEEDS
     object_episode_ids: tuple[int, ...] = OBJECT_EPISODE_IDS
     max_steps: int | None = None
@@ -330,8 +330,8 @@ def run_simpler_episode(
 ) -> tuple[dict[str, Any], list[np.ndarray]]:
     """Run one official WidowX episode through a model-specific adapter."""
 
-    if not 1 <= action_horizon <= 8:
-        raise SimplerEvaluationError("action_horizon must be in [1, 8]")
+    if action_horizon != 1:
+        raise SimplerEvaluationError("action_horizon must be 1 for stepwise inference")
     if max_steps <= 0:
         raise SimplerEvaluationError("max_steps must be positive")
     try:
@@ -362,24 +362,22 @@ def run_simpler_episode(
         if hasattr(predicted, "detach"):
             predicted = predicted.detach().float().cpu().numpy()
         actions = np.asarray(predicted, dtype=np.float32)
-        if actions.shape != (1, 8, 7):
+        if actions.ndim != 3 or actions.shape[0] != 1 or actions.shape[1] < 1 or actions.shape[2] != 7:
             policy_name = str(getattr(policy, "policy_name", "policy"))
             raise SimplerEvaluationError(
-                f"{policy_name} returned actions with shape {actions.shape}; expected (1, 8, 7)"
+                f"{policy_name} returned actions with shape {actions.shape}; "
+                "expected (1, T, 7) with T >= 1"
             )
-        simpler_actions = bridge_actions_to_simpler(
-            actions[0],
+        simpler_action = bridge_actions_to_simpler(
+            actions[0, 0],
             gripper_threshold=float(getattr(policy, "gripper_threshold", 0.5)),
         )
-        for action in simpler_actions[: min(action_horizon, max_steps - steps)]:
-            observation, success, truncated, last_info = _step_environment(
-                environment, action
-            )
-            steps += 1
-            if capture_video:
-                frames.append(image_from_simpler_observation(observation))
-            if success or truncated:
-                break
+        observation, success, truncated, last_info = _step_environment(
+            environment, simpler_action
+        )
+        steps += 1
+        if capture_video:
+            frames.append(image_from_simpler_observation(observation))
 
     episode_stats = last_info.get("episode_stats", {})
     if not isinstance(episode_stats, Mapping):
@@ -446,12 +444,28 @@ def _summary(
                 "success_rate": task_successes / len(selected) if selected else None,
             }
         )
+    by_policy_seed = []
+    for seed in sorted({int(episode["policy_seed"]) for episode in episodes}):
+        selected = [
+            episode for episode in episodes if int(episode["policy_seed"]) == seed
+        ]
+        seed_successes = sum(bool(episode["success"]) for episode in selected)
+        by_policy_seed.append(
+            {
+                "policy_seed": seed,
+                "completed_episodes": len(selected),
+                "successes": seed_successes,
+                "failures": len(selected) - seed_successes,
+                "success_rate": seed_successes / len(selected) if selected else None,
+            }
+        )
     return {
         "completed_episodes": len(episodes),
         "successes": successes,
         "failures": len(episodes) - successes,
         "success_rate": successes / len(episodes) if episodes else None,
         "by_task": by_task,
+        "by_policy_seed": by_policy_seed,
     }
 
 
@@ -460,8 +474,8 @@ def _validate_settings(settings: SimplerRunSettings) -> None:
         raise SimplerEvaluationError("At least one SimplerEnv task is required")
     if not settings.policy_seeds or not settings.object_episode_ids:
         raise SimplerEvaluationError("policy_seeds and object_episode_ids must be non-empty")
-    if not 1 <= settings.action_horizon <= 8:
-        raise SimplerEvaluationError("action_horizon must be in [1, 8]")
+    if settings.action_horizon != 1:
+        raise SimplerEvaluationError("action_horizon must be 1 for stepwise inference")
     if settings.max_steps is not None and settings.max_steps <= 0:
         raise SimplerEvaluationError("max_steps must be positive when provided")
     if settings.video_fps <= 0:
@@ -522,7 +536,14 @@ def _protocol(
         "object_episode_ids": list(settings.object_episode_ids),
         "control_frequency_hz": 5,
         "simulation_frequency_hz": 500,
+        "control_mode": CONTROL_MODE,
         "action_horizon": settings.action_horizon,
+        "execution_mode": "stepwise_first_action",
+        "planned_episodes": (
+            len(settings.tasks)
+            * len(settings.policy_seeds)
+            * len(settings.object_episode_ids)
+        ),
         "max_steps_override": settings.max_steps,
     }
     overlap = sorted(set(protocol).intersection(metadata))
@@ -831,14 +852,19 @@ def run_simpler_preflight(
                 if hasattr(predicted, "detach"):
                     predicted = predicted.detach().float().cpu().numpy()
                 predicted_actions = np.asarray(predicted, dtype=np.float32)
-                if predicted_actions.shape != (1, 8, 7):
+                if (
+                    predicted_actions.ndim != 3
+                    or predicted_actions.shape[0] != 1
+                    or predicted_actions.shape[1] < 1
+                    or predicted_actions.shape[2] != 7
+                ):
                     policy_name = str(getattr(policy, "policy_name", "policy"))
                     raise SimplerEvaluationError(
                         f"{policy_name} preflight returned actions with shape "
-                        f"{predicted_actions.shape}; expected (1, 8, 7)"
+                        f"{predicted_actions.shape}; expected (1, T, 7) with T >= 1"
                     )
                 bridge_actions_to_simpler(
-                    predicted_actions,
+                    predicted_actions[0, 0],
                     gripper_threshold=float(
                         getattr(policy, "gripper_threshold", 0.5)
                     ),
@@ -868,12 +894,7 @@ def run_simpler_preflight(
         "status": "passed",
         "route": route,
         "checkpoint": dict(checkpoint),
-        "protocol": {
-            "tasks": [task.key for task in settings.tasks],
-            "control_frequency_hz": 5,
-            "simulation_frequency_hz": 500,
-            "control_mode": CONTROL_MODE,
-        },
+        "protocol": _protocol(settings, policy.protocol_metadata()),
         "environments": environments,
         "model_inference": inference,
         "runtime": {

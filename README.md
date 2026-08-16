@@ -859,6 +859,15 @@ episode，并分别写入 `outputs/qwen_libero_eval/task-0/` 到 `task-9/`。单
 `--num-envs` 仍控制 LIBERO 仿真并行度。已有结果不会自动覆盖，重复正式评测需传
 `--overwrite`。
 
+### SimplerEnv 统一逐步动作协议
+
+Qwen、Octo-small 和 StarVLA 三类入口使用相同执行语义：每个环境步都重新推理原生
+动作块，每次只执行动作块的第一个动作，不缓存或复用后续动作，也不启用 temporal
+ensemble。`--action-horizon` 的唯一合法值为 `1`；旧值 `8` 会在启动参数解析阶段直接
+失败。正式口径统一为 4 个任务 × 24 个 object episode × 策略种子 `0,2,4`，
+共 288 回合。结果协议记录 `execution_mode: stepwise_first_action`、
+`action_horizon: 1` 和模型自己的 `native_action_chunk_size`。
+
 ### Qwen Bridge 的 SimplerEnv 四任务闭环评测
 
 该入口只评测以下固定 WidowX Bridge 任务：`spoon`、`carrot`、`stack`、
@@ -901,7 +910,8 @@ bash scripts/evaluate_simpler_qwen.sh \
 ```
 
 完整协议为 4 个任务 × object episode `0..23` × 策略种子 `0,2,4`，共 288 回合；
-模型只加载一次，每个回合单独创建/关闭环境，每次预测并执行完整 8 步动作块：
+模型只加载一次，每个回合单独创建/关闭环境。每个环境步重新预测原生 8 步动作块，
+但只执行第一个动作：
 
 ```bash
 bash scripts/evaluate_simpler_qwen.sh \
@@ -911,7 +921,7 @@ bash scripts/evaluate_simpler_qwen.sh \
   --output-dir outputs/qwen_simpler_eval
 ```
 
-`--tasks` 也接受如 `spoon,eggplant` 的逗号列表；`--action-horizon` 可设为 1–8。
+`--tasks` 也接受如 `spoon,eggplant` 的逗号列表；`--action-horizon` 只接受 `1`。
 默认不录像；传入 `--save-videos-path outputs/qwen_simpler_videos` 后保存全部执行回合，
 路径为 `TASK/seed-SEED/episode-ID_{success|failure}.mp4`，默认 5 FPS。结果目录在运行中
 原子更新 `episodes.partial.jsonl`，正常结束后写 `episodes.jsonl` 与 `results.json`；
@@ -976,7 +986,64 @@ bash scripts/evaluate_simpler_octo_small.sh \
 
 评测只启用 primary 图像 tokenizer，使用 Bridge stats 标准化 proprio、反标准化前六维
 动作，并保持训练时的 `[-1,+1]` 抓手语义（以 0 为开合阈值）。默认不录像；输出文件、
-覆盖保护和退出码与 Qwen SimplerEnv 入口一致。
+覆盖保护和退出码与 Qwen SimplerEnv 入口一致。Octo-small 同样在每个环境步重新预测
+原生 8 步动作块，并且只执行第一个动作。
+
+### StarVLA Qwen3VL-GR00T Bridge 的 SimplerEnv 评测
+
+StarVLA 模型进程固定由 `/home/dwb/.pyenv/bin/pyenv` 的
+`miniconda3-3.12-25.11.1-1` 环境加载。该环境必须保持 Python 3.12.12、
+Torch 2.10.0+cu128、Transformers 5.2.0 和 NumPy 2.2.0；只补装
+`diffusers==0.38.0`，不执行项目 editable install，也不降级已有 Torch 或
+Transformers：
+
+```bash
+PYENV_VERSION=miniconda3-3.12-25.11.1-1 \
+  /home/dwb/.pyenv/bin/pyenv exec python -m pip install \
+  -r requirements-starvla-pyenv.txt
+```
+
+启动器自动管理两个进程：上述 pyenv 中的模型服务，以及
+`.venv-octo-simpler/bin/python` 中的 SimplerEnv 客户端。两者只通过启动器创建的
+私有 Unix socket 通信。模型服务从
+`/data/dwb/models/Qwen3-VL-4B-Instruct` 读取 config、processor 和 chat template，
+在 meta device 构造与 StarVLA 提交
+`3422b9f2387b6f682cf02802904a77b23ab13afd` 同构的网络，再以 mmap、
+`weights_only=True`、`strict=True` 和 `assign=True` 加载目标 checkpoint 的全部
+962 个 BF16 tensors；不会修改任一本地模型目录。
+
+先运行预检。服务只有在严格加载完成并通过一次有限值 `(1,16,7)` 黑图推理后才创建
+socket；客户端随后校验四个环境并完成 SimplerEnv 预检：
+
+```bash
+bash scripts/evaluate_simpler_starvla.sh \
+  --output-dir outputs/starvla_simpler_preflight \
+  --preflight-only
+```
+
+四任务 smoke test 对每个任务只运行 seed 0、object episode 0，最多执行 8 个环境步：
+
+```bash
+bash scripts/evaluate_simpler_starvla.sh \
+  --output-dir outputs/starvla_simpler_smoke \
+  --smoke-test
+```
+
+正式命令默认读取
+`/data/dwb/models/Qwen3VL-GR00T-Bridge-RT-1`，运行固定 288 回合：
+
+```bash
+bash scripts/evaluate_simpler_starvla.sh \
+  --tasks all \
+  --output-dir outputs/starvla_simpler_eval
+```
+
+每个 `task × policy_seed` 只重置一次 Python、NumPy、Torch 和 CUDA 随机流，然后连续
+完成该 seed 的 24 个对象。StarVLA 每步返回原生 `(1,16,7)` 动作块，只执行首个
+动作；前六维按 `oxe_bridge.action` 的 q01/q99 和 mask 反归一化，抓手保持 `[0,1]`
+并以 `0.5` 为阈值。启动失败、客户端失败或收到 INT/TERM 时，脚本只回收本次启动的
+服务进程；`model-server.log` 保留在输出目录。正式完成后 `episodes.jsonl` 应恰有
+288 条，`results.json` 按任务和三个策略种子汇总。
 
 ## 测试
 
@@ -989,6 +1056,10 @@ pytest -q tests/test_simpler_bridge_evaluation.py \
   tests/test_octo_small_simpler_evaluation.py \
   tests/test_evaluate_simpler_octo_small_script.py
 bash -n scripts/evaluate_simpler_octo_small.sh
+pytest -q tests/test_starvla_modeling.py tests/test_starvla_runtime.py \
+  tests/test_starvla_ipc.py tests/test_starvla_simpler_evaluation.py \
+  tests/test_evaluate_simpler_starvla_script.py
+bash -n scripts/evaluate_simpler_starvla.sh
 ```
 
 真实 4/8 卡 smoke test 必须在能访问 NVIDIA 驱动的训练机运行。

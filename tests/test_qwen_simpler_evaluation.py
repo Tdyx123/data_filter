@@ -64,6 +64,19 @@ def test_task_selection_preserves_requested_order_and_rejects_duplicates():
         evaluation.resolve_task_selection("spoon,drawer")
 
 
+def test_qwen_simpler_cli_only_accepts_stepwise_action_horizon():
+    from qwen3_vl_groot.evaluate_simpler import build_parser
+
+    parser = build_parser()
+    arguments = parser.parse_args(["--checkpoint", "/models/checkpoint"])
+
+    assert arguments.action_horizon == 1
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--checkpoint", "/models/checkpoint", "--action-horizon", "8"]
+        )
+
+
 def test_bridge_image_preprocessing_resizes_then_center_crops():
     evaluation = _evaluation()
     image = np.empty((4, 6, 3), dtype=np.uint8)
@@ -265,7 +278,7 @@ class _FakeEnvironment:
         self.closed = True
 
 
-def test_run_episode_executes_action_chunk_until_early_success():
+def test_run_episode_replans_each_step_until_early_success():
     evaluation = _evaluation()
     environment = _FakeEnvironment(success_step=3)
     policy = _FakePolicy()
@@ -279,7 +292,7 @@ def test_run_episode_executes_action_chunk_until_early_success():
         generator="seeded-generator",
         data_config={"train_crop_size": 4, "output_image_size": 4},
         denoising_steps=5,
-        action_horizon=8,
+        action_horizon=1,
         max_steps=60,
         capture_video=True,
     )
@@ -296,16 +309,16 @@ def test_run_episode_executes_action_chunk_until_early_success():
         "episode_stats": {"is_src_obj_grasped": True},
     }
     assert environment.reset_options["obj_init_options"] == {"episode_id": 7}
-    assert [action[0] for action in environment.actions] == [0, 1, 2]
+    assert [action[0] for action in environment.actions] == [0, 0, 0]
     assert all(action[6] == 1.0 for action in environment.actions)
-    assert len(policy.calls) == 1
+    assert len(policy.calls) == 3
     assert policy.calls[0]["instruction"] == "Put Spoon on Towel"
     assert policy.calls[0]["denoising_steps"] == 5
     assert policy.calls[0]["generator"] == "seeded-generator"
     assert len(frames) == 4
 
 
-def test_run_episode_replans_after_selected_horizon_and_stops_on_truncation():
+def test_run_episode_replans_every_step_and_stops_on_truncation():
     evaluation = _evaluation()
     environment = _FakeEnvironment(truncate_step=5)
     policy = _FakePolicy()
@@ -319,7 +332,7 @@ def test_run_episode_replans_after_selected_horizon_and_stops_on_truncation():
         generator=object(),
         data_config={"train_crop_size": 4, "output_image_size": 4},
         denoising_steps=4,
-        action_horizon=4,
+        action_horizon=1,
         max_steps=12,
         capture_video=False,
     )
@@ -327,7 +340,7 @@ def test_run_episode_replans_after_selected_horizon_and_stops_on_truncation():
     assert episode["success"] is False
     assert episode["steps"] == 5
     assert episode["termination"] == "truncated"
-    assert len(policy.calls) == 2
+    assert len(policy.calls) == 5
     assert len(frames) == 0
 
 
@@ -351,7 +364,7 @@ def test_episode_stats_are_converted_to_json_values():
         generator=object(),
         data_config={"train_crop_size": 4, "output_image_size": 4},
         denoising_steps=4,
-        action_horizon=8,
+        action_horizon=1,
         max_steps=8,
         capture_video=False,
     )
@@ -408,7 +421,7 @@ def test_evaluate_protocol_writes_partial_and_final_reports(tmp_path):
         tasks=(evaluation.SIMPLER_TASKS[0], evaluation.SIMPLER_TASKS[1]),
         policy_seeds=(0, 2),
         object_episode_ids=(0, 1),
-        action_horizon=8,
+        action_horizon=1,
     )
     checkpoint = SimpleNamespace(
         requested_path=settings.checkpoint,
@@ -428,6 +441,7 @@ def test_evaluate_protocol_writes_partial_and_final_reports(tmp_path):
     )
 
     assert report["status"] == "complete"
+    assert report["protocol"]["planned_episodes"] == 8
     assert report["summary"] == {
         "completed_episodes": 8,
         "successes": 4,
@@ -447,6 +461,22 @@ def test_evaluate_protocol_writes_partial_and_final_reports(tmp_path):
                 "successes": 0,
                 "failures": 4,
                 "success_rate": 0.0,
+            },
+        ],
+        "by_policy_seed": [
+            {
+                "policy_seed": 0,
+                "completed_episodes": 4,
+                "successes": 2,
+                "failures": 2,
+                "success_rate": 0.5,
+            },
+            {
+                "policy_seed": 2,
+                "completed_episodes": 4,
+                "successes": 2,
+                "failures": 2,
+                "success_rate": 0.5,
             },
         ],
     }
@@ -492,6 +522,12 @@ def test_full_single_task_protocol_runs_24_by_3_and_updates_partial(tmp_path):
     )
 
     assert report["summary"]["completed_episodes"] == 72
+    assert report["protocol"]["planned_episodes"] == 72
+    assert [item["completed_episodes"] for item in report["summary"]["by_policy_seed"]] == [
+        24,
+        24,
+        24,
+    ]
     assert made_generators == [0, 2, 4]
     assert partial_counts == list(range(72))
     episodes = [

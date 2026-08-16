@@ -1,0 +1,120 @@
+import numpy as np
+import pytest
+
+
+class _FakeClient:
+    def __init__(self):
+        self.seeds = []
+        self.inferences = []
+
+    def metadata(self):
+        return {
+            "protocol_version": 1,
+            "model": "Qwen3VL-GR00T-Bridge-RT-1",
+            "native_action_chunk_size": 16,
+            "available_unnorm_keys": ["oxe_bridge"],
+            "runtime": {"python": "3.12.12", "torch": "2.10.0+cu128"},
+            "startup_preflight": {"action_shape": [1, 16, 7], "finite": True},
+        }
+
+    def reset_rng(self, seed):
+        self.seeds.append(seed)
+        return seed
+
+    def infer(self, image, instruction):
+        self.inferences.append((np.asarray(image).copy(), instruction))
+        actions = np.zeros((1, 16, 7), dtype=np.float32)
+        actions[..., 6] = 0.75
+        return actions
+
+
+def test_remote_policy_resizes_rgb_resets_seed_and_reports_native_chunk():
+    from starvla_bridge.simpler_evaluation import StarVLARemotePolicy
+
+    client = _FakeClient()
+    policy = StarVLARemotePolicy(client)
+    image = np.zeros((120, 160, 3), dtype=np.uint8)
+
+    generator = policy.make_generator(2)
+    prepared = policy.prepare_observation(
+        image,
+        np.arange(8, dtype=np.float32),
+        "Put Spoon on Towel",
+    )
+    actions = policy.predict_actions(prepared, generator=generator)
+
+    assert generator == 2
+    assert client.seeds == [2]
+    assert prepared["image"].shape == (224, 224, 3)
+    assert client.inferences[0][1] == "Put Spoon on Towel"
+    assert actions.shape == (1, 16, 7)
+    protocol = policy.protocol_metadata()
+    assert protocol["native_action_chunk_size"] == 16
+    assert protocol["model_runtime"]["python"] == "3.12.12"
+    assert protocol["startup_preflight"]["finite"] is True
+    assert protocol["terminate_episode"] == 0
+    assert policy.metadata["model"] == "Qwen3VL-GR00T-Bridge-RT-1"
+    assert policy.gripper_threshold == 0.5
+
+
+def test_remote_policy_rejects_server_metadata_for_wrong_checkpoint_contract():
+    from starvla_bridge.simpler_evaluation import StarVLARemotePolicy
+
+    client = _FakeClient()
+    client.metadata = lambda: {
+        "protocol_version": 1,
+        "native_action_chunk_size": 8,
+        "available_unnorm_keys": ["oxe_bridge"],
+    }
+
+    with pytest.raises(Exception, match="native_action_chunk_size"):
+        StarVLARemotePolicy(client)
+
+
+def test_starvla_first_action_uses_world_euler_axis_angle_and_binary_gripper():
+    from simpler_bridge.evaluation import bridge_actions_to_simpler
+
+    action = np.asarray(
+        [0.1, -0.2, 0.3, 0.0, 0.0, np.pi / 2, 0.51],
+        dtype=np.float32,
+    )
+
+    converted = bridge_actions_to_simpler(action, gripper_threshold=0.5)
+
+    np.testing.assert_allclose(converted[:3], action[:3], rtol=0, atol=1.0e-7)
+    np.testing.assert_allclose(
+        converted[3:6], [0.0, 0.0, np.pi / 2], rtol=0, atol=1.0e-6
+    )
+    assert converted[6] == 1.0
+    action[6] = 0.5
+    assert bridge_actions_to_simpler(action, gripper_threshold=0.5)[6] == -1.0
+
+
+def test_starvla_cli_defaults_to_full_stepwise_protocol():
+    from starvla_bridge.evaluate_simpler import build_parser
+
+    parser = build_parser()
+    arguments = parser.parse_args(
+        [
+            "--socket",
+            "/tmp/policy.sock",
+            "--auth-key-hex",
+            "001122",
+        ]
+    )
+
+    assert arguments.tasks == "all"
+    assert arguments.action_horizon == 1
+    assert arguments.output_dir.name == "starvla_simpler_eval"
+    assert arguments.smoke_test is False
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--socket",
+                "/tmp/policy.sock",
+                "--auth-key-hex",
+                "001122",
+                "--action-horizon",
+                "8",
+            ]
+        )

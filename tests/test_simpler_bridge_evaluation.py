@@ -2,6 +2,7 @@ import importlib
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 
 def test_qwen_reexports_the_shared_simpler_protocol():
@@ -92,6 +93,112 @@ class _Adapter:
         return {"policy": "test"}
 
 
+class _ThreeStepEnvironment(_Environment):
+    def step(self, action):
+        self.actions.append(np.asarray(action))
+        success = len(self.actions) == 3
+        return self.reset(options=self.options)[0], float(success), success, False, {}
+
+
+class _VariableChunkAdapter(_Adapter):
+    def __init__(self, chunk_size):
+        super().__init__()
+        self.chunk_size = chunk_size
+
+    def predict_actions(self, prepared, *, generator):
+        self.generators.append(generator)
+        call_index = len(self.generators) - 1
+        actions = np.full((1, self.chunk_size, 7), 99.0, dtype=np.float32)
+        actions[0, 0] = np.asarray(
+            [call_index, 0, 0, 0, 0, 0, 1], dtype=np.float32
+        )
+        return actions
+
+
+@pytest.mark.parametrize("chunk_size", [1, 8, 16])
+def test_shared_runner_replans_every_step_and_executes_only_chunk_head(chunk_size):
+    shared = importlib.import_module("simpler_bridge.evaluation")
+    environment = _ThreeStepEnvironment()
+    adapter = _VariableChunkAdapter(chunk_size)
+
+    episode, _ = shared.run_simpler_episode(
+        task=shared.SIMPLER_TASKS[0],
+        object_episode_id=0,
+        policy_seed=2,
+        policy=adapter,
+        environment=environment,
+        generator="generator-2",
+        action_horizon=1,
+        max_steps=5,
+        capture_video=False,
+    )
+
+    assert episode["steps"] == 3
+    assert [action[0] for action in environment.actions] == [0.0, 1.0, 2.0]
+    assert adapter.generators == ["generator-2"] * 3
+
+
+def test_shared_protocol_defaults_to_stepwise_first_action_and_rejects_other_horizons(
+    tmp_path,
+):
+    shared = importlib.import_module("simpler_bridge.evaluation")
+    settings = shared.SimplerRunSettings(
+        output_dir=tmp_path / "results",
+        tasks=(shared.SIMPLER_TASKS[0],),
+        policy_seeds=(0,),
+        object_episode_ids=(0,),
+    )
+
+    assert settings.action_horizon == 1
+    report = shared.evaluate_simpler_policy(
+        settings,
+        checkpoint={"requested_path": "/models/checkpoint"},
+        policy=_Adapter(),
+        environment_factory=lambda task: _Environment(),
+        source_versions={},
+        route="stepwise-test",
+        protocol_metadata={"native_action_chunk_size": 8},
+    )
+    assert report["protocol"]["execution_mode"] == "stepwise_first_action"
+    assert report["protocol"]["action_horizon"] == 1
+
+    invalid = shared.SimplerRunSettings(
+        output_dir=tmp_path / "invalid",
+        tasks=(shared.SIMPLER_TASKS[0],),
+        action_horizon=8,
+        policy_seeds=(0,),
+        object_episode_ids=(0,),
+    )
+    with pytest.raises(shared.SimplerEvaluationError, match="must be 1"):
+        shared.evaluate_simpler_policy(
+            invalid,
+            checkpoint={},
+            policy=_Adapter(),
+            environment_factory=lambda task: _Environment(),
+            source_versions={},
+            route="invalid-stepwise-test",
+            protocol_metadata={},
+        )
+
+
+def test_full_shared_protocol_plans_four_by_twenty_four_by_three_episodes(tmp_path):
+    shared = importlib.import_module("simpler_bridge.evaluation")
+    settings = shared.SimplerRunSettings(
+        output_dir=tmp_path / "results",
+        tasks=shared.SIMPLER_TASKS,
+    )
+
+    protocol = shared._protocol(
+        settings,
+        {"native_action_chunk_size": 16},
+    )
+
+    assert protocol["tasks"] == ["spoon", "carrot", "stack", "eggplant"]
+    assert protocol["policy_seeds"] == [0, 2, 4]
+    assert len(protocol["object_episode_ids"]) == 24
+    assert protocol["planned_episodes"] == 288
+
+
 def test_shared_episode_runner_uses_a_model_independent_policy_adapter():
     shared = importlib.import_module("simpler_bridge.evaluation")
     environment = _Environment()
@@ -104,7 +211,7 @@ def test_shared_episode_runner_uses_a_model_independent_policy_adapter():
         policy=adapter,
         environment=environment,
         generator="generator-2",
-        action_horizon=8,
+        action_horizon=1,
         max_steps=60,
         capture_video=True,
     )
@@ -137,7 +244,7 @@ def test_shared_episode_runner_uses_adapter_gripper_threshold():
         policy=NormalizedGripperAdapter(),
         environment=environment,
         generator="generator-0",
-        action_horizon=8,
+        action_horizon=1,
         max_steps=60,
         capture_video=False,
     )
@@ -192,6 +299,9 @@ def test_shared_preflight_reports_adapter_input_metadata(tmp_path):
     )
 
     assert report["route"] == "octo-test-preflight"
+    assert report["protocol"]["execution_mode"] == "stepwise_first_action"
+    assert report["protocol"]["action_horizon"] == 1
+    assert report["protocol"]["policy"] == "test"
     assert report["model_inference"] == {
         "task": "spoon",
         "action_shape": [1, 8, 7],

@@ -69,7 +69,7 @@ def test_launcher_uses_fixed_sources_and_forwards_evaluation_options(tmp_path):
         "--model-path",
         "/models/Qwen3-VL-4B-Instruct",
         "--action-horizon",
-        "4",
+        "1",
         "--save-videos-path",
         "/tmp/simpler-videos",
         "--smoke-test",
@@ -91,7 +91,7 @@ def test_launcher_uses_fixed_sources_and_forwards_evaluation_options(tmp_path):
     assert "--python" not in call
     assert call[call.index("--checkpoint") + 1] == CHECKPOINT
     assert "--tasks=spoon,eggplant" in call
-    assert call[call.index("--action-horizon") + 1] == "4"
+    assert call[call.index("--action-horizon") + 1] == "1"
     assert call[call.index("--save-videos-path") + 1] == "/tmp/simpler-videos"
     assert "--smoke-test" in call
 

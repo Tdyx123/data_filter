@@ -91,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
-    parser.add_argument("--action-horizon", type=int, choices=range(1, 9), default=8)
+    parser.add_argument("--action-horizon", type=int, choices=(1,), default=1)
     parser.add_argument("--save-videos-path", type=Path, default=None)
     parser.add_argument("--video-fps", type=int, default=5)
     parser.add_argument("--preflight-only", action="store_true")

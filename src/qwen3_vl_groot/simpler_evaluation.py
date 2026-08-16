@@ -60,7 +60,7 @@ class SimplerEvaluationSettings:
     model_path: Path | None = None
     device: str = "cuda:0"
     denoising_steps: int = 4
-    action_horizon: int = 8
+    action_horizon: int = 1
     policy_seeds: tuple[int, ...] = POLICY_SEEDS
     object_episode_ids: tuple[int, ...] = OBJECT_EPISODE_IDS
     max_steps: int | None = None
@@ -205,7 +205,10 @@ class _QwenPolicyAdapter:
         )
 
     def protocol_metadata(self) -> dict[str, int]:
-        return {"denoising_steps": self.denoising_steps}
+        return {
+            "denoising_steps": self.denoising_steps,
+            "native_action_chunk_size": 8,
+        }
 
 
 def run_simpler_episode(
@@ -258,8 +261,8 @@ def _validate_settings(settings: SimplerEvaluationSettings) -> None:
         raise SimplerEvaluationError("At least one SimplerEnv task is required")
     if not settings.policy_seeds or not settings.object_episode_ids:
         raise SimplerEvaluationError("policy_seeds and object_episode_ids must be non-empty")
-    if not 1 <= settings.action_horizon <= 8:
-        raise SimplerEvaluationError("action_horizon must be in [1, 8]")
+    if settings.action_horizon != 1:
+        raise SimplerEvaluationError("action_horizon must be 1 for stepwise inference")
     if settings.denoising_steps <= 0:
         raise SimplerEvaluationError("denoising_steps must be positive")
     if settings.max_steps is not None and settings.max_steps <= 0:

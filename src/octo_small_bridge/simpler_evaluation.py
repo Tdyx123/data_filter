@@ -335,6 +335,7 @@ class OctoBridgeSimplerPolicy:
         return {
             "diffusion_steps": DIFFUSION_STEPS,
             "gripper_threshold": self.gripper_threshold,
+            "native_action_chunk_size": ACTION_HORIZON,
             "observation_tokenizers": ["primary"],
             "precision": self.precision,
             "statistics": self.statistics.as_dict(),
