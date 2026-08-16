@@ -14,8 +14,8 @@ def _objective(relation: str = "cooccurrence", weight: float = 1.0) -> dict[str,
     return {"objective": {"relation": relation, "relation_weight": weight}}
 
 
-def test_package_version_matches_schema_five_release() -> None:
-    assert cocore.__version__ == "0.9.0"
+def test_package_version_matches_uniform_clip_release() -> None:
+    assert cocore.__version__ == "0.10.0"
 
 
 def test_config_requires_explicit_relation_and_weight() -> None:
@@ -24,6 +24,11 @@ def test_config_requires_explicit_relation_and_weight() -> None:
 
     with pytest.raises(ValueError, match="objective.relation_weight is required"):
         resolve_config({"objective": {"relation": "cooccurrence"}})
+
+
+def test_config_rejects_clip_overrides_with_uniform_window_contract() -> None:
+    with pytest.raises(ValueError, match="near-uniform 15-frame"):
+        resolve_config({**_objective(), "clip": {"length": 15, "stride": 15}})
 
 
 @pytest.mark.parametrize("relation", ["sequence", "cooccurrence"])

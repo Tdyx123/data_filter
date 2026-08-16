@@ -77,9 +77,9 @@ outputs/cocore_bridge_v2/bridge_orig_1.0.0
 graph 目录提供 schema 5 的 `prototype_catalog.json`、`prototype_centers.npy` 和内部
 校验用 `half_action_labels.npy`。选择输出包含最终原型标签、动作标签、绝对置信度和
 `half_action_labels`，不包含旧的 action/distance 分解权重。manifest 的生产者仍为
-`cocore`；Cocore 版本为 0.9.0，Bridge 包版本为 0.2.0。
+`cocore`；Cocore 版本为 0.10.0，Bridge 包版本为 0.2.0。
 
-schema 4 缓存不迁移，也不会被当作 schema 5 读取。升级后必须重新构建 encode、graph 和
+0.9.0 及更早的 Cocore 缓存不迁移。升级后必须重新构建 scan、encode、graph 和
 selection；建议使用新的输出目录，或在确认目标后使用 `--force`。
 
 验证时必须重复传入生成该选择结果时使用的目标、比例、数据集路径以及

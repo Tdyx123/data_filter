@@ -690,9 +690,9 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     select_manifest = json.loads((result / "manifest.json").read_text())
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert select_manifest["producer"] == "cocore"
-    assert select_manifest["cocore_version"] == "0.9.0"
+    assert select_manifest["cocore_version"] == "0.10.0"
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.9.0"
+    assert run_manifest["cocore_version"] == "0.10.0"
     assert run_manifest["stage_directories"]["graph"] == "graph-14-motion-hard-nearest"
     assert validate_output(result, config=config) == {
         "status": "valid",

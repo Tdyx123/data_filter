@@ -11,19 +11,15 @@ from cocore.encoding import (
     CocorePCAProjector,
     encode_cocore_dataset,
     fuse_fragment_features,
-    reference_windows,
     temporal_pool,
     visual_half_means,
     visual_fragment_feature,
 )
+from cocore.index import uniform_clip_windows
 from segment_filter_core.encoding import (
     NumericNormalizers,
     PCAProjector,
     fuse_fragment_features as reference_fuse_fragment_features,
-)
-from segment_filter_core.windows import (
-    candidate_windows,
-    reference_windows as reference_quality_windows,
 )
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
 
@@ -139,9 +135,6 @@ def test_quality_style_primitives_match_shared_reference() -> None:
         reference_projector.fit_transform(raw, max_samples=5),
         atol=1.0e-6,
     )
-    assert reference_windows(46) == reference_quality_windows(46)
-
-
 def test_quality_style_pca_requires_positive_output_dimension() -> None:
     with pytest.raises(ValueError, match="output_dim must be positive"):
         CocorePCAProjector(output_dim=0)
@@ -179,7 +172,8 @@ def test_cocore_encoder_uses_quality_fusion_and_caches_episode_frames(
 
     assert adapter.load_images_calls == [False, True]
     assert visual.episode_lengths == [46, 15, 7]
-    assert [clip.start_step for clip in cocore.clips] == [0, 15, 30, 31, 0]
+    assert [clip.start_step for clip in cocore.clips] == [0, 10, 20, 31, 0]
+    assert cocore.pca_fit_fragment_count == len(cocore.clips) == 5
     assert cocore.embeddings.shape == (5, 159)
     np.testing.assert_allclose(np.linalg.norm(cocore.embeddings, axis=1), 1.0, atol=1.0e-6)
     assert [
@@ -202,10 +196,7 @@ def test_cocore_encoder_uses_quality_fusion_and_caches_episode_frames(
     union_raw: list[np.ndarray] = []
     union_positions: dict[tuple[int, int, int], int] = {}
     for record in adapter.episodes():
-        windows = sorted(
-            set(candidate_windows(record.length)) | set(reference_quality_windows(record.length))
-        )
-        for start, end in windows:
+        for start, end in uniform_clip_windows(record.length):
             union_positions[(record.episode_id, start, end)] = len(union_raw)
             union_raw.append(
                 visual_fragment_feature(frame_features[record.episode_id][start : end + 1])
