@@ -94,6 +94,11 @@ class _CountingVisualEncoder:
         return np.stack([values + 1.0, values + 2.0, values + 4.0], axis=1)
 
 
+class _FailingVisualEncoder(_CountingVisualEncoder):
+    def encode(self, images: np.ndarray) -> np.ndarray:
+        raise RuntimeError(f"injected visual failure for {len(images)} frames")
+
+
 def test_quality_style_primitives_match_shared_reference() -> None:
     actions = np.asarray(
         [[-5.0, 2.0], [0.0, 4.0], [5.0, 8.0], [10.0, 16.0]],
@@ -254,3 +259,35 @@ def test_cocore_encoder_uses_quality_fusion_and_caches_episode_frames(
         1.0,
         atol=1.0e-6,
     )
+
+
+def test_cocore_encoder_reports_completed_step_timings(tmp_path: Path) -> None:
+    events: list[tuple[str, float]] = []
+
+    encode_cocore_dataset(
+        _EncodingAdapter(),
+        _CountingVisualEncoder(),
+        frame_cache_dir=tmp_path / "frame_embeddings",
+        timing_callback=lambda step, seconds: events.append((step, seconds)),
+    )
+
+    assert [step for step, _ in events] == [
+        "encode.numeric_normalization",
+        "encode.visual_cache",
+        "encode.pca_fusion",
+    ]
+    assert all(seconds >= 0.0 for _, seconds in events)
+
+
+def test_cocore_encoder_does_not_report_failed_visual_step(tmp_path: Path) -> None:
+    events: list[tuple[str, float]] = []
+
+    with pytest.raises(RuntimeError, match="injected visual failure"):
+        encode_cocore_dataset(
+            _EncodingAdapter(),
+            _FailingVisualEncoder(),
+            frame_cache_dir=tmp_path / "frame_embeddings",
+            timing_callback=lambda step, seconds: events.append((step, seconds)),
+        )
+
+    assert [step for step, _ in events] == ["encode.numeric_normalization"]

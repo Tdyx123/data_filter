@@ -431,6 +431,7 @@ def encode_stage(
             num_workers=int(resolved["runtime"].get("num_workers", 0)),
             max_episodes=resolved["runtime"].get("max_episodes"),
             progress_interval=100,
+            timing_callback=emit_completed_timing,
         )
         if [clip.sample_id for clip in encoded.clips] != [clip.sample_id for clip in clips]:
             raise ValueError("encode clip order does not match scan clip index")
@@ -474,7 +475,8 @@ def encode_stage(
                 f"cocore visual half embedding cache is incompatible: {destination}; pass --force"
             ) from error
         frame_cache_valid = True
-    publish_stage(
+    stage_started = time.perf_counter()
+    built = publish_stage(
         destination,
         fingerprint=fingerprint,
         required=required,
@@ -482,6 +484,8 @@ def encode_stage(
         resume=resume and frame_cache_valid,
         build=build,
     )
+    if built:
+        emit_completed_timing("encode", time.perf_counter() - stage_started)
     _validate_frame_embedding_cache(
         destination,
         expected_episodes=expected_frame_episodes,

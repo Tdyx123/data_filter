@@ -15,6 +15,8 @@ from relcore.features.visual_encoder import VisualEncoder
 from relcore.schemas import ClipRecord
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
 
+from cocore.timing import TimingCallback, timed_step
+
 
 CLIP_LENGTH = 15
 CLIP_STRIDE = 15
@@ -404,6 +406,7 @@ def encode_cocore_dataset(
     num_workers: int = 0,
     max_episodes: int | None = None,
     progress_interval: int = 0,
+    timing_callback: TimingCallback | None = None,
 ) -> CocoreEncodedClips:
     """Encode Quality-style fragments and cache each usable episode's frames."""
 
@@ -415,171 +418,174 @@ def encode_cocore_dataset(
     if not clips:
         raise ValueError("dataset contains no complete clips")
 
-    numeric_episodes: list[tuple[np.ndarray, Mapping[str, np.ndarray]]] = []
-    numeric_seen: set[int] = set()
-    for episode in adapter.iter_episodes(
-        num_workers=num_workers,
-        max_episodes=max_episodes,
-        load_images=False,
-    ):
-        _validate_episode_metadata(episode, records_by_id, numeric_seen, "numeric")
-        numeric_episodes.append((episode.actions, episode.observations))
-    if numeric_seen != set(records_by_id):
-        raise ValueError("numeric pass did not yield every indexed episode exactly once")
-    normalizers = CocoreNumericNormalizers.fit(
-        numeric_episodes,
-        adapter.vector_observation_keys,
-        quantile_low=quantile_low,
-        quantile_high=quantile_high,
-        epsilon=epsilon,
-    )
-
-    clips_by_episode: dict[int, list[tuple[int, ClipRecord]]] = {}
-    for index, clip in enumerate(clips):
-        clips_by_episode.setdefault(clip.episode_id, []).append((index, clip))
-    union_windows = {
-        record.episode_id: sorted(
-            {
-                (clip.start_step, clip.end_step)
-                for _, clip in clips_by_episode.get(record.episode_id, ())
-            }
-            | set(reference_windows(record.length))
-        )
-        for record in records
-    }
-    union_order = [
-        (record.episode_id, start, end)
-        for record in records
-        for start, end in union_windows[record.episode_id]
-    ]
-
-    cache_root = Path(frame_cache_dir)
-    if cache_root.exists() and any(cache_root.iterdir()):
-        raise FileExistsError(f"frame cache directory must be empty: {cache_root}")
-    cache_root.mkdir(parents=True, exist_ok=True)
-    raw_visual: dict[tuple[int, int, int], np.ndarray] = {}
-    half_visual_by_index: dict[int, np.ndarray] = {}
-    state_by_index: dict[int, np.ndarray] = {}
-    action_by_index: dict[int, np.ndarray] = {}
-    position_by_index: dict[int, float] = {}
-    progress_by_index: dict[int, float] = {}
-    frame_entries: dict[int, FrameEmbeddingEntry] = {}
-    image_key = adapter.image_observation_keys[0]
-    image_seen: set[int] = set()
-    feature_dim: int | None = None
-    for completed, episode in enumerate(
-        adapter.iter_episode_subset(
-            records,
+    with timed_step("encode.numeric_normalization", timing_callback):
+        numeric_episodes: list[tuple[np.ndarray, Mapping[str, np.ndarray]]] = []
+        numeric_seen: set[int] = set()
+        for episode in adapter.iter_episodes(
             num_workers=num_workers,
-            load_images=True,
-        ),
-        start=1,
-    ):
-        _validate_episode_metadata(episode, records_by_id, image_seen, "image")
-        if image_key not in episode.observations:
-            raise ValueError(f"episode {episode.episode_id} is missing image {image_key!r}")
-        frame_features = np.asarray(
-            visual_encoder.encode(episode.observations[image_key]), dtype=np.float32
-        )
-        if (
-            frame_features.ndim != 2
-            or frame_features.shape[0] != episode.length
-            or frame_features.shape[1] == 0
-            or not np.all(np.isfinite(frame_features))
+            max_episodes=max_episodes,
+            load_images=False,
         ):
-            raise ValueError(f"episode {episode.episode_id}: visual feature length mismatch")
-        feature_dim = frame_features.shape[1] if feature_dim is None else feature_dim
-        if frame_features.shape[1] != feature_dim:
-            raise ValueError(f"episode {episode.episode_id}: visual feature dimension changed")
-        filename = f"ep{episode.episode_id:06d}.npy"
-        frame_path = cache_root / filename
-        np.save(frame_path, frame_features)
-        frame_entries[episode.episode_id] = FrameEmbeddingEntry(
-            episode_id=episode.episode_id,
-            filename=filename,
-            frames=episode.length,
-            embedding_dim=feature_dim,
-            sha256=_sha256(frame_path),
+            _validate_episode_metadata(episode, records_by_id, numeric_seen, "numeric")
+            numeric_episodes.append((episode.actions, episode.observations))
+        if numeric_seen != set(records_by_id):
+            raise ValueError("numeric pass did not yield every indexed episode exactly once")
+        normalizers = CocoreNumericNormalizers.fit(
+            numeric_episodes,
+            adapter.vector_observation_keys,
+            quantile_low=quantile_low,
+            quantile_high=quantile_high,
+            epsilon=epsilon,
         )
 
-        normalized_state = normalizers.state(episode.observations)
-        normalized_action = normalizers.action(episode.actions)
-        for start, end in union_windows[episode.episode_id]:
-            raw_visual[(episode.episode_id, start, end)] = visual_fragment_feature(
-                frame_features[start : end + 1]
+    with timed_step("encode.visual_cache", timing_callback):
+        clips_by_episode: dict[int, list[tuple[int, ClipRecord]]] = {}
+        for index, clip in enumerate(clips):
+            clips_by_episode.setdefault(clip.episode_id, []).append((index, clip))
+        union_windows = {
+            record.episode_id: sorted(
+                {
+                    (clip.start_step, clip.end_step)
+                    for _, clip in clips_by_episode.get(record.episode_id, ())
+                }
+                | set(reference_windows(record.length))
             )
-        for clip_index, clip in clips_by_episode.get(episode.episode_id, ()):
-            window = slice(clip.start_step, clip.end_step + 1)
-            visual = frame_features[window]
-            state = normalized_state[window]
-            action = normalized_action[window]
-            half_visual_by_index[clip_index] = visual_half_means(visual)
-            state_by_index[clip_index] = state
-            action_by_index[clip_index] = action
-            position_by_index[clip_index] = float(clip.start_step) / float(episode.length)
-            normalized_visual = visual / np.maximum(
-                np.linalg.norm(visual, axis=1, keepdims=True), 1.0e-8
-            )
-            progress_by_index[clip_index] = float(
-                np.linalg.norm(normalized_visual[-1] - normalized_visual[0])
-            )
-        if progress_interval > 0 and (
-            completed % progress_interval == 0 or completed == len(records)
-        ):
-            print(
-                f"cocore_encode completed={completed} remaining={len(records) - completed}",
-                file=sys.stderr,
-                flush=True,
-            )
-    if image_seen != set(records_by_id):
-        raise ValueError("image pass did not yield every indexed episode exactly once")
-    if len(half_visual_by_index) != len(clips):
-        raise ValueError("encoded clip count does not match clip index")
-    if set(raw_visual) != set(union_order):
-        raise ValueError("encoded visual union does not match expected fragment windows")
+            for record in records
+        }
+        union_order = [
+            (record.episode_id, start, end)
+            for record in records
+            for start, end in union_windows[record.episode_id]
+        ]
 
-    visual_raw = np.stack([raw_visual[key] for key in union_order])
-    projector = CocorePCAProjector(output_dim=visual_dim, seed=seed)
-    union_projected = projector.fit_transform(
-        visual_raw,
-        max_samples=pca_fit_max_samples,
-    )
-    union_index = {key: index for index, key in enumerate(union_order)}
-    candidate_visual = union_projected[
-        np.asarray(
-            [union_index[(clip.episode_id, clip.start_step, clip.end_step)] for clip in clips],
-            dtype=np.int64,
+        cache_root = Path(frame_cache_dir)
+        if cache_root.exists() and any(cache_root.iterdir()):
+            raise FileExistsError(f"frame cache directory must be empty: {cache_root}")
+        cache_root.mkdir(parents=True, exist_ok=True)
+        raw_visual: dict[tuple[int, int, int], np.ndarray] = {}
+        half_visual_by_index: dict[int, np.ndarray] = {}
+        state_by_index: dict[int, np.ndarray] = {}
+        action_by_index: dict[int, np.ndarray] = {}
+        position_by_index: dict[int, float] = {}
+        progress_by_index: dict[int, float] = {}
+        frame_entries: dict[int, FrameEmbeddingEntry] = {}
+        image_key = adapter.image_observation_keys[0]
+        image_seen: set[int] = set()
+        feature_dim: int | None = None
+        for completed, episode in enumerate(
+            adapter.iter_episode_subset(
+                records,
+                num_workers=num_workers,
+                load_images=True,
+            ),
+            start=1,
+        ):
+            _validate_episode_metadata(episode, records_by_id, image_seen, "image")
+            if image_key not in episode.observations:
+                raise ValueError(f"episode {episode.episode_id} is missing image {image_key!r}")
+            frame_features = np.asarray(
+                visual_encoder.encode(episode.observations[image_key]), dtype=np.float32
+            )
+            if (
+                frame_features.ndim != 2
+                or frame_features.shape[0] != episode.length
+                or frame_features.shape[1] == 0
+                or not np.all(np.isfinite(frame_features))
+            ):
+                raise ValueError(f"episode {episode.episode_id}: visual feature length mismatch")
+            feature_dim = frame_features.shape[1] if feature_dim is None else feature_dim
+            if frame_features.shape[1] != feature_dim:
+                raise ValueError(f"episode {episode.episode_id}: visual feature dimension changed")
+            filename = f"ep{episode.episode_id:06d}.npy"
+            frame_path = cache_root / filename
+            np.save(frame_path, frame_features)
+            frame_entries[episode.episode_id] = FrameEmbeddingEntry(
+                episode_id=episode.episode_id,
+                filename=filename,
+                frames=episode.length,
+                embedding_dim=feature_dim,
+                sha256=_sha256(frame_path),
+            )
+
+            normalized_state = normalizers.state(episode.observations)
+            normalized_action = normalizers.action(episode.actions)
+            for start, end in union_windows[episode.episode_id]:
+                raw_visual[(episode.episode_id, start, end)] = visual_fragment_feature(
+                    frame_features[start : end + 1]
+                )
+            for clip_index, clip in clips_by_episode.get(episode.episode_id, ()):
+                window = slice(clip.start_step, clip.end_step + 1)
+                visual = frame_features[window]
+                state = normalized_state[window]
+                action = normalized_action[window]
+                half_visual_by_index[clip_index] = visual_half_means(visual)
+                state_by_index[clip_index] = state
+                action_by_index[clip_index] = action
+                position_by_index[clip_index] = float(clip.start_step) / float(episode.length)
+                normalized_visual = visual / np.maximum(
+                    np.linalg.norm(visual, axis=1, keepdims=True), 1.0e-8
+                )
+                progress_by_index[clip_index] = float(
+                    np.linalg.norm(normalized_visual[-1] - normalized_visual[0])
+                )
+            if progress_interval > 0 and (
+                completed % progress_interval == 0 or completed == len(records)
+            ):
+                print(
+                    f"cocore_encode completed={completed} remaining={len(records) - completed}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        if image_seen != set(records_by_id):
+            raise ValueError("image pass did not yield every indexed episode exactly once")
+        if len(half_visual_by_index) != len(clips):
+            raise ValueError("encoded clip count does not match clip index")
+        if set(raw_visual) != set(union_order):
+            raise ValueError("encoded visual union does not match expected fragment windows")
+
+    with timed_step("encode.pca_fusion", timing_callback):
+        visual_raw = np.stack([raw_visual[key] for key in union_order])
+        projector = CocorePCAProjector(output_dim=visual_dim, seed=seed)
+        union_projected = projector.fit_transform(
+            visual_raw,
+            max_samples=pca_fit_max_samples,
         )
-    ]
-    state_sequences = np.stack([state_by_index[index] for index in range(len(clips))]).astype(
-        np.float32
-    )
-    action_sequences = np.stack([action_by_index[index] for index in range(len(clips))]).astype(
-        np.float32
-    )
-    _, embeddings = fuse_fragment_features(
-        candidate_visual,
-        np.stack([temporal_pool(values) for values in state_sequences]),
-        np.stack([temporal_pool(values) for values in action_sequences]),
-        np.asarray(
-            [position_by_index[index] for index in range(len(clips))],
+        union_index = {key: index for index, key in enumerate(union_order)}
+        candidate_visual = union_projected[
+            np.asarray(
+                [union_index[(clip.episode_id, clip.start_step, clip.end_step)] for clip in clips],
+                dtype=np.int64,
+            )
+        ]
+        state_sequences = np.stack([state_by_index[index] for index in range(len(clips))]).astype(
             dtype=np.float32,
-        ),
-    )
-    return CocoreEncodedClips(
-        clips=clips,
-        embeddings=embeddings,
-        visual_half_embeddings=np.stack(
-            [half_visual_by_index[index] for index in range(len(clips))]
-        ).astype(np.float32),
-        state_sequences=state_sequences,
-        action_sequences=action_sequences,
-        visual_progress=np.asarray(
-            [progress_by_index[index] for index in range(len(clips))],
-            dtype=np.float32,
-        ),
-        numeric_normalizers=normalizers,
-        visual_projector=projector,
-        frame_embeddings=[frame_entries[record.episode_id] for record in records],
-        union_fragment_count=len(union_order),
-    )
+        )
+        action_sequences = np.stack(
+            [action_by_index[index] for index in range(len(clips))]
+        ).astype(dtype=np.float32)
+        _, embeddings = fuse_fragment_features(
+            candidate_visual,
+            np.stack([temporal_pool(values) for values in state_sequences]),
+            np.stack([temporal_pool(values) for values in action_sequences]),
+            np.asarray(
+                [position_by_index[index] for index in range(len(clips))],
+                dtype=np.float32,
+            ),
+        )
+        return CocoreEncodedClips(
+            clips=clips,
+            embeddings=embeddings,
+            visual_half_embeddings=np.stack(
+                [half_visual_by_index[index] for index in range(len(clips))]
+            ).astype(np.float32),
+            state_sequences=state_sequences,
+            action_sequences=action_sequences,
+            visual_progress=np.asarray(
+                [progress_by_index[index] for index in range(len(clips))],
+                dtype=np.float32,
+            ),
+            numeric_normalizers=normalizers,
+            visual_projector=projector,
+            frame_embeddings=[frame_entries[record.episode_id] for record in records],
+            union_fragment_count=len(union_order),
+        )

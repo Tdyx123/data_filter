@@ -212,6 +212,44 @@ def test_encode_stage_publishes_normalized_visual_half_artifact(tmp_path: Path) 
     assert CocorePipelineAdapter.load_images_calls == [False, False, True]
 
 
+def test_encode_stage_reports_new_build_but_not_cache_hit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    root = tmp_path / "timed-encode"
+
+    encode_stage(
+        _config(tmp_path),
+        output_dir=root,
+        visual_encoder=CocoreVisualEncoder(),
+    )
+
+    first = capsys.readouterr()
+    assert first.out == ""
+    assert [
+        line.split(" step=", 1)[1].split(" ", 1)[0]
+        for line in first.err.splitlines()
+        if line.startswith("cocore_timing")
+    ] == [
+        "scan",
+        "encode.numeric_normalization",
+        "encode.visual_cache",
+        "encode.pca_fusion",
+        "encode",
+    ]
+
+    encode_stage(
+        _config(tmp_path),
+        output_dir=root,
+        visual_encoder=FailingCocoreVisualEncoder(),
+    )
+
+    cached = capsys.readouterr()
+    assert cached.out == ""
+    assert "cocore_timing" not in cached.err
+
+
 @pytest.mark.parametrize(
     ("corruption", "message"),
     [
