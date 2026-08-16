@@ -558,10 +558,13 @@ bash scripts/evaluate_libero_octo_small.sh \
 `outputs/libero10_videos/task-0/{success,failure}/` 和
 `outputs/libero10_videos/task-1/{success,failure}/`；显式使用 `--task-name` 时则直接
 写入给定路径下的 `{success,failure}/`。成功视频包含初始帧并录到首次成功 step；
-失败视频同样保存完整 episode。录像使用正式评测中生成的动作轨迹进行确定性
-单环境回放，不重复模型推理，也不改变正式评测的并行协议。目标目录已有
+失败视频同样保存完整 episode。录像直接使用正式并行 rollout 返回的 observation，
+不重复模型推理、不新建单环境回放，也不改变正式评测协议。目标目录已有
 `episode-*.mp4` 时需要传入 `--overwrite`；覆盖只替换这些生成视频并保留目录中的
-其他文件。`--preflight-only` 不运行 episode，因此不会生成视频。
+其他文件。正式 rollout 开始后的取帧、编码或视频落盘错误只产生 warning，不会让
+已经完成的评测失败；schema 4 的 `results.json` 会在 `video_generation` 中记录
+`complete`、`partial` 或 `failed` 状态、分类数量和首个错误，顶层 `status` 仍为
+`complete`。`--preflight-only` 不运行 episode，因此录像状态为 `skipped`。
 
 服务器启动脚本默认使用 `MUJOCO_GL=egl`；无 GPU 的主机可在安装 OSMesa 后使用
 `MUJOCO_GL=osmesa bash scripts/evaluate_libero_octo_small.sh ...`。并行环境使用

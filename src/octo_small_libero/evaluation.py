@@ -16,7 +16,7 @@ import time
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -42,7 +42,7 @@ MATPLOTLIB_REQUIREMENT = ">=3.5.3,<4"
 TERMCOLOR_REQUIREMENT = ">=2.4.0,<4"
 MUJOCO_COMPATIBILITY = "libero-robosuite-1.4.0-mujoco-3.10.0-gymnasium-1.3.0-v1"
 LIBERO_MULTIPROCESSING_START_METHOD = "spawn"
-RESULT_SCHEMA_VERSION = 3
+RESULT_SCHEMA_VERSION = 4
 EVALUATION_SEEDS = (3471197683, 1232873419, 1448008435)
 ACTION_HORIZON = 8
 ACTION_DIM = 7
@@ -182,6 +182,45 @@ class EvaluationSettings:
     libero_root: Path | None = None
     libero_config_path: Path | None = None
     overwrite: bool = False
+
+
+@dataclass(frozen=True)
+class VideoGenerationResult:
+    requested: bool
+    status: str
+    requested_per_outcome: int
+    recorded_success: int = 0
+    recorded_failure: int = 0
+    error: str | None = None
+    videos: tuple[str, ...] = ()
+
+    @classmethod
+    def not_requested(cls) -> VideoGenerationResult:
+        return cls(
+            requested=False,
+            status="not_requested",
+            requested_per_outcome=0,
+        )
+
+    @classmethod
+    def skipped(cls, settings: EvaluationSettings) -> VideoGenerationResult:
+        return cls(
+            requested=settings.save_videos_path is not None,
+            status="skipped",
+            requested_per_outcome=settings.record_videos,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "requested": self.requested,
+            "status": self.status,
+            "requested_per_outcome": self.requested_per_outcome,
+            "recorded": {
+                "success": self.recorded_success,
+                "failure": self.recorded_failure,
+            },
+            "error": self.error,
+        }
 
 
 @dataclass(frozen=True)
@@ -1326,7 +1365,7 @@ def rollout_action_chunks(
     seed: int,
     max_steps: int,
     action_horizon: int = ACTION_HORIZON,
-    frame_callback: Callable[[Any, int], None] | None = None,
+    frame_callback: Callable[[Any, int, np.ndarray], None] | None = None,
 ) -> tuple[list[dict[str, Any]], Any]:
     if max_steps <= 0 or action_horizon <= 0:
         raise EvaluationError("max_steps and action_horizon must be positive")
@@ -1339,7 +1378,7 @@ def rollout_action_chunks(
     first_success_step = np.full(batch_size, -1, dtype=np.int64)
     executed_steps = 0
     if frame_callback is not None:
-        frame_callback(observations, executed_steps)
+        frame_callback(observations, executed_steps, success_mask.copy())
 
     while executed_steps < max_steps and not np.all(success_mask):
         actions = np.asarray(predictor(observations), dtype=np.float32)
@@ -1366,7 +1405,7 @@ def rollout_action_chunks(
             first_success_step[newly_successful] = executed_steps
             success_mask |= successes
             if frame_callback is not None:
-                frame_callback(observations, executed_steps)
+                frame_callback(observations, executed_steps, success_mask.copy())
             if np.all(success_mask):
                 break
 
@@ -1517,11 +1556,15 @@ def _select_video_episodes(
     episodes: Sequence[Mapping[str, Any]],
     *,
     limit: int,
+    initial_counts: Mapping[bool, int] | None = None,
 ) -> list[Mapping[str, Any]]:
     if limit <= 0:
         raise EvaluationError("video selection limit must be positive")
     selected: list[Mapping[str, Any]] = []
-    counts = {True: 0, False: 0}
+    counts = {
+        True: int(initial_counts.get(True, 0)) if initial_counts is not None else 0,
+        False: int(initial_counts.get(False, 0)) if initial_counts is not None else 0,
+    }
     for episode in sorted(episodes, key=lambda item: int(item["episode_id"])):
         outcome = bool(episode["success"])
         if counts[outcome] >= limit:
@@ -1531,145 +1574,249 @@ def _select_video_episodes(
     return selected
 
 
-def _video_action_limit(episode: Mapping[str, Any]) -> int:
-    return int(episode["steps"])
-
-
-def _replay_episode_frames(
-    environment: Any,
-    observations: Any,
-    actions: Sequence[np.ndarray],
-    *,
-    expected_success: bool,
-) -> Iterator[np.ndarray]:
-    values = observation_batch_to_list(observations)
-    if len(values) != 1:
-        raise EvaluationError("Video replay requires exactly one environment")
-    yield _frame_from_observation(values[0])
-
-    for step, action in enumerate(actions, start=1):
-        action_array = np.asarray(action, dtype=np.float32)
-        if action_array.shape != (ACTION_DIM,):
-            raise EvaluationError(
-                f"Video replay action shape is {action_array.shape}; expected {(ACTION_DIM,)}"
-            )
-        result = environment.step(action_array[None, :])
-        if not isinstance(result, tuple) or len(result) not in {4, 5}:
-            raise EvaluationError("LIBERO video replay returned an invalid step tuple")
-        observations = result[0]
-        successes = np.asarray(environment.check_success(), dtype=bool)
-        if successes.shape != (1,):
-            raise EvaluationError(
-                f"LIBERO video replay success shape is {successes.shape}; expected {(1,)}"
-            )
-        succeeded = bool(successes[0])
-        values = observation_batch_to_list(observations)
-        if len(values) != 1:
-            raise EvaluationError("Video replay requires exactly one observation")
-        if succeeded and not expected_success:
-            raise EvaluationError(f"Failed episode reproduced success at step {step}")
-        yield _frame_from_observation(values[0])
-        if succeeded:
-            return
-
-    if expected_success:
-        raise EvaluationError(
-            f"Successful episode did not reproduce success after {len(actions)} steps"
-        )
-
-
-def _write_video(path: Path, frames: Iterable[np.ndarray], *, fps: int) -> None:
+def _open_video_writer(path: Path, fps: int) -> Any:
     try:
         import imageio.v2 as imageio
     except ImportError as error:
         raise EvaluationError("imageio and imageio-ffmpeg are required to record videos") from error
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with imageio.get_writer(path, fps=fps) as writer:
-            for frame in frames:
-                writer.append_data(np.asarray(frame, dtype=np.uint8))
-    except EvaluationError:
-        raise
-    except Exception as error:
-        raise EvaluationError(f"Could not encode LIBERO video {path}: {error}") from error
+    return imageio.get_writer(path, fps=fps)
 
 
-def _record_replay_videos(
-    settings: EvaluationSettings,
-    *,
-    task: LiberoTask,
-    statistics: NormalizationStatistics,
-    episodes: Sequence[Mapping[str, Any]],
-    action_trajectories: Mapping[int, Sequence[np.ndarray]],
-) -> list[str]:
-    if settings.save_videos_path is None:
-        return []
-    _validate_video_settings(settings)
-    _check_video_targets(settings)
-    selected = _select_video_episodes(episodes, limit=settings.record_videos)
-    video_root = settings.save_videos_path
-    video_root.parent.mkdir(parents=True, exist_ok=True)
-    final_paths: list[Path] = []
+class _RolloutVideoRecorder:
+    def __init__(self, settings: EvaluationSettings):
+        if settings.save_videos_path is None:
+            raise ValueError("Rollout video recorder requires save_videos_path")
+        self.settings = settings
+        self.video_root = settings.save_videos_path
+        self._temporary: tempfile.TemporaryDirectory[str] | None = None
+        self._staging_root: Path | None = None
+        self._writers: dict[int, Any] = {}
+        self._candidate_paths: dict[int, Path] = {}
+        self._batch_episode_ids: tuple[int, ...] = ()
+        self._selected: list[tuple[int, str, Path]] = []
+        self._selected_counts = {"success": 0, "failure": 0}
+        self._error: str | None = None
+        self._disabled = False
+        self._final_result: VideoGenerationResult | None = None
 
-    with tempfile.TemporaryDirectory(
-        prefix=f".{video_root.name or 'octo-videos'}-",
-        dir=video_root.parent,
-    ) as temporary_directory:
-        staging_root = Path(temporary_directory)
-        environment = None
+    def _record_error(self, error: BaseException) -> None:
+        if self._error is not None:
+            return
+        self._error = f"{type(error).__name__}: {error}"
+        self._disabled = True
+        print(
+            f"[warning] video recording disabled: {self._error}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _ensure_staging_root(self) -> Path:
+        if self._staging_root is not None:
+            return self._staging_root
+        self.video_root.parent.mkdir(parents=True, exist_ok=True)
+        self._temporary = tempfile.TemporaryDirectory(
+            prefix=f".{self.video_root.name or 'octo-videos'}-",
+            dir=self.video_root.parent,
+        )
+        self._staging_root = Path(self._temporary.name)
+        return self._staging_root
+
+    def _close_writers(self) -> None:
+        first_error: BaseException | None = None
+        for episode_id, writer in list(self._writers.items()):
+            try:
+                writer.close()
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+            finally:
+                self._writers.pop(episode_id, None)
+        if first_error is not None:
+            raise first_error
+
+    def _discard_current_batch(self) -> None:
+        for writer in list(self._writers.values()):
+            try:
+                writer.close()
+            except Exception:
+                pass
+        self._writers.clear()
+        for path in self._candidate_paths.values():
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._candidate_paths.clear()
+        self._batch_episode_ids = ()
+
+    def _fail_current_batch(self, error: BaseException) -> None:
+        self._record_error(error)
+        self._discard_current_batch()
+
+    def _quotas_met(self) -> bool:
+        limit = self.settings.record_videos
+        return all(self._selected_counts[outcome] >= limit for outcome in ("success", "failure"))
+
+    def begin_batch(self, episode_ids: Sequence[int]) -> bool:
+        if self._disabled or self._quotas_met():
+            return False
+        if self._batch_episode_ids:
+            self._fail_current_batch(EvaluationError("Previous video batch was not completed"))
+            return False
         try:
-            if selected:
-                environment, _ = make_vector_environment_with_backoff(
-                    task,
-                    1,
-                    auto_reduce=settings.auto_reduce_num_envs,
+            staging_root = self._ensure_staging_root()
+            self._batch_episode_ids = tuple(int(episode_id) for episode_id in episode_ids)
+            candidate_root = staging_root / "candidates"
+            for episode_id in self._batch_episode_ids:
+                path = candidate_root / f"episode-{episode_id:03d}.mp4"
+                self._candidate_paths[episode_id] = path
+                self._writers[episode_id] = _open_video_writer(path, self.settings.video_fps)
+        except Exception as error:
+            self._fail_current_batch(error)
+            return False
+        return True
+
+    def capture(self, observations: Any, step: int, success_mask: np.ndarray) -> None:
+        del step
+        if self._disabled or not self._batch_episode_ids:
+            return
+        try:
+            values = observation_batch_to_list(observations)
+            successes = np.asarray(success_mask, dtype=bool)
+            expected_shape = (len(self._batch_episode_ids),)
+            if len(values) != len(self._batch_episode_ids):
+                raise EvaluationError("Video observation count does not match the rollout batch")
+            if successes.shape != expected_shape:
+                raise EvaluationError(
+                    f"Video success mask shape is {successes.shape}; expected {expected_shape}"
                 )
-            for episode in selected:
-                episode_id = int(episode["episode_id"])
-                init_state_id = int(episode["init_state_id"])
-                replay_steps = _video_action_limit(episode)
-                trajectory = list(action_trajectories.get(episode_id, ()))
-                if len(trajectory) < replay_steps:
-                    raise EvaluationError(
-                        f"Episode {episode_id} has {len(trajectory)} recorded actions; "
-                        f"video replay requires {replay_steps}"
-                    )
-                observations = settle_vector_environment(
-                    environment,
-                    init_states=task.init_states[[init_state_id]],
-                    statistics=statistics,
-                    seed=int(episode["seed"]) + init_state_id,
-                    settle_steps=settings.settle_steps,
+            for index, episode_id in enumerate(self._batch_episode_ids):
+                writer = self._writers.get(episode_id)
+                if writer is None:
+                    continue
+                writer.append_data(
+                    np.asarray(_frame_from_observation(values[index]), dtype=np.uint8)
                 )
+                if successes[index]:
+                    writer.close()
+                    self._writers.pop(episode_id, None)
+        except Exception as error:
+            self._fail_current_batch(error)
+
+    def end_batch(self, episodes: Sequence[Mapping[str, Any]]) -> None:
+        if self._disabled or not self._batch_episode_ids:
+            return
+        selected_for_batch: list[tuple[int, str, Path, Path]] = []
+        moved: list[tuple[int, str, Path]] = []
+        try:
+            self._close_writers()
+            episodes_by_id = {int(episode["episode_id"]): episode for episode in episodes}
+            if set(episodes_by_id) != set(self._batch_episode_ids):
+                raise EvaluationError("Video episode results do not match the rollout batch")
+            selected_episode_ids = {
+                int(episode["episode_id"])
+                for episode in _select_video_episodes(
+                    episodes,
+                    limit=self.settings.record_videos,
+                    initial_counts={
+                        True: self._selected_counts["success"],
+                        False: self._selected_counts["failure"],
+                    },
+                )
+            }
+            for episode_id in sorted(self._batch_episode_ids):
+                episode = episodes_by_id[episode_id]
                 outcome = "success" if bool(episode["success"]) else "failure"
-                staged_path = staging_root / outcome / f"episode-{episode_id:03d}.mp4"
-                _write_video(
-                    staged_path,
-                    _replay_episode_frames(
-                        environment,
-                        observations,
-                        trajectory[:replay_steps],
-                        expected_success=bool(episode["success"]),
-                    ),
-                    fps=settings.video_fps,
-                )
-                final_paths.append(video_root / outcome / f"episode-{episode_id:03d}.mp4")
+                source = self._candidate_paths[episode_id]
+                if episode_id not in selected_episode_ids:
+                    source.unlink(missing_ok=True)
+                    continue
+                destination = self._ensure_staging_root() / "selected" / outcome / source.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                selected_for_batch.append((episode_id, outcome, source, destination))
+                self._selected_counts[outcome] += 1
+
+            for episode_id, outcome, source, destination in selected_for_batch:
+                source.replace(destination)
+                moved.append((episode_id, outcome, destination))
+            self._selected.extend(moved)
+        except Exception as error:
+            for _, outcome, _, _ in selected_for_batch:
+                self._selected_counts[outcome] = max(0, self._selected_counts[outcome] - 1)
+            for _, _, destination in moved:
+                try:
+                    destination.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self._fail_current_batch(error)
+            return
+        self._candidate_paths.clear()
+        self._batch_episode_ids = ()
+
+    def abort(self) -> VideoGenerationResult:
+        if self._final_result is not None:
+            return self._final_result
+        self._discard_current_batch()
+        if self._temporary is not None:
+            try:
+                self._temporary.cleanup()
+            except OSError:
+                pass
+        self._final_result = VideoGenerationResult(
+            requested=True,
+            status="aborted",
+            requested_per_outcome=self.settings.record_videos,
+            error=self._error,
+        )
+        return self._final_result
+
+    def finalize(self) -> VideoGenerationResult:
+        if self._final_result is not None:
+            return self._final_result
+        if self._batch_episode_ids:
+            self._fail_current_batch(EvaluationError("Video batch was not completed"))
+
+        promoted: list[tuple[int, str, Path]] = []
+        try:
+            for outcome in ("success", "failure"):
+                target_directory = self.video_root / outcome
+                target_directory.mkdir(parents=True, exist_ok=True)
+                if self.settings.overwrite:
+                    for existing in target_directory.glob("episode-*.mp4"):
+                        existing.unlink()
+            for episode_id, outcome, source in sorted(self._selected):
+                target = self.video_root / outcome / source.name
+                source.replace(target)
+                promoted.append((episode_id, outcome, target))
+        except Exception as error:
+            self._record_error(error)
         finally:
-            if environment is not None:
-                environment.close()
+            if self._temporary is not None:
+                try:
+                    self._temporary.cleanup()
+                except OSError as error:
+                    self._record_error(error)
 
-        for outcome in ("success", "failure"):
-            target_directory = video_root / outcome
-            target_directory.mkdir(parents=True, exist_ok=True)
-            if settings.overwrite:
-                for existing in target_directory.glob("episode-*.mp4"):
-                    existing.unlink()
-            staged_directory = staging_root / outcome
-            if staged_directory.is_dir():
-                for staged_path in sorted(staged_directory.glob("episode-*.mp4")):
-                    staged_path.replace(target_directory / staged_path.name)
-
-    return [str(path) for path in final_paths]
+        videos = tuple(str(path) for _, _, path in promoted)
+        success_count = sum(outcome == "success" for _, outcome, _ in promoted)
+        failure_count = sum(outcome == "failure" for _, outcome, _ in promoted)
+        if self._error is None:
+            status = "complete"
+        elif videos:
+            status = "partial"
+        else:
+            status = "failed"
+        self._final_result = VideoGenerationResult(
+            requested=True,
+            status=status,
+            requested_per_outcome=self.settings.record_videos,
+            recorded_success=success_count,
+            recorded_failure=failure_count,
+            error=self._error,
+            videos=videos,
+        )
+        return self._final_result
 
 
 def _make_report(
@@ -1682,10 +1829,13 @@ def _make_report(
     episodes: Sequence[Mapping[str, Any]],
     elapsed_seconds: float,
     videos: Sequence[str],
+    video_generation: VideoGenerationResult | None = None,
     libero_commit: str,
     environment_batch_sizes: Sequence[int] = (),
     error: str | None = None,
 ) -> dict[str, Any]:
+    if video_generation is None:
+        video_generation = VideoGenerationResult.not_requested()
     successes = sum(bool(episode["success"]) for episode in episodes)
     summaries_by_seed = []
     for seed in settings.seeds:
@@ -1756,6 +1906,7 @@ def _make_report(
             "elapsed_seconds": elapsed_seconds,
         },
         "videos": list(videos),
+        "video_generation": video_generation.as_dict(),
     }
     if error is not None:
         report["error"] = error
@@ -1825,6 +1976,7 @@ def run_preflight(
             "seeds": list(settings.seeds),
         },
         "sample_action_shape": list(actions.shape),
+        "video_generation": VideoGenerationResult.skipped(settings).as_dict(),
         "runtime": {
             "device": settings.device,
             "precision": settings.precision,
@@ -1896,8 +2048,10 @@ def evaluate_checkpoint(
     _check_video_targets(settings)
     started = time.monotonic()
     episodes: list[dict[str, Any]] = []
-    action_trajectories: dict[int, list[np.ndarray]] = {}
-    record_actions = settings.save_videos_path is not None
+    video_recorder = (
+        _RolloutVideoRecorder(settings) if settings.save_videos_path is not None else None
+    )
+    video_generation = VideoGenerationResult.not_requested()
     videos: list[str] = []
     environment = None
     environment_batch_size = 0
@@ -1933,22 +2087,16 @@ def evaluate_checkpoint(
                     settle_steps=settings.settle_steps,
                 )
 
-                if record_actions:
-                    for episode_id in episode_ids:
-                        action_trajectories[episode_id] = []
+                record_batch = (
+                    video_recorder.begin_batch(episode_ids) if video_recorder is not None else False
+                )
 
                 def predict_actions(current: Any) -> np.ndarray:
-                    actions = policy.predict_action_chunk(
+                    return policy.predict_action_chunk(
                         current,
                         task.language,
                         generator=generator,
                     )
-                    if record_actions:
-                        for local_index, episode_id in enumerate(episode_ids):
-                            action_trajectories[episode_id].extend(
-                                np.asarray(actions[local_index], dtype=np.float32).copy()
-                            )
-                    return actions
 
                 group_episodes, _ = rollout_action_chunks(
                     environment,
@@ -1959,7 +2107,14 @@ def evaluate_checkpoint(
                     seed=seed,
                     max_steps=settings.max_steps,
                     action_horizon=ACTION_HORIZON,
+                    frame_callback=(
+                        video_recorder.capture
+                        if video_recorder is not None and record_batch
+                        else None
+                    ),
                 )
+                if video_recorder is not None and record_batch:
+                    video_recorder.end_batch(group_episodes)
                 episodes.extend(group_episodes)
                 _atomic_write_jsonl(
                     settings.output_dir / "episodes.partial.jsonl",
@@ -1970,14 +2125,12 @@ def evaluate_checkpoint(
             environment.close()
             environment = None
             environment_batch_size = 0
-        videos = _record_replay_videos(
-            settings,
-            task=task,
-            statistics=statistics,
-            episodes=episodes,
-            action_trajectories=action_trajectories,
-        )
+        if video_recorder is not None:
+            video_generation = video_recorder.finalize()
+            videos = list(video_generation.videos)
     except Exception as error:
+        if video_recorder is not None:
+            video_generation = video_recorder.abort()
         elapsed = time.monotonic() - started
         partial = _make_report(
             status="failed",
@@ -1988,6 +2141,7 @@ def evaluate_checkpoint(
             episodes=episodes,
             elapsed_seconds=elapsed,
             videos=videos,
+            video_generation=video_generation,
             libero_commit=libero_commit,
             environment_batch_sizes=environment_batch_sizes,
             error=f"{type(error).__name__}: {error}",
@@ -2009,6 +2163,9 @@ def evaluate_checkpoint(
                     episodes=episodes,
                     elapsed_seconds=elapsed,
                     videos=videos,
+                    video_generation=(
+                        video_recorder.abort() if video_recorder is not None else video_generation
+                    ),
                     libero_commit=libero_commit,
                     environment_batch_sizes=environment_batch_sizes,
                     error=f"{type(error).__name__}: {error}",
@@ -2026,14 +2183,14 @@ def evaluate_checkpoint(
         episodes=episodes,
         elapsed_seconds=elapsed,
         videos=videos,
+        video_generation=video_generation,
         libero_commit=libero_commit,
         environment_batch_sizes=environment_batch_sizes,
     )
     _atomic_write_jsonl(settings.output_dir / "episodes.jsonl", episodes)
     _atomic_write_json(settings.output_dir / "results.json", report)
-    partial_path = settings.output_dir / "episodes.partial.jsonl"
-    if partial_path.exists():
-        partial_path.unlink()
+    (settings.output_dir / "episodes.partial.jsonl").unlink(missing_ok=True)
+    (settings.output_dir / "failure.json").unlink(missing_ok=True)
     return report
 
 

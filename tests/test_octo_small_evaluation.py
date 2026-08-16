@@ -437,6 +437,40 @@ def test_chunk_rollout_records_first_success_and_stops_when_all_succeed():
     ]
 
 
+def test_chunk_rollout_frame_callback_receives_cumulative_success_mask():
+    environment = _FakeVectorEnvironment([2, 4])
+    observations = np.asarray([{"value": 0}, {"value": 0}], dtype=object)
+    captured = []
+
+    rollout_action_chunks(
+        environment,
+        observations,
+        predictor=lambda current: np.zeros(
+            (len(current), ACTION_HORIZON, 7),
+            dtype=np.float32,
+        ),
+        episode_ids=[11, 12],
+        init_state_ids=[1, 2],
+        seed=1,
+        max_steps=960,
+        frame_callback=lambda current, step, success_mask: captured.append(
+            (
+                step,
+                [int(item["value"]) for item in current],
+                success_mask.tolist(),
+            )
+        ),
+    )
+
+    assert captured == [
+        (0, [0, 0], [False, False]),
+        (1, [1, 1], [False, False]),
+        (2, [2, 2], [True, False]),
+        (3, [3, 3], [True, False]),
+        (4, [4, 4], [True, True]),
+    ]
+
+
 def test_video_selection_uses_earliest_episode_ids_per_result():
     episodes = [
         {"episode_id": 8, "success": False},
@@ -451,201 +485,325 @@ def test_video_selection_uses_earliest_episode_ids_per_result():
     assert [episode["episode_id"] for episode in selected] == [1, 3, 4, 6]
 
 
-def test_video_action_limit_keeps_complete_success_and_failure_episodes():
-    assert evaluation_module._video_action_limit({"success": True, "steps": 345}) == 345
-    assert evaluation_module._video_action_limit({"success": False, "steps": 960}) == 960
-    assert evaluation_module._video_action_limit({"success": False, "steps": 8}) == 8
+def _video_observations(*values):
+    return np.asarray(
+        [
+            {
+                "agentview_image": np.full(
+                    (4, 4, 3),
+                    value,
+                    dtype=np.uint8,
+                )
+            }
+            for value in values
+        ],
+        dtype=object,
+    )
 
 
-class _ReplayVideoEnvironment:
-    def __init__(self):
+class _MemoryVideoWriter:
+    def __init__(self, path, written_frames):
+        self.path = path
+        self.written_frames = written_frames
+        self.frames = []
         self.closed = False
-        self.seed_values = []
-        self.step_count = 0
-        self.success_after = None
 
-    @staticmethod
-    def _observations(value):
-        return np.asarray(
-            [
-                {
-                    "agentview_image": np.full(
-                        (4, 4, 3),
-                        value,
-                        dtype=np.uint8,
-                    )
-                }
-            ],
-            dtype=object,
-        )
-
-    def reset(self):
-        self.step_count = 0
-
-    def seed(self, value):
-        self.seed_values.append(value)
-
-    def set_init_state(self, values):
-        init_state_id = int(np.asarray(values)[0, 0])
-        self.success_after = 2 if init_state_id == 1 else None
-        return self._observations(0)
-
-    def step(self, actions):
-        assert np.asarray(actions).shape == (1, 7)
-        self.step_count += 1
-        return (
-            self._observations(self.step_count),
-            np.zeros(1),
-            np.zeros(1, dtype=bool),
-            np.asarray([{}], dtype=object),
-        )
-
-    def check_success(self):
-        return [self.success_after is not None and self.step_count >= self.success_after]
+    def append_data(self, frame):
+        assert self.closed is False
+        self.frames.append(np.asarray(frame).copy())
 
     def close(self):
+        if self.closed:
+            return
         self.closed = True
+        self.written_frames[self.path.name] = self.frames
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_bytes(b"video")
 
 
-def test_replay_selected_videos_writes_complete_stratified_outputs(
+def test_rollout_video_recorder_uses_formal_frames_and_stops_success_early(
     tmp_path,
     monkeypatch,
 ):
-    import octo_small_libero.evaluation as evaluation
-
-    environment = _ReplayVideoEnvironment()
-    monkeypatch.setattr(
-        evaluation,
-        "make_vector_environment_with_backoff",
-        lambda task, num_envs, auto_reduce: (environment, 1),
-    )
     written_frames = {}
-
-    def write_video(path, frames, *, fps):
-        materialized = list(frames)
-        written_frames[path.relative_to(path.parents[2])] = materialized
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"video")
-
-    monkeypatch.setattr(evaluation, "_write_video", write_video)
+    monkeypatch.setattr(
+        evaluation_module,
+        "_open_video_writer",
+        lambda path, fps: _MemoryVideoWriter(path, written_frames),
+    )
     settings = EvaluationSettings(
-        output_dir=tmp_path / "results",
         save_videos_path=tmp_path / "videos",
-        episodes=3,
-        num_envs=1,
-        max_steps=960,
-        settle_steps=0,
         record_videos=1,
         overwrite=True,
     )
-    task = LiberoTask(
-        task_id=5,
-        name="task",
-        language="do the task",
-        bddl_file=tmp_path / "task.bddl",
-        init_states_file=tmp_path / "task.init",
-        init_states_sha256="sha256",
-        init_states_git_blob="blob",
-        init_states=np.asarray([[0.0], [1.0], [2.0]], dtype=np.float32),
+    recorder = evaluation_module._RolloutVideoRecorder(settings)
+
+    assert recorder.begin_batch([0, 1]) is True
+    recorder.capture(_video_observations(10, 20), 0, np.asarray([False, False]))
+    recorder.capture(_video_observations(11, 21), 1, np.asarray([False, False]))
+    recorder.capture(_video_observations(12, 22), 2, np.asarray([True, False]))
+    recorder.capture(_video_observations(13, 23), 3, np.asarray([True, False]))
+    recorder.end_batch(
+        [
+            {"episode_id": 0, "success": True},
+            {"episode_id": 1, "success": False},
+        ]
     )
-    episodes = [
-        {
-            "episode_id": 1,
-            "init_state_id": 1,
-            "seed": EXPECTED_EVALUATION_SEEDS[0],
-            "success": True,
-            "steps": 2,
-            "first_success_step": 2,
-            "termination": "success",
-        },
-        {
-            "episode_id": 0,
-            "init_state_id": 0,
-            "seed": EXPECTED_EVALUATION_SEEDS[0],
-            "success": False,
-            "steps": 105,
-            "first_success_step": None,
-            "termination": "max_steps",
-        },
+    result = recorder.finalize()
+
+    assert [int(frame[0, 0, 0]) for frame in written_frames["episode-000.mp4"]] == [
+        10,
+        11,
+        12,
     ]
-    action_trajectories = {
-        0: [np.zeros(7, dtype=np.float32) for _ in range(105)],
-        1: [np.zeros(7, dtype=np.float32) for _ in range(2)],
+    assert [int(frame[0, 0, 0]) for frame in written_frames["episode-001.mp4"]] == [
+        20,
+        21,
+        22,
+        23,
+    ]
+    assert result.as_dict() == {
+        "requested": True,
+        "status": "complete",
+        "requested_per_outcome": 1,
+        "recorded": {"success": 1, "failure": 1},
+        "error": None,
+    }
+    assert {Path(path).relative_to(settings.save_videos_path) for path in result.videos} == {
+        Path("success/episode-000.mp4"),
+        Path("failure/episode-001.mp4"),
     }
 
-    paths = evaluation_module._record_replay_videos(
-        settings,
-        task=task,
-        statistics=_statistics(tmp_path),
-        episodes=episodes,
-        action_trajectories=action_trajectories,
+
+def test_rollout_video_recorder_stops_opening_batches_after_quotas_are_met(
+    tmp_path,
+    monkeypatch,
+):
+    opened = []
+
+    def open_writer(path, fps):
+        opened.append(path.name)
+        return _MemoryVideoWriter(path, {})
+
+    monkeypatch.setattr(evaluation_module, "_open_video_writer", open_writer)
+    recorder = evaluation_module._RolloutVideoRecorder(
+        EvaluationSettings(
+            save_videos_path=tmp_path / "videos",
+            record_videos=1,
+            overwrite=True,
+        )
     )
 
-    assert {Path(path).relative_to(settings.save_videos_path) for path in paths} == {
-        Path("failure/episode-000.mp4"),
+    assert recorder.begin_batch([2, 3]) is True
+    recorder.capture(_video_observations(2, 3), 0, np.asarray([False, False]))
+    recorder.end_batch(
+        [
+            {"episode_id": 2, "success": False},
+            {"episode_id": 3, "success": True},
+        ]
+    )
+
+    assert recorder.begin_batch([4, 5]) is False
+    assert opened == ["episode-002.mp4", "episode-003.mp4"]
+    assert recorder.finalize().status == "complete"
+
+
+def test_rollout_video_recorder_selects_earliest_outcomes_across_batches(
+    tmp_path,
+    monkeypatch,
+):
+    opened = []
+
+    def open_writer(path, fps):
+        opened.append(path.name)
+        return _MemoryVideoWriter(path, {})
+
+    monkeypatch.setattr(evaluation_module, "_open_video_writer", open_writer)
+    recorder = evaluation_module._RolloutVideoRecorder(
+        EvaluationSettings(
+            save_videos_path=tmp_path / "videos",
+            record_videos=2,
+            overwrite=True,
+        )
+    )
+
+    for episode_ids, outcomes in [
+        ([0, 1], [True, True]),
+        ([2, 3], [True, False]),
+        ([4, 5], [False, False]),
+    ]:
+        assert recorder.begin_batch(episode_ids) is True
+        recorder.capture(
+            _video_observations(*episode_ids),
+            0,
+            np.zeros(len(episode_ids), dtype=bool),
+        )
+        recorder.end_batch(
+            [
+                {"episode_id": episode_id, "success": success}
+                for episode_id, success in zip(episode_ids, outcomes, strict=True)
+            ]
+        )
+
+    assert recorder.begin_batch([6]) is False
+    result = recorder.finalize()
+
+    assert opened == [f"episode-{episode_id:03d}.mp4" for episode_id in range(6)]
+    assert {Path(path).relative_to(recorder.video_root) for path in result.videos} == {
+        Path("success/episode-000.mp4"),
         Path("success/episode-001.mp4"),
+        Path("failure/episode-003.mp4"),
+        Path("failure/episode-004.mp4"),
     }
-    assert sorted(len(frames) for frames in written_frames.values()) == [3, 106]
-    assert environment.seed_values == [
-        EXPECTED_EVALUATION_SEEDS[0],
-        EXPECTED_EVALUATION_SEEDS[0] + 1,
-    ]
-    assert environment.closed is True
 
 
-def test_replay_frames_rejects_a_success_that_does_not_reproduce():
-    environment = _ReplayVideoEnvironment()
-    environment.success_after = None
-    observations = environment._observations(0)
-    actions = [np.zeros(7, dtype=np.float32) for _ in range(2)]
+def test_rollout_video_recorder_overwrite_only_replaces_generated_videos(
+    tmp_path,
+    monkeypatch,
+):
+    video_root = tmp_path / "videos"
+    old_success = video_root / "success" / "episode-999.mp4"
+    old_failure = video_root / "failure" / "episode-998.mp4"
+    preserved = video_root / "success" / "notes.txt"
+    for path in (old_success, old_failure, preserved):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"old")
 
-    with pytest.raises(EvaluationError, match="did not reproduce success"):
-        list(
-            evaluation_module._replay_episode_frames(
-                environment,
-                observations,
-                actions,
-                expected_success=True,
-            )
+    monkeypatch.setattr(
+        evaluation_module,
+        "_open_video_writer",
+        lambda path, fps: _MemoryVideoWriter(path, {}),
+    )
+    recorder = evaluation_module._RolloutVideoRecorder(
+        EvaluationSettings(
+            save_videos_path=video_root,
+            record_videos=1,
+            overwrite=True,
         )
+    )
+    assert recorder.begin_batch([0, 1]) is True
+    recorder.capture(_video_observations(0, 1), 0, np.asarray([False, False]))
+    recorder.end_batch(
+        [
+            {"episode_id": 0, "success": True},
+            {"episode_id": 1, "success": False},
+        ]
+    )
+
+    result = recorder.finalize()
+
+    assert result.status == "complete"
+    assert old_success.exists() is False
+    assert old_failure.exists() is False
+    assert preserved.read_bytes() == b"old"
+    assert (video_root / "success" / "episode-000.mp4").exists()
+    assert (video_root / "failure" / "episode-001.mp4").exists()
 
 
-def test_replay_frames_stop_at_first_reproduced_success():
-    environment = _ReplayVideoEnvironment()
-    environment.success_after = 1
-    observations = environment._observations(0)
-    actions = [np.zeros(7, dtype=np.float32) for _ in range(2)]
+def test_rollout_video_recorder_failure_is_nonfatal_and_reported(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    def fail_writer(path, fps):
+        raise RuntimeError("encoder unavailable")
 
-    frames = list(
-        evaluation_module._replay_episode_frames(
-            environment,
-            observations,
-            actions,
-            expected_success=True,
+    monkeypatch.setattr(evaluation_module, "_open_video_writer", fail_writer)
+    recorder = evaluation_module._RolloutVideoRecorder(
+        EvaluationSettings(
+            save_videos_path=tmp_path / "videos",
+            record_videos=1,
         )
     )
 
-    assert len(frames) == 2
-    assert np.all(frames[0] == 0)
-    assert np.all(frames[1] == 1)
-    assert environment.step_count == 1
+    assert recorder.begin_batch([0]) is False
+    result = recorder.finalize()
+
+    assert result.status == "failed"
+    assert result.videos == ()
+    assert result.error == "RuntimeError: encoder unavailable"
+    assert "video recording disabled: RuntimeError: encoder unavailable" in capsys.readouterr().err
 
 
-def test_replay_frames_reject_success_for_failed_episode():
-    environment = _ReplayVideoEnvironment()
-    environment.success_after = 1
-    observations = environment._observations(0)
-    actions = [np.zeros(7, dtype=np.float32) for _ in range(2)]
+@pytest.mark.parametrize("failure_point", ["append", "close"])
+def test_rollout_video_recorder_writer_failures_do_not_escape(
+    tmp_path,
+    monkeypatch,
+    failure_point,
+):
+    class FailingWriter(_MemoryVideoWriter):
+        def append_data(self, frame):
+            if failure_point == "append":
+                raise OSError("video disk full")
+            super().append_data(frame)
 
-    with pytest.raises(EvaluationError, match="Failed episode reproduced success at step 1"):
-        list(
-            evaluation_module._replay_episode_frames(
-                environment,
-                observations,
-                actions,
-                expected_success=False,
-            )
+        def close(self):
+            if failure_point == "close":
+                raise OSError("video encoder failed")
+            super().close()
+
+    monkeypatch.setattr(
+        evaluation_module,
+        "_open_video_writer",
+        lambda path, fps: FailingWriter(path, {}),
+    )
+    recorder = evaluation_module._RolloutVideoRecorder(
+        EvaluationSettings(
+            save_videos_path=tmp_path / "videos",
+            record_videos=1,
         )
+    )
+
+    assert recorder.begin_batch([0]) is True
+    recorder.capture(_video_observations(0), 0, np.asarray([False]))
+    recorder.end_batch([{"episode_id": 0, "success": False}])
+    result = recorder.finalize()
+
+    assert result.status == "failed"
+    assert result.videos == ()
+    assert result.error is not None
+
+
+def test_rollout_video_recorder_keeps_completed_video_when_final_move_fails(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        evaluation_module,
+        "_open_video_writer",
+        lambda path, fps: _MemoryVideoWriter(path, {}),
+    )
+    recorder = evaluation_module._RolloutVideoRecorder(
+        EvaluationSettings(
+            save_videos_path=tmp_path / "videos",
+            record_videos=1,
+            overwrite=True,
+        )
+    )
+    assert recorder.begin_batch([0, 1]) is True
+    recorder.capture(_video_observations(0, 1), 0, np.asarray([False, False]))
+    recorder.end_batch(
+        [
+            {"episode_id": 0, "success": True},
+            {"episode_id": 1, "success": False},
+        ]
+    )
+    original_replace = Path.replace
+
+    def fail_second_final_move(path, target):
+        if path.parent.name == "failure":
+            raise OSError("final video move failed")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_second_final_move)
+
+    result = recorder.finalize()
+
+    assert result.status == "partial"
+    assert result.recorded_success == 1
+    assert result.recorded_failure == 0
+    assert result.error == "OSError: final video move failed"
+    assert result.videos == (str(tmp_path / "videos" / "success" / "episode-000.mp4"),)
 
 
 def test_video_settings_require_path_and_positive_limit(tmp_path):
@@ -829,7 +987,7 @@ def test_evaluation_protocol_uses_three_fixed_seeds_and_balanced_episodes():
         validate_settings(EvaluationSettings(episodes=150, num_envs=50, seeds=(3, 4, 5)))
 
 
-def test_evaluate_checkpoint_repeats_states_and_delegates_video_replay(
+def test_evaluate_checkpoint_keeps_formal_results_when_rollout_video_fails(
     tmp_path,
     monkeypatch,
 ):
@@ -950,26 +1108,13 @@ def test_evaluate_checkpoint_repeats_states_and_delegates_video_replay(
         "make_vector_environment_with_backoff",
         lambda *args, **kwargs: (environment, settings.num_envs),
     )
-    recorded_replay = {}
 
-    def record_replay_videos(
-        replay_settings,
-        *,
-        task,
-        statistics,
-        episodes,
-        action_trajectories,
-    ):
-        recorded_replay["settings"] = replay_settings
-        recorded_replay["task"] = task
-        recorded_replay["statistics"] = statistics
-        recorded_replay["episodes"] = list(episodes)
-        recorded_replay["action_trajectories"] = {
-            episode_id: list(actions) for episode_id, actions in action_trajectories.items()
-        }
-        return [str(settings.save_videos_path / "success" / "episode-000.mp4")]
+    def fail_writer(path, fps):
+        raise RuntimeError("encoder unavailable")
 
-    monkeypatch.setattr(evaluation, "_record_replay_videos", record_replay_videos)
+    monkeypatch.setattr(evaluation, "_open_video_writer", fail_writer)
+    settings.output_dir.mkdir(parents=True)
+    (settings.output_dir / "failure.json").write_text("stale", encoding="utf-8")
 
     report = evaluate_checkpoint(settings)
     episode_rows = [
@@ -995,16 +1140,17 @@ def test_evaluate_checkpoint_repeats_states_and_delegates_video_replay(
         1.0,
         1.0,
     ]
-    assert recorded_replay["settings"] is settings
-    assert recorded_replay["task"] is task
-    assert recorded_replay["statistics"] is statistics
-    assert len(recorded_replay["episodes"]) == 6
-    assert set(recorded_replay["action_trajectories"]) == set(range(6))
-    assert all(
-        len(actions) == ACTION_HORIZON
-        for actions in recorded_replay["action_trajectories"].values()
-    )
-    assert report["videos"] == [str(settings.save_videos_path / "success" / "episode-000.mp4")]
+    assert report["status"] == "complete"
+    assert report["videos"] == []
+    assert report["video_generation"] == {
+        "requested": True,
+        "status": "failed",
+        "requested_per_outcome": 1,
+        "recorded": {"success": 0, "failure": 0},
+        "error": "RuntimeError: encoder unavailable",
+    }
+    assert json.loads((settings.output_dir / "results.json").read_text())["status"] == "complete"
+    assert not (settings.output_dir / "failure.json").exists()
 
 
 def test_libero_source_checkout_layout_is_added_to_import_path(tmp_path, monkeypatch):
@@ -1739,7 +1885,14 @@ def test_result_schema_contains_protocol_outcome_and_runtime(tmp_path):
         libero_commit=LIBERO_COMMIT,
     )
 
-    assert report["schema_version"] == 3
+    assert report["schema_version"] == 4
+    assert report["video_generation"] == {
+        "requested": False,
+        "status": "not_requested",
+        "requested_per_outcome": 0,
+        "recorded": {"success": 0, "failure": 0},
+        "error": None,
+    }
     assert report["protocol"]["episodes"] == 3
     assert report["protocol"]["episodes_per_seed"] == 1
     assert report["protocol"]["seeds"] == list(EVALUATION_SEEDS)

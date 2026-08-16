@@ -46,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--save-videos-path",
         action=_StoreOnce,
-        help="Write stratified success/failure replay videos under PATH",
+        help="Write stratified success/failure rollout videos under PATH",
     )
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument(
