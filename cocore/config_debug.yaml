@@ -32,7 +32,7 @@ selection:
   max_refreshes: 100
 
 runtime:
-  max_episodes: 2
+  max_episodes: 20
   num_workers: 0
 
 output:

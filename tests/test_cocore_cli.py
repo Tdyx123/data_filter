@@ -14,8 +14,8 @@ def _objective(relation: str = "cooccurrence", weight: float = 1.0) -> dict[str,
     return {"objective": {"relation": relation, "relation_weight": weight}}
 
 
-def test_package_version_matches_schema_four_release() -> None:
-    assert cocore.__version__ == "0.8.0"
+def test_package_version_matches_schema_five_release() -> None:
+    assert cocore.__version__ == "0.9.0"
 
 
 def test_config_requires_explicit_relation_and_weight() -> None:
@@ -120,7 +120,7 @@ def test_config_rejects_non_mapping_encoding() -> None:
 def test_config_rejects_flat_prototype_controls_replaced_by_action_formulas(
     obsolete: str,
 ) -> None:
-    with pytest.raises(ValueError, match="fixed by the schema-4 algorithm"):
+    with pytest.raises(ValueError, match="fixed by the schema-5 algorithm"):
         resolve_config(
             {
                 **_objective(),
@@ -224,7 +224,7 @@ def test_main_applies_cli_overrides_to_run_pipeline(monkeypatch, capsys) -> None
     assert capsys.readouterr().out.strip().endswith("select-sequence-w2-top25pct")
 
 
-def test_build_graph_cli_reports_schema_four_graph_directory(monkeypatch, capsys) -> None:
+def test_build_graph_cli_reports_schema_five_graph_directory(monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli, "load_config", lambda _: _objective())
     monkeypatch.setattr(
         cli,
@@ -241,7 +241,7 @@ def test_build_graph_cli_reports_schema_four_graph_directory(monkeypatch, capsys
     cli.main(["build-graph", "--config", "unused.yaml"])
 
     assert capsys.readouterr().out.strip() == (
-        "cocore_output=outputs/cocore/test/graph-13-motion-softmax nodes=2"
+        "cocore_output=outputs/cocore/test/graph-14-motion-hard-nearest nodes=2"
     )
 
 
@@ -277,3 +277,5 @@ def test_shipped_configs_resolve_to_fixed_cocore_contract(path: str) -> None:
         & config["selection"].keys()
     )
     assert config["output"]["directory"].startswith("outputs/cocore/")
+    if path.endswith("config_debug.yaml"):
+        assert config["runtime"]["max_episodes"] == 20

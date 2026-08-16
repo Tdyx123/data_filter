@@ -8,34 +8,42 @@ Cocore 从 LeRobot v2 LIBERO episode 中选择固定预算的 15 帧片段。它
 episode 只执行一次视觉模型前向；候选与 reference 片段的视觉特征
 `[sum(v0..v14), v14-v0]` 在去重并集上拟合 128 维 PCA，再与 state/action 的
 `mean/std/max` 及 `start/episode_length` 拼接并做行 L2 归一化。该 embedding 用于
-可靠性 support 和相似图。原型分配另用完整 15 帧 CLIP embedding 的均值并做 L2
-归一化，使图编码与动作桶内的视觉场景建模保持独立。
+可靠性 support 和相似图。原型分配另将候选拆成共享第 7 帧的 `[0..7]`、`[7..14]`
+两个半段，分别计算 8 帧 CLIP 均值并 L2 归一化。
 
-动作—视觉软标签保留两级解耦：一级只表达动作语义，二级只表达对应动作桶内的视觉
-场景。学习原型时，对每条完整轨迹生成所有 stride=1 的 8 帧窗口 `[t,t+7]`，用
+动作—视觉原型保留两级解耦：一级表达动作桶，二级表达桶内视觉中心。学习原型时，
+对每条完整轨迹生成所有 stride=1 的 8 帧窗口 `[t,t+7]`，用
 `state[t]→state[t+7]` 分类动作，并用窗口内 8 个逐帧 CLIP embedding 的归一化均值
 学习视觉中心。设全部窗口数为 `W`，动作保留条件为：
 
 ```text
-count >= max(40, ceil(0.005 * W))
+count >= max(400, ceil(0.005 * W))
 ```
 
-低频组合动作会解析为原子动作集合，并映射到原子数最多的保留子集父类；多个最近父类
-按它们的原始窗口频次归一化，没有非空父类时回退到 `stop=1`。低频窗口仍按父类概率
-作为 `sample_weight` 进入所有对应动作桶。动作桶有效质量为
-`M_a=sum_w p(a|w)`，中心数固定为 `K_a=min(16, 1+floor(log2(M_a)))`。
-
-构造 15 帧候选标签时，分别分类 `state[0]→state[7]` 与
-`state[7]→state[14]`，将两者的原子动作取并集、去重并按固定语义顺序规范化；不保留
-前后次序。保留动作的动作概率为 1，否则沿用上述最大子集父类频次分配。在每个父动作
-桶内，候选的 15 帧视觉均值会对全部中心计算稳定 softmax，不做 Top-K 截断：
+非 `stop` 桶只训练原始标签本身达到门槛的硬窗口；低频窗口不进入任何训练桶。`stop`
+只训练原始 `stop` 窗口。令 `M_a` 为桶内硬样本数，中心数固定为：
 
 ```text
-p(k | a, v) = softmax_k(-||v - c[a,k]||^2 / 0.1)
-p(a, k | clip) = p(a | clip) * p(k | a, v)
+K_a = min(16, floor(log2(M_a)) - 2)
 ```
 
-两层各自归一化，因此每个候选的全部叶原型概率严格和为 1。
+MiniBatchKMeans 不使用样本权重；中心按硬归属数降序、坐标字典序稳定编号。每桶还记录
+训练窗口到最近中心的欧氏距离 q10/q90。
+
+构造 15 帧候选标签时，分别分类 `state[0]→state[7]` 与
+`state[7]→state[14]`，两个半段各自独立打一个叶标签。若原始动作未保留，先找原子数
+最多的保留子集；多个父动作并列时，在它们的所有中心中选欧氏距离最近的叶原型，距离
+相同取较小叶 ID。没有非空父集时回退 `stop`。
+
+```text
+w_r = 0.5 + 0.5 * |A_parent| / |A_raw|
+w_d = q10 处 1.0、q90 处 0.3，中间线性插值并截断到 [0.3, 1.0]
+w_half = w_r * w_d
+```
+
+精确标签（包括原始 `stop`）的保留比例取 1；非 `stop` 回退 `stop` 的比例取 0。两半
+命中同一叶时合并为 `max(w1,w2)+0.5*min(w1,w2)`；同动作不同中心不合并。最终固定
+最多两个槽位，按权重降序、叶 ID 破平局；权重不归一、不截断，范围可到 1.5。
 
 可靠性固定为 `sqrt(support * progress)`。初始集合为每个可达运动原语选择
 `reliability * assignment` 最大的片段并取并集，使所有原型 coverage 达到全池最大值。
@@ -104,7 +112,7 @@ prototypes:
 片段长度与步长是 Cocore 固定算法的一部分，均为 15；配置中不接受 `clip` section。
 Quality 风格编码取代了旧关系编码，因此不再接受顶层 `relation` 或 `normalization`；
 `encoding.visual_dim` 固定为 128，`pca_fit_max_samples` 可限制 PCA 拟合样本数。
-动作门槛、中心数公式、16 个中心上限和视觉 softmax 温度 0.1 都是 Cocore 固定算法，
+动作门槛、中心数公式、16 个中心上限、距离分位和权重公式都是 Cocore 固定算法，
 不可配置；`prototypes` 只接受 `method`、`batch_size` 和 `max_iter`，并明确拒绝旧
 `count`、`top_r` 或 `temperature`。
 
@@ -128,24 +136,24 @@ RelCore 的 `--reliability-metrics`、`--prototype-method` 或
 python -m cocore run --config cocore/config_debug.yaml --force
 ```
 
-Cocore 0.8.0 使用 prototype schema 4，并按 episode 持久化完整逐帧 CLIP 特征。
-schema 3 的 encode、graph 和 selection 缓存不迁移、也不会按 schema 4 读取；升级后
+Cocore 0.9.0 使用 prototype schema 5，并按 episode 持久化完整逐帧 CLIP 特征。
+schema 4 的 encode、graph 和 selection 缓存不迁移、也不会按 schema 5 读取；升级后
 必须通过 `--force` 重新构建 graph 和 selection，或使用新的输出目录。
 
 ## 输出与校验
 
-输出根目录包含 `scan/`、`encode/`、`graph-13-motion-softmax/` 和一个或多个
+输出根目录包含 `scan/`、`encode/`、`graph-14-motion-hard-nearest/` 和一个或多个
 `select-<关系>-w<权重>-top<比例>pct/`。选择目录包含：
 
 - graph 目录中的 `prototype_catalog.json` 与 `prototype_centers.npy`：动作类别、
-  原始计数、父类概率、有效质量、视觉中心数量、固定常量以及按叶 ID 对齐的中心；
+  原始计数、训练计数、视觉中心数量、距离 q10/q90、固定常量以及按叶 ID 对齐的中心；
 - encode 目录中的 `embeddings.npy`、`visual_pca.npz` 和
   `numeric_normalizers.npz`：Quality 融合 embedding 及其可重放参数；
 - encode 目录中的 `frame_embeddings/ep<episode_id>.npy`：每个已索引 episode（包括
   短 episode）的完整 `[帧数, CLIP 维度]`、`float32` 逐帧特征；
   `frame_embeddings_index.json` 记录顺序、shape 和 SHA-256；
-- encode 目录中的 `visual_clip_embeddings.npy`：每个候选的 15 帧归一化视觉均值；
-  graph 目录中的 `clip_action_labels.npy` 记录两个半段原子动作并集后的原始组合标签；
+- encode 目录中的 `visual_half_embeddings.npy`：每个候选两个半段的归一化视觉均值；
+  graph 目录中的 `half_action_labels.npy` 记录两个半段各自的原始动作标签；
 
 - `selected_manifest.jsonl`：训练入口可直接消费的片段清单；
 - `all_clips.parquet`：全池 support、progress、reliability、运动原语与选择诊断；
@@ -166,4 +174,5 @@ python -m cocore validate \
 
 当前版本只支持本仓库约定的 8 维 LIBERO `observation.state`。selection 的
 parquet/JSONL 导出最终 `prototype_indices`、`prototype_weights`、叶标签、动作标签与
-`raw_action_label`，不再导出可分解的 action/distance 权重。
+`half_action_labels`，不导出可分解的 action/distance 权重。所有图关系与选择目标直接
+消费绝对 `prototype_weights`，不对每行额外归一或截断。

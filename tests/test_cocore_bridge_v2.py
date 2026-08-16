@@ -114,8 +114,8 @@ def _write_synthetic_bridge_dataset(
     ]
     episodes = [
         {"episode_index": 0, "tasks": [""], "length": 45},
-        {"episode_index": 1, "tasks": ["move object one"], "length": 45},
-        {"episode_index": 2, "tasks": ["move object two"], "length": 45},
+        {"episode_index": 1, "tasks": ["move object one"], "length": 207},
+        {"episode_index": 2, "tasks": ["move object two"], "length": 207},
     ]
     _write_jsonl(meta / "tasks.jsonl", tasks)
     _write_jsonl(meta / "episodes.jsonl", episodes)
@@ -124,7 +124,7 @@ def _write_synthetic_bridge_dataset(
     info.update(
         {
             "total_episodes": 3,
-            "total_frames": 135,
+            "total_frames": 459,
             "total_tasks": 3,
             "total_videos": 12,
             "total_chunks": 1,
@@ -152,12 +152,12 @@ def _write_synthetic_bridge_dataset(
     _write_bridge_info(root, info)
 
     for episode_id in (1, 2):
-        steps = np.arange(45, dtype=np.float32)
-        states = np.zeros((45, 8), dtype=np.float32)
+        steps = np.arange(207, dtype=np.float32)
+        states = np.zeros((207, 8), dtype=np.float32)
         if not (stop_first_valid_episode and episode_id == 1):
             states[:, 0] = steps * 0.01
-            states[:, 7] = np.clip(steps / 44.0, 0.0, 1.0)
-        actions = np.zeros((45, 7), dtype=np.float32)
+            states[:, 7] = np.clip(steps / 206.0, 0.0, 1.0)
+        actions = np.zeros((207, 7), dtype=np.float32)
         actions[:, 0] = 0.01
         actions[:, 6] = states[:, 7]
         table = pa.table(
@@ -167,14 +167,14 @@ def _write_synthetic_bridge_dataset(
                 ),
                 "action": pa.array(actions.tolist(), type=pa.list_(pa.float32(), list_size=7)),
                 "timestamp": pa.array(steps / 5.0, type=pa.float32()),
-                "frame_index": pa.array(np.arange(45), type=pa.int64()),
-                "episode_index": pa.array([episode_id] * 45, type=pa.int64()),
-                "task_index": pa.array([episode_id] * 45, type=pa.int64()),
+                "frame_index": pa.array(np.arange(207), type=pa.int64()),
+                "episode_index": pa.array([episode_id] * 207, type=pa.int64()),
+                "task_index": pa.array([episode_id] * 207, type=pa.int64()),
             }
         )
         pq.write_table(table, data / f"episode_{episode_id:06d}.parquet")
-        pixel_values = np.mod(np.arange(45) + episode_id * 37, 255).astype(np.uint8)
-        frames = np.broadcast_to(pixel_values[:, None, None, None], (45, 32, 32, 3)).copy()
+        pixel_values = np.mod(np.arange(207) + episode_id * 37, 255).astype(np.uint8)
+        frames = np.broadcast_to(pixel_values[:, None, None, None], (207, 32, 32, 3)).copy()
         _write_av1_video(
             root
             / "videos"
@@ -215,7 +215,7 @@ def test_package_exposes_only_version() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["0.1.0", "['__version__']"]
+    assert result.stdout.splitlines() == ["0.2.0", "['__version__']"]
 
 
 def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None:
@@ -519,7 +519,7 @@ def test_scan_cli_preflights_and_delegates_resolved_bridge_config(
             "build-graph",
             "graph_stage",
             lambda root: (root, None, None, SimpleNamespace(sample_ids=(1, 2)), "fingerprint"),
-            "cocore_output={root}/graph-13-motion-softmax nodes=2",
+            "cocore_output={root}/graph-14-motion-hard-nearest nodes=2",
         ),
         (
             "select",
@@ -657,6 +657,7 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(tmp_path: Pat
     config["runtime"]["num_workers"] = 0
     config["quality"]["knn"] = 2
     config["graph"]["knn"] = 2
+    config["prototypes"]["max_iter"] = 2
     config["selection"]["budget"] = 6
 
     result = run_pipeline(config, output_dir=output, visual_encoder=DummyVisualEncoder())
@@ -669,7 +670,7 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(tmp_path: Pat
         "excluded_episodes": 1,
         "excluded_empty_task_episodes": 1,
     }
-    assert scan_manifest["clips"] == 6
+    assert scan_manifest["clips"] == 28
     scanned_episode_ids = pq.read_table(output / "scan" / "episodes.parquet")[
         "episode_id"
     ].to_pylist()
@@ -681,10 +682,10 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(tmp_path: Pat
     select_manifest = json.loads((result / "manifest.json").read_text())
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert select_manifest["producer"] == "cocore"
-    assert select_manifest["cocore_version"] == "0.8.0"
+    assert select_manifest["cocore_version"] == "0.9.0"
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.8.0"
-    assert run_manifest["stage_directories"]["graph"] == "graph-13-motion-softmax"
+    assert run_manifest["cocore_version"] == "0.9.0"
+    assert run_manifest["stage_directories"]["graph"] == "graph-14-motion-hard-nearest"
     assert validate_output(result, config=config) == {
         "status": "valid",
         "selected_clips": 6,
@@ -694,6 +695,7 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(tmp_path: Pat
 def test_bridge_validate_replays_the_same_max_episode_subset(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from cocore.pipeline import run_pipeline
     from cocore_bridge_v2 import cli
@@ -720,6 +722,16 @@ def test_bridge_validate_replays_the_same_max_episode_subset(
     config["runtime"]["num_workers"] = 0
     config["quality"]["knn"] = 2
     config["graph"]["knn"] = 2
+    config["prototypes"]["max_iter"] = 2
+
+    original_build_config = cli.build_config
+
+    def build_test_config(**kwargs):
+        replay_config = original_build_config(**kwargs)
+        replay_config["prototypes"]["max_iter"] = 2
+        return replay_config
+
+    monkeypatch.setattr(cli, "build_config", build_test_config)
 
     result = run_pipeline(config, output_dir=output, visual_encoder=DummyVisualEncoder())
 
@@ -742,6 +754,6 @@ def test_bridge_validate_replays_the_same_max_episode_subset(
     )
 
     assert json.loads(capsys.readouterr().out) == {
-        "selected_clips": 2,
+        "selected_clips": 7,
         "status": "valid",
     }

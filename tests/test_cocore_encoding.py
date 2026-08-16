@@ -13,6 +13,7 @@ from cocore.encoding import (
     fuse_fragment_features,
     reference_windows,
     temporal_pool,
+    visual_half_means,
     visual_fragment_feature,
 )
 from segment_filter_core.encoding import (
@@ -141,6 +142,17 @@ def test_quality_style_pca_requires_positive_output_dimension() -> None:
         CocorePCAProjector(output_dim=0)
 
 
+def test_visual_half_means_use_overlapping_eight_frame_windows() -> None:
+    steps = np.arange(15, dtype=np.float32)
+    frames = np.stack([steps, steps**2 + 1.0], axis=1)
+
+    actual = visual_half_means(frames)
+
+    expected = np.stack([frames[:8].mean(axis=0), frames[7:].mean(axis=0)])
+    expected /= np.linalg.norm(expected, axis=1, keepdims=True)
+    np.testing.assert_allclose(actual, expected, atol=1.0e-7)
+
+
 def test_cocore_encoder_uses_quality_fusion_and_caches_episode_frames(
     tmp_path: Path,
 ) -> None:
@@ -224,14 +236,21 @@ def test_cocore_encoder_uses_quality_fusion_and_caches_episode_frames(
     )
     np.testing.assert_array_equal(cocore.embeddings, local_expected)
 
-    assert cocore.visual_clip_embeddings.shape == (5, 3)
+    assert cocore.visual_half_embeddings.shape == (5, 2, 3)
+    first_half = np.asarray([4.5, 5.5, 7.5], dtype=np.float32)
+    second_half = np.asarray([11.5, 12.5, 14.5], dtype=np.float32)
     np.testing.assert_allclose(
-        cocore.visual_clip_embeddings[0],
-        np.asarray([8.0, 9.0, 11.0], dtype=np.float32) / np.float32(np.sqrt(266.0)),
+        cocore.visual_half_embeddings[0, 0],
+        first_half / np.linalg.norm(first_half),
         atol=1.0e-7,
     )
     np.testing.assert_allclose(
-        np.linalg.norm(cocore.visual_clip_embeddings, axis=1),
+        cocore.visual_half_embeddings[0, 1],
+        second_half / np.linalg.norm(second_half),
+        atol=1.0e-7,
+    )
+    np.testing.assert_allclose(
+        np.linalg.norm(cocore.visual_half_embeddings, axis=2),
         1.0,
         atol=1.0e-6,
     )

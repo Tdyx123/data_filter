@@ -52,11 +52,11 @@ from cocore.objective import CocoreObjectiveContext
 from cocore.prototypes import (
     MAX_VISUAL_CENTERS,
     MIN_ACTION_COUNT,
+    MIN_DISTANCE_WEIGHT,
     MIN_ACTION_FREQUENCY,
     STATE_THRESHOLD,
-    VISUAL_SOFTMAX_TEMPERATURE,
     build_hierarchical_motion_prototypes,
-    cluster_count_for_mass,
+    cluster_count_for_training_count,
 )
 from cocore.selection import (
     LazyHeapSelector,
@@ -64,10 +64,10 @@ from cocore.selection import (
 )
 
 
-GRAPH_DIRECTORY = "graph-13-motion-softmax"
+GRAPH_DIRECTORY = "graph-14-motion-hard-nearest"
 RELIABILITY_METRICS = ("support", "progress")
-PROTOTYPE_SCHEMA_VERSION = 4
-PROTOTYPE_STRATEGY = "trajectory_action_subset_then_visual_softmax"
+PROTOTYPE_SCHEMA_VERSION = 5
+PROTOTYPE_STRATEGY = "trajectory_retained_action_then_half_visual_nearest"
 
 
 def _number_tag(value: float) -> str:
@@ -116,7 +116,7 @@ def _save_cocore_encoded(
     runtime_seconds: float,
 ) -> None:
     np.save(temporary / "embeddings.npy", encoded.embeddings)
-    np.save(temporary / "visual_clip_embeddings.npy", encoded.visual_clip_embeddings)
+    np.save(temporary / "visual_half_embeddings.npy", encoded.visual_half_embeddings)
     np.save(temporary / "state_sequences.npy", encoded.state_sequences)
     np.save(temporary / "action_sequences.npy", encoded.action_sequences)
     np.save(temporary / "visual_progress.npy", encoded.visual_progress)
@@ -185,12 +185,12 @@ def _save_cocore_encoded(
             "encoding": "quality_fusion",
             "visual_embedding_dim": projector.output_dim,
             "embedding_dim": int(encoded.embeddings.shape[1]),
-            "visual_clip_embedding_dim": int(encoded.visual_clip_embeddings.shape[1]),
+            "visual_half_embedding_dim": int(encoded.visual_half_embeddings.shape[2]),
             "clip_length": 15,
             "clip_stride": 15,
             "clip_anchors": [0, 7, 14],
-            "visual_clip_frames": 15,
-            "visual_clip_encoding": "l2_normalized_per_frame_clip_mean",
+            "visual_half_windows": [[0, 8], [7, 15]],
+            "visual_half_encoding": "l2_normalized_eight_frame_mean",
             "counts": {
                 "candidate_fragments": candidate_count,
                 "reference_fragments": reference_count,
@@ -282,36 +282,36 @@ def _validate_frame_embedding_cache(
         raise ValueError("cocore frame embedding episodes do not match the scan index")
 
 
-def _validate_visual_clip_embedding_cache(
+def _validate_visual_half_embedding_cache(
     encode_root: Path,
     clips: list[ClipRecord],
 ) -> None:
-    path = encode_root / "visual_clip_embeddings.npy"
+    path = encode_root / "visual_half_embeddings.npy"
     try:
-        visual_clips = np.load(path, allow_pickle=False, mmap_mode="r")
+        visual_halves = np.load(path, allow_pickle=False, mmap_mode="r")
     except (OSError, ValueError) as error:
-        raise ValueError("cocore visual clip embedding cache could not be loaded") from error
+        raise ValueError("cocore visual half embedding cache could not be loaded") from error
     if (
-        visual_clips.dtype != np.dtype(np.float32)
-        or visual_clips.ndim != 2
-        or visual_clips.shape[0] != len(clips)
-        or visual_clips.shape[1] == 0
+        visual_halves.dtype != np.dtype(np.float32)
+        or visual_halves.ndim != 3
+        or visual_halves.shape[:2] != (len(clips), 2)
+        or visual_halves.shape[2] == 0
     ):
-        raise ValueError("cocore visual clip embedding shape or dtype is invalid")
-    for start in range(0, len(visual_clips), 4096):
-        block = visual_clips[start : start + 4096]
+        raise ValueError("cocore visual half embedding shape or dtype is invalid")
+    for start in range(0, len(visual_halves), 4096):
+        block = visual_halves[start : start + 4096]
         if not np.all(np.isfinite(block)):
-            raise ValueError("cocore visual clip embedding contains NaN or infinity")
-        norms = np.linalg.norm(block, axis=1)
+            raise ValueError("cocore visual half embedding contains NaN or infinity")
+        norms = np.linalg.norm(block, axis=2)
         if not np.all(np.isfinite(norms)) or np.any(norms <= 1.0e-8):
-            raise ValueError("cocore visual clip embedding has a non-positive norm")
+            raise ValueError("cocore visual half embedding has a non-positive norm")
         if not np.allclose(norms, 1.0, rtol=1.0e-5, atol=1.0e-6):
-            raise ValueError("cocore visual clip embeddings must be L2-normalized")
+            raise ValueError("cocore visual half embeddings must be L2-normalized")
 
     clips_by_episode: dict[int, list[tuple[int, ClipRecord]]] = {}
     for clip_index, clip in enumerate(clips):
         if clip.length != 15 or clip.end_step - clip.start_step + 1 != 15 or clip.start_step < 0:
-            raise ValueError("cocore visual clip boundary is invalid")
+            raise ValueError("cocore visual half boundary is invalid")
         clips_by_episode.setdefault(clip.episode_id, []).append((clip_index, clip))
 
     for episode_id in sorted(clips_by_episode):
@@ -319,31 +319,31 @@ def _validate_visual_clip_embedding_cache(
         try:
             frame_values = np.load(frame_path, allow_pickle=False, mmap_mode="r")
         except (OSError, ValueError) as error:
-            raise ValueError("cocore visual clip frame cache could not be loaded") from error
+            raise ValueError("cocore visual half frame cache could not be loaded") from error
         if (
             frame_values.dtype != np.dtype(np.float32)
             or frame_values.ndim != 2
-            or frame_values.shape[1] != visual_clips.shape[1]
+            or frame_values.shape[1] != visual_halves.shape[2]
         ):
-            raise ValueError("cocore visual clip frame cache shape or dtype is invalid")
+            raise ValueError("cocore visual half frame cache shape or dtype is invalid")
         for clip_index, clip in clips_by_episode[episode_id]:
             if clip.end_step >= len(frame_values):
-                raise ValueError("cocore visual clip boundary exceeds frame cache")
+                raise ValueError("cocore visual half boundary exceeds frame cache")
             window = frame_values[clip.start_step : clip.end_step + 1]
-            if window.shape != (15, visual_clips.shape[1]) or not np.all(np.isfinite(window)):
-                raise ValueError("cocore visual clip frame window is invalid")
-            mean = window.mean(axis=0)
-            norm = float(np.linalg.norm(mean))
-            if not math.isfinite(norm) or norm <= 1.0e-8:
-                raise ValueError("cocore visual clip frame mean has a non-positive norm")
-            expected = (mean / norm).astype(np.float32)
+            if window.shape != (15, visual_halves.shape[2]) or not np.all(np.isfinite(window)):
+                raise ValueError("cocore visual half frame window is invalid")
+            means = np.stack([window[:8].mean(axis=0), window[7:].mean(axis=0)])
+            norms = np.linalg.norm(means, axis=1, keepdims=True)
+            if not np.all(np.isfinite(norms)) or np.any(norms <= 1.0e-8):
+                raise ValueError("cocore visual half frame mean has a non-positive norm")
+            expected = (means / norms).astype(np.float32)
             if not np.allclose(
-                visual_clips[clip_index],
+                visual_halves[clip_index],
                 expected,
                 rtol=1.0e-6,
                 atol=1.0e-7,
             ):
-                raise ValueError("visual clip embeddings do not match frame cache")
+                raise ValueError("visual half embeddings do not match frame cache")
 
 
 def scan_stage(
@@ -390,9 +390,9 @@ def encode_stage(
             "runtime": {"max_episodes": resolved["runtime"].get("max_episodes")},
             "seed": resolved["seed"],
             "fixed_clip": {"length": 15, "stride": 15},
-            "visual_clip": {
-                "frames": 15,
-                "encoding": "l2_normalized_per_frame_clip_mean",
+            "visual_halves": {
+                "windows": [[0, 8], [7, 15]],
+                "encoding": "l2_normalized_eight_frame_mean",
             },
             "visual_model_sha256": model_sha256,
         }
@@ -428,7 +428,7 @@ def encode_stage(
 
     required = (
         "embeddings.npy",
-        "visual_clip_embeddings.npy",
+        "visual_half_embeddings.npy",
         "state_sequences.npy",
         "action_sequences.npy",
         "visual_progress.npy",
@@ -453,10 +453,10 @@ def encode_stage(
                 f"cocore frame embedding cache is incompatible: {destination}; pass --force"
             ) from error
         try:
-            _validate_visual_clip_embedding_cache(destination, clips)
+            _validate_visual_half_embedding_cache(destination, clips)
         except ValueError as error:
             raise FileExistsError(
-                f"cocore visual clip embedding cache is incompatible: {destination}; pass --force"
+                f"cocore visual half embedding cache is incompatible: {destination}; pass --force"
             ) from error
         frame_cache_valid = True
     publish_stage(
@@ -471,14 +471,14 @@ def encode_stage(
         destination,
         expected_episodes=expected_frame_episodes,
     )
-    _validate_visual_clip_embedding_cache(destination, clips)
+    _validate_visual_half_embedding_cache(destination, clips)
     return (
         root,
         adapter,
         CocoreEncodedArtifact(
             clips=clips,
             embeddings=np.load(destination / "embeddings.npy"),
-            visual_clip_embeddings=np.load(destination / "visual_clip_embeddings.npy"),
+            visual_half_embeddings=np.load(destination / "visual_half_embeddings.npy"),
             state_sequences=np.load(destination / "state_sequences.npy"),
             action_sequences=np.load(destination / "action_sequences.npy"),
             visual_progress=np.load(destination / "visual_progress.npy"),
@@ -541,7 +541,7 @@ def graph_stage(
         hierarchy = build_hierarchical_motion_prototypes(
             adapter,
             encoded.clips,
-            encoded.visual_clip_embeddings,
+            encoded.visual_half_embeddings,
             frame_cache_dir=root / "encode" / "frame_embeddings",
             batch_size=int(prototype_config["batch_size"]),
             max_iter=int(prototype_config["max_iter"]),
@@ -558,6 +558,7 @@ def graph_stage(
             knn=int(graph_config["knn"]),
             similarity_threshold=float(graph_config["similarity_threshold"]),
             cooccurrence_max_gap=int(graph_config["cooccurrence_max_gap"]),
+            normalize_prototype_relations=False,
         )
         np.savez(
             temporary / "nodes.npz",
@@ -572,7 +573,7 @@ def graph_stage(
         )
         assert hierarchy.prototypes.centers is not None
         np.save(temporary / "prototype_centers.npy", hierarchy.prototypes.centers)
-        np.save(temporary / "clip_action_labels.npy", hierarchy.clip_action_labels)
+        np.save(temporary / "half_action_labels.npy", hierarchy.half_action_labels)
         write_json(temporary / "prototype_catalog.json", hierarchy.catalog.to_dict())
         _save_edge_table(temporary / "sequence_edges.npz", graph.sequence_edges)
         _save_edge_table(temporary / "similarity_edges.npz", graph.similarity_edges)
@@ -606,7 +607,7 @@ def graph_stage(
             "nodes.npz",
             "prototype_catalog.json",
             "prototype_centers.npy",
-            "clip_action_labels.npy",
+            "half_action_labels.npy",
             "sequence_edges.npz",
             "similarity_edges.npz",
             "transition_matrix.npz",
@@ -708,7 +709,7 @@ def _load_graph(root: Path) -> tuple[list[ClipRecord], GraphData, Mapping[str, n
     return clips, graph, nodes
 
 
-def _validate_schema_four_catalog(
+def _validate_schema_five_catalog(
     payload: Mapping[str, Any],
     *,
     expected_total_raw_actions: int,
@@ -718,8 +719,12 @@ def _validate_schema_four_catalog(
         "min_action_count": MIN_ACTION_COUNT,
         "min_action_frequency": MIN_ACTION_FREQUENCY,
         "max_visual_centers": MAX_VISUAL_CENTERS,
-        "visual_softmax_temperature": VISUAL_SOFTMAX_TEMPERATURE,
-        "cluster_count": "min(16, 1 + floor(log2(effective_mass)))",
+        "visual_half_windows": [[0, 8], [7, 15]],
+        "cluster_count": "min(16, floor(log2(training_count)) - 2)",
+        "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
+        "distance_quantiles": [0.1, 0.9],
+        "distance_weight_range": [1.0, MIN_DISTANCE_WEIGHT],
+        "duplicate_merge": "max + 0.5 * min",
     }
     if (
         payload.get("method") != "motion_primitives"
@@ -768,9 +773,6 @@ def _validate_schema_four_catalog(
     ] + ["stop"]
     action_ids = {label: index for index, label in enumerate(assigned_labels)}
     categories_by_id: dict[int, Mapping[str, Any]] = {}
-    expected_mass_terms: dict[int, list[float]] = {
-        action_id: [] for action_id in action_ids.values()
-    }
     for category in categories:
         count = int(category["raw_count"])
         label = str(category["label"])
@@ -799,46 +801,22 @@ def _validate_schema_four_catalog(
         if expected_action_id is not None:
             categories_by_id[expected_action_id] = category
 
-        parents = category.get("parents")
-        if not isinstance(parents, list) or not parents:
-            raise ValueError("hierarchical prototype parent assignments are invalid")
-        probability_sum = 0.0
-        for parent in parents:
-            if not isinstance(parent, Mapping):
-                raise ValueError("hierarchical prototype parent assignments are invalid")
-            parent_id = parent.get("action_id")
-            parent_label = parent.get("label")
-            probability = parent.get("probability")
-            if (
-                isinstance(parent_id, bool)
-                or not isinstance(parent_id, int)
-                or parent_id not in expected_mass_terms
-                or parent_label != assigned_labels[parent_id]
-                or isinstance(probability, bool)
-                or not isinstance(probability, (int, float))
-                or not math.isfinite(float(probability))
-                or float(probability) <= 0.0
-            ):
-                raise ValueError("hierarchical prototype parent assignments are invalid")
-            probability_sum += float(probability)
-            expected_mass_terms[parent_id].append(count * float(probability))
-        if not math.isclose(probability_sum, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
-            raise ValueError("hierarchical prototype parent probabilities are invalid")
+        expected_training = count if label == "stop" or expected_retained else 0
+        training = category.get("training_count")
+        if (
+            isinstance(training, bool)
+            or not isinstance(training, int)
+            or training != expected_training
+        ):
+            raise ValueError("hierarchical prototype training count is invalid")
 
     if sorted(categories_by_id) != list(range(len(categories_by_id))):
         raise ValueError("hierarchical action ids are not contiguous")
     for action_id, category in categories_by_id.items():
-        mass = category.get("effective_mass")
-        expected_mass = math.fsum(expected_mass_terms[action_id])
-        if (
-            isinstance(mass, bool)
-            or not isinstance(mass, (int, float))
-            or not math.isfinite(float(mass))
-            or float(mass) < 0.0
-            or not math.isclose(float(mass), expected_mass, rel_tol=0.0, abs_tol=1.0e-10)
-        ):
-            raise ValueError("hierarchical prototype effective mass is invalid")
-        expected_requested = cluster_count_for_mass(expected_mass) if expected_mass > 0.0 else None
+        training_count = int(category["training_count"])
+        expected_requested = (
+            cluster_count_for_training_count(training_count) if training_count > 0 else None
+        )
         requested = category.get("requested_centers")
         if (
             requested != expected_requested
@@ -850,13 +828,29 @@ def _validate_schema_four_catalog(
         actual = category.get("actual_centers")
         if actual != expected_actual or isinstance(actual, bool) or not isinstance(actual, int):
             raise ValueError("hierarchical prototype leaf count is invalid")
+        lower = category.get("nearest_distance_q10")
+        upper = category.get("nearest_distance_q90")
+        if training_count > 0:
+            if (
+                isinstance(lower, bool)
+                or not isinstance(lower, (int, float))
+                or isinstance(upper, bool)
+                or not isinstance(upper, (int, float))
+                or not math.isfinite(float(lower))
+                or not math.isfinite(float(upper))
+                or float(lower) < 0.0
+                or float(upper) < float(lower)
+            ):
+                raise ValueError("hierarchical prototype distance quantiles are invalid")
+        elif lower is not None or upper is not None:
+            raise ValueError("hierarchical prototype distance quantiles are invalid")
     for category in categories:
         if category.get("action_id") is None and (
-            category.get("effective_mass") is not None
+            category.get("training_count") != 0
             or category.get("requested_centers") is not None
             or category.get("actual_centers") != 0
-            or isinstance(category.get("actual_centers"), bool)
-            or not isinstance(category.get("actual_centers"), int)
+            or category.get("nearest_distance_q10") is not None
+            or category.get("nearest_distance_q90") is not None
         ):
             raise ValueError("hierarchical prototype unassigned action metadata is invalid")
 
@@ -921,42 +915,44 @@ def _validate_hierarchical_graph_artifacts(
         or indices.ndim != 2
         or indices.shape != weights.shape
         or indices.shape[0] != len(clips)
-        or indices.shape[1] == 0
+        or indices.shape[1] != 2
         or not np.all(np.isfinite(weights))
     ):
         raise ValueError("hierarchical prototype node shape or dtype is invalid")
 
     payload = json.loads((graph_root / "prototype_catalog.json").read_text(encoding="utf-8"))
-    leaves = _validate_schema_four_catalog(
+    leaves = _validate_schema_five_catalog(
         payload,
         expected_total_raw_actions=expected_total_raw_actions,
     )
-    visual_clips = np.load(root / "encode" / "visual_clip_embeddings.npy", allow_pickle=False)
+    visual_halves = np.load(root / "encode" / "visual_half_embeddings.npy", allow_pickle=False)
     centers = np.load(graph_root / "prototype_centers.npy", allow_pickle=False)
-    clip_action_labels = np.load(graph_root / "clip_action_labels.npy", allow_pickle=False)
+    half_action_labels = np.load(graph_root / "half_action_labels.npy", allow_pickle=False)
     if (
-        visual_clips.dtype != np.dtype(np.float32)
-        or visual_clips.ndim != 2
-        or visual_clips.shape[0] != len(clips)
-        or visual_clips.shape[1] == 0
-        or not np.all(np.isfinite(visual_clips))
-        or not np.allclose(np.linalg.norm(visual_clips, axis=1), 1.0, rtol=1.0e-5, atol=1.0e-6)
+        visual_halves.dtype != np.dtype(np.float32)
+        or visual_halves.ndim != 3
+        or visual_halves.shape[:2] != (len(clips), 2)
+        or visual_halves.shape[2] == 0
+        or not np.all(np.isfinite(visual_halves))
+        or not np.allclose(
+            np.linalg.norm(visual_halves, axis=2), 1.0, rtol=1.0e-5, atol=1.0e-6
+        )
     ):
-        raise ValueError("visual clip embeddings are invalid")
+        raise ValueError("visual half embeddings are invalid")
     if (
         centers.dtype != np.dtype(np.float32)
         or centers.ndim != 2
-        or centers.shape != (len(leaves), visual_clips.shape[1])
+        or centers.shape != (len(leaves), visual_halves.shape[2])
         or not np.all(np.isfinite(centers))
     ):
         raise ValueError("hierarchical prototype centers are invalid")
     if (
-        clip_action_labels.ndim != 1
-        or clip_action_labels.shape != (len(clips),)
-        or clip_action_labels.dtype.kind != "U"
-        or any(not str(label) for label in clip_action_labels)
+        half_action_labels.ndim != 2
+        or half_action_labels.shape != (len(clips), 2)
+        or half_action_labels.dtype.kind != "U"
+        or any(not str(label) for label in half_action_labels.flat)
     ):
-        raise ValueError("hierarchical clip action labels are invalid")
+        raise ValueError("hierarchical half action labels are invalid")
 
     valid = indices >= 0
     counts = np.sum(valid, axis=1)
@@ -968,15 +964,18 @@ def _validate_hierarchical_graph_artifacts(
         or np.any(indices[valid] >= len(leaves))
         or np.any(weights[~valid] != 0.0)
         or np.any(weights[valid] <= 0.0)
-        or not np.allclose(
-            np.sum(weights, axis=1, dtype=np.float64),
-            1.0,
-            rtol=0.0,
-            atol=1.0e-7,
-        )
+        or np.any(weights[valid] > 1.5)
         or any(
             len(set(int(value) for value in row[:count])) != int(count)
             for row, count in zip(indices, counts, strict=True)
+        )
+        or any(
+            list(zip(row_weights[:count], row_indices[:count], strict=True))
+            != sorted(
+                zip(row_weights[:count], row_indices[:count], strict=True),
+                key=lambda item: (-float(item[0]), int(item[1])),
+            )
+            for row_indices, row_weights, count in zip(indices, weights, counts, strict=True)
         )
     ):
         raise ValueError("hierarchical prototype assignment arrays are invalid")
@@ -985,7 +984,7 @@ def _validate_hierarchical_graph_artifacts(
     replay = build_hierarchical_motion_prototypes(
         adapter,
         clips,
-        visual_clips,
+        visual_halves,
         frame_cache_dir=root / "encode" / "frame_embeddings",
         batch_size=int(prototype_config["batch_size"]),
         max_iter=int(prototype_config["max_iter"]),
@@ -998,8 +997,8 @@ def _validate_hierarchical_graph_artifacts(
         raise ValueError("hierarchical prototype replay produced no centers")
     if payload != replay.catalog.to_dict():
         raise ValueError("hierarchical prototype catalog does not match prototype replay")
-    if not np.array_equal(clip_action_labels, replay.clip_action_labels):
-        raise ValueError("hierarchical clip action labels do not match prototype replay")
+    if not np.array_equal(half_action_labels, replay.half_action_labels):
+        raise ValueError("hierarchical half action labels do not match prototype replay")
     if not np.allclose(centers, replay_centers, rtol=1.0e-6, atol=1.0e-7):
         raise ValueError("hierarchical prototype centers do not match prototype replay")
     if not np.array_equal(indices, replay.prototypes.indices) or not np.allclose(
@@ -1019,7 +1018,7 @@ def _selection_rows(
     result,
     context: CocoreObjectiveContext,
     leaf_metadata: tuple[Mapping[str, Any], ...],
-    clip_action_labels: np.ndarray,
+    half_action_labels: np.ndarray,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     positions = {index: position for position, index in enumerate(result.selected_indices)}
     all_rows: list[dict[str, Any]] = []
@@ -1046,7 +1045,7 @@ def _selection_rows(
             "primary_prototype_label": labels[0],
             "prototype_labels": labels,
             "primary_action_label": action_labels[0],
-            "raw_action_label": str(clip_action_labels[index]),
+            "half_action_labels": [str(value) for value in half_action_labels[index]],
             "selection_order": position + 1 if position is not None else None,
             "selection_phase": result.selection_phases[position] if position is not None else None,
             "selection_step": result.selection_steps[position] if position is not None else None,
@@ -1121,8 +1120,8 @@ def select_stage(
         )
         result = selector.select(budget, initial_indices=coverage_seed.selected_indices)
         graph_nodes = np.load(root / GRAPH_DIRECTORY / "nodes.npz")
-        clip_action_labels = np.load(
-            root / GRAPH_DIRECTORY / "clip_action_labels.npy", allow_pickle=False
+        half_action_labels = np.load(
+            root / GRAPH_DIRECTORY / "half_action_labels.npy", allow_pickle=False
         )
         selected_rows, all_rows = _selection_rows(
             resolved,
@@ -1132,7 +1131,7 @@ def select_stage(
             result,
             context,
             _leaf_prototype_metadata(root / GRAPH_DIRECTORY),
-            clip_action_labels,
+            half_action_labels,
         )
         final_coverage = context.prototype_mass[
             np.asarray(result.selected_indices, dtype=np.int64)
@@ -1348,7 +1347,7 @@ def validate_output(
         "scan": ("episodes.parquet", "clips.parquet", "normalization.npz"),
         "encode": (
             "embeddings.npy",
-            "visual_clip_embeddings.npy",
+            "visual_half_embeddings.npy",
             "state_sequences.npy",
             "action_sequences.npy",
             "visual_progress.npy",
@@ -1360,7 +1359,7 @@ def validate_output(
             "nodes.npz",
             "prototype_catalog.json",
             "prototype_centers.npy",
-            "clip_action_labels.npy",
+            "half_action_labels.npy",
             "sequence_edges.npz",
             "similarity_edges.npz",
             "transition_matrix.npz",
@@ -1398,7 +1397,7 @@ def validate_output(
         root / "encode",
         expected_episodes=[(int(row["episode_id"]), int(row["length"])) for row in episode_rows],
     )
-    _validate_visual_clip_embedding_cache(root / "encode", scan_clips)
+    _validate_visual_half_embedding_cache(root / "encode", scan_clips)
     if config is None:
         resolved_path = result / "resolved_config.yaml"
         if not resolved_path.is_file():
@@ -1457,8 +1456,8 @@ def validate_output(
         raise ValueError("all_clips.parquet is not sorted by sample_id")
     leaf_metadata = _leaf_prototype_metadata(root / GRAPH_DIRECTORY)
     nodes = np.load(root / GRAPH_DIRECTORY / "nodes.npz")
-    clip_action_labels = np.load(
-        root / GRAPH_DIRECTORY / "clip_action_labels.npy", allow_pickle=False
+    half_action_labels = np.load(
+        root / GRAPH_DIRECTORY / "half_action_labels.npy", allow_pickle=False
     )
     clip_index_by_id = {
         clip.sample_id: index
@@ -1487,7 +1486,8 @@ def validate_output(
             or row.get("primary_prototype") != int(assigned_indices[0])
             or row.get("primary_prototype_label") != expected_labels[0]
             or row.get("primary_action_label") != expected_actions[0]
-            or row.get("raw_action_label") != str(clip_action_labels[index])
+            or row.get("half_action_labels")
+            != [str(value) for value in half_action_labels[index]]
         ):
             raise ValueError("hierarchical prototype row metadata mismatch")
     selected_from_all = sorted(
@@ -1506,7 +1506,7 @@ def validate_output(
         "primary_prototype",
         "primary_prototype_label",
         "primary_action_label",
-        "raw_action_label",
+        "half_action_labels",
     )
     for selected_row, all_row in zip(selected_rows, selected_from_all, strict=True):
         if any(

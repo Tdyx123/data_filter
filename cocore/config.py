@@ -99,7 +99,7 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
             names = ", ".join(sorted(obsolete))
             raise ValueError(
                 f"cocore prototypes {names} were removed; action retention, visual K, "
-                "and temperature are fixed by the schema-4 algorithm"
+                "and temperature are fixed by the schema-5 algorithm"
             )
         unsupported = configured_prototypes.keys() - {"method", "batch_size", "max_iter"}
         if unsupported:
