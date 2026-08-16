@@ -12,7 +12,9 @@ from cocore.selection import (
     LazyHeapSelector,
     build_max_coverage_seed,
 )
-from relcore.schemas import EdgeTable, GraphData
+from relcore.graph import build_graph
+from relcore.graph.prototypes import PrototypeData
+from relcore.schemas import ClipRecord, EdgeTable, GraphData
 from relcore.selection.objective import (
     ObjectiveWeights,
     recompute_objective as recompute_relcore_objective,
@@ -44,6 +46,30 @@ def _graph() -> GraphData:
         ),
         prototype_labels=("move forward", "open gripper"),
     )
+
+
+def test_cocore_graph_consumes_absolute_prototype_confidence_without_normalizing() -> None:
+    clips = [
+        ClipRecord("a", 0, 0, "task", 0, 14, 15, None, "b"),
+        ClipRecord("b", 0, 0, "task", 15, 29, 15, "a", None),
+    ]
+    prototypes = PrototypeData(
+        centers=np.asarray([[1.0]], dtype=np.float32),
+        indices=np.zeros((2, 1), dtype=np.int32),
+        weights=np.asarray([[1.5], [0.5]], dtype=np.float32),
+        labels=("leaf",),
+    )
+
+    graph = build_graph(
+        clips,
+        np.eye(2, dtype=np.float32),
+        np.asarray([0.8, 0.5], dtype=np.float32),
+        prototypes,
+        knn=1,
+        normalize_prototype_relations=False,
+    )
+
+    assert graph.transition_matrix.toarray()[0, 0] == pytest.approx(0.3)
 
 
 def test_incremental_asymmetric_relation_and_redundancy_match_literal_values() -> None:

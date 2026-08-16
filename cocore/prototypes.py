@@ -1,4 +1,4 @@
-"""Pure action-distribution and visual-probability primitives for Cocore."""
+"""Hard action buckets and nearest visual-leaf assignments for Cocore."""
 
 from __future__ import annotations
 
@@ -17,10 +17,10 @@ from relcore.schemas import ClipRecord
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
 
 
-MIN_ACTION_COUNT = 40
+MIN_ACTION_COUNT = 400
 MIN_ACTION_FREQUENCY = 0.005
 MAX_VISUAL_CENTERS = 16
-VISUAL_SOFTMAX_TEMPERATURE = 0.1
+MIN_DISTANCE_WEIGHT = 0.3
 STATE_THRESHOLD = 0.03
 STATE_KEY = "observation.state"
 TRAJECTORY_WINDOW_LENGTH = 8
@@ -45,23 +45,17 @@ _BLOCK_ACTIONS = {value for kind, value in _ATOMIC_ACTION_ORDER if kind == "bloc
 
 
 @dataclass(frozen=True)
-class ActionParentAssignment:
-    action_id: int
-    label: str
-    probability: float
-
-
-@dataclass(frozen=True)
 class ActionCategory:
     action_id: int | None
     label: str
     raw_count: int
     raw_proportion: float
     retained: bool
-    parents: tuple[ActionParentAssignment, ...]
-    effective_mass: float | None = None
+    training_count: int = 0
     requested_centers: int | None = None
     actual_centers: int = 0
+    nearest_distance_q10: float | None = None
+    nearest_distance_q90: float | None = None
 
 
 @dataclass(frozen=True)
@@ -97,25 +91,24 @@ class ActionCatalog:
         return tuple(leaf.label for leaf in assigned)
 
     def to_dict(self) -> dict[str, object]:
-        categories: list[dict[str, object]] = []
-        for category in self.action_categories:
-            payload = asdict(category)
-            payload["parents"] = [asdict(parent) for parent in category.parents]
-            categories.append(payload)
         return {
             "method": "motion_primitives",
-            "schema_version": 4,
-            "strategy": "trajectory_action_subset_then_visual_softmax",
+            "schema_version": 5,
+            "strategy": "trajectory_retained_action_then_half_visual_nearest",
             "constants": {
                 "state_threshold": STATE_THRESHOLD,
                 "min_action_count": MIN_ACTION_COUNT,
                 "min_action_frequency": MIN_ACTION_FREQUENCY,
                 "max_visual_centers": MAX_VISUAL_CENTERS,
-                "visual_softmax_temperature": VISUAL_SOFTMAX_TEMPERATURE,
-                "cluster_count": ("min(16, 1 + floor(log2(effective_mass)))"),
+                "visual_half_windows": [[0, 8], [7, 15]],
+                "cluster_count": "min(16, floor(log2(training_count)) - 2)",
+                "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
+                "distance_quantiles": [0.1, 0.9],
+                "distance_weight_range": [1.0, MIN_DISTANCE_WEIGHT],
+                "duplicate_merge": "max + 0.5 * min",
             },
             "total_raw_actions": self.total_raw_actions,
-            "action_categories": categories,
+            "action_categories": [asdict(category) for category in self.action_categories],
             "leaf_prototypes": [asdict(leaf) for leaf in self.leaf_prototypes],
         }
 
@@ -124,7 +117,7 @@ class ActionCatalog:
 class HierarchicalPrototypeResult:
     prototypes: PrototypeData
     catalog: ActionCatalog
-    clip_action_labels: np.ndarray
+    half_action_labels: np.ndarray
 
 
 def _atomic_actions(label: str) -> list[tuple[str, str]]:
@@ -146,27 +139,11 @@ def _atomic_actions(label: str) -> list[tuple[str, str]]:
     return actions
 
 
-def _compose_actions(actions: Sequence[tuple[str, str]]) -> str:
-    included = set(actions)
-    ordered = [action for action in _ATOMIC_ACTION_ORDER if action in included]
-    move = [value for kind, value in ordered if kind == "move"]
-    blocks = [value for kind, value in ordered if kind == "block"]
-    output = (["move " + " ".join(move)] if move else []) + blocks
-    return ", ".join(output) if output else "stop"
-
-
-def canonical_clip_action(first_half_label: str, second_half_label: str) -> str:
-    """Return the canonical atomic-action union of a clip's two halves."""
-
-    actions = _atomic_actions(first_half_label) + _atomic_actions(second_half_label)
-    return _compose_actions(actions)
-
-
-def action_parent_distribution(
+def maximum_retained_parents(
     label: str,
     retained_counts: Mapping[str, int],
-) -> tuple[tuple[str, float], ...]:
-    """Map an action to all maximum-cardinality retained atomic subsets."""
+) -> tuple[str, ...]:
+    """Return every maximum-cardinality retained atomic subset in stable order."""
 
     atomic = frozenset(_atomic_actions(label))
     candidates: list[tuple[str, int, int]] = []
@@ -177,8 +154,7 @@ def action_parent_distribution(
         if parent_atomic and parent_atomic.issubset(atomic):
             candidates.append((parent_label, int(raw_count), len(parent_atomic)))
     if not candidates:
-        return (("stop", 1.0),)
-
+        return ("stop",)
     maximum_cardinality = max(cardinality for _, _, cardinality in candidates)
     parents = [
         (parent_label, raw_count)
@@ -186,65 +162,114 @@ def action_parent_distribution(
         if cardinality == maximum_cardinality
     ]
     parents.sort(key=lambda item: (-item[1], item[0]))
-    total = sum(raw_count for _, raw_count in parents)
-    return tuple((parent_label, raw_count / total) for parent_label, raw_count in parents)
+    return tuple(parent_label for parent_label, _ in parents)
 
 
-def cluster_count_for_mass(effective_mass: float) -> int:
-    """Return ``min(16, 1 + floor(log2(mass)))`` for positive finite mass."""
+def retention_weight(raw_label: str, parent_label: str) -> float:
+    """Map the retained atomic-action ratio linearly onto ``[0.5, 1]``."""
 
-    if isinstance(effective_mass, bool) or not isinstance(effective_mass, Real):
-        raise ValueError("effective action mass must be a finite positive float")
-    value = float(effective_mass)
+    raw = frozenset(_atomic_actions(raw_label))
+    parent = frozenset(_atomic_actions(parent_label))
+    if raw_label == parent_label:
+        return 1.0
+    if not parent:
+        return 0.5
+    if not raw or not parent.issubset(raw):
+        raise ValueError("parent action must be an atomic subset of the raw action")
+    return 0.5 + 0.5 * (len(parent) / len(raw))
+
+
+def cluster_count_for_training_count(training_count: float) -> int:
+    """Return ``min(16, floor(log2(training_count)) - 2)`` when positive."""
+
+    if isinstance(training_count, bool) or not isinstance(training_count, Real):
+        raise ValueError("training count must be a finite positive number")
+    value = float(training_count)
     if not math.isfinite(value) or value <= 0.0:
-        raise ValueError("effective action mass must be a finite positive float")
-    return min(MAX_VISUAL_CENTERS, 1 + math.floor(math.log2(value)))
+        raise ValueError("training count must be a finite positive number")
+    clusters = min(MAX_VISUAL_CENTERS, math.floor(math.log2(value)) - 2)
+    if clusters <= 0:
+        raise ValueError(
+            "training count must be finite positive and produce a positive cluster count"
+        )
+    return clusters
 
 
-def visual_center_probabilities(
-    values: np.ndarray,
-    centers: np.ndarray,
-) -> np.ndarray:
-    """Return stable conditional probabilities over every visual center."""
+def nearest_distance_bounds(distances: np.ndarray) -> tuple[float, float]:
+    """Return q10/q90 for one action bucket's nearest-center distances."""
 
     try:
-        left = np.asarray(values, dtype=np.float64)
-        right = np.asarray(centers, dtype=np.float64)
+        values = np.asarray(distances, dtype=np.float64)
     except (TypeError, ValueError) as error:
-        raise ValueError("visual values and centers must be finite non-empty matrices") from error
+        raise ValueError("nearest distances must be a finite non-empty vector") from error
     if (
-        left.ndim != 2
-        or right.ndim != 2
-        or left.shape[0] == 0
-        or right.shape[0] == 0
-        or left.shape[1] == 0
-        or left.shape[1] != right.shape[1]
-        or not np.all(np.isfinite(left))
-        or not np.all(np.isfinite(right))
+        values.ndim != 1
+        or len(values) == 0
+        or not np.all(np.isfinite(values))
+        or np.any(values < 0.0)
     ):
-        raise ValueError("visual values and centers must be finite non-empty matrices")
-    if right.shape[0] == 1:
-        return np.ones((left.shape[0], 1), dtype=np.float64)
+        raise ValueError("nearest distances must be a finite non-empty non-negative vector")
+    lower, upper = np.quantile(values, (0.1, 0.9))
+    return float(lower), float(upper)
 
-    with np.errstate(over="ignore", invalid="ignore"):
-        squared_distances = np.sum(
-            np.square(left[:, None, :] - right[None, :, :]),
-            axis=2,
-        )
-    if not np.all(np.isfinite(squared_distances)):
-        raise ValueError("visual squared distances must be finite")
-    logits = -squared_distances / VISUAL_SOFTMAX_TEMPERATURE
-    logits -= np.max(logits, axis=1, keepdims=True)
-    probabilities = np.exp(logits)
-    probabilities /= np.sum(probabilities, axis=1, keepdims=True)
-    return probabilities
+
+def distance_confidence(distance: float, lower: float, upper: float) -> float:
+    """Map Euclidean distance onto clipped ``[0.3, 1]`` confidence."""
+
+    values = (distance, lower, upper)
+    if any(isinstance(value, bool) or not isinstance(value, Real) for value in values):
+        raise ValueError("distance confidence inputs must be finite non-negative numbers")
+    value, low, high = (float(item) for item in values)
+    if not all(math.isfinite(item) for item in (value, low, high)) or min(value, low) < 0.0:
+        raise ValueError("distance confidence inputs must be finite non-negative numbers")
+    if high < low:
+        raise ValueError("distance confidence upper bound cannot be below lower bound")
+    if high == low:
+        return 1.0
+    scaled = 1.0 - (1.0 - MIN_DISTANCE_WEIGHT) * (value - low) / (high - low)
+    return float(np.clip(scaled, MIN_DISTANCE_WEIGHT, 1.0))
+
+
+def merge_half_leaf_assignments(
+    assignments: Sequence[tuple[int, float]],
+) -> tuple[tuple[int, float], ...]:
+    """Merge two half-clip leaves with ``max + 0.5 * min`` for duplicates."""
+
+    if not 1 <= len(assignments) <= 2:
+        raise ValueError("half-clip assignments must contain one or two leaves")
+    merged: dict[int, float] = {}
+    for leaf_id, raw_weight in assignments:
+        if (
+            isinstance(leaf_id, bool)
+            or not isinstance(leaf_id, Integral)
+            or int(leaf_id) < 0
+            or isinstance(raw_weight, bool)
+            or not isinstance(raw_weight, Real)
+            or not math.isfinite(float(raw_weight))
+            or float(raw_weight) <= 0.0
+        ):
+            raise ValueError("half-clip assignments must contain valid leaves and weights")
+        key = int(leaf_id)
+        weight = float(raw_weight)
+        if key in merged:
+            larger = max(merged[key], weight)
+            smaller = min(merged[key], weight)
+            merged[key] = larger + 0.5 * smaller
+        else:
+            merged[key] = weight
+    quantized = tuple(
+        (leaf_id, float(np.float32(weight))) for leaf_id, weight in merged.items()
+    )
+    if any(not math.isfinite(weight) for _, weight in quantized):
+        raise ValueError("half-clip assignment weights must fit float32")
+    return tuple(sorted(quantized, key=lambda item: (-item[1], item[0])))
 
 
 def create_action_catalog(
     counts: Mapping[str, int],
     total_labels: int,
 ) -> ActionCatalog:
-    """Build a deterministic schema-4 action catalog from raw action counts."""
+    """Build a deterministic schema-5 action catalog from raw action counts."""
 
     if isinstance(total_labels, bool) or not isinstance(total_labels, Integral):
         raise ValueError("motion primitive total_labels must be a non-negative integer")
@@ -283,15 +308,7 @@ def create_action_catalog(
 
     categories: list[ActionCategory] = []
     for label, raw_count in ordered:
-        distribution = action_parent_distribution(label, retained_non_stop_counts)
-        parents = tuple(
-            ActionParentAssignment(
-                action_id=action_ids[parent_label],
-                label=parent_label,
-                probability=probability,
-            )
-            for parent_label, probability in distribution
-        )
+        training_count = raw_count if label == "stop" or label in retained else 0
         categories.append(
             ActionCategory(
                 action_id=action_ids.get(label),
@@ -299,7 +316,7 @@ def create_action_catalog(
                 raw_count=raw_count,
                 raw_proportion=(raw_count / total if total else 0.0),
                 retained=label in retained,
-                parents=parents,
+                training_count=training_count,
             )
         )
     return ActionCatalog(
@@ -313,25 +330,6 @@ def _records_by_id(records: Sequence[EpisodeRecord]) -> dict[int, EpisodeRecord]
     if len(result) != len(records):
         raise ValueError("episode metadata contains duplicate episode ids")
     return result
-
-
-def _action_bucket_statistics(
-    catalog: ActionCatalog,
-) -> tuple[dict[int, int], dict[int, float]]:
-    action_ids = {
-        int(category.action_id)
-        for category in catalog.action_categories
-        if category.action_id is not None
-    }
-    member_counts = {action_id: 0 for action_id in action_ids}
-    mass_terms: dict[int, list[float]] = {action_id: [] for action_id in action_ids}
-    for category in catalog.action_categories:
-        for parent in category.parents:
-            if parent.action_id not in action_ids:
-                raise ValueError(f"missing parent assignments for action {category.label!r}")
-            member_counts[parent.action_id] += category.raw_count
-            mass_terms[parent.action_id].append(category.raw_count * parent.probability)
-    return member_counts, {action_id: math.fsum(mass_terms[action_id]) for action_id in action_ids}
 
 
 def _validated_states(
@@ -419,25 +417,24 @@ def _squared_distances(values: np.ndarray, centers: np.ndarray) -> np.ndarray:
     return squared
 
 
+def _euclidean_distances(values: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    squared = _squared_distances(values, centers)
+    return np.sqrt(squared, out=squared).astype(np.float32, copy=False)
+
+
 def _initialize_action_cluster_model(
     embeddings: np.ndarray,
-    sample_weights: np.ndarray,
     *,
     clusters: int,
     batch_size: int,
     seed: int,
 ):
     values = np.asarray(embeddings, dtype=np.float32)
-    weights = np.asarray(sample_weights, dtype=np.float64)
     if (
         values.ndim != 2
         or values.shape[0] == 0
         or values.shape[1] == 0
-        or weights.ndim != 1
-        or len(weights) != len(values)
         or not np.all(np.isfinite(values))
-        or not np.all(np.isfinite(weights))
-        or np.any(weights <= 0.0)
         or isinstance(clusters, bool)
         or not isinstance(clusters, Integral)
         or not 1 <= int(clusters) <= len(values)
@@ -452,54 +449,39 @@ def _initialize_action_cluster_model(
         random_state=seed,
         n_init=10,
     )
-    model.partial_fit(values, sample_weight=weights)
+    model.partial_fit(values)
     centers = np.asarray(model.cluster_centers_, dtype=np.float32)
     if centers.shape != (int(clusters), values.shape[1]) or not np.all(np.isfinite(centers)):
         raise ValueError("invalid KMeans outputs")
     return model
 
 
-def _episode_parent_memberships(
+def _episode_exact_memberships(
     states: np.ndarray,
     categories_by_label: Mapping[str, ActionCategory],
-    action_ids: Sequence[int],
     primitive_config: object,
-) -> dict[int, tuple[np.ndarray, np.ndarray]]:
-    local_rows: dict[int, list[int]] = {action_id: [] for action_id in action_ids}
-    local_weights: dict[int, list[float]] = {action_id: [] for action_id in action_ids}
+) -> dict[int, np.ndarray]:
+    local_rows: dict[int, list[int]] = {}
     for timestep in range(max(len(states) - 7, 0)):
         raw_label = classify_motion_primitive(
             states[timestep], states[timestep + 7], primitive_config
         )
         category = categories_by_label.get(raw_label)
-        if category is None or not category.parents:
-            raise ValueError(f"missing parent assignments for action {raw_label!r}")
-        probability_sum = sum(parent.probability for parent in category.parents)
-        if not math.isclose(probability_sum, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
-            raise ValueError(f"non-normalized parent assignments for action {raw_label!r}")
-        for parent in category.parents:
-            if (
-                parent.action_id not in local_rows
-                or not math.isfinite(parent.probability)
-                or parent.probability <= 0.0
-            ):
-                raise ValueError(f"missing parent assignments for action {raw_label!r}")
-            local_rows[parent.action_id].append(timestep)
-            local_weights[parent.action_id].append(parent.probability)
+        if category is None:
+            raise ValueError(f"missing action category for {raw_label!r}")
+        if category.action_id is None or category.training_count <= 0:
+            continue
+        local_rows.setdefault(int(category.action_id), []).append(timestep)
     return {
-        action_id: (
-            np.asarray(local_rows[action_id], dtype=np.int64),
-            np.asarray(local_weights[action_id], dtype=np.float64),
-        )
-        for action_id in action_ids
-        if local_rows[action_id]
+        action_id: np.asarray(rows, dtype=np.int64)
+        for action_id, rows in local_rows.items()
     }
 
 
 def build_hierarchical_motion_prototypes(
     adapter: DatasetAdapter,
     clips: Sequence[ClipRecord],
-    visual_clip_embeddings: np.ndarray,
+    visual_half_embeddings: np.ndarray,
     *,
     frame_cache_dir: str | Path,
     batch_size: int,
@@ -508,22 +490,23 @@ def build_hierarchical_motion_prototypes(
     max_episodes: int | None,
     num_workers: int,
 ) -> HierarchicalPrototypeResult:
-    """Learn weighted action/visual leaves from all stride-one trajectory windows."""
+    """Learn exact action buckets and assign one nearest visual leaf per clip half."""
 
     try:
-        candidate_values = np.asarray(visual_clip_embeddings, dtype=np.float32)
+        candidate_values = np.asarray(visual_half_embeddings, dtype=np.float32)
     except (TypeError, ValueError) as error:
-        raise ValueError("visual clip embeddings must align with clips and be finite") from error
+        raise ValueError("visual half embeddings must align with clips and be finite") from error
     if (
-        candidate_values.ndim != 2
+        candidate_values.ndim != 3
         or candidate_values.shape[0] != len(clips)
-        or candidate_values.shape[1] == 0
+        or candidate_values.shape[1] != 2
+        or candidate_values.shape[2] == 0
         or not np.all(np.isfinite(candidate_values))
     ):
-        raise ValueError("visual clip embeddings must align with clips and be finite")
-    candidate_norms = np.linalg.norm(candidate_values, axis=1)
+        raise ValueError("visual half embeddings must align with clips and be finite")
+    candidate_norms = np.linalg.norm(candidate_values, axis=2)
     if len(candidate_norms) and not np.allclose(candidate_norms, 1.0, rtol=1.0e-5, atol=1.0e-6):
-        raise ValueError("visual clip embeddings must be L2-normalized")
+        raise ValueError("visual half embeddings must be L2-normalized")
     if (
         isinstance(batch_size, bool)
         or not isinstance(batch_size, Integral)
@@ -562,7 +545,7 @@ def build_hierarchical_motion_prototypes(
 
     primitive_config = make_libero_config(threshold=STATE_THRESHOLD)
     raw_counts: Counter[str] = Counter()
-    candidate_labels: dict[int, str] = {}
+    candidate_labels: dict[int, tuple[str, str]] = {}
     seen: set[int] = set()
     for episode in adapter.iter_episodes(
         num_workers=num_workers,
@@ -582,7 +565,7 @@ def build_hierarchical_motion_prototypes(
             second = classify_motion_primitive(
                 states[clip.start_step + 7], states[clip.end_step], primitive_config
             )
-            candidate_labels[clip_index] = canonical_clip_action(first, second)
+            candidate_labels[clip_index] = (first, second)
     if seen != set(expected):
         raise ValueError("action pass did not yield every indexed episode exactly once")
     total_windows = sum(raw_counts.values())
@@ -600,54 +583,46 @@ def build_hierarchical_motion_prototypes(
     }
     if sorted(categories_by_id) != list(range(len(categories_by_id))):
         raise ValueError("action ids must be contiguous")
-    member_counts, effective_mass = _action_bucket_statistics(catalog)
-
     requested_centers: dict[int, int] = {}
     models: dict[int, object] = {}
     initial_values: dict[int, np.ndarray] = {}
-    initial_weights: dict[int, np.ndarray] = {}
     initial_counts: dict[int, int] = {}
     updated_categories: dict[int, ActionCategory] = {}
     for action_id in sorted(categories_by_id):
         category = categories_by_id[action_id]
-        mass = float(effective_mass[action_id])
-        if member_counts[action_id] == 0:
-            updated_categories[action_id] = replace(category, effective_mass=0.0)
+        training_count = int(category.training_count)
+        if training_count == 0:
             continue
-        clusters = cluster_count_for_mass(mass)
+        clusters = cluster_count_for_training_count(training_count)
         capacity = min(
-            member_counts[action_id],
+            training_count,
             max(int(batch_size), clusters),
         )
         if clusters <= 0 or clusters > capacity:
             raise ValueError("invalid KMeans inputs")
         requested_centers[action_id] = clusters
         initial_values[action_id] = np.empty(
-            (capacity, candidate_values.shape[1]), dtype=np.float32
+            (capacity, candidate_values.shape[2]), dtype=np.float32
         )
-        initial_weights[action_id] = np.empty(capacity, dtype=np.float64)
         initial_counts[action_id] = 0
 
     def update_action_model(
         action_id: int,
         member_values: np.ndarray,
-        member_weights: np.ndarray,
     ) -> None:
         cursor = 0
         if action_id not in models:
             filled = initial_counts[action_id]
-            capacity = len(initial_weights[action_id])
+            capacity = len(initial_values[action_id])
             take = min(capacity - filled, len(member_values))
             if take:
                 initial_values[action_id][filled : filled + take] = member_values[:take]
-                initial_weights[action_id][filled : filled + take] = member_weights[:take]
                 filled += take
                 cursor += take
                 initial_counts[action_id] = filled
             if filled == capacity:
                 models[action_id] = _initialize_action_cluster_model(
                     initial_values[action_id],
-                    initial_weights[action_id],
                     clusters=requested_centers[action_id],
                     batch_size=int(batch_size),
                     seed=int(seed) + action_id,
@@ -656,10 +631,7 @@ def build_hierarchical_motion_prototypes(
             model = models[action_id]
             while cursor < len(member_values):
                 end = min(cursor + int(batch_size), len(member_values))
-                model.partial_fit(
-                    member_values[cursor:end],
-                    sample_weight=member_weights[cursor:end],
-                )
+                model.partial_fit(member_values[cursor:end])
                 cursor = end
 
     cache_root = Path(frame_cache_dir)
@@ -680,19 +652,18 @@ def build_hierarchical_motion_prototypes(
             window_visuals = _episode_window_visuals(
                 cache_root,
                 record,
-                embedding_dim=candidate_values.shape[1],
+                embedding_dim=candidate_values.shape[2],
             )
             if len(window_visuals) != max(len(states) - 7, 0):
                 raise ValueError(f"episode {episode.episode_id}: state/cache length mismatch")
-            memberships = _episode_parent_memberships(
+            memberships = _episode_exact_memberships(
                 states,
                 categories_by_label,
-                tuple(categories_by_id),
                 primitive_config,
             )
             for action_id in sorted(memberships):
-                rows, weights = memberships[action_id]
-                update_action_model(action_id, window_visuals[rows], weights)
+                rows = memberships[action_id]
+                update_action_model(action_id, window_visuals[rows])
         if cache_seen != set(expected):
             raise ValueError("cache pass did not yield every indexed episode exactly once")
         if set(models) != set(requested_centers):
@@ -703,9 +674,14 @@ def build_hierarchical_motion_prototypes(
     leaf_ids_by_action: dict[int, np.ndarray] = {}
     centers_by_action: dict[int, np.ndarray] = {}
     assigned_masses = {
-        action_id: np.zeros(requested_centers[action_id], dtype=np.float64)
+        action_id: np.zeros(requested_centers[action_id], dtype=np.int64)
         for action_id in requested_centers
     }
+    nearest_distances = {
+        action_id: np.empty(categories_by_id[action_id].training_count, dtype=np.float32)
+        for action_id in requested_centers
+    }
+    distance_cursors = {action_id: 0 for action_id in requested_centers}
     ordering_seen: set[int] = set()
     for episode in adapter.iter_episodes(
         num_workers=num_workers,
@@ -717,24 +693,33 @@ def build_hierarchical_motion_prototypes(
         window_visuals = _episode_window_visuals(
             cache_root,
             record,
-            embedding_dim=candidate_values.shape[1],
+            embedding_dim=candidate_values.shape[2],
         )
-        memberships = _episode_parent_memberships(
+        memberships = _episode_exact_memberships(
             states,
             categories_by_label,
-            tuple(categories_by_id),
             primitive_config,
         )
-        for action_id, (rows, weights) in memberships.items():
+        for action_id, rows in memberships.items():
             action_centers = np.asarray(models[action_id].cluster_centers_, dtype=np.float32)
-            assigned = np.argmin(_squared_distances(window_visuals[rows], action_centers), axis=1)
+            distances = _euclidean_distances(window_visuals[rows], action_centers)
+            assigned = np.argmin(distances, axis=1)
             assigned_masses[action_id] += np.bincount(
                 assigned,
-                weights=weights,
                 minlength=requested_centers[action_id],
             )
+            closest = distances[np.arange(len(rows)), assigned]
+            start = distance_cursors[action_id]
+            end = start + len(closest)
+            nearest_distances[action_id][start:end] = closest
+            distance_cursors[action_id] = end
     if ordering_seen != set(expected):
         raise ValueError("ordering pass did not yield every indexed episode exactly once")
+    if any(
+        distance_cursors[action_id] != len(nearest_distances[action_id])
+        for action_id in nearest_distances
+    ):
+        raise ValueError("exact action membership counts do not match the catalog")
 
     for action_id in sorted(categories_by_id):
         category = categories_by_id[action_id]
@@ -765,11 +750,13 @@ def build_hierarchical_motion_prototypes(
             action_leaf_ids.append(prototype_id)
         leaf_ids_by_action[action_id] = np.asarray(action_leaf_ids, dtype=np.int32)
         centers_by_action[action_id] = action_centers
+        lower, upper = nearest_distance_bounds(nearest_distances[action_id])
         updated_categories[action_id] = replace(
             category,
-            effective_mass=float(effective_mass[action_id]),
             requested_centers=requested_centers[action_id],
             actual_centers=len(action_centers),
+            nearest_distance_q10=lower,
+            nearest_distance_q90=upper,
         )
 
     refined_catalog = ActionCatalog(
@@ -787,75 +774,60 @@ def build_hierarchical_motion_prototypes(
         for category in refined_catalog.action_categories
         if category.retained and category.label != "stop"
     }
-    per_clip: list[list[tuple[int, float]]] = []
-    for clip_index, raw_label in enumerate(candidate_labels[index] for index in range(len(clips))):
-        assignments = action_parent_distribution(raw_label, retained_counts)
-        if not assignments:
-            raise ValueError(f"missing parent assignments for clip {clip_index}")
-        merged: dict[int, float] = {}
-        for parent_label, action_probability in assignments:
-            parent_category = next(
-                (
-                    category
-                    for category in refined_catalog.action_categories
-                    if category.label == parent_label and category.action_id is not None
-                ),
-                None,
+    refined_by_label = {
+        category.label: category for category in refined_catalog.action_categories
+    }
+    per_clip: list[tuple[tuple[int, float], ...]] = []
+    for clip_index in range(len(clips)):
+        half_assignments: list[tuple[int, float]] = []
+        for half_index, raw_label in enumerate(candidate_labels[clip_index]):
+            parent_labels = maximum_retained_parents(raw_label, retained_counts)
+            nearest: tuple[float, int, str] | None = None
+            for parent_label in parent_labels:
+                parent_category = refined_by_label.get(parent_label)
+                if parent_category is None or parent_category.action_id is None:
+                    raise ValueError(f"missing parent action {parent_label!r} for clip {clip_index}")
+                action_id = int(parent_category.action_id)
+                if action_id not in centers_by_action or action_id not in leaf_ids_by_action:
+                    raise ValueError(
+                        f"missing visual centers for parent action {parent_label!r}"
+                    )
+                distances = _euclidean_distances(
+                    candidate_values[clip_index, half_index][None, :],
+                    centers_by_action[action_id],
+                )[0]
+                for local_index, distance in enumerate(distances):
+                    leaf_id = int(leaf_ids_by_action[action_id][local_index])
+                    candidate = (float(distance), leaf_id, parent_label)
+                    if nearest is None or candidate[:2] < nearest[:2]:
+                        nearest = candidate
+            if nearest is None:
+                raise ValueError(f"clip {clip_index} half {half_index} has no leaf assignment")
+            distance, leaf_id, parent_label = nearest
+            parent_category = refined_by_label[parent_label]
+            assert parent_category.nearest_distance_q10 is not None
+            assert parent_category.nearest_distance_q90 is not None
+            weight = retention_weight(raw_label, parent_label) * distance_confidence(
+                distance,
+                parent_category.nearest_distance_q10,
+                parent_category.nearest_distance_q90,
             )
-            if parent_category is None:
-                raise ValueError(f"missing parent assignments for clip {clip_index}")
-            action_id = int(parent_category.action_id)
-            if action_id not in centers_by_action or action_id not in leaf_ids_by_action:
-                raise ValueError(f"missing parent assignments for clip {clip_index}")
-            conditional = visual_center_probabilities(
-                candidate_values[clip_index : clip_index + 1],
-                centers_by_action[action_id],
-            )[0]
-            for leaf_id, visual_probability in zip(
-                leaf_ids_by_action[action_id], conditional, strict=True
-            ):
-                key = int(leaf_id)
-                merged[key] = merged.get(key, 0.0) + float(action_probability * visual_probability)
-        ordered = sorted(merged.items(), key=lambda item: (-item[1], item[0]))
-        total = sum(weight for _, weight in ordered)
-        if (
-            not ordered
-            or not math.isfinite(total)
-            or not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1.0e-10)
-        ):
-            raise ValueError(f"non-normalized prototype output for clip {clip_index}")
-        per_clip.append([(leaf_id, weight / total) for leaf_id, weight in ordered])
+            half_assignments.append((leaf_id, weight))
+        per_clip.append(merge_half_leaf_assignments(tuple(half_assignments)))
 
-    width = max((len(assignments) for assignments in per_clip), default=0)
-    prototype_indices = np.full((len(clips), width), -1, dtype=np.int32)
-    prototype_weights = np.zeros((len(clips), width), dtype=np.float32)
+    prototype_indices = np.full((len(clips), 2), -1, dtype=np.int32)
+    prototype_weights = np.zeros((len(clips), 2), dtype=np.float32)
     for clip_index, assignments in enumerate(per_clip):
         for slot, (leaf_id, weight) in enumerate(assignments):
             prototype_indices[clip_index, slot] = leaf_id
             prototype_weights[clip_index, slot] = np.float32(weight)
-        row_sum = float(np.sum(prototype_weights[clip_index], dtype=np.float64))
-        prototype_weights[clip_index, 0] += np.float32(1.0 - row_sum)
-        definitive_order = sorted(
-            range(len(assignments)),
-            key=lambda slot: (
-                -float(prototype_weights[clip_index, slot]),
-                int(prototype_indices[clip_index, slot]),
-            ),
-        )
-        valid_indices = prototype_indices[clip_index, : len(assignments)].copy()
-        valid_weights = prototype_weights[clip_index, : len(assignments)].copy()
-        prototype_indices[clip_index, : len(assignments)] = valid_indices[definitive_order]
-        prototype_weights[clip_index, : len(assignments)] = valid_weights[definitive_order]
     if len(clips) and (
         np.any((prototype_indices < 0) != (prototype_weights == 0.0))
-        or not np.allclose(
-            np.sum(prototype_weights, axis=1, dtype=np.float64),
-            1.0,
-            rtol=0.0,
-            atol=1.0e-7,
-        )
+        or np.any(prototype_weights < 0.0)
+        or np.any(prototype_weights > 1.5)
+        or not np.all(np.isfinite(prototype_weights))
     ):
-        raise ValueError("non-normalized prototype output")
+        raise ValueError("invalid hard-nearest prototype output")
 
     return HierarchicalPrototypeResult(
         prototypes=PrototypeData(
@@ -865,7 +837,7 @@ def build_hierarchical_motion_prototypes(
             labels=refined_catalog.labels,
         ),
         catalog=refined_catalog,
-        clip_action_labels=np.asarray(
+        half_action_labels=np.asarray(
             [candidate_labels[index] for index in range(len(clips))], dtype=np.str_
         ),
     )

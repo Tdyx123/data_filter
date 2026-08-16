@@ -32,6 +32,8 @@ def _edge_table(edges: list[tuple[int, int, float]], edge_type: str) -> EdgeTabl
 def _prototype_matrix(
     edges: list[tuple[int, int, float]],
     prototypes: PrototypeData,
+    *,
+    normalize: bool,
 ) -> sparse.csr_matrix:
     count = prototypes.count
     matrix = np.zeros((count, count), dtype=np.float64)
@@ -47,9 +49,10 @@ def _prototype_matrix(
                 matrix[source_index, target_index] += (
                     edge_weight * float(source_weight) * float(target_weight)
                 )
-    total = float(matrix.sum())
-    if total > 0:
-        matrix /= total
+    if normalize:
+        total = float(matrix.sum())
+        if total > 0:
+            matrix /= total
     return sparse.csr_matrix(matrix.astype(np.float32))
 
 
@@ -78,6 +81,7 @@ def build_graph(
     knn: int = 32,
     similarity_threshold: float = 0.8,
     cooccurrence_max_gap: int = 4,
+    normalize_prototype_relations: bool = True,
 ) -> GraphData:
     values = np.asarray(embeddings, dtype=np.float32)
     quality = np.asarray(reliability, dtype=np.float32)
@@ -149,7 +153,12 @@ def build_graph(
                 for source, target, _ in sequence
             ],
             prototypes,
+            normalize=normalize_prototype_relations,
         ),
-        cooccurrence_matrix=_prototype_matrix(cooccurrence, prototypes),
+        cooccurrence_matrix=_prototype_matrix(
+            cooccurrence,
+            prototypes,
+            normalize=normalize_prototype_relations,
+        ),
         prototype_labels=prototypes.labels,
     )

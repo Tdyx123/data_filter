@@ -1,4 +1,4 @@
-"""Cocore-owned Quality-style fragment and full-clip visual encoding."""
+"""Cocore-owned Quality-style fragment and overlapping-half visual encoding."""
 
 from __future__ import annotations
 
@@ -316,19 +316,19 @@ def fuse_fragment_features(
     return fused_raw, _l2_normalize_rows(fused_raw)
 
 
-def visual_clip_mean(frame_features: np.ndarray) -> np.ndarray:
-    """Return the L2-normalized mean of one fixed 15-frame clip."""
+def visual_half_means(frame_features: np.ndarray) -> np.ndarray:
+    """Return normalized means for overlapping frames ``[0..7]`` and ``[7..14]``."""
 
     values = np.asarray(frame_features, dtype=np.float32)
     if values.ndim != 2 or values.shape[0] != CLIP_LENGTH or values.shape[1] == 0:
         raise ValueError("visual clip features must have shape [15, positive dimensions]")
     if not np.all(np.isfinite(values)):
         raise ValueError("visual clip features must be finite")
-    mean = values.mean(axis=0)
-    norm = float(np.linalg.norm(mean))
-    if not np.isfinite(norm) or norm <= 1.0e-8:
-        raise ValueError("visual clip mean must have a finite positive norm")
-    return (mean / norm).astype(np.float32)
+    means = np.stack([values[:8].mean(axis=0), values[7:].mean(axis=0)])
+    norms = np.linalg.norm(means, axis=1, keepdims=True)
+    if not np.all(np.isfinite(norms)) or np.any(norms <= 1.0e-8):
+        raise ValueError("visual half means must have finite positive norms")
+    return (means / norms).astype(np.float32)
 
 
 @dataclass(frozen=True)
@@ -344,7 +344,7 @@ class FrameEmbeddingEntry:
 class CocoreEncodedClips:
     clips: list[ClipRecord]
     embeddings: np.ndarray
-    visual_clip_embeddings: np.ndarray
+    visual_half_embeddings: np.ndarray
     state_sequences: np.ndarray
     action_sequences: np.ndarray
     visual_progress: np.ndarray
@@ -358,7 +358,7 @@ class CocoreEncodedClips:
 class CocoreEncodedArtifact:
     clips: list[ClipRecord]
     embeddings: np.ndarray
-    visual_clip_embeddings: np.ndarray
+    visual_half_embeddings: np.ndarray
     state_sequences: np.ndarray
     action_sequences: np.ndarray
     visual_progress: np.ndarray
@@ -458,7 +458,7 @@ def encode_cocore_dataset(
         raise FileExistsError(f"frame cache directory must be empty: {cache_root}")
     cache_root.mkdir(parents=True, exist_ok=True)
     raw_visual: dict[tuple[int, int, int], np.ndarray] = {}
-    clip_visual_by_index: dict[int, np.ndarray] = {}
+    half_visual_by_index: dict[int, np.ndarray] = {}
     state_by_index: dict[int, np.ndarray] = {}
     action_by_index: dict[int, np.ndarray] = {}
     position_by_index: dict[int, float] = {}
@@ -513,7 +513,7 @@ def encode_cocore_dataset(
             visual = frame_features[window]
             state = normalized_state[window]
             action = normalized_action[window]
-            clip_visual_by_index[clip_index] = visual_clip_mean(visual)
+            half_visual_by_index[clip_index] = visual_half_means(visual)
             state_by_index[clip_index] = state
             action_by_index[clip_index] = action
             position_by_index[clip_index] = float(clip.start_step) / float(episode.length)
@@ -533,7 +533,7 @@ def encode_cocore_dataset(
             )
     if image_seen != set(records_by_id):
         raise ValueError("image pass did not yield every indexed episode exactly once")
-    if len(clip_visual_by_index) != len(clips):
+    if len(half_visual_by_index) != len(clips):
         raise ValueError("encoded clip count does not match clip index")
     if set(raw_visual) != set(union_order):
         raise ValueError("encoded visual union does not match expected fragment windows")
@@ -569,8 +569,8 @@ def encode_cocore_dataset(
     return CocoreEncodedClips(
         clips=clips,
         embeddings=embeddings,
-        visual_clip_embeddings=np.stack(
-            [clip_visual_by_index[index] for index in range(len(clips))]
+        visual_half_embeddings=np.stack(
+            [half_visual_by_index[index] for index in range(len(clips))]
         ).astype(np.float32),
         state_sequences=state_sequences,
         action_sequences=action_sequences,
