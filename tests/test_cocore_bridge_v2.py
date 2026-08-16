@@ -629,7 +629,10 @@ def test_validate_cli_passes_custom_dataset_path_without_preflight(
     }
 
 
-def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(tmp_path: Path) -> None:
+def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     import pyarrow.parquet as pq
 
     from cocore.pipeline import run_pipeline, validate_output
@@ -661,6 +664,11 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(tmp_path: Pat
     config["selection"]["budget"] = 6
 
     result = run_pipeline(config, output_dir=output, visual_encoder=DummyVisualEncoder())
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "cocore_timing step=scan " in captured.err
+    assert "cocore_timing step=select " in captured.err
 
     scan_manifest = json.loads((output / "scan" / "manifest.json").read_text())
     assert scan_manifest["dataset_summary"] == {

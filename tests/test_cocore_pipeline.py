@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import ClassVar
@@ -319,7 +320,10 @@ def test_encode_stage_caches_every_indexed_episode_including_short_episodes(
     assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 6}
 
 
-def test_interrupted_encode_does_not_publish_partial_frame_cache(tmp_path: Path) -> None:
+def test_interrupted_encode_does_not_publish_partial_frame_cache(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     root = tmp_path / "interrupted-cocore"
 
@@ -331,6 +335,11 @@ def test_interrupted_encode_does_not_publish_partial_frame_cache(tmp_path: Path)
         )
 
     assert not (root / "encode").exists()
+    captured = capsys.readouterr()
+    assert "cocore_timing step=encode.numeric_normalization " in captured.err
+    assert "cocore_timing step=encode.visual_cache " not in captured.err
+    assert "cocore_timing step=encode.pca_fusion " not in captured.err
+    assert "cocore_timing step=encode " not in captured.err
 
 
 @pytest.mark.parametrize("relation", ["cooccurrence", "sequence"])
@@ -485,6 +494,56 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     (result / "selection_report.json").write_text(json.dumps(report))
     with pytest.raises(ValueError, match="heap total refreshes"):
         validate_output(result, config=config)
+
+
+def test_run_pipeline_reports_all_completed_timings_and_cached_run_is_silent(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+
+    first = capsys.readouterr()
+    assert first.out == ""
+    timing_lines = [line for line in first.err.splitlines() if line.startswith("cocore_timing")]
+    expected_steps = [
+        "scan",
+        "encode.numeric_normalization",
+        "encode.visual_cache",
+        "encode.pca_fusion",
+        "encode",
+        "graph.reliability",
+        "graph.prototypes.action_scan",
+        "graph.prototypes.kmeans",
+        "graph.prototypes.center_statistics",
+        "graph.prototypes.candidate_assignment",
+        "graph.prototypes",
+        "graph.sparse_graph",
+        "graph",
+        "select.context",
+        "select.coverage_seed",
+        "select.lazy_heap",
+        "select.export",
+        "select",
+    ]
+    assert len(timing_lines) == len(expected_steps)
+    for line, expected_step in zip(timing_lines, expected_steps, strict=True):
+        match = re.fullmatch(
+            r"cocore_timing step=([^ ]+) seconds=([0-9]+\.[0-9]{6}) status=completed",
+            line,
+        )
+        assert match is not None
+        assert match.group(1) == expected_step
+        assert float(match.group(2)) >= 0.0
+
+    cached = run_pipeline(config, visual_encoder=FailingCocoreVisualEncoder())
+
+    second = capsys.readouterr()
+    assert cached == result
+    assert second.out == ""
+    assert "cocore_timing" not in second.err
 
 
 def test_validate_rejects_tampered_relation_weight(tmp_path: Path) -> None:

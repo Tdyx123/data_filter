@@ -1133,18 +1133,23 @@ def select_stage(
 
     def build(temporary: Path) -> None:
         started = time.perf_counter()
-        context = CocoreObjectiveContext(
-            graph,
-            relation_type,
-            relation_weight,
-            similarity_threshold=float(resolved["graph"]["similarity_threshold"]),
-        )
-        coverage_seed = build_max_coverage_seed(context, budget=budget)
-        selector = LazyHeapSelector(
-            context,
-            max_refreshes=max_refreshes,
-        )
-        result = selector.select(budget, initial_indices=coverage_seed.selected_indices)
+        with timed_step("select.context", emit_completed_timing):
+            context = CocoreObjectiveContext(
+                graph,
+                relation_type,
+                relation_weight,
+                similarity_threshold=float(resolved["graph"]["similarity_threshold"]),
+            )
+        with timed_step("select.coverage_seed", emit_completed_timing):
+            coverage_seed = build_max_coverage_seed(context, budget=budget)
+        with timed_step("select.lazy_heap", emit_completed_timing):
+            selector = LazyHeapSelector(
+                context,
+                max_refreshes=max_refreshes,
+            )
+            result = selector.select(budget, initial_indices=coverage_seed.selected_indices)
+
+        export_started = time.perf_counter()
         graph_nodes = np.load(root / GRAPH_DIRECTORY / "nodes.npz")
         half_action_labels = np.load(
             root / GRAPH_DIRECTORY / "half_action_labels.npy", allow_pickle=False
@@ -1239,8 +1244,10 @@ def select_stage(
                 "prototype_strategy": PROTOTYPE_STRATEGY,
             },
         )
+        emit_completed_timing("select.export", time.perf_counter() - export_started)
 
-    publish_stage(
+    stage_started = time.perf_counter()
+    built = publish_stage(
         destination,
         fingerprint=fingerprint,
         required=("selected_manifest.jsonl", "all_clips.parquet", "selection_report.json"),
@@ -1248,6 +1255,8 @@ def select_stage(
         resume=bool(resolved["runtime"].get("resume", True)),
         build=build,
     )
+    if built:
+        emit_completed_timing("select", time.perf_counter() - stage_started)
     stage_directories = {
         "scan": "scan",
         "encode": "encode",
