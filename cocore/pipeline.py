@@ -62,6 +62,7 @@ from cocore.selection import (
     LazyHeapSelector,
     build_max_coverage_seed,
 )
+from cocore.timing import emit_completed_timing
 
 
 GRAPH_DIRECTORY = "graph-14-motion-hard-nearest"
@@ -354,8 +355,22 @@ def scan_stage(
 ) -> tuple[Path, object, list[ClipRecord], str]:
     resolved = resolve_config(config)
     translated = to_relcore_config(resolved)
-    result = relcore_scan_stage(translated, output_dir=output_dir, force=force)
+    started = time.perf_counter()
+    built = False
+
+    def mark_built() -> None:
+        nonlocal built
+        built = True
+
+    result = relcore_scan_stage(
+        translated,
+        output_dir=output_dir,
+        force=force,
+        on_built=mark_built,
+    )
     _mark_shared_stage(result[0], "scan", "scan")
+    if built:
+        emit_completed_timing("scan", time.perf_counter() - started)
     return result
 
 

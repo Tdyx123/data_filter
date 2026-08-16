@@ -358,6 +358,19 @@ def test_scan_performs_the_numeric_pass_without_loading_images(tmp_path: Path):
     assert manifest["skipped_short_episode_count"] == 1
 
 
+def test_scan_reports_only_newly_built_stage(tmp_path: Path) -> None:
+    register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
+    config = _config(tmp_path)
+    completed: list[str] = []
+
+    first = scan_stage(config, on_built=lambda: completed.append("scan"))
+    second = scan_stage(config, on_built=lambda: completed.append("cached"))
+
+    assert len(first) == 4
+    assert second[0] == first[0]
+    assert completed == ["scan"]
+
+
 def test_force_rebuilds_only_changed_selection_stage(tmp_path: Path):
     register_dataset_adapter("relcore_pipeline_synthetic", PipelineAdapter)
     config = _config(tmp_path)

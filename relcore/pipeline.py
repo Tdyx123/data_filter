@@ -6,7 +6,7 @@ import json
 import platform
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -207,6 +207,7 @@ def scan_stage(
     *,
     output_dir: str | Path | None = None,
     force: bool = False,
+    on_built: Callable[[], None] | None = None,
 ) -> tuple[Path, DatasetAdapter, list[ClipRecord], str]:
     resolved = resolve_config(config)
     root = _output_root(resolved, output_dir)
@@ -268,7 +269,7 @@ def scan_stage(
             },
         )
 
-    publish_stage(
+    built = publish_stage(
         destination,
         fingerprint=fingerprint,
         required=("episodes.parquet", "clips.parquet", "normalization.npz"),
@@ -276,6 +277,8 @@ def scan_stage(
         resume=bool(resolved["runtime"].get("resume", True)),
         build=build,
     )
+    if built and on_built is not None:
+        on_built()
     return root, adapter, _load_clips(destination / "clips.parquet"), fingerprint
 
 
