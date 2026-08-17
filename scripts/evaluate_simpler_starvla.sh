@@ -8,6 +8,7 @@ sim_python="${project_root}/.venv-octo-simpler/bin/python"
 model_dir="/data/dwb/models/Qwen3VL-GR00T-Bridge-RT-1"
 base_model="/data/dwb/models/Qwen3-VL-4B-Instruct"
 device="cuda:0"
+sim_device="cuda:0"
 output_dir="${project_root}/outputs/starvla_simpler_eval"
 server_timeout=600
 forwarded=()
@@ -24,7 +25,8 @@ Launcher options:
   --sim-python PATH      SimplerEnv Python (default: .venv-octo-simpler/bin/python)
   --model-dir PATH       StarVLA checkpoint directory
   --base-model PATH      local Qwen3-VL config/processor directory
-  --device DEVICE        model device (default: cuda:0)
+  --device DEVICE        model service CUDA device (default: cuda:0)
+  --sim-device DEVICE    simulator renderer CUDA device (default: cuda:0)
   --output-dir PATH      evaluation output and persistent model-server.log
   --server-timeout SEC   maximum model load wait (default: 600)
   -h, --help             show this help without starting either process
@@ -58,7 +60,7 @@ while (($#)); do
       usage
       exit 0
       ;;
-    --pyenv-bin|--pyenv-version|--sim-python|--model-dir|--base-model|--device|--output-dir|--server-timeout)
+    --pyenv-bin|--pyenv-version|--sim-python|--model-dir|--base-model|--device|--sim-device|--output-dir|--server-timeout)
       option="$1"
       set_once "${option}"
       (($# >= 2)) || fail "${option} requires a non-empty value"
@@ -70,12 +72,13 @@ while (($#)); do
         --model-dir) model_dir="$2" ;;
         --base-model) base_model="$2" ;;
         --device) device="$2" ;;
+        --sim-device) sim_device="$2" ;;
         --output-dir) output_dir="$2" ;;
         --server-timeout) server_timeout="$2" ;;
       esac
       shift 2
       ;;
-    --pyenv-bin=*|--pyenv-version=*|--sim-python=*|--model-dir=*|--base-model=*|--device=*|--output-dir=*|--server-timeout=*)
+    --pyenv-bin=*|--pyenv-version=*|--sim-python=*|--model-dir=*|--base-model=*|--device=*|--sim-device=*|--output-dir=*|--server-timeout=*)
       option="${1%%=*}"
       value="${1#*=}"
       set_once "${option}"
@@ -87,6 +90,7 @@ while (($#)); do
         --model-dir) model_dir="${value}" ;;
         --base-model) base_model="${value}" ;;
         --device) device="${value}" ;;
+        --sim-device) sim_device="${value}" ;;
         --output-dir) output_dir="${value}" ;;
         --server-timeout) server_timeout="${value}" ;;
       esac
@@ -117,6 +121,8 @@ while (($#)); do
 done
 
 [[ "${server_timeout}" =~ ^[1-9][0-9]*$ ]] || fail "--server-timeout must be a positive integer"
+[[ "${sim_device}" =~ ^cuda:[0-9]+$ ]] ||
+  fail "--sim-device must match cuda:<non-negative decimal integer>"
 [[ -x "${pyenv_bin}" ]] || fail "pyenv executable is not executable: ${pyenv_bin}"
 [[ -x "${sim_python}" ]] || fail "simulator Python is not executable: ${sim_python}"
 
@@ -210,6 +216,7 @@ sim_status=0
     --socket "${socket_path}" \
     --auth-key-hex "${auth_key_hex}" \
     --output-dir "${output_dir}" \
+    --sim-device "${sim_device}" \
     "${forwarded[@]}"
 ) &
 sim_pid=$!

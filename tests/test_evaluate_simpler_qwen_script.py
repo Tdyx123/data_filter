@@ -90,10 +90,53 @@ def test_launcher_uses_fixed_sources_and_forwards_evaluation_options(tmp_path):
     assert call[2:4] == ["-m", "qwen3_vl_groot.evaluate_simpler"]
     assert "--python" not in call
     assert call[call.index("--checkpoint") + 1] == CHECKPOINT
+    assert call[call.index("--sim-device") + 1] == "cuda:0"
     assert "--tasks=spoon,eggplant" in call
     assert call[call.index("--action-horizon") + 1] == "1"
     assert call[call.index("--save-videos-path") + 1] == "/tmp/simpler-videos"
     assert "--smoke-test" in call
+
+
+def test_launcher_forwards_explicit_sim_device_once(tmp_path):
+    completed, calls = _run_script(
+        tmp_path,
+        "--checkpoint",
+        CHECKPOINT,
+        "--sim-device=cuda:7",
+    )
+
+    assert completed.returncode == 0
+    assert len(calls) == 1
+    call = calls[0]
+    assert call.count("--sim-device") == 1
+    assert call[call.index("--sim-device") + 1] == "cuda:7"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (("--sim-device", "cpu"), "must match cuda:<non-negative decimal integer>"),
+        (("--sim-device",), "--sim-device requires a non-empty value"),
+        (
+            ("--sim-device", "cuda:0", "--sim-device=cuda:1"),
+            "--sim-device may only be specified once",
+        ),
+    ],
+    ids=("invalid", "missing", "duplicate"),
+)
+def test_launcher_rejects_invalid_missing_or_duplicate_sim_device(
+    tmp_path, arguments, message
+):
+    completed, calls = _run_script(
+        tmp_path,
+        "--checkpoint",
+        CHECKPOINT,
+        *arguments,
+    )
+
+    assert completed.returncode == 2
+    assert calls == []
+    assert message in completed.stderr
 
 
 @pytest.mark.parametrize(

@@ -93,8 +93,59 @@ def test_launcher_sets_simpler_sources_and_forwards_octo_options(tmp_path):
     assert call[call.index("--checkpoint") + 1] == CHECKPOINT
     assert call[call.index("--base-model") + 1] == BASE_MODEL
     assert call[call.index("--statistics") + 1] == STATISTICS
+    assert call[call.index("--sim-device") + 1] == "cuda:0"
     assert "--tasks=spoon,eggplant" in call
     assert "--smoke-test" in call
+
+
+def test_launcher_forwards_explicit_sim_device_once(tmp_path):
+    completed, calls = _run_script(
+        tmp_path,
+        "--checkpoint",
+        CHECKPOINT,
+        "--base-model",
+        BASE_MODEL,
+        "--statistics",
+        STATISTICS,
+        "--sim-device=cuda:7",
+    )
+
+    assert completed.returncode == 0
+    assert len(calls) == 1
+    call = calls[0]
+    assert call.count("--sim-device") == 1
+    assert call[call.index("--sim-device") + 1] == "cuda:7"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (("--sim-device", "cpu"), "must match cuda:<non-negative decimal integer>"),
+        (("--sim-device",), "--sim-device requires a non-empty value"),
+        (
+            ("--sim-device", "cuda:0", "--sim-device=cuda:1"),
+            "--sim-device may only be specified once",
+        ),
+    ],
+    ids=("invalid", "missing", "duplicate"),
+)
+def test_launcher_rejects_invalid_missing_or_duplicate_sim_device(
+    tmp_path, arguments, message
+):
+    completed, calls = _run_script(
+        tmp_path,
+        "--checkpoint",
+        CHECKPOINT,
+        "--base-model",
+        BASE_MODEL,
+        "--statistics",
+        STATISTICS,
+        *arguments,
+    )
+
+    assert completed.returncode == 2
+    assert calls == []
+    assert message in completed.stderr
 
 
 @pytest.mark.parametrize("option", ["--checkpoint", "--base-model", "--statistics", "--python"])

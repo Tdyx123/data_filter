@@ -178,11 +178,71 @@ def test_launcher_starts_pyenv_model_then_simulator_and_cleans_private_socket(tm
     socket_path = Path(sim_call[sim_call.index("--socket") + 1])
     assert sim_call[sim_call.index("--auth-key-hex") + 1]
     assert sim_call[sim_call.index("--output-dir") + 1] == str(output_dir)
+    assert sim_call[sim_call.index("--sim-device") + 1] == "cuda:0"
     assert "--tasks=spoon,eggplant" in sim_call
     assert "--smoke-test" in sim_call
     assert not socket_path.exists()
     assert stopped.read_text(encoding="utf-8") == "stopped"
     assert (output_dir / "model-server.log").exists()
+
+
+def test_launcher_keeps_model_device_separate_from_explicit_sim_device(tmp_path):
+    completed, model_calls, sim_calls, _stopped, _output_dir = _run(
+        tmp_path,
+        "--device",
+        "cuda:2",
+        "--sim-device=cuda:7",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert len(model_calls) == 1
+    assert len(sim_calls) == 1
+    model_call = model_calls[0]
+    sim_call = sim_calls[0]
+    assert model_call[model_call.index("--device") + 1] == "cuda:2"
+    assert "--sim-device" not in model_call
+    assert sim_call.count("--sim-device") == 1
+    assert sim_call[sim_call.index("--sim-device") + 1] == "cuda:7"
+    assert "--device" not in sim_call
+
+
+def test_launcher_rejects_invalid_sim_device_before_starting_processes(tmp_path):
+    completed, model_calls, sim_calls, _stopped, _output_dir = _run(
+        tmp_path,
+        "--sim-device",
+        "cpu",
+    )
+
+    assert completed.returncode == 2
+    assert model_calls == []
+    assert sim_calls == []
+    assert "must match cuda:<non-negative decimal integer>" in completed.stderr
+
+
+def test_launcher_rejects_missing_sim_device_before_starting_processes(tmp_path):
+    completed, model_calls, sim_calls, _stopped, _output_dir = _run(
+        tmp_path,
+        "--sim-device",
+    )
+
+    assert completed.returncode == 2
+    assert model_calls == []
+    assert sim_calls == []
+    assert "--sim-device requires a non-empty value" in completed.stderr
+
+
+def test_launcher_rejects_duplicate_sim_device_before_starting_processes(tmp_path):
+    completed, model_calls, sim_calls, _stopped, _output_dir = _run(
+        tmp_path,
+        "--sim-device",
+        "cuda:0",
+        "--sim-device=cuda:1",
+    )
+
+    assert completed.returncode == 2
+    assert model_calls == []
+    assert sim_calls == []
+    assert "--sim-device may only be specified once" in completed.stderr
 
 
 def test_launcher_propagates_simulator_failure_and_cleans_its_socket(tmp_path):
@@ -233,6 +293,8 @@ def test_launcher_help_does_not_start_either_process(tmp_path):
     assert sim_calls == []
     assert "--pyenv-version" in completed.stdout
     assert "--preflight-only" in completed.stdout
+    assert "--device DEVICE        model service CUDA device" in completed.stdout
+    assert "--sim-device DEVICE    simulator renderer CUDA device" in completed.stdout
 
 
 def test_launcher_rejects_legacy_action_horizon_before_loading_model(tmp_path):

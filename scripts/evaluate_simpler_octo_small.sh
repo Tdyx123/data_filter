@@ -10,12 +10,19 @@ base_model=""
 base_model_seen=0
 statistics=""
 statistics_seen=0
+sim_device="cuda:0"
+sim_device_seen=0
 help_requested=0
 forwarded=()
 
 fail() {
   printf 'error: %s\n' "$1" >&2
   exit 2
+}
+
+validate_sim_device() {
+  [[ "$1" =~ ^cuda:[0-9]+$ ]] ||
+    fail "--sim-device must match cuda:<non-negative decimal integer>"
 }
 
 while (($#)); do
@@ -80,6 +87,23 @@ while (($#)); do
       statistics_seen=1
       shift
       ;;
+    --sim-device)
+      ((sim_device_seen == 0)) || fail "--sim-device may only be specified once"
+      (($# >= 2)) || fail "--sim-device requires a non-empty value"
+      [[ -n "$2" ]] || fail "--sim-device requires a non-empty value"
+      validate_sim_device "$2"
+      sim_device="$2"
+      sim_device_seen=1
+      shift 2
+      ;;
+    --sim-device=*)
+      ((sim_device_seen == 0)) || fail "--sim-device may only be specified once"
+      sim_device="${1#*=}"
+      [[ -n "${sim_device}" ]] || fail "--sim-device requires a non-empty value"
+      validate_sim_device "${sim_device}"
+      sim_device_seen=1
+      shift
+      ;;
     -h|--help)
       help_requested=1
       forwarded+=("$1")
@@ -113,5 +137,6 @@ fi
 if ((statistics_seen)); then
   command+=(--statistics "${statistics}")
 fi
+command+=(--sim-device "${sim_device}")
 command+=("${forwarded[@]}")
 exec "${command[@]}"
