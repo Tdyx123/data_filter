@@ -17,6 +17,7 @@ from .simpler_evaluation import (
     create_simpler_environment,
     default_simpler_root,
     evaluate_simpler_checkpoint,
+    parse_sim_device,
     resolve_task_selection,
     validate_runtime_contract,
     validate_simpler_source,
@@ -74,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("outputs/qwen_simpler_eval"),
     )
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--sim-device", type=parse_sim_device, default="cuda:0")
     parser.add_argument("--denoising-steps", type=int, default=4)
     parser.add_argument("--action-horizon", type=int, choices=(1,), default=1)
     parser.add_argument("--save-videos-path", type=Path, default=None)
@@ -127,6 +129,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             tasks=tasks,
             model_path=arguments.model_path,
             device=arguments.device,
+            sim_device=arguments.sim_device,
             denoising_steps=arguments.denoising_steps,
             action_horizon=arguments.action_horizon,
             policy_seeds=(0,) if arguments.smoke_test else POLICY_SEEDS,
@@ -143,7 +146,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 settings,
                 checkpoint=checkpoint,
                 policy=policy,
-                environment_factory=lambda task: create_simpler_environment(task),
+                environment_factory=lambda task: create_simpler_environment(
+                    task, sim_device=settings.sim_device
+                ),
                 source_versions=source_versions,
                 package_versions=package_versions,
             )
@@ -152,7 +157,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 settings,
                 checkpoint=checkpoint,
                 policy=policy,
-                environment_factory=lambda task: create_simpler_environment(task),
+                environment_factory=lambda task: create_simpler_environment(
+                    task, sim_device=settings.sim_device
+                ),
                 source_versions={**source_versions, "package_versions": package_versions},
             )
     except SimplerInfrastructureError as error:

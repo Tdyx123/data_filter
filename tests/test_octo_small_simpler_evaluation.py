@@ -296,8 +296,21 @@ def test_octo_simpler_cli_requires_all_model_paths_and_defaults_to_full_protocol
     assert arguments.tasks == "all"
     assert arguments.output_dir == Path("outputs/octo_small_bridge_simpler_eval")
     assert arguments.device == "cuda:0"
+    assert arguments.sim_device == "cuda:0"
     assert arguments.precision == "bf16"
     assert arguments.action_horizon == 1
+    assert parser.parse_args(
+        [
+            "--checkpoint",
+            "/models/step-00020000",
+            "--base-model",
+            "/models/octo-small-pytorch",
+            "--statistics",
+            "/data/bridge/meta/stats.json",
+            "--sim-device",
+            "cuda:12",
+        ]
+    ).sim_device == "cuda:12"
     with pytest.raises(SystemExit):
         parser.parse_args(
             [
@@ -314,6 +327,28 @@ def test_octo_simpler_cli_requires_all_model_paths_and_defaults_to_full_protocol
     assert arguments.smoke_test is False
     with pytest.raises(SystemExit):
         parser.parse_args(["--checkpoint", "/models/step-00020000"])
+
+
+@pytest.mark.parametrize(
+    "sim_device",
+    ("cuda:-1", "cuda", "3", "/dev/nvidia3", "cpu", "cuda:+1", "cuda: 1"),
+)
+def test_octo_simpler_cli_rejects_non_logical_cuda_sim_devices(sim_device):
+    from octo_small_bridge.evaluate_simpler import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "--checkpoint",
+                "/models/step-00020000",
+                "--base-model",
+                "/models/octo-small-pytorch",
+                "--statistics",
+                "/data/bridge/meta/stats.json",
+                "--sim-device",
+                sim_device,
+            ]
+        )
 
 
 def test_octo_simpler_cli_applies_smoke_protocol_and_model_metadata(tmp_path, monkeypatch):
@@ -376,6 +411,66 @@ def test_octo_simpler_cli_applies_smoke_protocol_and_model_metadata(tmp_path, mo
         "statistics": {"path": "/data/bridge/meta/stats.json", "sha256": "abc"},
     }
     assert captured["kwargs"]["route"] == "octo-small-bridge-simpler-widowx-eval"
+
+
+@pytest.mark.parametrize("preflight_only", (False, True), ids=("evaluation", "preflight"))
+def test_octo_cli_forwards_sim_device_to_environment_builder(
+    tmp_path, monkeypatch, preflight_only
+):
+    from octo_small_bridge import evaluate_simpler
+
+    captured = {}
+    checkpoint = SimpleNamespace(as_dict=lambda: {})
+    policy = SimpleNamespace(
+        statistics=SimpleNamespace(as_dict=lambda: {}),
+        protocol_metadata=lambda: {},
+    )
+    monkeypatch.setattr(evaluate_simpler, "validate_simpler_source", lambda path: {})
+    monkeypatch.setattr(
+        evaluate_simpler, "validate_runtime_contract", lambda device: {}
+    )
+    monkeypatch.setattr(
+        evaluate_simpler,
+        "load_octo_bridge_policy",
+        lambda *args, **kwargs: (checkpoint, policy),
+    )
+    monkeypatch.setattr(
+        evaluate_simpler,
+        "create_simpler_environment",
+        lambda task, *, sim_device: captured.setdefault(
+            "builder", (task.key, sim_device)
+        ),
+    )
+
+    def run(settings, **kwargs):
+        captured["settings"] = settings
+        kwargs["environment_factory"](settings.tasks[0])
+        return {"status": "complete"}
+
+    monkeypatch.setattr(evaluate_simpler, "evaluate_simpler_policy", run)
+    monkeypatch.setattr(evaluate_simpler, "run_simpler_preflight", run)
+    arguments = [
+        "--checkpoint",
+        "/models/step-00020000",
+        "--base-model",
+        "/models/octo-small-pytorch",
+        "--statistics",
+        "/data/bridge/meta/stats.json",
+        "--tasks",
+        "spoon",
+        "--output-dir",
+        str(tmp_path / "output"),
+        "--sim-device",
+        "cuda:7",
+    ]
+    if preflight_only:
+        arguments.append("--preflight-only")
+
+    status = evaluate_simpler.main(arguments)
+
+    assert status == 0
+    assert captured["settings"].sim_device == "cuda:7"
+    assert captured["builder"] == ("spoon", "cuda:7")
 
 
 def test_octo_simpler_cli_writes_contract_failures(tmp_path, monkeypatch):

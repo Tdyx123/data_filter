@@ -71,10 +71,88 @@ def test_qwen_simpler_cli_only_accepts_stepwise_action_horizon():
     arguments = parser.parse_args(["--checkpoint", "/models/checkpoint"])
 
     assert arguments.action_horizon == 1
+    assert arguments.sim_device == "cuda:0"
+    assert parser.parse_args(
+        ["--checkpoint", "/models/checkpoint", "--sim-device", "cuda:12"]
+    ).sim_device == "cuda:12"
     with pytest.raises(SystemExit):
         parser.parse_args(
             ["--checkpoint", "/models/checkpoint", "--action-horizon", "8"]
         )
+
+
+@pytest.mark.parametrize(
+    "sim_device",
+    ("cuda:-1", "cuda", "3", "/dev/nvidia3", "cpu", "cuda:+1", "cuda: 1"),
+)
+def test_qwen_simpler_cli_rejects_non_logical_cuda_sim_devices(sim_device):
+    from qwen3_vl_groot.evaluate_simpler import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            ["--checkpoint", "/models/checkpoint", "--sim-device", sim_device]
+        )
+
+
+def test_qwen_simpler_settings_default_sim_device(tmp_path):
+    evaluation = _evaluation()
+
+    settings = evaluation.SimplerEvaluationSettings(checkpoint=tmp_path / "checkpoint")
+
+    assert settings.sim_device == "cuda:0"
+
+
+def test_qwen_settings_preserve_sim_device_for_both_shared_runners(tmp_path, monkeypatch):
+    evaluation = _evaluation()
+    from simpler_bridge import evaluation as shared_evaluation
+
+    captured = {}
+    checkpoint = SimpleNamespace(
+        config={"data": {"train_crop_size": 4, "output_image_size": 4}},
+        as_dict=lambda: {},
+    )
+    settings = evaluation.SimplerEvaluationSettings(
+        checkpoint=tmp_path / "checkpoint",
+        output_dir=tmp_path / "output",
+        tasks=(evaluation.SIMPLER_TASKS[0],),
+        policy_seeds=(0,),
+        object_episode_ids=(0,),
+        sim_device="cuda:7",
+    )
+
+    monkeypatch.setattr(
+        shared_evaluation,
+        "evaluate_simpler_policy",
+        lambda shared_settings, **kwargs: captured.setdefault(
+            "evaluation", shared_settings
+        ),
+    )
+    monkeypatch.setattr(
+        shared_evaluation,
+        "run_simpler_preflight",
+        lambda shared_settings, **kwargs: captured.setdefault(
+            "preflight", shared_settings
+        ),
+    )
+
+    evaluation.evaluate_simpler_checkpoint(
+        settings,
+        checkpoint=checkpoint,
+        policy=object(),
+        environment_factory=lambda task: object(),
+        source_versions={},
+    )
+    evaluation.run_simpler_preflight(
+        settings,
+        checkpoint=checkpoint,
+        policy=object(),
+        environment_factory=lambda task: object(),
+        source_versions={},
+        package_versions={},
+    )
+
+    assert captured["evaluation"].sim_device == "cuda:7"
+    assert captured["preflight"].sim_device == "cuda:7"
 
 
 def test_bridge_image_preprocessing_resizes_then_center_crops():

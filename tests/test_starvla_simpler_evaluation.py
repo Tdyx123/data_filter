@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 
 class _FakeClient:
@@ -119,8 +120,19 @@ def test_starvla_cli_defaults_to_full_stepwise_protocol():
 
     assert arguments.tasks == "all"
     assert arguments.action_horizon == 1
+    assert arguments.sim_device == "cuda:0"
     assert arguments.output_dir.name == "starvla_simpler_eval"
     assert arguments.smoke_test is False
+    assert parser.parse_args(
+        [
+            "--socket",
+            "/tmp/policy.sock",
+            "--auth-key-hex",
+            "001122",
+            "--sim-device",
+            "cuda:12",
+        ]
+    ).sim_device == "cuda:12"
     with pytest.raises(SystemExit):
         parser.parse_args(
             [
@@ -132,3 +144,81 @@ def test_starvla_cli_defaults_to_full_stepwise_protocol():
                 "8",
             ]
         )
+
+
+@pytest.mark.parametrize(
+    "sim_device",
+    ("cuda:-1", "cuda", "3", "/dev/nvidia3", "cpu", "cuda:+1", "cuda: 1"),
+)
+def test_starvla_cli_rejects_non_logical_cuda_sim_devices(sim_device):
+    from starvla_bridge.evaluate_simpler import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "--socket",
+                "/tmp/policy.sock",
+                "--auth-key-hex",
+                "001122",
+                "--sim-device",
+                sim_device,
+            ]
+        )
+
+
+@pytest.mark.parametrize("preflight_only", (False, True), ids=("evaluation", "preflight"))
+def test_starvla_cli_keeps_remote_model_device_and_forwards_sim_device(
+    tmp_path, monkeypatch, preflight_only
+):
+    from starvla_bridge import evaluate_simpler
+
+    captured = {}
+
+    class Client:
+        def __init__(self, socket, *, authkey):
+            captured["connection"] = (socket, authkey)
+
+        def shutdown(self):
+            captured["shutdown"] = True
+
+    policy = SimpleNamespace(metadata={}, protocol_metadata=lambda: {})
+    monkeypatch.setattr(evaluate_simpler, "StarVLAIPCClient", Client)
+    monkeypatch.setattr(evaluate_simpler, "StarVLARemotePolicy", lambda client: policy)
+    monkeypatch.setattr(evaluate_simpler, "validate_simpler_source", lambda path: {})
+    monkeypatch.setattr(
+        evaluate_simpler,
+        "create_simpler_environment",
+        lambda task, *, sim_device: captured.setdefault(
+            "builder", (task.key, sim_device)
+        ),
+    )
+
+    def run(settings, **kwargs):
+        captured["settings"] = settings
+        kwargs["environment_factory"](settings.tasks[0])
+        return {"status": "complete"}
+
+    monkeypatch.setattr(evaluate_simpler, "evaluate_simpler_policy", run)
+    monkeypatch.setattr(evaluate_simpler, "run_simpler_preflight", run)
+    arguments = [
+        "--socket",
+        str(tmp_path / "policy.sock"),
+        "--auth-key-hex",
+        "001122",
+        "--tasks",
+        "spoon",
+        "--output-dir",
+        str(tmp_path / "output"),
+        "--sim-device",
+        "cuda:7",
+    ]
+    if preflight_only:
+        arguments.append("--preflight-only")
+
+    status = evaluate_simpler.main(arguments)
+
+    assert status == 0
+    assert captured["settings"].device == "remote-pyenv-cuda:0"
+    assert captured["settings"].sim_device == "cuda:7"
+    assert captured["builder"] == ("spoon", "cuda:7")
+    assert captured["shutdown"] is True

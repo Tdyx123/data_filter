@@ -18,6 +18,7 @@ from simpler_bridge.evaluation import (
     create_simpler_environment,
     default_simpler_root,
     evaluate_simpler_policy,
+    parse_sim_device,
     resolve_task_selection,
     run_simpler_preflight,
     validate_simpler_source,
@@ -90,6 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("outputs/octo_small_bridge_simpler_eval"),
     )
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--sim-device", type=parse_sim_device, default="cuda:0")
     parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--action-horizon", type=int, choices=(1,), default=1)
     parser.add_argument("--save-videos-path", type=Path, default=None)
@@ -132,6 +134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_dir=arguments.output_dir,
             tasks=tasks,
             device=arguments.device,
+            sim_device=arguments.sim_device,
             action_horizon=arguments.action_horizon,
             policy_seeds=(0,) if arguments.smoke_test else POLICY_SEEDS,
             object_episode_ids=(0,) if arguments.smoke_test else OBJECT_EPISODE_IDS,
@@ -146,7 +149,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 settings,
                 checkpoint=checkpoint_report,
                 policy=policy,
-                environment_factory=lambda task: create_simpler_environment(task),
+                environment_factory=lambda task: create_simpler_environment(
+                    task, sim_device=settings.sim_device
+                ),
                 source_versions=source_versions,
                 package_versions=package_versions,
                 route=PREFLIGHT_ROUTE,
@@ -156,7 +161,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 settings,
                 checkpoint=checkpoint_report,
                 policy=policy,
-                environment_factory=lambda task: create_simpler_environment(task),
+                environment_factory=lambda task: create_simpler_environment(
+                    task, sim_device=settings.sim_device
+                ),
                 source_versions={
                     **source_versions,
                     "package_versions": package_versions,

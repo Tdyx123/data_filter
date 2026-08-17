@@ -20,6 +20,7 @@ from simpler_bridge.evaluation import (
     create_simpler_environment,
     default_simpler_root,
     evaluate_simpler_policy,
+    parse_sim_device,
     resolve_task_selection,
     run_simpler_preflight,
     validate_simpler_source,
@@ -46,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("outputs/starvla_simpler_eval"),
     )
     parser.add_argument("--action-horizon", type=int, choices=(1,), default=1)
+    parser.add_argument("--sim-device", type=parse_sim_device, default="cuda:0")
     parser.add_argument("--save-videos-path", type=Path, default=None)
     parser.add_argument("--video-fps", type=int, default=5)
     parser.add_argument("--preflight-only", action="store_true")
@@ -101,6 +103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_dir=arguments.output_dir,
             tasks=tasks,
             device="remote-pyenv-cuda:0",
+            sim_device=arguments.sim_device,
             action_horizon=arguments.action_horizon,
             policy_seeds=(0,) if arguments.smoke_test else POLICY_SEEDS,
             object_episode_ids=(0,) if arguments.smoke_test else OBJECT_EPISODE_IDS,
@@ -125,7 +128,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 settings,
                 checkpoint=checkpoint,
                 policy=policy,
-                environment_factory=create_simpler_environment,
+                environment_factory=lambda task: create_simpler_environment(
+                    task, sim_device=settings.sim_device
+                ),
                 source_versions=source_versions,
                 package_versions={"numpy": np.__version__},
                 route=PREFLIGHT_ROUTE,
@@ -135,7 +140,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 settings,
                 checkpoint=checkpoint,
                 policy=policy,
-                environment_factory=create_simpler_environment,
+                environment_factory=lambda task: create_simpler_environment(
+                    task, sim_device=settings.sim_device
+                ),
                 source_versions=source_versions,
                 route=EVALUATION_ROUTE,
                 protocol_metadata=policy.protocol_metadata(),

@@ -24,6 +24,7 @@ from simpler_bridge.evaluation import (  # noqa: F401
     default_simpler_root,
     environment_to_bridge_proprio,
     image_from_simpler_observation,
+    parse_sim_device,
     resolve_task_selection,
     validate_simpler_source,
 )
@@ -59,6 +60,7 @@ class SimplerEvaluationSettings:
     tasks: tuple[SimplerTaskSpec, ...] = ()
     model_path: Path | None = None
     device: str = "cuda:0"
+    sim_device: str = "cuda:0"
     denoising_steps: int = 4
     action_horizon: int = 1
     policy_seeds: tuple[int, ...] = POLICY_SEEDS
@@ -345,6 +347,7 @@ def run_simpler_preflight(
         output_dir=settings.output_dir,
         tasks=settings.tasks,
         device=settings.device,
+        sim_device=settings.sim_device,
         action_horizon=settings.action_horizon,
         policy_seeds=settings.policy_seeds,
         object_episode_ids=settings.object_episode_ids,
@@ -393,6 +396,7 @@ def evaluate_simpler_checkpoint(
         output_dir=settings.output_dir,
         tasks=settings.tasks,
         device=settings.device,
+        sim_device=settings.sim_device,
         action_horizon=settings.action_horizon,
         policy_seeds=settings.policy_seeds,
         object_episode_ids=settings.object_episode_ids,

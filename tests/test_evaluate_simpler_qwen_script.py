@@ -218,3 +218,65 @@ def test_python_cli_applies_task_filter_and_smoke_protocol(tmp_path, monkeypatch
     assert settings.save_videos_path == tmp_path / "videos"
     assert captured["kwargs"]["checkpoint"] is checkpoint
     assert captured["kwargs"]["policy"] is policy
+
+
+@pytest.mark.parametrize("preflight_only", (False, True), ids=("evaluation", "preflight"))
+def test_python_cli_forwards_sim_device_to_environment_builder(
+    tmp_path, monkeypatch, preflight_only
+):
+    from types import SimpleNamespace
+
+    from qwen3_vl_groot import evaluate_simpler
+    from qwen3_vl_groot import simpler_evaluation
+
+    captured = {}
+    checkpoint = SimpleNamespace()
+    policy = SimpleNamespace()
+    monkeypatch.setattr(
+        evaluate_simpler,
+        "validate_simpler_source",
+        lambda path: {"simpler_env_commit": "06accaca9353"},
+    )
+    monkeypatch.setattr(
+        evaluate_simpler,
+        "validate_runtime_contract",
+        lambda device: {"numpy": "1.24.4"},
+    )
+    monkeypatch.setattr(
+        evaluate_simpler,
+        "_load_checkpoint_and_policy",
+        lambda arguments: (checkpoint, policy),
+    )
+    monkeypatch.setattr(
+        evaluate_simpler,
+        "create_simpler_environment",
+        lambda task, *, sim_device: captured.setdefault(
+            "builder", (task.key, sim_device)
+        ),
+    )
+
+    def run(settings, **kwargs):
+        captured["settings"] = settings
+        kwargs["environment_factory"](settings.tasks[0])
+        return {"status": "complete"}
+
+    monkeypatch.setattr(evaluate_simpler, "evaluate_simpler_checkpoint", run)
+    monkeypatch.setattr(simpler_evaluation, "run_simpler_preflight", run)
+    arguments = [
+        "--checkpoint",
+        CHECKPOINT,
+        "--tasks",
+        "spoon",
+        "--output-dir",
+        str(tmp_path / "output"),
+        "--sim-device",
+        "cuda:7",
+    ]
+    if preflight_only:
+        arguments.append("--preflight-only")
+
+    status = evaluate_simpler.main(arguments)
+
+    assert status == 0
+    assert captured["settings"].sim_device == "cuda:7"
+    assert captured["builder"] == ("spoon", "cuda:7")

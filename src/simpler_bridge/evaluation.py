@@ -32,6 +32,12 @@ class SimplerInfrastructureError(RuntimeError):
     """Raised when SimplerEnv cannot create or run its simulation."""
 
 
+def parse_sim_device(value: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"cuda:[0-9]+", value) is None:
+        raise ValueError("sim_device must match cuda:<non-negative decimal integer>")
+    return value
+
+
 @dataclass(frozen=True)
 class SimplerTaskSpec:
     key: str
@@ -508,12 +514,10 @@ def _validate_settings(settings: SimplerRunSettings) -> None:
         raise SimplerEvaluationError("max_steps must be positive when provided")
     if settings.video_fps <= 0:
         raise SimplerEvaluationError("video_fps must be positive")
-    if not isinstance(settings.sim_device, str) or re.fullmatch(
-        r"cuda:[0-9]+", settings.sim_device
-    ) is None:
-        raise SimplerEvaluationError(
-            "sim_device must match cuda:<non-negative decimal integer>"
-        )
+    try:
+        parse_sim_device(settings.sim_device)
+    except ValueError as error:
+        raise SimplerEvaluationError(str(error)) from error
     if len(settings.policy_seeds) != len(set(settings.policy_seeds)):
         raise SimplerEvaluationError("policy_seeds must be unique")
     if len(settings.object_episode_ids) != len(set(settings.object_episode_ids)):
