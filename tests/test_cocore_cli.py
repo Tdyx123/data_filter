@@ -43,6 +43,7 @@ def test_config_accepts_supported_relations(relation: str) -> None:
         "epsilon": 1.0e-8,
     }
     assert resolved["prototypes"]["method"] == "motion_primitives"
+    assert resolved["prototypes"]["num_threads"] == 4
     assert resolved["reliability_metrics"] == ["support", "progress"]
     assert resolved["objective"] == {"relation": relation, "relation_weight": 1.0}
     assert resolved["selection"]["max_refreshes"] == 100
@@ -143,6 +144,31 @@ def test_config_rejects_unknown_prototype_controls() -> None:
                     "method": "motion_primitives",
                     "unsupported_field": 3,
                 },
+            }
+        )
+
+
+@pytest.mark.parametrize("num_threads", [1, 4, 8])
+def test_config_accepts_positive_prototype_thread_counts(num_threads: int) -> None:
+    resolved = resolve_config(
+        {
+            **_objective(),
+            "prototypes": {"num_threads": num_threads},
+        }
+    )
+
+    assert resolved["prototypes"]["num_threads"] == num_threads
+
+
+@pytest.mark.parametrize("num_threads", [0, -1, 1.5, True, "4"])
+def test_config_rejects_non_positive_or_non_integer_prototype_thread_counts(
+    num_threads: object,
+) -> None:
+    with pytest.raises(ValueError, match="prototypes.num_threads"):
+        resolve_config(
+            {
+                **_objective(),
+                "prototypes": {"num_threads": num_threads},
             }
         )
 
@@ -265,7 +291,10 @@ def test_shipped_configs_resolve_to_fixed_cocore_contract(path: str) -> None:
         "epsilon": 1.0e-8,
     }
     assert config["prototypes"]["method"] == "motion_primitives"
-    assert set(config["prototypes"]) == {"method", "batch_size", "max_iter"}
+    assert set(config["prototypes"]) == {"method", "batch_size", "max_iter", "num_threads"}
+    assert config["prototypes"]["num_threads"] == (
+        1 if path.endswith("config_debug.yaml") else 4
+    )
     assert config["reliability_metrics"] == ["support", "progress"]
     assert config["objective"] == {
         "relation": "cooccurrence",

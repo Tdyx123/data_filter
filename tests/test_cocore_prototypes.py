@@ -4,6 +4,7 @@ from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import replace
 from pathlib import Path
+import threading
 
 import numpy as np
 import pytest
@@ -711,6 +712,234 @@ def test_full_trajectory_builder_trains_exact_buckets_and_labels_each_half_once(
     assert assigned_actions == {"move forward", "move right"}
 
 
+def test_full_trajectory_builder_materializes_each_episode_visual_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _TrajectoryPrototypeAdapter()
+    cache = tmp_path / "frame_embeddings"
+    _write_frame_caches(cache, adapter)
+    candidate_frames = np.load(cache / "ep000002.npy", allow_pickle=False)
+    candidate_halves = np.stack(
+        [candidate_frames[:8].mean(axis=0), candidate_frames[7:].mean(axis=0)]
+    )
+    candidate_halves /= np.linalg.norm(candidate_halves, axis=1, keepdims=True)
+    calls: Counter[int] = Counter()
+    materialized: dict[int, prototypes._ActionTrainingData] = {}
+    real_episode_window_visuals = prototypes._episode_window_visuals
+    real_materialize = prototypes._materialize_action_training_data
+
+    def counting_episode_window_visuals(
+        cache_root: Path,
+        record: EpisodeRecord,
+        *,
+        pca_components: np.ndarray,
+        visual_dim: int,
+    ) -> np.ndarray:
+        calls[record.episode_id] += 1
+        return real_episode_window_visuals(
+            cache_root,
+            record,
+            pca_components=pca_components,
+            visual_dim=visual_dim,
+        )
+
+    def capture_materialized(*args: object, **kwargs: object):
+        result = real_materialize(*args, **kwargs)
+        materialized.update(result)
+        return result
+
+    monkeypatch.setattr(prototypes, "_episode_window_visuals", counting_episode_window_visuals)
+    monkeypatch.setattr(prototypes, "_materialize_action_training_data", capture_materialized)
+
+    prototypes.build_hierarchical_motion_prototypes(
+        adapter,
+        [_candidate_clip()],
+        candidate_halves[None, :, :],
+        pca_components=_identity_fragment_pca(2),
+        visual_dim=2,
+        frame_cache_dir=cache,
+        batch_size=32,
+        max_iter=100,
+        seed=23,
+        max_episodes=None,
+        num_workers=0,
+    )
+
+    assert calls == Counter({0: 1, 1: 1, 2: 1})
+    assert set(materialized) == {0, 1}
+    for action_id, training_data in materialized.items():
+        assert training_data.action_id == action_id
+        assert training_data.values.shape == (401, 2)
+        assert training_data.values.dtype == np.float32
+        assert training_data.values.flags.c_contiguous
+        assert training_data.episode_ranges == ((0, 400), (400, 401))
+
+
+def test_full_trajectory_builder_runs_action_fit_and_statistics_in_parallel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _TrajectoryPrototypeAdapter()
+    cache = tmp_path / "frame_embeddings"
+    _write_frame_caches(cache, adapter)
+    candidate_frames = np.load(cache / "ep000002.npy", allow_pickle=False)
+    candidate_halves = np.stack(
+        [candidate_frames[:8].mean(axis=0), candidate_frames[7:].mean(axis=0)]
+    )
+    candidate_halves /= np.linalg.norm(candidate_halves, axis=1, keepdims=True)
+    fit_barrier = threading.Barrier(2, timeout=5.0)
+    statistics_barrier = threading.Barrier(2, timeout=5.0)
+    fit_threads: set[int] = set()
+    statistics_threads: set[int] = set()
+    real_fit_action_model = prototypes._fit_action_model
+    real_compute_statistics = prototypes._compute_action_center_statistics
+
+    def synchronized_fit(*args: object, **kwargs: object) -> object:
+        fit_threads.add(threading.get_ident())
+        fit_barrier.wait()
+        return real_fit_action_model(*args, **kwargs)
+
+    def synchronized_statistics(*args: object, **kwargs: object) -> tuple[np.ndarray, np.ndarray]:
+        statistics_threads.add(threading.get_ident())
+        statistics_barrier.wait()
+        return real_compute_statistics(*args, **kwargs)
+
+    monkeypatch.setattr(prototypes, "_fit_action_model", synchronized_fit)
+    monkeypatch.setattr(
+        prototypes,
+        "_compute_action_center_statistics",
+        synchronized_statistics,
+    )
+
+    prototypes.build_hierarchical_motion_prototypes(
+        adapter,
+        [_candidate_clip()],
+        candidate_halves[None, :, :],
+        pca_components=_identity_fragment_pca(2),
+        visual_dim=2,
+        frame_cache_dir=cache,
+        batch_size=32,
+        max_iter=2,
+        seed=23,
+        max_episodes=None,
+        num_workers=0,
+        num_threads=2,
+    )
+
+    assert len(fit_threads) == 2
+    assert len(statistics_threads) == 2
+
+
+def test_full_trajectory_builder_matches_single_and_multi_thread_outputs(
+    tmp_path: Path,
+) -> None:
+    adapter = _TrajectoryPrototypeAdapter()
+    cache = tmp_path / "frame_embeddings"
+    _write_frame_caches(cache, adapter)
+    candidate_frames = np.load(cache / "ep000002.npy", allow_pickle=False)
+    candidate_halves = np.stack(
+        [candidate_frames[:8].mean(axis=0), candidate_frames[7:].mean(axis=0)]
+    )
+    candidate_halves /= np.linalg.norm(candidate_halves, axis=1, keepdims=True)
+
+    results = [
+        prototypes.build_hierarchical_motion_prototypes(
+            adapter,
+            [_candidate_clip()],
+            candidate_halves[None, :, :],
+            pca_components=_identity_fragment_pca(2),
+            visual_dim=2,
+            frame_cache_dir=cache,
+            batch_size=32,
+            max_iter=3,
+            seed=23,
+            max_episodes=None,
+            num_workers=0,
+            num_threads=num_threads,
+        )
+        for num_threads in (1, 4)
+    ]
+
+    assert results[0].catalog.to_dict() == results[1].catalog.to_dict()
+    np.testing.assert_array_equal(
+        results[0].prototypes.centers,
+        results[1].prototypes.centers,
+    )
+    np.testing.assert_array_equal(
+        results[0].prototypes.indices,
+        results[1].prototypes.indices,
+    )
+    np.testing.assert_array_equal(
+        results[0].prototypes.weights,
+        results[1].prototypes.weights,
+    )
+    np.testing.assert_array_equal(results[0].half_action_labels, results[1].half_action_labels)
+
+
+@pytest.mark.parametrize("num_threads", [0, -1, 1.5, True, "4"])
+def test_full_trajectory_builder_rejects_invalid_thread_counts(
+    tmp_path: Path,
+    num_threads: object,
+) -> None:
+    adapter = _TrajectoryPrototypeAdapter()
+    cache = tmp_path / "frame_embeddings"
+    _write_frame_caches(cache, adapter)
+
+    with pytest.raises(ValueError, match="thread count must be a positive integer"):
+        prototypes.build_hierarchical_motion_prototypes(
+            adapter,
+            [_candidate_clip()],
+            np.asarray([[[1.0, 0.0], [1.0, 0.0]]], dtype=np.float32),
+            pca_components=_identity_fragment_pca(2),
+            visual_dim=2,
+            frame_cache_dir=cache,
+            batch_size=32,
+            max_iter=2,
+            seed=23,
+            max_episodes=None,
+            num_workers=0,
+            num_threads=num_threads,  # type: ignore[arg-type]
+        )
+
+
+def test_full_trajectory_builder_propagates_lowest_action_failure_and_closes_threads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _TrajectoryPrototypeAdapter()
+    cache = tmp_path / "frame_embeddings"
+    _write_frame_caches(cache, adapter)
+    barrier = threading.Barrier(2, timeout=5.0)
+
+    def failing_fit(training_data: object, **_: object) -> object:
+        barrier.wait()
+        action_id = int(getattr(training_data, "action_id"))
+        raise RuntimeError(f"fit failed for action {action_id}")
+
+    monkeypatch.setattr(prototypes, "_fit_action_model", failing_fit)
+
+    with pytest.raises(RuntimeError, match="fit failed for action 0"):
+        prototypes.build_hierarchical_motion_prototypes(
+            adapter,
+            [_candidate_clip()],
+            np.asarray([[[1.0, 0.0], [1.0, 0.0]]], dtype=np.float32),
+            pca_components=_identity_fragment_pca(2),
+            visual_dim=2,
+            frame_cache_dir=cache,
+            batch_size=32,
+            max_iter=2,
+            seed=23,
+            max_episodes=None,
+            num_workers=0,
+            num_threads=2,
+        )
+
+    assert not any(
+        thread.name.startswith("cocore-prototypes") for thread in threading.enumerate()
+    )
+
+
 def test_full_trajectory_builder_reports_aggregate_step_timings(tmp_path: Path) -> None:
     adapter = _TrajectoryPrototypeAdapter()
     cache = tmp_path / "frame_embeddings"
@@ -739,6 +968,7 @@ def test_full_trajectory_builder_reports_aggregate_step_timings(tmp_path: Path) 
 
     assert [step for step, _ in events] == [
         "graph.prototypes.action_scan",
+        "graph.prototypes.training_data",
         "graph.prototypes.kmeans",
         "graph.prototypes.center_statistics",
         "graph.prototypes.candidate_assignment",
@@ -908,6 +1138,7 @@ def test_full_trajectory_builder_allows_k_above_batch_size_and_bounds_updates(
     candidate_halves /= np.linalg.norm(candidate_halves, axis=1, keepdims=True)
     fit_rows: list[int] = []
     update_rows: list[int] = []
+    update_rows_by_seed: dict[int, list[int]] = {}
     real_fit = MiniBatchKMeans.fit
     real_partial_fit = MiniBatchKMeans.partial_fit
 
@@ -927,6 +1158,7 @@ def test_full_trajectory_builder_allows_k_above_batch_size_and_bounds_updates(
         sample_weight: np.ndarray | None = None,
     ) -> MiniBatchKMeans:
         update_rows.append(len(features))
+        update_rows_by_seed.setdefault(int(self.random_state), []).append(len(features))
         return real_partial_fit(self, features, labels, sample_weight=sample_weight)
 
     monkeypatch.setattr(MiniBatchKMeans, "fit", recording_fit)
@@ -953,6 +1185,17 @@ def test_full_trajectory_builder_allows_k_above_batch_size_and_bounds_updates(
     assert update_rows
     assert max(update_rows) <= 3
     assert sum(update_rows) == 802 * 3
+    expected_per_action = [
+        3,
+        *([2] * 198),
+        1,
+        1,
+        *([2] * 200),
+        1,
+        *([2] * 200),
+        1,
+    ]
+    assert update_rows_by_seed == {23: expected_per_action, 24: expected_per_action}
 
 
 def test_streaming_kmeans_consumes_every_window_once_per_epoch_without_order_bias(

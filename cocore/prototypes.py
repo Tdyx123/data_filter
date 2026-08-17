@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 import math
 import time
 from dataclasses import asdict, dataclass, replace
 from numbers import Integral, Real
 from pathlib import Path
+from typing import TypeVar
 
 import numpy as np
 
@@ -18,6 +20,9 @@ from relcore.schemas import ClipRecord
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
 
 from cocore.timing import TimingCallback
+
+
+_ActionResult = TypeVar("_ActionResult")
 
 
 MIN_ACTION_COUNT = 400
@@ -134,6 +139,13 @@ class HierarchicalPrototypeResult:
     prototypes: PrototypeData
     catalog: ActionCatalog
     half_action_labels: np.ndarray
+
+
+@dataclass(frozen=True)
+class _ActionTrainingData:
+    action_id: int
+    values: np.ndarray
+    episode_ranges: tuple[tuple[int, int], ...]
 
 
 def _atomic_actions(label: str) -> list[tuple[str, str]]:
@@ -565,6 +577,154 @@ def _episode_exact_memberships(
     return {action_id: np.asarray(rows, dtype=np.int64) for action_id, rows in local_rows.items()}
 
 
+def _materialize_action_training_data(
+    adapter: DatasetAdapter,
+    expected: Mapping[int, EpisodeRecord],
+    categories_by_label: Mapping[str, ActionCategory],
+    categories_by_id: Mapping[int, ActionCategory],
+    primitive_config: object,
+    *,
+    cache_root: Path,
+    pca_components: np.ndarray,
+    visual_dim: int,
+    max_episodes: int | None,
+    num_workers: int,
+) -> dict[int, _ActionTrainingData]:
+    values = {
+        action_id: np.empty((category.training_count, int(visual_dim)), dtype=np.float32)
+        for action_id, category in categories_by_id.items()
+        if category.training_count > 0
+    }
+    cursors = {action_id: 0 for action_id in values}
+    episode_ranges: dict[int, list[tuple[int, int]]] = {
+        action_id: [] for action_id in values
+    }
+    seen: set[int] = set()
+    for episode in adapter.iter_episodes(
+        num_workers=num_workers,
+        max_episodes=max_episodes,
+        load_images=False,
+    ):
+        states = _validated_states(episode, expected, seen, pass_name="training data")
+        record = expected[episode.episode_id]
+        window_visuals = _episode_window_visuals(
+            cache_root,
+            record,
+            pca_components=pca_components,
+            visual_dim=visual_dim,
+        )
+        if len(window_visuals) != len(trajectory_window_starts(len(states))):
+            raise ValueError(f"episode {episode.episode_id}: state/cache length mismatch")
+        memberships = _episode_exact_memberships(
+            states,
+            categories_by_label,
+            primitive_config,
+        )
+        for action_id in sorted(memberships):
+            rows = memberships[action_id]
+            start = cursors[action_id]
+            end = start + len(rows)
+            if end > len(values[action_id]):
+                raise ValueError("exact action membership counts do not match the catalog")
+            values[action_id][start:end] = window_visuals[rows]
+            episode_ranges[action_id].append((start, end))
+            cursors[action_id] = end
+    if seen != set(expected):
+        raise ValueError("training data pass did not yield every indexed episode exactly once")
+    if any(cursors[action_id] != len(action_values) for action_id, action_values in values.items()):
+        raise ValueError("exact action membership counts do not match the catalog")
+    return {
+        action_id: _ActionTrainingData(
+            action_id=action_id,
+            values=action_values,
+            episode_ranges=tuple(episode_ranges[action_id]),
+        )
+        for action_id, action_values in values.items()
+    }
+
+
+def _fit_action_model(
+    training_data: _ActionTrainingData,
+    *,
+    clusters: int,
+    batch_size: int,
+    max_iter: int,
+    seed: int,
+):
+    capacity = min(
+        len(training_data.values),
+        max(int(batch_size), int(clusters)),
+    )
+    initial_values = np.empty(
+        (capacity, training_data.values.shape[1]),
+        dtype=np.float32,
+    )
+    initial_count = 0
+    model = None
+
+    for _ in range(int(max_iter)):
+        for start, end in training_data.episode_ranges:
+            member_values = training_data.values[start:end]
+            cursor = 0
+            if model is None:
+                take = min(capacity - initial_count, len(member_values))
+                if take:
+                    initial_values[initial_count : initial_count + take] = member_values[:take]
+                    initial_count += take
+                    cursor += take
+                if initial_count == capacity:
+                    model = _initialize_action_cluster_model(
+                        initial_values,
+                        clusters=int(clusters),
+                        batch_size=int(batch_size),
+                        seed=int(seed) + training_data.action_id,
+                    )
+            if model is not None:
+                while cursor < len(member_values):
+                    batch_end = min(cursor + int(batch_size), len(member_values))
+                    model.partial_fit(member_values[cursor:batch_end])
+                    cursor = batch_end
+    if model is None:
+        raise ValueError("invalid KMeans inputs")
+    return model
+
+
+def _compute_action_center_statistics(
+    training_data: _ActionTrainingData,
+    centers: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    assigned_masses = np.zeros(len(centers), dtype=np.int64)
+    nearest_distances = np.empty(len(training_data.values), dtype=np.float32)
+    for start, end in training_data.episode_ranges:
+        distances = _euclidean_distances(training_data.values[start:end], centers)
+        assigned = np.argmin(distances, axis=1)
+        assigned_masses += np.bincount(assigned, minlength=len(centers))
+        nearest_distances[start:end] = distances[np.arange(end - start), assigned]
+    return assigned_masses, nearest_distances
+
+
+def _run_action_tasks(
+    executor: ThreadPoolExecutor | None,
+    action_ids: Sequence[int],
+    operation: Callable[[int], _ActionResult],
+) -> dict[int, _ActionResult]:
+    if executor is None:
+        return {action_id: operation(action_id) for action_id in action_ids}
+    futures = {
+        action_id: executor.submit(operation, action_id)
+        for action_id in action_ids
+    }
+    try:
+        return {
+            action_id: futures[action_id].result()
+            for action_id in action_ids
+        }
+    except BaseException:
+        for future in futures.values():
+            future.cancel()
+        raise
+
+
 def build_hierarchical_motion_prototypes(
     adapter: DatasetAdapter,
     clips: Sequence[ClipRecord],
@@ -578,6 +738,7 @@ def build_hierarchical_motion_prototypes(
     seed: int,
     max_episodes: int | None,
     num_workers: int,
+    num_threads: int = 4,
     timing_callback: TimingCallback | None = None,
 ) -> HierarchicalPrototypeResult:
     """Learn exact action buckets and assign one nearest visual leaf per clip half."""
@@ -608,6 +769,12 @@ def build_hierarchical_motion_prototypes(
     ):
         raise ValueError("projected visual half embeddings must have finite positive norms")
     candidate_values = (candidate_values / np.maximum(projected_norms, 1.0e-8)).astype(np.float32)
+    if (
+        isinstance(num_threads, bool)
+        or not isinstance(num_threads, Integral)
+        or int(num_threads) <= 0
+    ):
+        raise ValueError("hierarchical prototype thread count must be a positive integer")
     if (
         isinstance(batch_size, bool)
         or not isinstance(batch_size, Integral)
@@ -690,9 +857,6 @@ def build_hierarchical_motion_prototypes(
     if sorted(categories_by_id) != list(range(len(categories_by_id))):
         raise ValueError("action ids must be contiguous")
     requested_centers: dict[int, int] = {}
-    models: dict[int, object] = {}
-    initial_values: dict[int, np.ndarray] = {}
-    initial_counts: dict[int, int] = {}
     updated_categories: dict[int, ActionCategory] = {}
     for action_id in sorted(categories_by_id):
         category = categories_by_id[action_id]
@@ -707,10 +871,6 @@ def build_hierarchical_motion_prototypes(
         if clusters <= 0 or clusters > capacity:
             raise ValueError("invalid KMeans inputs")
         requested_centers[action_id] = clusters
-        initial_values[action_id] = np.empty(
-            (capacity, candidate_values.shape[2]), dtype=np.float32
-        )
-        initial_counts[action_id] = 0
 
     if timing_callback is not None:
         timing_callback(
@@ -718,127 +878,78 @@ def build_hierarchical_motion_prototypes(
             time.perf_counter() - action_scan_started,
         )
 
-    def update_action_model(
-        action_id: int,
-        member_values: np.ndarray,
-    ) -> None:
-        cursor = 0
-        if action_id not in models:
-            filled = initial_counts[action_id]
-            capacity = len(initial_values[action_id])
-            take = min(capacity - filled, len(member_values))
-            if take:
-                initial_values[action_id][filled : filled + take] = member_values[:take]
-                filled += take
-                cursor += take
-                initial_counts[action_id] = filled
-            if filled == capacity:
-                models[action_id] = _initialize_action_cluster_model(
-                    initial_values[action_id],
-                    clusters=requested_centers[action_id],
-                    batch_size=int(batch_size),
-                    seed=int(seed) + action_id,
-                )
-        if action_id in models:
-            model = models[action_id]
-            while cursor < len(member_values):
-                end = min(cursor + int(batch_size), len(member_values))
-                model.partial_fit(member_values[cursor:end])
-                cursor = end
-
-    kmeans_started = time.perf_counter()
+    training_data_started = time.perf_counter()
     cache_root = Path(frame_cache_dir)
-    for epoch in range(int(max_iter)):
-        cache_seen: set[int] = set()
-        for episode in adapter.iter_episodes(
-            num_workers=num_workers,
-            max_episodes=max_episodes,
-            load_images=False,
-        ):
-            states = _validated_states(
-                episode,
-                expected,
-                cache_seen,
-                pass_name=f"cache epoch {epoch + 1}",
-            )
-            record = expected[episode.episode_id]
-            window_visuals = _episode_window_visuals(
-                cache_root,
-                record,
-                pca_components=pca_components,
-                visual_dim=visual_dim,
-            )
-            if len(window_visuals) != len(trajectory_window_starts(len(states))):
-                raise ValueError(f"episode {episode.episode_id}: state/cache length mismatch")
-            memberships = _episode_exact_memberships(
-                states,
-                categories_by_label,
-                primitive_config,
-            )
-            for action_id in sorted(memberships):
-                rows = memberships[action_id]
-                update_action_model(action_id, window_visuals[rows])
-        if cache_seen != set(expected):
-            raise ValueError("cache pass did not yield every indexed episode exactly once")
-        if set(models) != set(requested_centers):
-            raise ValueError("invalid KMeans inputs")
-
+    training_data = _materialize_action_training_data(
+        adapter,
+        expected,
+        categories_by_label,
+        categories_by_id,
+        primitive_config,
+        cache_root=cache_root,
+        pca_components=pca_components,
+        visual_dim=visual_dim,
+        max_episodes=max_episodes,
+        num_workers=num_workers,
+    )
     if timing_callback is not None:
-        timing_callback("graph.prototypes.kmeans", time.perf_counter() - kmeans_started)
+        timing_callback(
+            "graph.prototypes.training_data",
+            time.perf_counter() - training_data_started,
+        )
 
-    center_statistics_started = time.perf_counter()
+    action_ids = sorted(requested_centers)
+    effective_threads = min(int(num_threads), len(action_ids))
+    executor = (
+        ThreadPoolExecutor(
+            max_workers=effective_threads,
+            thread_name_prefix="cocore-prototypes",
+        )
+        if effective_threads > 1
+        else None
+    )
+    try:
+        def fit_action(action_id: int):
+            return _fit_action_model(
+                training_data[action_id],
+                clusters=requested_centers[action_id],
+                batch_size=int(batch_size),
+                max_iter=int(max_iter),
+                seed=int(seed),
+            )
+
+        kmeans_started = time.perf_counter()
+        models = _run_action_tasks(executor, action_ids, fit_action)
+
+        if timing_callback is not None:
+            timing_callback("graph.prototypes.kmeans", time.perf_counter() - kmeans_started)
+
+        center_statistics_started = time.perf_counter()
+
+        def compute_statistics(action_id: int) -> tuple[np.ndarray, np.ndarray]:
+            return _compute_action_center_statistics(
+                training_data[action_id],
+                np.asarray(models[action_id].cluster_centers_, dtype=np.float32),
+            )
+
+        statistics = _run_action_tasks(executor, action_ids, compute_statistics)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    training_data.clear()
+    if timing_callback is not None:
+        timing_callback(
+            "graph.prototypes.center_statistics",
+            time.perf_counter() - center_statistics_started,
+        )
+
     centers: list[np.ndarray] = []
     leaves: list[LeafPrototype] = []
     leaf_ids_by_action: dict[int, np.ndarray] = {}
     centers_by_action: dict[int, np.ndarray] = {}
-    assigned_masses = {
-        action_id: np.zeros(requested_centers[action_id], dtype=np.int64)
-        for action_id in requested_centers
-    }
-    nearest_distances = {
-        action_id: np.empty(categories_by_id[action_id].training_count, dtype=np.float32)
-        for action_id in requested_centers
-    }
-    distance_cursors = {action_id: 0 for action_id in requested_centers}
-    ordering_seen: set[int] = set()
-    for episode in adapter.iter_episodes(
-        num_workers=num_workers,
-        max_episodes=max_episodes,
-        load_images=False,
-    ):
-        states = _validated_states(episode, expected, ordering_seen, pass_name="ordering")
-        record = expected[episode.episode_id]
-        window_visuals = _episode_window_visuals(
-            cache_root,
-            record,
-            pca_components=pca_components,
-            visual_dim=visual_dim,
-        )
-        memberships = _episode_exact_memberships(
-            states,
-            categories_by_label,
-            primitive_config,
-        )
-        for action_id, rows in memberships.items():
-            action_centers = np.asarray(models[action_id].cluster_centers_, dtype=np.float32)
-            distances = _euclidean_distances(window_visuals[rows], action_centers)
-            assigned = np.argmin(distances, axis=1)
-            assigned_masses[action_id] += np.bincount(
-                assigned,
-                minlength=requested_centers[action_id],
-            )
-            closest = distances[np.arange(len(rows)), assigned]
-            start = distance_cursors[action_id]
-            end = start + len(closest)
-            nearest_distances[action_id][start:end] = closest
-            distance_cursors[action_id] = end
-    if ordering_seen != set(expected):
-        raise ValueError("ordering pass did not yield every indexed episode exactly once")
-    if any(
-        distance_cursors[action_id] != len(nearest_distances[action_id])
-        for action_id in nearest_distances
-    ):
-        raise ValueError("exact action membership counts do not match the catalog")
+    assigned_masses = {action_id: value[0] for action_id, value in statistics.items()}
+    nearest_distances = {action_id: value[1] for action_id, value in statistics.items()}
 
     for action_id in sorted(categories_by_id):
         category = categories_by_id[action_id]
@@ -888,11 +999,9 @@ def build_hierarchical_motion_prototypes(
         ),
         leaf_prototypes=tuple(leaves),
     )
-    if timing_callback is not None:
-        timing_callback(
-            "graph.prototypes.center_statistics",
-            time.perf_counter() - center_statistics_started,
-        )
+    statistics.clear()
+    assigned_masses.clear()
+    nearest_distances.clear()
 
     candidate_assignment_started = time.perf_counter()
     retained_counts = {

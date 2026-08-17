@@ -44,6 +44,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "output": {"directory": "outputs/cocore/libero90"},
 }
 DEFAULT_CONFIG["prototypes"]["method"] = "motion_primitives"
+DEFAULT_CONFIG["prototypes"]["num_threads"] = 4
 for _obsolete_prototype_field in ("count", "top_r", "temperature"):
     DEFAULT_CONFIG["prototypes"].pop(_obsolete_prototype_field, None)
 
@@ -104,7 +105,12 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 f"cocore prototypes {names} were removed; action retention, visual K, "
                 "and temperature are fixed by the schema-5 algorithm"
             )
-        unsupported = configured_prototypes.keys() - {"method", "batch_size", "max_iter"}
+        unsupported = configured_prototypes.keys() - {
+            "method",
+            "batch_size",
+            "max_iter",
+            "num_threads",
+        }
         if unsupported:
             names = ", ".join(sorted(unsupported))
             raise ValueError(f"cocore prototypes contains unsupported fields: {names}")
@@ -115,6 +121,14 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("cocore reliability_metrics are fixed to support,progress")
     resolved = _merge(DEFAULT_CONFIG, config)
     resolved["prototypes"]["method"] = "motion_primitives"
+    num_threads = resolved["prototypes"].get("num_threads")
+    if (
+        isinstance(num_threads, bool)
+        or not isinstance(num_threads, Integral)
+        or num_threads <= 0
+    ):
+        raise ValueError("cocore prototypes.num_threads must be a positive integer")
+    resolved["prototypes"]["num_threads"] = int(num_threads)
     resolved["reliability_metrics"] = ["support", "progress"]
     relation = str(resolved["objective"]["relation"])
     if relation not in {"sequence", "cooccurrence"}:
@@ -181,7 +195,13 @@ def to_relcore_config(resolved: Mapping[str, Any]) -> dict[str, Any]:
     translated["seed"] = int(resolved.get("seed", 42))
     for section in _SHARED_SECTIONS:
         if section == "prototypes":
-            translated[section].update(copy.deepcopy(resolved[section]))
+            translated[section].update(
+                {
+                    key: copy.deepcopy(value)
+                    for key, value in resolved[section].items()
+                    if key != "num_threads"
+                }
+            )
         else:
             translated[section] = copy.deepcopy(resolved[section])
     translated["clip"] = {"length": 15, "stride": 15}

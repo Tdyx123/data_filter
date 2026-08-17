@@ -21,6 +21,7 @@ encoding:
 
 prototypes:
   method: motion_primitives
+  num_threads: 1
 
 objective:
   relation: cooccurrence

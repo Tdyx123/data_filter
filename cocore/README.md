@@ -122,6 +122,7 @@ prototypes:
   method: motion_primitives
   batch_size: 4096
   max_iter: 100
+  num_threads: 4
 ```
 
 片段长度固定为 15，候选数量、首尾锚定与近似均匀间隔是 Cocore 固定算法的一部分；
@@ -129,8 +130,15 @@ prototypes:
 Quality 风格编码取代了旧关系编码，因此不再接受顶层 `relation` 或 `normalization`；
 `encoding.visual_dim` 固定为 128，`pca_fit_max_samples` 可限制 PCA 拟合样本数。
 动作门槛、中心数公式、16 个中心上限、距离分位和权重公式都是 Cocore 固定算法，
-不可配置；`prototypes` 只接受 `method`、`batch_size` 和 `max_iter`，并明确拒绝旧
-`count`、`top_r` 或 `temperature`。
+不可配置；`prototypes` 只接受 `method`、`batch_size`、`max_iter` 和正整数
+`num_threads`，并明确拒绝旧 `count`、`top_r` 或 `temperature`。`num_threads`
+默认为 4，只并行不同的活跃动作桶；debug 配置固定为 1。它与
+`runtime.num_workers` 相互独立，后者仍只控制 episode 读取进程。
+
+视觉中心训练会一次物化所有保留窗口的 128 维 `float32` 投影，再按动作桶并行重放
+原有 MiniBatchKMeans 批次。额外内存约为“保留窗口数 × 128 × 4 字节”：LIBERO90
+约 106 MiB，Bridge V2 约 273 MiB。改变 `num_threads` 不改变 graph 指纹或产物，
+因此可复用同一 graph 缓存。
 
 可在运行时覆盖选择比例、关系类型与关系权重：
 

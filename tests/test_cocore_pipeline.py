@@ -134,7 +134,12 @@ def _config(tmp_path: Path, relation: str = "cooccurrence") -> dict[str, object]
             "epsilon": 1.0e-8,
         },
         "quality": {"knn": 2},
-        "prototypes": {"method": "motion_primitives", "batch_size": 64, "max_iter": 2},
+        "prototypes": {
+            "method": "motion_primitives",
+            "batch_size": 64,
+            "max_iter": 2,
+            "num_threads": 4,
+        },
         "graph": {"knn": 2, "similarity_threshold": 0.8, "cooccurrence_max_gap": 4},
         "objective": {"relation": relation, "relation_weight": 1.0},
         "selection": {
@@ -548,6 +553,7 @@ def test_run_pipeline_reports_all_completed_timings_and_cached_run_is_silent(
         "encode",
         "graph.reliability",
         "graph.prototypes.action_scan",
+        "graph.prototypes.training_data",
         "graph.prototypes.kmeans",
         "graph.prototypes.center_statistics",
         "graph.prototypes.candidate_assignment",
@@ -794,9 +800,10 @@ def test_graph_stage_reports_aggregate_and_prototype_step_timings(
         for line in capsys.readouterr().err.splitlines()
         if line.startswith("cocore_timing")
     ]
-    assert steps[-8:] == [
+    assert steps[-9:] == [
         "graph.reliability",
         "graph.prototypes.action_scan",
+        "graph.prototypes.training_data",
         "graph.prototypes.kmeans",
         "graph.prototypes.center_statistics",
         "graph.prototypes.candidate_assignment",
@@ -804,6 +811,48 @@ def test_graph_stage_reports_aggregate_and_prototype_step_timings(
         "graph.sparse_graph",
         "graph",
     ]
+
+
+def test_graph_and_validation_honor_single_prototype_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["prototypes"]["num_threads"] = 1  # type: ignore[index]
+    thread_counts: list[int] = []
+    real_builder = cocore_pipeline.build_hierarchical_motion_prototypes
+
+    def recording_builder(*args: object, **kwargs: object):
+        thread_counts.append(int(kwargs["num_threads"]))
+        return real_builder(*args, **kwargs)
+
+    monkeypatch.setattr(
+        cocore_pipeline,
+        "build_hierarchical_motion_prototypes",
+        recording_builder,
+    )
+
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+
+    assert thread_counts == [1]
+    thread_counts.clear()
+
+    assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 6}
+    assert thread_counts == [1]
+
+
+def test_graph_fingerprint_ignores_prototype_thread_count(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["prototypes"]["num_threads"] = 1  # type: ignore[index]
+
+    first = graph_stage(config, visual_encoder=CocoreVisualEncoder())
+    config["prototypes"]["num_threads"] = 4  # type: ignore[index]
+    second = graph_stage(config, visual_encoder=FailingCocoreVisualEncoder())
+
+    assert first[0] == second[0]
+    assert first[4] == second[4]
 
 
 def test_validate_rejects_tampered_visual_prototype_center(tmp_path: Path) -> None:

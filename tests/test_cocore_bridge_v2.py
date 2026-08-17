@@ -255,13 +255,15 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
         "epsilon": 1.0e-8,
     }
     assert config["prototypes"]["method"] == "motion_primitives"
-    assert set(config["prototypes"]) == {"method", "batch_size", "max_iter"}
+    assert set(config["prototypes"]) == {"method", "batch_size", "max_iter", "num_threads"}
+    assert config["prototypes"]["num_threads"] == 4
     assert config["objective"] == {"relation": "sequence", "relation_weight": 1.5}
     assert config["selection"]["ratio"] == 0.2
     assert config["selection"]["budget"] is None
     assert config["runtime"]["max_episodes"] == 100
     assert config["output"]["directory"] == ("outputs/cocore_bridge_v2/bridge_orig_1.0.0")
     translated = to_relcore_config(config)
+    assert "num_threads" not in translated["prototypes"]
     assert translated["selection"]["quota_mode"] == "none"
     assert translated["selection"]["minimum_per_task"] == 0
 

@@ -579,6 +579,10 @@ def graph_stage(
     )
     visual_dim = int(resolved["encoding"]["visual_dim"])
     pca_components = _load_visual_pca_components(root / "encode", visual_dim=visual_dim)
+    prototype_config = resolved["prototypes"]
+    prototype_fingerprint_config = {
+        key: prototype_config[key] for key in ("method", "batch_size", "max_iter")
+    }
     fingerprint = stable_hash(
         {
             "producer": "cocore",
@@ -587,7 +591,7 @@ def graph_stage(
             "adapter": adapter.fingerprint(),
             "upstream": encoded.fingerprint,
             "quality": resolved["quality"],
-            "prototypes": resolved["prototypes"],
+            "prototypes": prototype_fingerprint_config,
             "graph": resolved["graph"],
             "seed": resolved["seed"],
             "max_episodes": resolved["runtime"].get("max_episodes"),
@@ -616,7 +620,6 @@ def graph_stage(
                 min_reliability=float(quality_config["min_reliability"]),
                 reliability_metrics=RELIABILITY_METRICS,
             )
-        prototype_config = resolved["prototypes"]
         with timed_step("graph.prototypes", emit_completed_timing):
             hierarchy = build_hierarchical_motion_prototypes(
                 adapter,
@@ -630,6 +633,7 @@ def graph_stage(
                 seed=int(resolved["seed"]),
                 max_episodes=resolved["runtime"].get("max_episodes"),
                 num_workers=int(resolved["runtime"].get("num_workers", 0)),
+                num_threads=int(prototype_config["num_threads"]),
                 timing_callback=emit_completed_timing,
             )
         graph_config = resolved["graph"]
@@ -1093,6 +1097,7 @@ def _validate_hierarchical_graph_artifacts(
         seed=int(resolved["seed"]),
         max_episodes=resolved["runtime"].get("max_episodes"),
         num_workers=int(resolved["runtime"].get("num_workers", 0)),
+        num_threads=int(prototype_config["num_threads"]),
     )
     replay_centers = replay.prototypes.centers
     if replay_centers is None:
