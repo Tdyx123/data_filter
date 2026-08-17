@@ -1002,6 +1002,44 @@ def test_preflight_reset_failure_is_infrastructure_error(tmp_path):
         )
 
 
+def test_preflight_environment_creation_error_is_infrastructure_error(tmp_path):
+    evaluation = _evaluation()
+    factory_tasks = []
+
+    def environment_factory(task):
+        factory_tasks.append(task.key)
+        raise RuntimeError("renderer unavailable")
+
+    settings = evaluation.SimplerEvaluationSettings(
+        checkpoint=tmp_path / "step-00020000",
+        output_dir=tmp_path / "preflight",
+        tasks=(evaluation.SIMPLER_TASKS[0], evaluation.SIMPLER_TASKS[1]),
+        policy_seeds=(0,),
+        object_episode_ids=(0,),
+    )
+
+    with pytest.raises(
+        evaluation.SimplerInfrastructureError,
+        match="Could not create SimplerEnv task spoon",
+    ) as caught:
+        evaluation.run_simpler_preflight(
+            settings,
+            checkpoint=SimpleNamespace(
+                config={"data": {"train_crop_size": 4, "output_image_size": 4}},
+                as_dict=lambda: {},
+            ),
+            policy=_EvaluationPolicy(),
+            environment_factory=environment_factory,
+            source_versions={},
+            package_versions={},
+        )
+
+    assert factory_tasks == ["spoon"]
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert str(caught.value.__cause__) == "renderer unavailable"
+    assert not (settings.output_dir / "preflight.json").exists()
+
+
 def test_preflight_close_failure_is_infrastructure_error(tmp_path):
     evaluation = _evaluation()
     environment = _CloseFailingEnvironment(success_step=1)

@@ -312,6 +312,22 @@ def _step_environment(
     return observation, bool(terminated), bool(truncated), dict(info)
 
 
+def _create_task_environment(
+    environment_factory: Callable[[SimplerTaskSpec], Any],
+    *,
+    task: SimplerTaskSpec,
+) -> Any:
+    try:
+        return environment_factory(task)
+    except (SimplerEvaluationError, SimplerInfrastructureError):
+        raise
+    except Exception as error:
+        raise SimplerInfrastructureError(
+            f"Could not create SimplerEnv task {task.key}: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+
+
 def _close_simpler_environment(
     environment: Any,
     *,
@@ -622,15 +638,10 @@ def evaluate_simpler_policy(
     try:
         for task in settings.tasks:
             task_failed = False
-            try:
-                environment = environment_factory(task)
-            except (SimplerEvaluationError, SimplerInfrastructureError):
-                raise
-            except Exception as error:
-                raise SimplerInfrastructureError(
-                    f"Could not create SimplerEnv task {task.key}: "
-                    f"{type(error).__name__}: {error}"
-                ) from error
+            environment = _create_task_environment(
+                environment_factory,
+                task=task,
+            )
             primary_error: BaseException | None = None
             try:
                 for policy_seed in settings.policy_seeds:
@@ -879,7 +890,10 @@ def run_simpler_preflight(
     inference: dict[str, Any] | None = None
     generator = policy.make_generator(0)
     for task in settings.tasks:
-        environment = environment_factory(task)
+        environment = _create_task_environment(
+            environment_factory,
+            task=task,
+        )
         primary_error: BaseException | None = None
         try:
             try:
