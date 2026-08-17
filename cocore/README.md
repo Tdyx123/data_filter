@@ -14,13 +14,16 @@ Cocore 从 LeRobot v2 LIBERO episode 中选择固定预算的 15 帧片段。它
 episode 只执行一次视觉模型前向；候选片段的视觉特征
 `[sum(v0..v14), v14-v0]` 直接用于拟合 128 维 PCA，再与 state/action 的
 `mean/std/max` 及 `start/episode_length` 拼接并做行 L2 归一化。该 embedding 用于
-可靠性 support 和相似图。原型分配另将候选拆成共享第 7 帧的 `[0..7]`、`[7..14]`
-两个半段，分别计算 8 帧 CLIP 均值并 L2 归一化。
+可靠性 support 和相似图。Encode 还保留原始逐帧 CLIP 缓存，并将候选拆成共享第 7 帧的
+`[0..7]`、`[7..14]` 两个半段，分别缓存原始 CLIP 空间中的 8 帧归一化均值。
 
 动作—视觉原型保留两级解耦：一级表达动作桶，二级表达桶内视觉中心。学习原型时，
 对每条完整轨迹生成所有 stride=1 的 8 帧窗口 `[t,t+7]`，用
-`state[t]→state[t+7]` 分类动作，并用窗口内 8 个逐帧 CLIP embedding 的归一化均值
-学习视觉中心。设全部窗口数为 `W`，动作保留条件为：
+`state[t]→state[t+7]` 分类动作。设原始逐帧 CLIP 维度为 `D`；聚类复用上述
+`visual_pca.npz`，裁剪 `components` 的前 `D` 列，对每帧执行纯矩阵乘法
+`v @ components[:, :D].T`，不应用 PCA 的 `mean` 或 `scale`，分量不足时右补零到
+128 维。窗口在投影后取 8 帧均值并 L2 归一化，再学习视觉中心；候选两个半段也投影到
+同一空间后分配最近中心。设全部窗口数为 `W`，动作保留条件为：
 
 ```text
 count >= max(400, ceil(0.005 * W))
@@ -143,19 +146,21 @@ RelCore 的 `--reliability-metrics`、`--prototype-method` 或
 python -m cocore run --config cocore/config_debug.yaml --force
 ```
 
-Cocore 0.10.0 使用 prototype schema 5、近似均匀候选和顺序相邻 sequence 图，并按
-episode 持久化完整逐帧 CLIP 特征。0.9.0 及更早版本的 scan、encode、graph 和
-selection 缓存不迁移；升级后必须通过 `--force` 重建全部阶段，或使用新的输出目录。
+Cocore 0.11.0 使用 prototype schema 6、裁剪 PCA 的 128 维聚类空间、近似均匀候选
+和顺序相邻 sequence 图，并按 episode 持久化完整原始逐帧 CLIP 特征。0.10.0 及更早
+版本的 scan、encode、graph 和 selection 缓存不迁移；升级后必须通过 `--force`
+重建全部阶段，或使用新的输出目录。
 
 ## 输出与校验
 
-输出根目录包含 `scan/`、`encode/`、`graph-14-motion-hard-nearest/` 和一个或多个
+输出根目录包含 `scan/`、`encode/`、`graph-15-motion-hard-nearest-pca/` 和一个或多个
 `select-<关系>-w<权重>-top<比例>pct/`。选择目录包含：
 
 - scan 目录中的 `episodes.parquet` 与 `clips.parquet`：episode 元数据和可重放的
   近似均匀候选；Cocore scan 不再生成未被后续阶段消费的 `normalization.npz`；
 - graph 目录中的 `prototype_catalog.json` 与 `prototype_centers.npy`：动作类别、
-  原始计数、训练计数、视觉中心数量、距离 q10/q90、固定常量以及按叶 ID 对齐的中心；
+  原始计数、训练计数、视觉中心数量、距离 q10/q90、投影契约以及按叶 ID 对齐的
+  128 维中心；
 - encode 目录中的 `embeddings.npy`、`visual_pca.npz` 和
   `numeric_normalizers.npz`：Quality 融合 embedding 及其可重放参数；
 - encode 目录中的 `frame_embeddings/ep<episode_id>.npy`：每个已索引 episode（包括
@@ -178,9 +183,10 @@ python -m cocore validate \
   --config cocore/config_libero90.yaml
 ```
 
-校验还会从 episode 元数据重放近似均匀候选，逐字段核对 `clips.parquet`，并逐个检查
-帧缓存文件集合、shape、dtype、有限值和 SHA-256。编码中断时临时缓存会被清理，
-下次从头执行；只有完整发布的 encode 阶段才会被复用。
+校验还会从 episode 元数据重放近似均匀候选，逐字段核对 `clips.parquet`，逐个检查
+帧缓存文件集合、shape、dtype、有限值和 SHA-256，并使用同一 PCA components 重算
+投影窗口、中心、距离分位和候选分配。编码中断时临时缓存会被清理，下次从头执行；
+只有完整发布的 encode 阶段才会被复用。
 
 当前版本只支持本仓库约定的 8 维 LIBERO `observation.state`。selection 的
 parquet/JSONL 导出最终 `prototype_indices`、`prototype_weights`、叶标签、动作标签与

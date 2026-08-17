@@ -215,7 +215,7 @@ def test_package_exposes_only_version() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["0.2.0", "['__version__']"]
+    assert result.stdout.splitlines() == ["0.3.0", "['__version__']"]
 
 
 def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None:
@@ -519,7 +519,7 @@ def test_scan_cli_preflights_and_delegates_resolved_bridge_config(
             "build-graph",
             "graph_stage",
             lambda root: (root, None, None, SimpleNamespace(sample_ids=(1, 2)), "fingerprint"),
-            "cocore_output={root}/graph-14-motion-hard-nearest nodes=2",
+            "cocore_output={root}/graph-15-motion-hard-nearest-pca nodes=2",
         ),
         (
             "select",
@@ -690,10 +690,10 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     select_manifest = json.loads((result / "manifest.json").read_text())
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert select_manifest["producer"] == "cocore"
-    assert select_manifest["cocore_version"] == "0.10.0"
+    assert select_manifest["cocore_version"] == "0.11.0"
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.10.0"
-    assert run_manifest["stage_directories"]["graph"] == "graph-14-motion-hard-nearest"
+    assert run_manifest["cocore_version"] == "0.11.0"
+    assert run_manifest["stage_directories"]["graph"] == "graph-15-motion-hard-nearest-pca"
     assert validate_output(result, config=config) == {
         "status": "valid",
         "selected_clips": 6,

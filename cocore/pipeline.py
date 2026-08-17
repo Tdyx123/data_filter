@@ -63,10 +63,12 @@ from cocore.selection import (
 from cocore.timing import emit_completed_timing, timed_step
 
 
-GRAPH_DIRECTORY = "graph-14-motion-hard-nearest"
+GRAPH_DIRECTORY = "graph-15-motion-hard-nearest-pca"
 RELIABILITY_METRICS = ("support", "progress")
-PROTOTYPE_SCHEMA_VERSION = 5
-PROTOTYPE_STRATEGY = "trajectory_retained_action_then_half_visual_nearest"
+PROTOTYPE_SCHEMA_VERSION = 6
+PROTOTYPE_STRATEGY = "trajectory_retained_action_then_cropped_pca_half_visual_nearest"
+PROTOTYPE_VISUAL_PROJECTION = "frame @ visual_pca.components[:, :frame_embedding_dim].T"
+PROTOTYPE_VISUAL_NORMALIZATION = "l2_normalized_eight_frame_mean_after_projection"
 
 
 def _number_tag(value: float) -> str:
@@ -188,6 +190,26 @@ def _save_cocore_encoded(
             "runtime_seconds": runtime_seconds,
         },
     )
+
+
+def _load_visual_pca_components(encode_root: Path, *, visual_dim: int) -> np.ndarray:
+    path = encode_root / "visual_pca.npz"
+    try:
+        with np.load(path, allow_pickle=False) as payload:
+            if "components" not in payload.files:
+                raise ValueError("cocore visual PCA components are missing")
+            components = np.asarray(payload["components"], dtype=np.float32)
+    except (OSError, TypeError, ValueError) as error:
+        raise ValueError("cocore visual PCA components are missing or invalid") from error
+    if (
+        components.ndim != 2
+        or components.shape[0] == 0
+        or components.shape[1] == 0
+        or components.shape[0] > int(visual_dim)
+        or not np.all(np.isfinite(components))
+    ):
+        raise ValueError("cocore visual PCA components are missing or invalid")
+    return components
 
 
 def _expected_frame_episodes(
@@ -362,9 +384,7 @@ def scan_stage(
         }
     )
     destination = root / "scan"
-    skipped_short = [
-        record.episode_id for record in episodes if record.length < CLIP_LENGTH
-    ]
+    skipped_short = [record.episode_id for record in episodes if record.length < CLIP_LENGTH]
 
     def build(temporary: Path) -> None:
         started = time.perf_counter()
@@ -552,6 +572,8 @@ def graph_stage(
         force=force,
         visual_encoder=visual_encoder,
     )
+    visual_dim = int(resolved["encoding"]["visual_dim"])
+    pca_components = _load_visual_pca_components(root / "encode", visual_dim=visual_dim)
     fingerprint = stable_hash(
         {
             "producer": "cocore",
@@ -595,6 +617,8 @@ def graph_stage(
                 adapter,
                 encoded.clips,
                 encoded.visual_half_embeddings,
+                pca_components=pca_components,
+                visual_dim=visual_dim,
                 frame_cache_dir=root / "encode" / "frame_embeddings",
                 batch_size=int(prototype_config["batch_size"]),
                 max_iter=int(prototype_config["max_iter"]),
@@ -648,6 +672,9 @@ def graph_stage(
                 "prototype_method": "motion_primitives",
                 "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
                 "prototype_strategy": PROTOTYPE_STRATEGY,
+                "prototype_visual_dim": visual_dim,
+                "prototype_visual_projection": PROTOTYPE_VISUAL_PROJECTION,
+                "prototype_visual_normalization": PROTOTYPE_VISUAL_NORMALIZATION,
                 "sequence_adjacency": SEQUENCE_ADJACENCY,
                 "nodes": len(graph.sample_ids),
                 "sequence_edges": len(graph.sequence_edges.source),
@@ -768,7 +795,7 @@ def _load_graph(root: Path) -> tuple[list[ClipRecord], GraphData, Mapping[str, n
     return clips, graph, nodes
 
 
-def _validate_schema_five_catalog(
+def _validate_schema_six_catalog(
     payload: Mapping[str, Any],
     *,
     expected_total_raw_actions: int,
@@ -779,6 +806,10 @@ def _validate_schema_five_catalog(
         "min_action_frequency": MIN_ACTION_FREQUENCY,
         "max_visual_centers": MAX_VISUAL_CENTERS,
         "visual_half_windows": [[0, 8], [7, 15]],
+        "visual_projection": PROTOTYPE_VISUAL_PROJECTION,
+        "visual_projection_centering": "none",
+        "visual_projection_padding": "right_zero_to_128",
+        "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
         "cluster_count": "min(16, floor(log2(training_count)) - 2)",
         "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
         "distance_quantiles": [0.1, 0.9],
@@ -980,11 +1011,13 @@ def _validate_hierarchical_graph_artifacts(
         raise ValueError("hierarchical prototype node shape or dtype is invalid")
 
     payload = json.loads((graph_root / "prototype_catalog.json").read_text(encoding="utf-8"))
-    leaves = _validate_schema_five_catalog(
+    leaves = _validate_schema_six_catalog(
         payload,
         expected_total_raw_actions=expected_total_raw_actions,
     )
     visual_halves = np.load(root / "encode" / "visual_half_embeddings.npy", allow_pickle=False)
+    visual_dim = int(resolved["encoding"]["visual_dim"])
+    pca_components = _load_visual_pca_components(root / "encode", visual_dim=visual_dim)
     centers = np.load(graph_root / "prototype_centers.npy", allow_pickle=False)
     half_action_labels = np.load(graph_root / "half_action_labels.npy", allow_pickle=False)
     if (
@@ -993,15 +1026,13 @@ def _validate_hierarchical_graph_artifacts(
         or visual_halves.shape[:2] != (len(clips), 2)
         or visual_halves.shape[2] == 0
         or not np.all(np.isfinite(visual_halves))
-        or not np.allclose(
-            np.linalg.norm(visual_halves, axis=2), 1.0, rtol=1.0e-5, atol=1.0e-6
-        )
+        or not np.allclose(np.linalg.norm(visual_halves, axis=2), 1.0, rtol=1.0e-5, atol=1.0e-6)
     ):
         raise ValueError("visual half embeddings are invalid")
     if (
         centers.dtype != np.dtype(np.float32)
         or centers.ndim != 2
-        or centers.shape != (len(leaves), visual_halves.shape[2])
+        or centers.shape != (len(leaves), visual_dim)
         or not np.all(np.isfinite(centers))
     ):
         raise ValueError("hierarchical prototype centers are invalid")
@@ -1044,6 +1075,8 @@ def _validate_hierarchical_graph_artifacts(
         adapter,
         clips,
         visual_halves,
+        pca_components=pca_components,
+        visual_dim=visual_dim,
         frame_cache_dir=root / "encode" / "frame_embeddings",
         batch_size=int(prototype_config["batch_size"]),
         max_iter=int(prototype_config["max_iter"]),
@@ -1462,6 +1495,11 @@ def validate_output(
     if (
         stage_manifests["graph"].get("prototype_schema_version") != PROTOTYPE_SCHEMA_VERSION
         or stage_manifests["graph"].get("prototype_strategy") != PROTOTYPE_STRATEGY
+        or stage_manifests["graph"].get("prototype_visual_dim") != 128
+        or stage_manifests["graph"].get("prototype_visual_projection")
+        != PROTOTYPE_VISUAL_PROJECTION
+        or stage_manifests["graph"].get("prototype_visual_normalization")
+        != PROTOTYPE_VISUAL_NORMALIZATION
         or stage_manifests["graph"].get("stage_directory") != GRAPH_DIRECTORY
         or stage_manifests["graph"].get("sequence_adjacency") != SEQUENCE_ADJACENCY
     ):
@@ -1580,8 +1618,7 @@ def validate_output(
             or row.get("primary_prototype") != int(assigned_indices[0])
             or row.get("primary_prototype_label") != expected_labels[0]
             or row.get("primary_action_label") != expected_actions[0]
-            or row.get("half_action_labels")
-            != [str(value) for value in half_action_labels[index]]
+            or row.get("half_action_labels") != [str(value) for value in half_action_labels[index]]
         ):
             raise ValueError("hierarchical prototype row metadata mismatch")
     selected_from_all = sorted(

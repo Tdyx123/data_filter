@@ -231,6 +231,16 @@ def _write_frame_caches(root: Path, adapter: DatasetAdapter) -> None:
         np.save(root / f"ep{record.episode_id:06d}.npy", features)
 
 
+def _identity_fragment_pca(frame_dim: int) -> np.ndarray:
+    return np.concatenate(
+        [
+            np.eye(frame_dim, dtype=np.float32),
+            np.zeros((frame_dim, frame_dim), dtype=np.float32),
+        ],
+        axis=1,
+    )
+
+
 def _candidate_clip() -> ClipRecord:
     return ClipRecord(
         sample_id="ep000002_chunk_000000_000014",
@@ -245,7 +255,7 @@ def _candidate_clip() -> ClipRecord:
     )
 
 
-def test_schema_five_action_catalog_uses_400_count_floor() -> None:
+def test_schema_six_action_catalog_uses_400_count_floor() -> None:
     fixed = prototypes.create_action_catalog(
         Counter({"move forward": 400, "move right": 79_600}),
         total_labels=80_000,
@@ -411,14 +421,116 @@ def test_merge_half_leaf_assignments_combines_only_the_same_leaf() -> None:
 
 
 def test_merge_half_leaf_assignments_breaks_serialized_float32_ties_by_leaf_id() -> None:
-    assignments = prototypes.merge_half_leaf_assignments(
-        ((9, 0.50000001), (2, 0.5))
-    )
+    assignments = prototypes.merge_half_leaf_assignments(((9, 0.50000001), (2, 0.5)))
 
     assert assignments == ((2, 0.5), (9, 0.5))
 
 
-def test_action_catalog_serializes_schema_five_strategy_and_metadata() -> None:
+def test_clustering_projection_uses_only_sum_block_and_zero_pads() -> None:
+    values = np.asarray(
+        [
+            [[1.0, 0.0], [0.0, 1.0]],
+            [[2.0, -1.0], [-1.0, 2.0]],
+        ],
+        dtype=np.float32,
+    )
+    components = np.asarray(
+        [
+            [1.0, 2.0, 100.0, 200.0],
+            [3.0, 4.0, 300.0, 400.0],
+        ],
+        dtype=np.float32,
+    )
+
+    actual = prototypes._project_clustering_features(
+        values,
+        components,
+        output_dim=4,
+    )
+
+    expected = np.asarray(
+        [
+            [[1.0, 3.0, 0.0, 0.0], [2.0, 4.0, 0.0, 0.0]],
+            [[0.0, 2.0, 0.0, 0.0], [3.0, 5.0, 0.0, 0.0]],
+        ],
+        dtype=np.float32,
+    )
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("values", "components", "output_dim", "message"),
+    [
+        (
+            np.ones((2, 2), dtype=np.float32),
+            np.ones((1, 3), dtype=np.float32),
+            4,
+            "twice the frame dimension",
+        ),
+        (
+            np.ones((2, 2), dtype=np.float32),
+            np.ones((5, 4), dtype=np.float32),
+            4,
+            "cannot exceed output dimension",
+        ),
+        (
+            np.ones((2, 2), dtype=np.float32),
+            np.asarray([[1.0, np.nan, 2.0, 3.0]], dtype=np.float32),
+            4,
+            "finite",
+        ),
+        (
+            np.asarray([[1.0, np.inf]], dtype=np.float32),
+            np.ones((1, 4), dtype=np.float32),
+            4,
+            "finite",
+        ),
+    ],
+)
+def test_clustering_projection_rejects_incompatible_inputs(
+    values: np.ndarray,
+    components: np.ndarray,
+    output_dim: int,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        prototypes._project_clustering_features(
+            values,
+            components,
+            output_dim=output_dim,
+        )
+
+
+def test_episode_window_visuals_project_each_frame_before_pooling(tmp_path: Path) -> None:
+    cache = tmp_path / "frame_embeddings"
+    cache.mkdir()
+    frames = np.stack(
+        [np.arange(8, dtype=np.float32), np.ones(8, dtype=np.float32)],
+        axis=1,
+    )
+    np.save(cache / "ep000000.npy", frames)
+    record = EpisodeRecord(0, 8, 0, "projection")
+    components = np.asarray(
+        [
+            [1.0, 0.0, 100.0, 200.0],
+            [0.0, 2.0, 300.0, 400.0],
+        ],
+        dtype=np.float32,
+    )
+
+    actual = prototypes._episode_window_visuals(
+        cache,
+        record,
+        pca_components=components,
+        visual_dim=4,
+    )
+
+    expected = np.asarray([[3.5, 2.0, 0.0, 0.0]], dtype=np.float32)
+    expected /= np.linalg.norm(expected, axis=1, keepdims=True)
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-7)
+
+
+def test_action_catalog_serializes_schema_six_projection_strategy_and_metadata() -> None:
     catalog = prototypes.create_action_catalog(
         Counter({"move forward": 400, "move right": 600}),
         total_labels=1_000,
@@ -452,14 +564,20 @@ def test_action_catalog_serializes_schema_five_strategy_and_metadata() -> None:
 
     payload = catalog.to_dict()
 
-    assert payload["schema_version"] == 5
-    assert payload["strategy"] == "trajectory_retained_action_then_half_visual_nearest"
+    assert payload["schema_version"] == 6
+    assert payload["strategy"] == (
+        "trajectory_retained_action_then_cropped_pca_half_visual_nearest"
+    )
     assert payload["constants"] == {
         "state_threshold": 0.03,
         "min_action_count": 400,
         "min_action_frequency": 0.005,
         "max_visual_centers": 16,
         "visual_half_windows": [[0, 8], [7, 15]],
+        "visual_projection": "frame @ visual_pca.components[:, :frame_embedding_dim].T",
+        "visual_projection_centering": "none",
+        "visual_projection_padding": "right_zero_to_128",
+        "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
         "cluster_count": "min(16, floor(log2(training_count)) - 2)",
         "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
         "distance_quantiles": [0.1, 0.9],
@@ -500,11 +618,17 @@ def test_full_trajectory_builder_trains_exact_buckets_and_labels_each_half_once(
         [candidate_frames[:8].mean(axis=0), candidate_frames[7:].mean(axis=0)]
     )
     candidate_halves /= np.linalg.norm(candidate_halves, axis=1, keepdims=True)
+    components = np.asarray(
+        [[1.0, 0.0, 900.0, 900.0], [0.0, 1.0, 900.0, 900.0]],
+        dtype=np.float32,
+    )
 
     result = prototypes.build_hierarchical_motion_prototypes(
         adapter,
         [clip],
         candidate_halves[None, :, :],
+        pca_components=components,
+        visual_dim=128,
         frame_cache_dir=cache,
         batch_size=32,
         max_iter=2,
@@ -527,7 +651,8 @@ def test_full_trajectory_builder_trains_exact_buckets_and_labels_each_half_once(
     assert by_label["move forward"].nearest_distance_q10 is not None
     assert by_label["move forward"].nearest_distance_q90 is not None
     assert result.prototypes.centers is not None
-    assert result.prototypes.centers.shape == (12, 2)
+    assert result.prototypes.centers.shape == (12, 128)
+    np.testing.assert_array_equal(result.prototypes.centers[:, 2:], 0.0)
     assert result.prototypes.indices.shape == (1, 2)
     assert np.all(result.prototypes.indices[0] >= 0)
     assert np.all((result.prototypes.weights[0] >= 0.3) & (result.prototypes.weights[0] <= 1.0))
@@ -553,6 +678,8 @@ def test_full_trajectory_builder_reports_aggregate_step_timings(tmp_path: Path) 
         adapter,
         [_candidate_clip()],
         candidate_halves[None, :, :],
+        pca_components=_identity_fragment_pca(2),
+        visual_dim=2,
         frame_cache_dir=cache,
         batch_size=32,
         max_iter=2,
@@ -590,10 +717,12 @@ def test_tied_maximum_parent_actions_choose_global_nearest_leaf_then_leaf_id(
         cache_root: Path,
         record: EpisodeRecord,
         *,
-        embedding_dim: int,
+        pca_components: np.ndarray,
+        visual_dim: int,
     ) -> np.ndarray:
         del cache_root
-        assert embedding_dim == 2
+        np.testing.assert_array_equal(pca_components, _identity_fragment_pca(2))
+        assert visual_dim == 2
         values = {
             0: np.asarray([1.0, 0.0], dtype=np.float32),
             1: np.asarray([0.0, 1.0], dtype=np.float32),
@@ -607,6 +736,8 @@ def test_tied_maximum_parent_actions_choose_global_nearest_leaf_then_leaf_id(
         adapter,
         [_candidate_clip()],
         np.stack([half, half])[None, :, :],
+        pca_components=_identity_fragment_pca(2),
+        visual_dim=2,
         frame_cache_dir=tmp_path,
         batch_size=32,
         max_iter=2,
@@ -615,9 +746,7 @@ def test_tied_maximum_parent_actions_choose_global_nearest_leaf_then_leaf_id(
         num_workers=0,
     )
 
-    assert result.half_action_labels.tolist() == [
-        ["move forward right", "move forward right"]
-    ]
+    assert result.half_action_labels.tolist() == [["move forward right", "move forward right"]]
     assert result.prototypes.indices[0, 1] == -1
     assert result.prototypes.weights[0].tolist() == pytest.approx([1.125, 0.0])
     leaf = result.catalog.leaf_prototypes[int(result.prototypes.indices[0, 0])]
@@ -634,10 +763,12 @@ def test_non_stop_half_falls_back_to_stop_with_absolute_merged_confidence(
         cache_root: Path,
         record: EpisodeRecord,
         *,
-        embedding_dim: int,
+        pca_components: np.ndarray,
+        visual_dim: int,
     ) -> np.ndarray:
         del cache_root
-        assert embedding_dim == 2
+        np.testing.assert_array_equal(pca_components, _identity_fragment_pca(2))
+        assert visual_dim == 2
         values = {
             0: np.asarray([1.0, 0.0], dtype=np.float32),
             1: np.asarray([0.0, 1.0], dtype=np.float32),
@@ -650,6 +781,8 @@ def test_non_stop_half_falls_back_to_stop_with_absolute_merged_confidence(
         adapter,
         [_candidate_clip()],
         np.asarray([[[0.0, -1.0], [0.0, -1.0]]], dtype=np.float32),
+        pca_components=_identity_fragment_pca(2),
+        visual_dim=2,
         frame_cache_dir=tmp_path,
         batch_size=32,
         max_iter=2,
@@ -679,10 +812,12 @@ def test_non_stop_fallback_fails_when_stop_has_no_visual_center(
         cache_root: Path,
         record: EpisodeRecord,
         *,
-        embedding_dim: int,
+        pca_components: np.ndarray,
+        visual_dim: int,
     ) -> np.ndarray:
         del cache_root
-        assert embedding_dim == 2
+        np.testing.assert_array_equal(pca_components, _identity_fragment_pca(2))
+        assert visual_dim == 2
         values = np.asarray(
             [1.0, 0.0] if record.episode_id == 0 else [0.0, -1.0],
             dtype=np.float32,
@@ -695,6 +830,8 @@ def test_non_stop_fallback_fails_when_stop_has_no_visual_center(
             adapter,
             [_candidate_clip()],
             np.asarray([[[0.0, -1.0], [0.0, -1.0]]], dtype=np.float32),
+            pca_components=_identity_fragment_pca(2),
+            visual_dim=2,
             frame_cache_dir=tmp_path,
             batch_size=32,
             max_iter=2,
@@ -748,6 +885,8 @@ def test_full_trajectory_builder_allows_k_above_batch_size_and_bounds_updates(
         adapter,
         [_candidate_clip()],
         candidate_halves[None, :, :],
+        pca_components=_identity_fragment_pca(2),
+        visual_dim=2,
         frame_cache_dir=cache,
         batch_size=4,
         max_iter=3,
@@ -798,10 +937,12 @@ def test_streaming_kmeans_consumes_every_window_once_per_epoch_without_order_bia
         cache_root: Path,
         record: EpisodeRecord,
         *,
-        embedding_dim: int,
+        pca_components: np.ndarray,
+        visual_dim: int,
     ) -> np.ndarray:
         del cache_root
-        assert embedding_dim == 1
+        np.testing.assert_array_equal(pca_components, _identity_fragment_pca(1))
+        assert visual_dim == 1
         return np.full(
             (record.length - 7, 1),
             10.0 if record.episode_id == 1 else 0.0,
@@ -831,6 +972,8 @@ def test_streaming_kmeans_consumes_every_window_once_per_epoch_without_order_bia
             _StreamingMeanAdapter(reverse=reverse),
             [clip],
             np.asarray([[[1.0], [1.0]]], dtype=np.float32),
+            pca_components=_identity_fragment_pca(1),
+            visual_dim=1,
             frame_cache_dir=tmp_path,
             batch_size=2,
             max_iter=3,
@@ -862,6 +1005,8 @@ def test_full_trajectory_builder_rejects_missing_frame_cache(tmp_path: Path) -> 
             adapter,
             [_candidate_clip()],
             candidate,
+            pca_components=_identity_fragment_pca(2),
+            visual_dim=2,
             frame_cache_dir=cache,
             batch_size=32,
             max_iter=50,
@@ -887,6 +1032,8 @@ def test_full_trajectory_builder_rejects_data_without_valid_windows(
             adapter,
             [],
             np.empty((0, 2, 2), dtype=np.float32),
+            pca_components=_identity_fragment_pca(2),
+            visual_dim=2,
             frame_cache_dir=cache,
             batch_size=32,
             max_iter=50,

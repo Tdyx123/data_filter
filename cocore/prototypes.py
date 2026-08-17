@@ -96,14 +96,18 @@ class ActionCatalog:
     def to_dict(self) -> dict[str, object]:
         return {
             "method": "motion_primitives",
-            "schema_version": 5,
-            "strategy": "trajectory_retained_action_then_half_visual_nearest",
+            "schema_version": 6,
+            "strategy": "trajectory_retained_action_then_cropped_pca_half_visual_nearest",
             "constants": {
                 "state_threshold": STATE_THRESHOLD,
                 "min_action_count": MIN_ACTION_COUNT,
                 "min_action_frequency": MIN_ACTION_FREQUENCY,
                 "max_visual_centers": MAX_VISUAL_CENTERS,
                 "visual_half_windows": [[0, 8], [7, 15]],
+                "visual_projection": ("frame @ visual_pca.components[:, :frame_embedding_dim].T"),
+                "visual_projection_centering": "none",
+                "visual_projection_padding": "right_zero_to_128",
+                "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
                 "cluster_count": "min(16, floor(log2(training_count)) - 2)",
                 "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
                 "distance_quantiles": [0.1, 0.9],
@@ -260,9 +264,7 @@ def merge_half_leaf_assignments(
             merged[key] = larger + 0.5 * smaller
         else:
             merged[key] = weight
-    quantized = tuple(
-        (leaf_id, float(np.float32(weight))) for leaf_id, weight in merged.items()
-    )
+    quantized = tuple((leaf_id, float(np.float32(weight))) for leaf_id, weight in merged.items())
     if any(not math.isfinite(weight) for _, weight in quantized):
         raise ValueError("half-clip assignment weights must fit float32")
     return tuple(sorted(quantized, key=lambda item: (-item[1], item[0])))
@@ -272,7 +274,7 @@ def create_action_catalog(
     counts: Mapping[str, int],
     total_labels: int,
 ) -> ActionCatalog:
-    """Build a deterministic schema-5 action catalog from raw action counts."""
+    """Build a deterministic schema-6 action catalog from raw action counts."""
 
     if isinstance(total_labels, bool) or not isinstance(total_labels, Integral):
         raise ValueError("motion primitive total_labels must be a non-negative integer")
@@ -367,11 +369,50 @@ def _validated_states(
     return states
 
 
+def _project_clustering_features(
+    values: np.ndarray,
+    components: np.ndarray,
+    *,
+    output_dim: int,
+) -> np.ndarray:
+    """Project raw frame features with the sum block of fragment PCA components."""
+
+    try:
+        features = np.asarray(values, dtype=np.float32)
+        matrix = np.asarray(components, dtype=np.float32)
+    except (TypeError, ValueError) as error:
+        raise ValueError("clustering projection inputs must be finite numeric arrays") from error
+    if features.ndim == 0 or features.shape[-1] == 0 or not np.all(np.isfinite(features)):
+        raise ValueError("clustering projection features must be finite with a positive dimension")
+    if matrix.ndim != 2 or matrix.shape[0] == 0:
+        raise ValueError("clustering PCA components must be a non-empty matrix")
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError("clustering PCA components must be finite")
+    frame_dim = int(features.shape[-1])
+    if matrix.shape[1] != 2 * frame_dim:
+        raise ValueError("clustering PCA component width must be twice the frame dimension")
+    if isinstance(output_dim, bool) or not isinstance(output_dim, Integral) or output_dim <= 0:
+        raise ValueError("clustering projection output dimension must be a positive integer")
+    if matrix.shape[0] > int(output_dim):
+        raise ValueError("clustering PCA component count cannot exceed output dimension")
+
+    projected = features @ matrix[:, :frame_dim].T
+    if projected.shape[-1] < int(output_dim):
+        padding = [(0, 0)] * projected.ndim
+        padding[-1] = (0, int(output_dim) - projected.shape[-1])
+        projected = np.pad(projected, padding)
+    projected = np.asarray(projected, dtype=np.float32)
+    if not np.all(np.isfinite(projected)):
+        raise ValueError("clustering projection produced non-finite values")
+    return projected
+
+
 def _episode_window_visuals(
     cache_root: Path,
     record: EpisodeRecord,
     *,
-    embedding_dim: int,
+    pca_components: np.ndarray,
+    visual_dim: int,
 ) -> np.ndarray:
     path = cache_root / f"ep{record.episode_id:06d}.npy"
     if not path.is_file():
@@ -383,19 +424,25 @@ def _episode_window_visuals(
         raise ValueError(f"episode {record.episode_id}: invalid frame embedding cache") from error
     if (
         values.ndim != 2
-        or values.shape != (record.length, embedding_dim)
+        or values.shape[0] != record.length
+        or values.shape[1] == 0
         or not np.all(np.isfinite(values))
     ):
         raise ValueError(
             f"episode {record.episode_id}: frame cache length/dimension mismatch or non-finite values"
         )
+    projected = _project_clustering_features(
+        values,
+        pca_components,
+        output_dim=visual_dim,
+    )
 
     window_count = max(record.length - (TRAJECTORY_WINDOW_LENGTH - 1), 0)
     if window_count == 0:
-        return np.empty((0, embedding_dim), dtype=np.float32)
-    prefix = np.empty((record.length + 1, embedding_dim), dtype=np.float64)
+        return np.empty((0, int(visual_dim)), dtype=np.float32)
+    prefix = np.empty((record.length + 1, int(visual_dim)), dtype=np.float64)
     prefix[0] = 0.0
-    np.cumsum(values, axis=0, dtype=np.float64, out=prefix[1:])
+    np.cumsum(projected, axis=0, dtype=np.float64, out=prefix[1:])
     means = (prefix[TRAJECTORY_WINDOW_LENGTH:] - prefix[:-TRAJECTORY_WINDOW_LENGTH]) / float(
         TRAJECTORY_WINDOW_LENGTH
     )
@@ -475,10 +522,7 @@ def _episode_exact_memberships(
         if category.action_id is None or category.training_count <= 0:
             continue
         local_rows.setdefault(int(category.action_id), []).append(timestep)
-    return {
-        action_id: np.asarray(rows, dtype=np.int64)
-        for action_id, rows in local_rows.items()
-    }
+    return {action_id: np.asarray(rows, dtype=np.int64) for action_id, rows in local_rows.items()}
 
 
 def build_hierarchical_motion_prototypes(
@@ -486,6 +530,8 @@ def build_hierarchical_motion_prototypes(
     clips: Sequence[ClipRecord],
     visual_half_embeddings: np.ndarray,
     *,
+    pca_components: np.ndarray,
+    visual_dim: int,
     frame_cache_dir: str | Path,
     batch_size: int,
     max_iter: int,
@@ -497,20 +543,31 @@ def build_hierarchical_motion_prototypes(
     """Learn exact action buckets and assign one nearest visual leaf per clip half."""
 
     try:
-        candidate_values = np.asarray(visual_half_embeddings, dtype=np.float32)
+        raw_candidate_values = np.asarray(visual_half_embeddings, dtype=np.float32)
     except (TypeError, ValueError) as error:
         raise ValueError("visual half embeddings must align with clips and be finite") from error
     if (
-        candidate_values.ndim != 3
-        or candidate_values.shape[0] != len(clips)
-        or candidate_values.shape[1] != 2
-        or candidate_values.shape[2] == 0
-        or not np.all(np.isfinite(candidate_values))
+        raw_candidate_values.ndim != 3
+        or raw_candidate_values.shape[0] != len(clips)
+        or raw_candidate_values.shape[1] != 2
+        or raw_candidate_values.shape[2] == 0
+        or not np.all(np.isfinite(raw_candidate_values))
     ):
         raise ValueError("visual half embeddings must align with clips and be finite")
-    candidate_norms = np.linalg.norm(candidate_values, axis=2)
+    candidate_norms = np.linalg.norm(raw_candidate_values, axis=2)
     if len(candidate_norms) and not np.allclose(candidate_norms, 1.0, rtol=1.0e-5, atol=1.0e-6):
         raise ValueError("visual half embeddings must be L2-normalized")
+    candidate_values = _project_clustering_features(
+        raw_candidate_values,
+        pca_components,
+        output_dim=visual_dim,
+    )
+    projected_norms = np.linalg.norm(candidate_values, axis=2, keepdims=True)
+    if len(projected_norms) and (
+        not np.all(np.isfinite(projected_norms)) or np.any(projected_norms <= 1.0e-8)
+    ):
+        raise ValueError("projected visual half embeddings must have finite positive norms")
+    candidate_values = (candidate_values / np.maximum(projected_norms, 1.0e-8)).astype(np.float32)
     if (
         isinstance(batch_size, bool)
         or not isinstance(batch_size, Integral)
@@ -664,7 +721,8 @@ def build_hierarchical_motion_prototypes(
             window_visuals = _episode_window_visuals(
                 cache_root,
                 record,
-                embedding_dim=candidate_values.shape[2],
+                pca_components=pca_components,
+                visual_dim=visual_dim,
             )
             if len(window_visuals) != max(len(states) - 7, 0):
                 raise ValueError(f"episode {episode.episode_id}: state/cache length mismatch")
@@ -709,7 +767,8 @@ def build_hierarchical_motion_prototypes(
         window_visuals = _episode_window_visuals(
             cache_root,
             record,
-            embedding_dim=candidate_values.shape[2],
+            pca_components=pca_components,
+            visual_dim=visual_dim,
         )
         memberships = _episode_exact_memberships(
             states,
@@ -797,9 +856,7 @@ def build_hierarchical_motion_prototypes(
         for category in refined_catalog.action_categories
         if category.retained and category.label != "stop"
     }
-    refined_by_label = {
-        category.label: category for category in refined_catalog.action_categories
-    }
+    refined_by_label = {category.label: category for category in refined_catalog.action_categories}
     per_clip: list[tuple[tuple[int, float], ...]] = []
     for clip_index in range(len(clips)):
         half_assignments: list[tuple[int, float]] = []
@@ -809,12 +866,12 @@ def build_hierarchical_motion_prototypes(
             for parent_label in parent_labels:
                 parent_category = refined_by_label.get(parent_label)
                 if parent_category is None or parent_category.action_id is None:
-                    raise ValueError(f"missing parent action {parent_label!r} for clip {clip_index}")
+                    raise ValueError(
+                        f"missing parent action {parent_label!r} for clip {clip_index}"
+                    )
                 action_id = int(parent_category.action_id)
                 if action_id not in centers_by_action or action_id not in leaf_ids_by_action:
-                    raise ValueError(
-                        f"missing visual centers for parent action {parent_label!r}"
-                    )
+                    raise ValueError(f"missing visual centers for parent action {parent_label!r}")
                 distances = _euclidean_distances(
                     candidate_values[clip_index, half_index][None, :],
                     centers_by_action[action_id],
