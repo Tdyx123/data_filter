@@ -136,6 +136,31 @@ class _Adapter:
         return {"policy": "test"}
 
 
+def test_shared_close_preserves_primary_error_without_add_note_support():
+    shared = importlib.import_module("simpler_bridge.evaluation")
+
+    class Python310StyleError:
+        def __init__(self):
+            self.__notes__ = ["existing context"]
+
+    class CloseFailingEnvironment:
+        def close(self):
+            raise RuntimeError("renderer teardown failed")
+
+    primary_error = Python310StyleError()
+
+    shared._close_simpler_environment(
+        CloseFailingEnvironment(),
+        task=shared.SIMPLER_TASKS[0],
+        primary_error=primary_error,
+    )
+
+    assert primary_error.__notes__ == [
+        "existing context",
+        "SimplerEnv close failed for task spoon: RuntimeError: renderer teardown failed",
+    ]
+
+
 class _ThreeStepEnvironment(_Environment):
     def step(self, action):
         self.actions.append(np.asarray(action))

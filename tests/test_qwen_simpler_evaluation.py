@@ -280,6 +280,12 @@ class _FakeEnvironment:
         self.closed = True
 
 
+class _CloseFailingEnvironment(_FakeEnvironment):
+    def close(self):
+        super().close()
+        raise RuntimeError("renderer teardown failed")
+
+
 def test_run_episode_replans_each_step_until_early_success():
     evaluation = _evaluation()
     environment = _FakeEnvironment(success_step=3)
@@ -918,6 +924,36 @@ def test_preflight_reset_failure_is_infrastructure_error(tmp_path):
         )
 
 
+def test_preflight_close_failure_is_infrastructure_error(tmp_path):
+    evaluation = _evaluation()
+    environment = _CloseFailingEnvironment(success_step=1)
+    settings = evaluation.SimplerEvaluationSettings(
+        checkpoint=tmp_path / "step-00020000",
+        output_dir=tmp_path / "preflight",
+        tasks=(evaluation.SIMPLER_TASKS[0],),
+        policy_seeds=(0,),
+        object_episode_ids=(0,),
+    )
+
+    with pytest.raises(evaluation.SimplerInfrastructureError, match="close failed") as caught:
+        evaluation.run_simpler_preflight(
+            settings,
+            checkpoint=SimpleNamespace(
+                config={"data": {"train_crop_size": 4, "output_image_size": 4}},
+                as_dict=lambda: {},
+            ),
+            policy=_EvaluationPolicy(),
+            environment_factory=lambda task: environment,
+            source_versions={},
+            package_versions={},
+        )
+
+    assert environment.close_count == 1
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert str(caught.value.__cause__) == "renderer teardown failed"
+    assert not (settings.output_dir / "preflight.json").exists()
+
+
 def test_preflight_protects_failure_output_without_overwrite(tmp_path):
     evaluation = _evaluation()
     output = tmp_path / "preflight"
@@ -1097,6 +1133,79 @@ def test_environment_creation_error_is_immediate_infrastructure_failure(tmp_path
     assert failure["status"] == "failed"
     assert failure["exit_code"] == 3
     assert failure["summary"]["completed_episodes"] == 0
+
+
+def test_environment_close_error_is_immediate_infrastructure_failure(tmp_path):
+    evaluation = _evaluation()
+    environment = _CloseFailingEnvironment(success_step=1)
+    settings = evaluation.SimplerEvaluationSettings(
+        checkpoint=tmp_path / "step-00020000",
+        output_dir=tmp_path / "results",
+        tasks=(evaluation.SIMPLER_TASKS[0],),
+        policy_seeds=(0,),
+        object_episode_ids=(0,),
+        max_steps=1,
+    )
+
+    with pytest.raises(evaluation.SimplerInfrastructureError, match="close failed") as caught:
+        evaluation.evaluate_simpler_checkpoint(
+            settings,
+            checkpoint=SimpleNamespace(
+                config={"data": {"train_crop_size": 4, "output_image_size": 4}},
+                as_dict=lambda: {},
+            ),
+            policy=_EvaluationPolicy(),
+            environment_factory=lambda task: environment,
+            source_versions={},
+        )
+
+    failure = json.loads((settings.output_dir / "failure.json").read_text())
+    assert environment.close_count == 1
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert str(caught.value.__cause__) == "renderer teardown failed"
+    assert failure["exit_code"] == 3
+    assert failure["summary"]["completed_episodes"] == 1
+
+
+def test_reset_error_remains_primary_when_environment_close_also_fails(tmp_path):
+    evaluation = _evaluation()
+
+    class ResetAndCloseFailingEnvironment(_CloseFailingEnvironment):
+        def reset(self, *, options):
+            del options
+            raise RuntimeError("renderer unavailable")
+
+    environment = ResetAndCloseFailingEnvironment()
+    settings = evaluation.SimplerEvaluationSettings(
+        checkpoint=tmp_path / "step-00020000",
+        output_dir=tmp_path / "results",
+        tasks=(evaluation.SIMPLER_TASKS[0],),
+        policy_seeds=(0,),
+        object_episode_ids=(0,),
+    )
+
+    with pytest.raises(evaluation.SimplerInfrastructureError, match="reset failed") as caught:
+        evaluation.evaluate_simpler_checkpoint(
+            settings,
+            checkpoint=SimpleNamespace(
+                config={"data": {"train_crop_size": 4, "output_image_size": 4}},
+                as_dict=lambda: {},
+            ),
+            policy=_EvaluationPolicy(),
+            environment_factory=lambda task: environment,
+            source_versions={},
+        )
+
+    failure = json.loads((settings.output_dir / "failure.json").read_text())
+    assert environment.close_count == 1
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert str(caught.value.__cause__) == "renderer unavailable"
+    assert any(
+        "close failed" in note and "renderer teardown failed" in note
+        for note in caught.value.__notes__
+    )
+    assert failure["exit_code"] == 3
+    assert "reset failed" in failure["error"]
 
 
 @pytest.mark.gpu

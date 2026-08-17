@@ -306,6 +306,32 @@ def _step_environment(
     return observation, bool(terminated), bool(truncated), dict(info)
 
 
+def _close_simpler_environment(
+    environment: Any,
+    *,
+    task: SimplerTaskSpec,
+    primary_error: BaseException | None = None,
+) -> None:
+    try:
+        environment.close()
+    except Exception as error:
+        message = (
+            f"SimplerEnv close failed for task {task.key}: "
+            f"{type(error).__name__}: {error}"
+        )
+        if primary_error is not None:
+            add_note = getattr(primary_error, "add_note", None)
+            if add_note is not None:
+                add_note(message)
+            else:
+                primary_error.__notes__ = [
+                    *(getattr(primary_error, "__notes__", None) or ()),
+                    message,
+                ]
+            return
+        raise SimplerInfrastructureError(message) from error
+
+
 def _json_compatible(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _json_compatible(item) for key, item in value.items()}
@@ -601,6 +627,7 @@ def evaluate_simpler_policy(
                     f"Could not create SimplerEnv task {task.key}: "
                     f"{type(error).__name__}: {error}"
                 ) from error
+            primary_error: BaseException | None = None
             try:
                 for policy_seed in settings.policy_seeds:
                     generator = policy.make_generator(policy_seed)
@@ -645,8 +672,15 @@ def evaluate_simpler_policy(
                         _atomic_write_jsonl(partial_path, episodes)
                     if task_failed:
                         break
+            except BaseException as error:
+                primary_error = error
+                raise
             finally:
-                environment.close()
+                _close_simpler_environment(
+                    environment,
+                    task=task,
+                    primary_error=primary_error,
+                )
     except Exception as error:
         if isinstance(error, SimplerInfrastructureError):
             exit_code = 3
@@ -842,6 +876,7 @@ def run_simpler_preflight(
     generator = policy.make_generator(0)
     for task in settings.tasks:
         environment = environment_factory(task)
+        primary_error: BaseException | None = None
         try:
             try:
                 observation, _ = environment.reset(
@@ -907,8 +942,15 @@ def run_simpler_preflight(
                     "episode_stats_present": "episode_stats" in info,
                 }
             )
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
-            environment.close()
+            _close_simpler_environment(
+                environment,
+                task=task,
+                primary_error=primary_error,
+            )
 
     report = {
         "schema_version": 1,
