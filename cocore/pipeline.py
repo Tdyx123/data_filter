@@ -53,8 +53,11 @@ from cocore.prototypes import (
     MIN_DISTANCE_WEIGHT,
     MIN_ACTION_FREQUENCY,
     STATE_THRESHOLD,
+    TRAJECTORY_WINDOW_LENGTH,
+    TRAJECTORY_WINDOW_POLICY,
     build_hierarchical_motion_prototypes,
     cluster_count_for_training_count,
+    trajectory_window_starts,
 )
 from cocore.selection import (
     LazyHeapSelector,
@@ -63,10 +66,12 @@ from cocore.selection import (
 from cocore.timing import emit_completed_timing, timed_step
 
 
-GRAPH_DIRECTORY = "graph-15-motion-hard-nearest-pca"
+GRAPH_DIRECTORY = "graph-16-motion-hard-nearest-pca"
 RELIABILITY_METRICS = ("support", "progress")
-PROTOTYPE_SCHEMA_VERSION = 6
-PROTOTYPE_STRATEGY = "trajectory_retained_action_then_cropped_pca_half_visual_nearest"
+PROTOTYPE_SCHEMA_VERSION = 7
+PROTOTYPE_STRATEGY = (
+    "trajectory_sampled_retained_action_then_cropped_pca_half_visual_nearest"
+)
 PROTOTYPE_VISUAL_PROJECTION = "frame @ visual_pca.components[:, :frame_embedding_dim].T"
 PROTOTYPE_VISUAL_NORMALIZATION = "l2_normalized_eight_frame_mean_after_projection"
 
@@ -795,7 +800,7 @@ def _load_graph(root: Path) -> tuple[list[ClipRecord], GraphData, Mapping[str, n
     return clips, graph, nodes
 
 
-def _validate_schema_six_catalog(
+def _validate_schema_seven_catalog(
     payload: Mapping[str, Any],
     *,
     expected_total_raw_actions: int,
@@ -805,12 +810,17 @@ def _validate_schema_six_catalog(
         "min_action_count": MIN_ACTION_COUNT,
         "min_action_frequency": MIN_ACTION_FREQUENCY,
         "max_visual_centers": MAX_VISUAL_CENTERS,
+        "trajectory_window_length": TRAJECTORY_WINDOW_LENGTH,
+        "trajectory_window_policy": TRAJECTORY_WINDOW_POLICY,
         "visual_half_windows": [[0, 8], [7, 15]],
         "visual_projection": PROTOTYPE_VISUAL_PROJECTION,
         "visual_projection_centering": "none",
         "visual_projection_padding": "right_zero_to_128",
         "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
-        "cluster_count": "min(16, floor(log2(training_count)) - 2)",
+        "cluster_count": (
+            "min(training_count, min(16, max(3, "
+            "floor(2 * log2(training_count) - 16))))"
+        ),
         "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
         "distance_quantiles": [0.1, 0.9],
         "distance_weight_range": [1.0, MIN_DISTANCE_WEIGHT],
@@ -1011,7 +1021,7 @@ def _validate_hierarchical_graph_artifacts(
         raise ValueError("hierarchical prototype node shape or dtype is invalid")
 
     payload = json.loads((graph_root / "prototype_catalog.json").read_text(encoding="utf-8"))
-    leaves = _validate_schema_six_catalog(
+    leaves = _validate_schema_seven_catalog(
         payload,
         expected_total_raw_actions=expected_total_raw_actions,
     )
@@ -1548,7 +1558,9 @@ def validate_output(
         adapter=replay_adapter,
         resolved=replay_resolved,
         clips=scan_clips,
-        expected_total_raw_actions=sum(max(int(row["length"]) - 7, 0) for row in episode_rows),
+        expected_total_raw_actions=sum(
+            len(trajectory_window_starts(int(row["length"]))) for row in episode_rows
+        ),
     )
     select_manifest = json.loads(required["select_manifest"].read_text(encoding="utf-8"))
     if select_manifest.get("producer") != "cocore":

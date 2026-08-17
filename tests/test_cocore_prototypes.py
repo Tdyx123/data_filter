@@ -17,8 +17,8 @@ class _TrajectoryPrototypeAdapter(DatasetAdapter):
     def __init__(self, *, combined_candidate: bool = False) -> None:
         self.combined_candidate = combined_candidate
         self._records = (
-            EpisodeRecord(0, 407, 0, "forward training"),
-            EpisodeRecord(1, 407, 0, "right training"),
+            EpisodeRecord(0, 1205, 0, "forward training"),
+            EpisodeRecord(1, 1205, 0, "right training"),
             EpisodeRecord(2, 15, 0, "union candidate"),
         )
 
@@ -170,7 +170,7 @@ class _StreamingMeanAdapter(DatasetAdapter):
 
 class _StopFallbackAdapter(DatasetAdapter):
     def __init__(self, *, include_stop: bool) -> None:
-        records = [EpisodeRecord(0, 407, 0, "forward training")]
+        records = [EpisodeRecord(0, 1205, 0, "forward training")]
         if include_stop:
             records.append(EpisodeRecord(1, 15, 0, "stop training"))
         records.append(EpisodeRecord(2, 15, 0, "right fallback candidate"))
@@ -255,7 +255,7 @@ def _candidate_clip() -> ClipRecord:
     )
 
 
-def test_schema_six_action_catalog_uses_400_count_floor() -> None:
+def test_schema_seven_action_catalog_uses_400_count_floor() -> None:
     fixed = prototypes.create_action_catalog(
         Counter({"move forward": 400, "move right": 79_600}),
         total_labels=80_000,
@@ -369,28 +369,71 @@ def test_action_helpers_reject_unknown_motion_labels(label: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("mass", "expected"),
+    ("training_count", "expected"),
     [
-        (8.0, 1),
-        (16.0, 2),
-        (400.0, 6),
-        (262_144.0, 16),
+        (1.0, 1),
+        (2.0, 2),
+        (3.0, 3),
+        (400.0, 3),
+        (1_023.0, 3),
+        (1_024.0, 4),
+        (65_536.0, 16),
         (1_000_000.0, 16),
     ],
 )
 def test_cluster_count_for_training_count_uses_capped_logarithmic_formula(
-    mass: float,
+    training_count: float,
     expected: int,
 ) -> None:
-    assert prototypes.cluster_count_for_training_count(mass) == expected
+    assert prototypes.cluster_count_for_training_count(training_count) == expected
 
 
-@pytest.mark.parametrize("mass", [0.0, 1.0, 7.0, -1.0, np.nan, np.inf, -np.inf, True, "2"])
+@pytest.mark.parametrize("mass", [0.0, -1.0, np.nan, np.inf, -np.inf, True, "2"])
 def test_cluster_count_for_training_count_rejects_non_positive_or_non_finite_values(
     mass: object,
 ) -> None:
     with pytest.raises(ValueError, match="finite positive"):
         prototypes.cluster_count_for_training_count(mass)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("trajectory_length", "expected"),
+    [
+        (7, ()),
+        (8, (0,)),
+        (9, (0, 1)),
+        (10, (0, 2)),
+        (11, (0, 3)),
+        (12, (0, 2, 4)),
+        (13, (0, 3, 5)),
+        (14, (0, 3, 6)),
+        (15, (0, 3, 5, 7)),
+    ],
+)
+def test_trajectory_window_starts_cover_tail_with_rebalanced_gaps(
+    trajectory_length: int,
+    expected: tuple[int, ...],
+) -> None:
+    assert prototypes.trajectory_window_starts(trajectory_length) == expected
+
+
+def test_trajectory_window_starts_preserve_full_coverage_and_gap_policy() -> None:
+    for trajectory_length in range(8, 501):
+        starts = prototypes.trajectory_window_starts(trajectory_length)
+        gaps = tuple(right - left for left, right in zip(starts, starts[1:], strict=False))
+
+        assert starts[0] == 0
+        assert starts[-1] == trajectory_length - 8
+        assert tuple(sorted(set(starts))) == starts
+        assert all(1 <= gap <= 3 for gap in gaps)
+        if trajectory_length == 9:
+            assert gaps == (1,)
+        elif trajectory_length % 3 == 0:
+            assert gaps[-2:] == (2, 2)
+        elif trajectory_length % 3 == 1:
+            assert gaps[-1:] == (2,)
+        elif gaps:
+            assert all(gap == 3 for gap in gaps)
 
 
 def test_nearest_distance_bounds_and_confidence_use_q10_q90_linear_mapping() -> None:
@@ -530,7 +573,7 @@ def test_episode_window_visuals_project_each_frame_before_pooling(tmp_path: Path
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-7)
 
 
-def test_action_catalog_serializes_schema_six_projection_strategy_and_metadata() -> None:
+def test_action_catalog_serializes_schema_seven_sampling_strategy_and_metadata() -> None:
     catalog = prototypes.create_action_catalog(
         Counter({"move forward": 400, "move right": 600}),
         total_labels=1_000,
@@ -564,21 +607,26 @@ def test_action_catalog_serializes_schema_six_projection_strategy_and_metadata()
 
     payload = catalog.to_dict()
 
-    assert payload["schema_version"] == 6
+    assert payload["schema_version"] == 7
     assert payload["strategy"] == (
-        "trajectory_retained_action_then_cropped_pca_half_visual_nearest"
+        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_nearest"
     )
     assert payload["constants"] == {
         "state_threshold": 0.03,
         "min_action_count": 400,
         "min_action_frequency": 0.005,
         "max_visual_centers": 16,
+        "trajectory_window_length": 8,
+        "trajectory_window_policy": "full_coverage_max_gap_3_tail_rebalanced",
         "visual_half_windows": [[0, 8], [7, 15]],
         "visual_projection": "frame @ visual_pca.components[:, :frame_embedding_dim].T",
         "visual_projection_centering": "none",
         "visual_projection_padding": "right_zero_to_128",
         "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
-        "cluster_count": "min(16, floor(log2(training_count)) - 2)",
+        "cluster_count": (
+            "min(training_count, min(16, max(3, "
+            "floor(2 * log2(training_count) - 16))))"
+        ),
         "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
         "distance_quantiles": [0.1, 0.9],
         "distance_weight_range": [1.0, 0.3],
@@ -644,14 +692,14 @@ def test_full_trajectory_builder_trains_exact_buckets_and_labels_each_half_once(
     assert by_label["move forward"].training_count == by_label["move forward"].raw_count
     assert by_label["move right"].training_count == by_label["move right"].raw_count
     assert by_label["move forward right"].training_count == 0
-    assert by_label["move forward"].requested_centers == 6
-    assert by_label["move right"].requested_centers == 6
-    assert by_label["move forward"].actual_centers == 6
-    assert by_label["move right"].actual_centers == 6
+    assert by_label["move forward"].requested_centers == 3
+    assert by_label["move right"].requested_centers == 3
+    assert by_label["move forward"].actual_centers == 3
+    assert by_label["move right"].actual_centers == 3
     assert by_label["move forward"].nearest_distance_q10 is not None
     assert by_label["move forward"].nearest_distance_q90 is not None
     assert result.prototypes.centers is not None
-    assert result.prototypes.centers.shape == (12, 128)
+    assert result.prototypes.centers.shape == (6, 128)
     np.testing.assert_array_equal(result.prototypes.centers[:, 2:], 0.0)
     assert result.prototypes.indices.shape == (1, 2)
     assert np.all(result.prototypes.indices[0] >= 0)
@@ -728,7 +776,8 @@ def test_tied_maximum_parent_actions_choose_global_nearest_leaf_then_leaf_id(
             1: np.asarray([0.0, 1.0], dtype=np.float32),
             2: np.asarray(candidate_visual, dtype=np.float32),
         }[record.episode_id]
-        return np.broadcast_to(values, (record.length - 7, 2)).copy()
+        window_count = {0: 400, 1: 400, 2: 4}[record.episode_id]
+        return np.broadcast_to(values, (window_count, 2)).copy()
 
     monkeypatch.setattr(prototypes, "_episode_window_visuals", block_visuals)
     half = np.asarray(candidate_visual, dtype=np.float32)
@@ -774,7 +823,8 @@ def test_non_stop_half_falls_back_to_stop_with_absolute_merged_confidence(
             1: np.asarray([0.0, 1.0], dtype=np.float32),
             2: np.asarray([0.0, -1.0], dtype=np.float32),
         }[record.episode_id]
-        return np.broadcast_to(values, (record.length - 7, 2)).copy()
+        window_count = {0: 400, 1: 4, 2: 4}[record.episode_id]
+        return np.broadcast_to(values, (window_count, 2)).copy()
 
     monkeypatch.setattr(prototypes, "_episode_window_visuals", block_visuals)
     result = prototypes.build_hierarchical_motion_prototypes(
@@ -792,8 +842,8 @@ def test_non_stop_half_falls_back_to_stop_with_absolute_merged_confidence(
     )
 
     by_label = {category.label: category for category in result.catalog.action_categories}
-    assert by_label["stop"].training_count == 8
-    assert by_label["stop"].actual_centers == 1
+    assert by_label["stop"].training_count == 4
+    assert by_label["stop"].actual_centers == 3
     assert result.half_action_labels.tolist() == [["move right", "move right"]]
     assert result.prototypes.indices[0, 0] >= 0
     assert result.prototypes.indices[0, 1] == -1
@@ -822,7 +872,8 @@ def test_non_stop_fallback_fails_when_stop_has_no_visual_center(
             [1.0, 0.0] if record.episode_id == 0 else [0.0, -1.0],
             dtype=np.float32,
         )
-        return np.broadcast_to(values, (record.length - 7, 2)).copy()
+        window_count = {0: 400, 2: 4}[record.episode_id]
+        return np.broadcast_to(values, (window_count, 2)).copy()
 
     monkeypatch.setattr(prototypes, "_episode_window_visuals", block_visuals)
     with pytest.raises(ValueError, match="missing visual centers for parent action 'stop'"):
@@ -888,7 +939,7 @@ def test_full_trajectory_builder_allows_k_above_batch_size_and_bounds_updates(
         pca_components=_identity_fragment_pca(2),
         visual_dim=2,
         frame_cache_dir=cache,
-        batch_size=4,
+        batch_size=2,
         max_iter=3,
         seed=23,
         max_episodes=None,
@@ -896,12 +947,12 @@ def test_full_trajectory_builder_allows_k_above_batch_size_and_bounds_updates(
     )
 
     by_label = {category.label: category for category in result.catalog.action_categories}
-    assert by_label["move forward"].requested_centers == 6
-    assert by_label["move right"].requested_centers == 6
+    assert by_label["move forward"].requested_centers == 3
+    assert by_label["move right"].requested_centers == 3
     assert fit_rows == []
     assert update_rows
-    assert max(update_rows) <= 6
-    assert sum(update_rows) == 804 * 3
+    assert max(update_rows) <= 3
+    assert sum(update_rows) == 802 * 3
 
 
 def test_streaming_kmeans_consumes_every_window_once_per_epoch_without_order_bias(
@@ -944,7 +995,7 @@ def test_streaming_kmeans_consumes_every_window_once_per_epoch_without_order_bia
         np.testing.assert_array_equal(pca_components, _identity_fragment_pca(1))
         assert visual_dim == 1
         return np.full(
-            (record.length - 7, 1),
+            (8, 1),
             10.0 if record.episode_id == 1 else 0.0,
             dtype=np.float32,
         )
@@ -985,9 +1036,9 @@ def test_streaming_kmeans_consumes_every_window_once_per_epoch_without_order_bia
         assert result.prototypes.centers is not None
         centers.append(float(result.prototypes.centers[0, 0]))
         all_consumed = np.concatenate(consumed, axis=0)
-        assert all_consumed.shape == (40 * 3, 1)
-        assert np.count_nonzero(all_consumed == 0.0) == 20 * 3
-        assert np.count_nonzero(all_consumed == 10.0) == 20 * 3
+        assert all_consumed.shape == (16 * 3, 1)
+        assert np.count_nonzero(all_consumed == 0.0) == 8 * 3
+        assert np.count_nonzero(all_consumed == 10.0) == 8 * 3
 
     assert fit_rows == []
     np.testing.assert_allclose(centers, [5.0, 5.0], rtol=0.0, atol=5.0e-6)

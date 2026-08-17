@@ -18,8 +18,11 @@ episode 只执行一次视觉模型前向；候选片段的视觉特征
 `[0..7]`、`[7..14]` 两个半段，分别缓存原始 CLIP 空间中的 8 帧归一化均值。
 
 动作—视觉原型保留两级解耦：一级表达动作桶，二级表达桶内视觉中心。学习原型时，
-对每条完整轨迹生成所有 stride=1 的 8 帧窗口 `[t,t+7]`，用
-`state[t]→state[t+7]` 分类动作。设原始逐帧 CLIP 维度为 `D`；聚类复用上述
+对每条完整轨迹生成首尾覆盖、起点间隔最大为 3 的 8 帧窗口 `[t,t+7]`，用
+`state[t]→state[t+7]` 分类动作。间隔默认取 3；轨迹长度为 `3x+1` 时最后一个间隔
+取 2，长度为 `3x` 时最后两个间隔取 2，长度 9 特取起点 `[0,1]`。例如长度
+12、13、14 的起点分别为 `[0,2,4]`、`[0,3,5]`、`[0,3,6]`。设原始逐帧 CLIP
+维度为 `D`；聚类复用上述
 `visual_pca.npz`，裁剪 `components` 的前 `D` 列，对每帧执行纯矩阵乘法
 `v @ components[:, :D].T`，不应用 PCA 的 `mean` 或 `scale`，分量不足时右补零到
 128 维。窗口在投影后取 8 帧均值并 L2 归一化，再学习视觉中心；候选两个半段也投影到
@@ -33,8 +36,11 @@ count >= max(400, ceil(0.005 * W))
 只训练原始 `stop` 窗口。令 `M_a` 为桶内硬样本数，中心数固定为：
 
 ```text
-K_a = min(16, floor(log2(M_a)) - 2)
+K_a = min(M_a, min(16, max(3, floor(2 * log2(M_a) - 16))))
 ```
+
+外层 `min(M_a, ...)` 只在桶内不足 3 个训练窗口时降低中心数；非 `stop` 桶仍受上述
+至少 400 个窗口的动作门槛保护。
 
 MiniBatchKMeans 不使用样本权重；中心按硬归属数降序、坐标字典序稳定编号。每桶还记录
 训练窗口到最近中心的欧氏距离 q10/q90。
@@ -146,14 +152,15 @@ RelCore 的 `--reliability-metrics`、`--prototype-method` 或
 python -m cocore run --config cocore/config_debug.yaml --force
 ```
 
-Cocore 0.11.0 使用 prototype schema 6、裁剪 PCA 的 128 维聚类空间、近似均匀候选
-和顺序相邻 sequence 图，并按 episode 持久化完整原始逐帧 CLIP 特征。0.10.0 及更早
+Cocore 0.12.0 使用 prototype schema 7、最大间隔 3 的动作训练窗口、裁剪 PCA 的
+128 维聚类空间、近似均匀候选和顺序相邻 sequence 图，并按 episode 持久化完整原始
+逐帧 CLIP 特征。0.11.0 及更早
 版本的 scan、encode、graph 和 selection 缓存不迁移；升级后必须通过 `--force`
 重建全部阶段，或使用新的输出目录。
 
 ## 输出与校验
 
-输出根目录包含 `scan/`、`encode/`、`graph-15-motion-hard-nearest-pca/` 和一个或多个
+输出根目录包含 `scan/`、`encode/`、`graph-16-motion-hard-nearest-pca/` 和一个或多个
 `select-<关系>-w<权重>-top<比例>pct/`。选择目录包含：
 
 - scan 目录中的 `episodes.parquet` 与 `clips.parquet`：episode 元数据和可重放的

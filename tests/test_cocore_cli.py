@@ -15,7 +15,7 @@ def _objective(relation: str = "cooccurrence", weight: float = 1.0) -> dict[str,
 
 
 def test_package_version_matches_cropped_pca_projection_release() -> None:
-    assert cocore.__version__ == "0.11.0"
+    assert cocore.__version__ == "0.12.0"
 
 
 def test_config_requires_explicit_relation_and_weight() -> None:
@@ -229,7 +229,7 @@ def test_main_applies_cli_overrides_to_run_pipeline(monkeypatch, capsys) -> None
     assert capsys.readouterr().out.strip().endswith("select-sequence-w2-top25pct")
 
 
-def test_build_graph_cli_reports_schema_six_graph_directory(monkeypatch, capsys) -> None:
+def test_build_graph_cli_reports_schema_seven_graph_directory(monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli, "load_config", lambda _: _objective())
     monkeypatch.setattr(
         cli,
@@ -246,7 +246,7 @@ def test_build_graph_cli_reports_schema_six_graph_directory(monkeypatch, capsys)
     cli.main(["build-graph", "--config", "unused.yaml"])
 
     assert capsys.readouterr().out.strip() == (
-        "cocore_output=outputs/cocore/test/graph-15-motion-hard-nearest-pca nodes=2"
+        "cocore_output=outputs/cocore/test/graph-16-motion-hard-nearest-pca nodes=2"
     )
 
 

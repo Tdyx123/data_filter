@@ -22,11 +22,13 @@ from cocore.timing import TimingCallback
 
 MIN_ACTION_COUNT = 400
 MIN_ACTION_FREQUENCY = 0.005
+MIN_VISUAL_CENTERS = 3
 MAX_VISUAL_CENTERS = 16
 MIN_DISTANCE_WEIGHT = 0.3
 STATE_THRESHOLD = 0.03
 STATE_KEY = "observation.state"
 TRAJECTORY_WINDOW_LENGTH = 8
+TRAJECTORY_WINDOW_POLICY = "full_coverage_max_gap_3_tail_rebalanced"
 CLIP_LENGTH = 15
 
 _ATOMIC_ACTION_ORDER = (
@@ -96,19 +98,26 @@ class ActionCatalog:
     def to_dict(self) -> dict[str, object]:
         return {
             "method": "motion_primitives",
-            "schema_version": 6,
-            "strategy": "trajectory_retained_action_then_cropped_pca_half_visual_nearest",
+            "schema_version": 7,
+            "strategy": (
+                "trajectory_sampled_retained_action_then_cropped_pca_half_visual_nearest"
+            ),
             "constants": {
                 "state_threshold": STATE_THRESHOLD,
                 "min_action_count": MIN_ACTION_COUNT,
                 "min_action_frequency": MIN_ACTION_FREQUENCY,
                 "max_visual_centers": MAX_VISUAL_CENTERS,
+                "trajectory_window_length": TRAJECTORY_WINDOW_LENGTH,
+                "trajectory_window_policy": TRAJECTORY_WINDOW_POLICY,
                 "visual_half_windows": [[0, 8], [7, 15]],
                 "visual_projection": ("frame @ visual_pca.components[:, :frame_embedding_dim].T"),
                 "visual_projection_centering": "none",
                 "visual_projection_padding": "right_zero_to_128",
                 "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
-                "cluster_count": "min(16, floor(log2(training_count)) - 2)",
+                "cluster_count": (
+                    "min(training_count, min(16, max(3, "
+                    "floor(2 * log2(training_count) - 16))))"
+                ),
                 "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
                 "distance_quantiles": [0.1, 0.9],
                 "distance_weight_range": [1.0, MIN_DISTANCE_WEIGHT],
@@ -187,19 +196,48 @@ def retention_weight(raw_label: str, parent_label: str) -> float:
 
 
 def cluster_count_for_training_count(training_count: float) -> int:
-    """Return ``min(16, floor(log2(training_count)) - 2)`` when positive."""
+    """Return the capped logarithmic visual-center count for one action bucket."""
 
     if isinstance(training_count, bool) or not isinstance(training_count, Real):
         raise ValueError("training count must be a finite positive number")
     value = float(training_count)
-    if not math.isfinite(value) or value <= 0.0:
+    if not math.isfinite(value) or value < 1.0:
         raise ValueError("training count must be a finite positive number")
-    clusters = min(MAX_VISUAL_CENTERS, math.floor(math.log2(value)) - 2)
-    if clusters <= 0:
-        raise ValueError(
-            "training count must be finite positive and produce a positive cluster count"
-        )
-    return clusters
+    clusters = min(
+        MAX_VISUAL_CENTERS,
+        max(MIN_VISUAL_CENTERS, math.floor(2.0 * math.log2(value) - 16.0)),
+    )
+    return min(int(value), clusters)
+
+
+def trajectory_window_starts(trajectory_length: int) -> tuple[int, ...]:
+    """Return full-coverage eight-frame starts with gaps of at most three."""
+
+    if isinstance(trajectory_length, bool) or not isinstance(trajectory_length, Integral):
+        raise ValueError("trajectory length must be a non-negative integer")
+    length = int(trajectory_length)
+    if length < 0:
+        raise ValueError("trajectory length must be a non-negative integer")
+    last_start = length - TRAJECTORY_WINDOW_LENGTH
+    if last_start < 0:
+        return ()
+    if last_start == 0:
+        return (0,)
+
+    full_gaps, remainder = divmod(last_start, 3)
+    if remainder == 0:
+        gaps = [3] * full_gaps
+    elif remainder == 2:
+        gaps = [3] * full_gaps + [2]
+    elif last_start == 1:
+        gaps = [1]
+    else:
+        gaps = [3] * (full_gaps - 1) + [2, 2]
+
+    starts = [0]
+    for gap in gaps:
+        starts.append(starts[-1] + gap)
+    return tuple(starts)
 
 
 def nearest_distance_bounds(distances: np.ndarray) -> tuple[float, float]:
@@ -274,7 +312,7 @@ def create_action_catalog(
     counts: Mapping[str, int],
     total_labels: int,
 ) -> ActionCatalog:
-    """Build a deterministic schema-6 action catalog from raw action counts."""
+    """Build a deterministic schema-7 action catalog from raw action counts."""
 
     if isinstance(total_labels, bool) or not isinstance(total_labels, Integral):
         raise ValueError("motion primitive total_labels must be a non-negative integer")
@@ -437,15 +475,15 @@ def _episode_window_visuals(
         output_dim=visual_dim,
     )
 
-    window_count = max(record.length - (TRAJECTORY_WINDOW_LENGTH - 1), 0)
-    if window_count == 0:
+    window_starts = np.asarray(trajectory_window_starts(record.length), dtype=np.int64)
+    if len(window_starts) == 0:
         return np.empty((0, int(visual_dim)), dtype=np.float32)
     prefix = np.empty((record.length + 1, int(visual_dim)), dtype=np.float64)
     prefix[0] = 0.0
     np.cumsum(projected, axis=0, dtype=np.float64, out=prefix[1:])
-    means = (prefix[TRAJECTORY_WINDOW_LENGTH:] - prefix[:-TRAJECTORY_WINDOW_LENGTH]) / float(
-        TRAJECTORY_WINDOW_LENGTH
-    )
+    means = (
+        prefix[window_starts + TRAJECTORY_WINDOW_LENGTH] - prefix[window_starts]
+    ) / float(TRAJECTORY_WINDOW_LENGTH)
     norms = np.linalg.norm(means, axis=1, keepdims=True)
     if not np.all(np.isfinite(norms)) or np.any(norms <= 1.0e-8):
         raise ValueError(
@@ -512,16 +550,18 @@ def _episode_exact_memberships(
     primitive_config: object,
 ) -> dict[int, np.ndarray]:
     local_rows: dict[int, list[int]] = {}
-    for timestep in range(max(len(states) - 7, 0)):
+    for row, timestep in enumerate(trajectory_window_starts(len(states))):
         raw_label = classify_motion_primitive(
-            states[timestep], states[timestep + 7], primitive_config
+            states[timestep],
+            states[timestep + TRAJECTORY_WINDOW_LENGTH - 1],
+            primitive_config,
         )
         category = categories_by_label.get(raw_label)
         if category is None:
             raise ValueError(f"missing action category for {raw_label!r}")
         if category.action_id is None or category.training_count <= 0:
             continue
-        local_rows.setdefault(int(category.action_id), []).append(timestep)
+        local_rows.setdefault(int(category.action_id), []).append(row)
     return {action_id: np.asarray(rows, dtype=np.int64) for action_id, rows in local_rows.items()}
 
 
@@ -615,10 +655,14 @@ def build_hierarchical_motion_prototypes(
         load_images=False,
     ):
         states = _validated_states(episode, expected, seen, pass_name="action")
-        window_count = max(len(states) - (TRAJECTORY_WINDOW_LENGTH - 1), 0)
+        window_starts = trajectory_window_starts(len(states))
         raw_counts.update(
-            classify_motion_primitive(states[t], states[t + 7], primitive_config)
-            for t in range(window_count)
+            classify_motion_primitive(
+                states[t],
+                states[t + TRAJECTORY_WINDOW_LENGTH - 1],
+                primitive_config,
+            )
+            for t in window_starts
         )
         for clip_index, clip in clips_by_episode.get(episode.episode_id, ()):
             first = classify_motion_primitive(
@@ -724,7 +768,7 @@ def build_hierarchical_motion_prototypes(
                 pca_components=pca_components,
                 visual_dim=visual_dim,
             )
-            if len(window_visuals) != max(len(states) - 7, 0):
+            if len(window_visuals) != len(trajectory_window_starts(len(states))):
                 raise ValueError(f"episode {episode.episode_id}: state/cache length mismatch")
             memberships = _episode_exact_memberships(
                 states,

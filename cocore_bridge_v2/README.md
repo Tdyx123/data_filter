@@ -11,14 +11,15 @@ Cocore 的编码、运动原语、关系目标或惰性最大堆算法，而是�
 - LeRobot `v2.0`、WidowX、5 Hz；
 - 只读取 `observation.images.image_0`、8 维 `observation.state` 和 7 维 `action`；
 - 排除任务名为空的 episode，再应用 `--max-episodes`；
-- 固定使用 15 帧近似均匀候选和 Cocore schema 6 两级动作原型；原型学习遍历完整轨迹
-  的全部 stride=1 八帧窗口，只用精确保留动作训练硬视觉桶；
+- 固定使用 15 帧近似均匀候选和 Cocore schema 7 两级动作原型；原型学习在完整轨迹
+  上使用首尾覆盖、起点间隔最大为 3 的八帧窗口，只用精确保留动作训练硬视觉桶；
 - 候选按 `[0..7]`、`[7..14]` 独立选择最近叶原型，权重为保留比例置信度与桶内距离
   置信度的乘积；同叶合并，最终绝对权重不归一；
 - 全局选择，不施加逐任务配额。
 
 Bridge 为 5 Hz，因此 15 帧片段覆盖约 3 秒，现有运动原语的 7–8 帧比较跨度约为
-1.4–1.6 秒。本适配包不重采样，也不改变 Cocore 的帧级语义。
+1.4–1.6 秒。本适配包不重采样轨迹帧，也不改变 Cocore 的帧级语义；最大间隔 3 只控制
+动作原型训练窗口的起点。
 
 安装依赖：
 
@@ -67,21 +68,21 @@ python -m cocore_bridge_v2 run \
 outputs/cocore_bridge_v2/bridge_orig_1.0.0
 ```
 
-其中包含 `scan/`、`encode/`、`graph-15-motion-hard-nearest-pca/` 和
+其中包含 `scan/`、`encode/`、`graph-16-motion-hard-nearest-pca/` 和
 `select-<relation>-w<weight>-top<ratio>pct/`。选择目录继续提供
 `selected_manifest.jsonl`、`all_clips.parquet`、`selection_report.json`、
 `manifest.json` 和 `run_manifest.json`；encode 目录提供 Quality 融合
 `embeddings.npy`、`visual_pca.npz`、`numeric_normalizers.npz`、按 episode 分片的
 `frame_embeddings/`、对应索引以及候选双半段均值
 `visual_half_embeddings.npy`。逐帧缓存覆盖所有已索引 episode，包括短 episode。
-graph 目录提供 schema 6 的 `prototype_catalog.json`、128 维
+graph 目录提供 schema 7 的 `prototype_catalog.json`、128 维
 `prototype_centers.npy` 和内部校验用 `half_action_labels.npy`。聚类复用 Encode 的
 PCA components 前半列进行逐帧纯矩阵投影，不使用 mean/scale。选择输出包含最终
 原型标签、动作标签、绝对置信度和 `half_action_labels`，不包含旧的 action/distance
-分解权重。manifest 的生产者仍为 `cocore`；Cocore 版本为 0.11.0，Bridge 包版本为
-0.3.0。
+分解权重。manifest 的生产者仍为 `cocore`；Cocore 版本为 0.12.0，Bridge 包版本为
+0.4.0。
 
-0.10.0 及更早的 Cocore 缓存不迁移。升级后必须重新构建 scan、encode、graph 和
+0.11.0 及更早的 Cocore 缓存不迁移。升级后必须重新构建 scan、encode、graph 和
 selection；建议使用新的输出目录，或在确认目标后使用 `--force`。
 
 验证时必须重复传入生成该选择结果时使用的目标、比例、数据集路径以及
