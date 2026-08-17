@@ -116,6 +116,28 @@ class ShortEpisodeCocorePipelineAdapter(CocorePipelineAdapter):
         self._records = (*self._records, EpisodeRecord(2, 5, 2, "short task"))
 
 
+class MixedStopCocorePipelineAdapter(CocorePipelineAdapter):
+    def __init__(self, config: Mapping[str, object]) -> None:
+        super().__init__(config)
+        self._records = (*self._records, EpisodeRecord(2, 30, 2, "stop task"))
+
+    def iter_episodes(
+        self,
+        *,
+        num_workers: int = 0,
+        max_episodes: int | None = None,
+        load_images: bool = True,
+    ) -> Iterator[EpisodeData]:
+        for episode in super().iter_episodes(
+            num_workers=num_workers,
+            max_episodes=max_episodes,
+            load_images=load_images,
+        ):
+            if episode.episode_id == 2:
+                episode.observations["observation.state"][:] = 0.0
+            yield episode
+
+
 def _config(tmp_path: Path, relation: str = "cooccurrence") -> dict[str, object]:
     return {
         "seed": 7,
@@ -364,22 +386,25 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert (root / "scan" / "manifest.json").is_file()
     assert (root / "encode" / "manifest.json").is_file()
     assert (root / "encode" / "visual_half_embeddings.npy").is_file()
-    assert (root / "graph-16-motion-hard-nearest-pca" / "prototype_catalog.json").is_file()
-    assert (root / "graph-16-motion-hard-nearest-pca" / "prototype_centers.npy").is_file()
-    assert (root / "graph-16-motion-hard-nearest-pca" / "half_action_labels.npy").is_file()
-    for directory in ("scan", "encode", "graph-16-motion-hard-nearest-pca"):
+    assert (root / "graph-17-motion-hard-nearest-pca" / "prototype_catalog.json").is_file()
+    assert (root / "graph-17-motion-hard-nearest-pca" / "prototype_centers.npy").is_file()
+    assert (root / "graph-17-motion-hard-nearest-pca" / "half_action_labels.npy").is_file()
+    assert (root / "graph-17-motion-hard-nearest-pca" / "source_clip_indices.npy").is_file()
+    for directory in ("scan", "encode", "graph-17-motion-hard-nearest-pca"):
         manifest = json.loads((root / directory / "manifest.json").read_text())
         assert manifest["producer"] == "cocore"
-        assert manifest["cocore_version"] == "0.13.0"
+        assert manifest["cocore_version"] == "0.14.0"
     scan_manifest = json.loads((root / "scan" / "manifest.json").read_text())
     assert scan_manifest["window_policy"] == "near_uniform_full_coverage"
     assert scan_manifest["clip_length"] == 15
     catalog = json.loads(
-        (root / "graph-16-motion-hard-nearest-pca" / "prototype_catalog.json").read_text()
+        (root / "graph-17-motion-hard-nearest-pca" / "prototype_catalog.json").read_text()
     )
-    assert catalog["schema_version"] == 8
+    assert catalog["schema_version"] == 9
+    assert catalog["use_stop_bucket"] is True
     assert catalog["strategy"] == (
-        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_hybrid_kmeans_nearest"
+        "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_half_visual_"
+        "hybrid_kmeans_nearest"
     )
     assert catalog["total_raw_actions"] == 400
     assert catalog["constants"] == {
@@ -410,18 +435,22 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     }
     assert catalog["leaf_prototypes"]
     half_action_labels = np.load(
-        root / "graph-16-motion-hard-nearest-pca" / "half_action_labels.npy"
+        root / "graph-17-motion-hard-nearest-pca" / "half_action_labels.npy"
     )
     assert half_action_labels.shape == (82, 2)
     assert half_action_labels.dtype.kind == "U"
     assert set(half_action_labels.flat) == {"move forward"}
-    centers = np.load(root / "graph-16-motion-hard-nearest-pca" / "prototype_centers.npy")
+    centers = np.load(root / "graph-17-motion-hard-nearest-pca" / "prototype_centers.npy")
     assert centers.shape[1] == 128
-    nodes = np.load(root / "graph-16-motion-hard-nearest-pca" / "nodes.npz")
-    sequence_edges = np.load(root / "graph-16-motion-hard-nearest-pca" / "sequence_edges.npz")
+    nodes = np.load(root / "graph-17-motion-hard-nearest-pca" / "nodes.npz")
+    source_clip_indices = np.load(
+        root / "graph-17-motion-hard-nearest-pca" / "source_clip_indices.npy"
+    )
+    np.testing.assert_array_equal(source_clip_indices, np.arange(82, dtype=np.int64))
+    sequence_edges = np.load(root / "graph-17-motion-hard-nearest-pca" / "sequence_edges.npz")
     assert len(sequence_edges["source"]) == 80
     graph_manifest = json.loads(
-        (root / "graph-16-motion-hard-nearest-pca" / "manifest.json").read_text()
+        (root / "graph-17-motion-hard-nearest-pca" / "manifest.json").read_text()
     )
     assert graph_manifest["sequence_adjacency"] == "ordered_candidates"
     assert graph_manifest["prototype_visual_dim"] == 128
@@ -475,9 +504,11 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert all("prototype_distance_weights" not in row for row in all_rows)
     assert all("prototype_action_weights" not in row for row in selected)
     assert all("prototype_distance_weights" not in row for row in selected)
-    assert report["prototype_schema_version"] == 8
+    assert report["prototype_schema_version"] == 9
+    assert report["use_stop_bucket"] is True
     assert report["prototype_strategy"] == (
-        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_hybrid_kmeans_nearest"
+        "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_half_visual_"
+        "hybrid_kmeans_nearest"
     )
     assert report["objective"]["total"] == (
         report["objective"]["weighted_relation"] - report["objective"]["redundancy"]
@@ -496,24 +527,28 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     }
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.13.0"
+    assert run_manifest["cocore_version"] == "0.14.0"
     assert run_manifest["relation_type"] == relation
     assert run_manifest["relation_weight"] == 1.0
-    assert run_manifest["prototype_schema_version"] == 8
+    assert run_manifest["prototype_schema_version"] == 9
+    assert run_manifest["use_stop_bucket"] is True
     assert run_manifest["prototype_strategy"] == (
-        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_hybrid_kmeans_nearest"
+        "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_half_visual_"
+        "hybrid_kmeans_nearest"
     )
-    assert run_manifest["stage_directories"]["graph"] == "graph-16-motion-hard-nearest-pca"
+    assert run_manifest["stage_directories"]["graph"] == "graph-17-motion-hard-nearest-pca"
     assert run_manifest["algorithm"] == report["algorithm"]
     assert run_manifest["window_policy"] == "near_uniform_full_coverage"
     assert run_manifest["sequence_adjacency"] == "ordered_candidates"
     select_manifest = json.loads((result / "manifest.json").read_text())
-    assert select_manifest["cocore_version"] == "0.13.0"
+    assert select_manifest["cocore_version"] == "0.14.0"
     assert select_manifest["relation_type"] == relation
     assert select_manifest["relation_weight"] == 1.0
-    assert select_manifest["prototype_schema_version"] == 8
+    assert select_manifest["prototype_schema_version"] == 9
+    assert select_manifest["use_stop_bucket"] is True
     assert select_manifest["prototype_strategy"] == (
-        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_hybrid_kmeans_nearest"
+        "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_half_visual_"
+        "hybrid_kmeans_nearest"
     )
     resolved = yaml.safe_load((result / "resolved_config.yaml").read_text())
     assert resolved["output"]["directory"] == str(root)
@@ -524,7 +559,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     (result / "manifest.json").write_text(json.dumps(select_manifest))
     with pytest.raises(ValueError, match="selection manifest Cocore version"):
         validate_output(result, config=config)
-    select_manifest["cocore_version"] = "0.13.0"
+    select_manifest["cocore_version"] = "0.14.0"
     (result / "manifest.json").write_text(json.dumps(select_manifest))
 
     report["relation_type"] = "sequence" if relation == "cooccurrence" else "cooccurrence"
@@ -537,6 +572,86 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     (result / "selection_report.json").write_text(json.dumps(report))
     with pytest.raises(ValueError, match="heap total refreshes"):
         validate_output(result, config=config)
+
+
+def test_disabled_stop_bucket_excludes_unlabeled_candidates_from_graph_and_selection(
+    tmp_path: Path,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_mixed_stop", MixedStopCocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["dataset"]["type"] = "cocore_pipeline_mixed_stop"
+    config["prototypes"]["use_stop_bucket"] = False
+    config["selection"]["budget"] = None
+    config["selection"]["ratio"] = 0.5
+
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    graph_root = result.parent / "graph-17-motion-hard-nearest-pca"
+
+    source_indices = np.load(graph_root / "source_clip_indices.npy", allow_pickle=False)
+    np.testing.assert_array_equal(source_indices, np.arange(82, dtype=np.int64))
+    with np.load(graph_root / "nodes.npz") as nodes:
+        assert len(nodes["prototype_indices"]) == 82
+        assert np.all(np.any(nodes["prototype_indices"] >= 0, axis=1))
+    assert np.load(graph_root / "half_action_labels.npy", allow_pickle=False).shape == (82, 2)
+
+    catalog = json.loads((graph_root / "prototype_catalog.json").read_text())
+    stop = next(category for category in catalog["action_categories"] if category["label"] == "stop")
+    assert catalog["use_stop_bucket"] is False
+    assert stop["action_id"] is None
+    assert stop["training_count"] == 0
+    assert all(leaf["action_label"] != "stop" for leaf in catalog["leaf_prototypes"])
+
+    rows = pq.read_table(result / "all_clips.parquet").to_pylist()
+    report = json.loads((result / "selection_report.json").read_text())
+    assert len(rows) == 82
+    assert sum(row["selected"] for row in rows) == 41
+    assert report["number_of_clips"] == 82
+    assert report["number_of_scanned_clips"] == 84
+    assert report["eligible_clips"] == 82
+    assert report["excluded_unlabeled_clips"] == 2
+    assert report["use_stop_bucket"] is False
+    assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 41}
+
+
+def test_validate_rejects_tampered_source_clip_indices(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_mixed_stop", MixedStopCocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["dataset"]["type"] = "cocore_pipeline_mixed_stop"
+    config["prototypes"]["use_stop_bucket"] = False
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    path = result.parent / "graph-17-motion-hard-nearest-pca" / "source_clip_indices.npy"
+    source_indices = np.load(path, allow_pickle=False)
+    source_indices[-1] = 82
+    np.save(path, source_indices)
+
+    with pytest.raises(ValueError, match="source clip indices do not match prototype replay"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_tampered_graph_candidate_counts(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    path = result.parent / "graph-17-motion-hard-nearest-pca" / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["excluded_unlabeled_nodes"] = 1
+    path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="graph manifest candidate counts"):
+        validate_output(result, config=config)
+
+
+def test_disabled_stop_bucket_rejects_budget_above_eligible_candidate_count(
+    tmp_path: Path,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_mixed_stop", MixedStopCocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["dataset"]["type"] = "cocore_pipeline_mixed_stop"
+    config["prototypes"]["use_stop_bucket"] = False
+    config["selection"]["budget"] = 83
+
+    with pytest.raises(ValueError, match="selection budget must be within eligible candidate count"):
+        run_pipeline(config, visual_encoder=CocoreVisualEncoder())
 
 
 def test_run_pipeline_reports_all_completed_timings_and_cached_run_is_silent(
@@ -618,7 +733,7 @@ def test_validate_rejects_tampered_absolute_leaf_weights_by_replay(tmp_path: Pat
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    nodes_path = result.parent / "graph-16-motion-hard-nearest-pca" / "nodes.npz"
+    nodes_path = result.parent / "graph-17-motion-hard-nearest-pca" / "nodes.npz"
     with np.load(nodes_path) as stored:
         nodes = {name: stored[name].copy() for name in stored.files}
     nodes["prototype_weights"][0] *= np.float32(0.9)
@@ -632,7 +747,7 @@ def test_validate_rejects_tampered_hierarchical_catalog(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    catalog_path = result.parent / "graph-16-motion-hard-nearest-pca" / "prototype_catalog.json"
+    catalog_path = result.parent / "graph-17-motion-hard-nearest-pca" / "prototype_catalog.json"
     catalog = json.loads(catalog_path.read_text())
     catalog["leaf_prototypes"][0]["label"] = "wrong"
     catalog_path.write_text(json.dumps(catalog))
@@ -659,7 +774,7 @@ def test_validate_recomputes_hierarchical_catalog_diagnostics(
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    catalog_path = result.parent / "graph-16-motion-hard-nearest-pca" / "prototype_catalog.json"
+    catalog_path = result.parent / "graph-17-motion-hard-nearest-pca" / "prototype_catalog.json"
     catalog = json.loads(catalog_path.read_text())
     category = next(
         category
@@ -692,7 +807,7 @@ def test_validate_rejects_missing_hierarchical_centers(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    (result.parent / "graph-16-motion-hard-nearest-pca" / "prototype_centers.npy").unlink()
+    (result.parent / "graph-17-motion-hard-nearest-pca" / "prototype_centers.npy").unlink()
 
     with pytest.raises(ValueError, match="invalid stage artifacts: graph"):
         validate_output(result, config=config)
@@ -790,7 +905,7 @@ def test_graph_build_rejects_semantically_tampered_visual_half_cache(
 
     with pytest.raises(FileExistsError, match="visual half embedding.*--force"):
         graph_stage(config, visual_encoder=FailingCocoreVisualEncoder())
-    assert not (root / "graph-16-motion-hard-nearest-pca").exists()
+    assert not (root / "graph-17-motion-hard-nearest-pca").exists()
 
 
 def test_graph_stage_reports_aggregate_and_prototype_step_timings(
@@ -880,7 +995,7 @@ def test_validate_rejects_tampered_visual_prototype_center(tmp_path: Path) -> No
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    path = result.parent / "graph-16-motion-hard-nearest-pca" / "prototype_centers.npy"
+    path = result.parent / "graph-17-motion-hard-nearest-pca" / "prototype_centers.npy"
     centers = np.load(path)
     centers[0] = np.zeros(128, dtype=np.float32)
     centers[0, 0] = 1.0
@@ -920,7 +1035,7 @@ def test_validate_rejects_tampered_graph_projection_contract(
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    path = result.parent / "graph-16-motion-hard-nearest-pca" / "manifest.json"
+    path = result.parent / "graph-17-motion-hard-nearest-pca" / "manifest.json"
     manifest = json.loads(path.read_text())
     manifest[field] = value
     path.write_text(json.dumps(manifest))
@@ -933,7 +1048,7 @@ def test_validate_rejects_tampered_half_action_labels(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    path = result.parent / "graph-16-motion-hard-nearest-pca" / "half_action_labels.npy"
+    path = result.parent / "graph-17-motion-hard-nearest-pca" / "half_action_labels.npy"
     labels = np.load(path)
     labels[0, 0] = "stop"
     np.save(path, labels)
@@ -992,7 +1107,7 @@ def test_validate_rejects_schema_six_graph_catalog_explicitly(tmp_path: Path) ->
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    catalog_path = result.parent / "graph-16-motion-hard-nearest-pca" / "prototype_catalog.json"
+    catalog_path = result.parent / "graph-17-motion-hard-nearest-pca" / "prototype_catalog.json"
     catalog = json.loads(catalog_path.read_text())
     catalog["schema_version"] = 6
     catalog_path.write_text(json.dumps(catalog))
@@ -1006,7 +1121,7 @@ def test_validate_rejects_schema_six_graph_catalog_explicitly(tmp_path: Path) ->
     [
         ("scan", "scan"),
         ("encode", "encode"),
-        ("graph", "graph-16-motion-hard-nearest-pca"),
+        ("graph", "graph-17-motion-hard-nearest-pca"),
     ],
 )
 def test_validate_rejects_tampered_stage_manifest_contract(
@@ -1038,7 +1153,7 @@ def test_validate_rejects_tampered_stage_manifest_contract(
         ("scan", "window_policy", "legacy_stride", "window policy"),
         ("encode", "window_policy", "legacy_stride", "window policy"),
         (
-            "graph-16-motion-hard-nearest-pca",
+            "graph-17-motion-hard-nearest-pca",
             "sequence_adjacency",
             "contiguous",
             "graph manifest prototype schema",

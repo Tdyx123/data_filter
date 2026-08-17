@@ -213,7 +213,7 @@ def test_package_exposes_only_version() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["0.4.0", "['__version__']"]
+    assert result.stdout.splitlines() == ["0.5.0", "['__version__']"]
 
 
 def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None:
@@ -255,12 +255,14 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
         "epsilon": 1.0e-8,
     }
     assert config["prototypes"]["method"] == "motion_primitives"
+    assert config["prototypes"]["use_stop_bucket"] is True
     assert set(config["prototypes"]) == {
         "method",
         "batch_size",
         "max_iter",
         "tol",
         "num_threads",
+        "use_stop_bucket",
     }
     assert config["prototypes"]["num_threads"] == 4
     assert config["objective"] == {"relation": "sequence", "relation_weight": 1.5}
@@ -526,7 +528,7 @@ def test_scan_cli_preflights_and_delegates_resolved_bridge_config(
             "build-graph",
             "graph_stage",
             lambda root: (root, None, None, SimpleNamespace(sample_ids=(1, 2)), "fingerprint"),
-            "cocore_output={root}/graph-16-motion-hard-nearest-pca nodes=2",
+            "cocore_output={root}/graph-17-motion-hard-nearest-pca nodes=2",
         ),
         (
             "select",
@@ -697,10 +699,10 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     select_manifest = json.loads((result / "manifest.json").read_text())
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert select_manifest["producer"] == "cocore"
-    assert select_manifest["cocore_version"] == "0.13.0"
+    assert select_manifest["cocore_version"] == "0.14.0"
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.13.0"
-    assert run_manifest["stage_directories"]["graph"] == "graph-16-motion-hard-nearest-pca"
+    assert run_manifest["cocore_version"] == "0.14.0"
+    assert run_manifest["stage_directories"]["graph"] == "graph-17-motion-hard-nearest-pca"
     assert validate_output(result, config=config) == {
         "status": "valid",
         "selected_clips": 6,

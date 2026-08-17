@@ -42,6 +42,7 @@ prototypes:
   max_iter: 100
   tol: 1.0e-4
   num_threads: 4
+  use_stop_bucket: true
 
 graph:
   knn: 32

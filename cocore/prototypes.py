@@ -88,6 +88,7 @@ class LeafPrototype:
 class ActionCatalog:
     total_raw_actions: int
     action_categories: tuple[ActionCategory, ...]
+    use_stop_bucket: bool = True
     leaf_prototypes: tuple[LeafPrototype, ...] = ()
 
     @property
@@ -110,10 +111,11 @@ class ActionCatalog:
     def to_dict(self) -> dict[str, object]:
         return {
             "method": "motion_primitives",
-            "schema_version": 8,
+            "schema_version": 9,
+            "use_stop_bucket": self.use_stop_bucket,
             "strategy": (
-                "trajectory_sampled_retained_action_then_cropped_pca_half_visual_"
-                "hybrid_kmeans_nearest"
+                "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_"
+                "half_visual_hybrid_kmeans_nearest"
             ),
             "constants": {
                 "state_threshold": STATE_THRESHOLD,
@@ -152,6 +154,7 @@ class HierarchicalPrototypeResult:
     prototypes: PrototypeData
     catalog: ActionCatalog
     half_action_labels: np.ndarray
+    eligible_mask: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -183,9 +186,13 @@ def _atomic_actions(label: str) -> list[tuple[str, str]]:
 def maximum_retained_parents(
     label: str,
     retained_counts: Mapping[str, int],
+    *,
+    use_stop_bucket: bool = True,
 ) -> tuple[str, ...]:
     """Return every maximum-cardinality retained atomic subset in stable order."""
 
+    if not isinstance(use_stop_bucket, bool):
+        raise ValueError("use_stop_bucket must be a boolean")
     atomic = frozenset(_atomic_actions(label))
     candidates: list[tuple[str, int, int]] = []
     for parent_label, raw_count in retained_counts.items():
@@ -195,7 +202,7 @@ def maximum_retained_parents(
         if parent_atomic and parent_atomic.issubset(atomic):
             candidates.append((parent_label, int(raw_count), len(parent_atomic)))
     if not candidates:
-        return ("stop",)
+        return ("stop",) if use_stop_bucket else ()
     maximum_cardinality = max(cardinality for _, _, cardinality in candidates)
     parents = [
         (parent_label, raw_count)
@@ -336,9 +343,13 @@ def merge_half_leaf_assignments(
 def create_action_catalog(
     counts: Mapping[str, int],
     total_labels: int,
+    *,
+    use_stop_bucket: bool = True,
 ) -> ActionCatalog:
-    """Build a deterministic schema-7 action catalog from raw action counts."""
+    """Build a deterministic schema-9 action catalog from raw action counts."""
 
+    if not isinstance(use_stop_bucket, bool):
+        raise ValueError("use_stop_bucket must be a boolean")
     if isinstance(total_labels, bool) or not isinstance(total_labels, Integral):
         raise ValueError("motion primitive total_labels must be a non-negative integer")
     total = int(total_labels)
@@ -371,12 +382,16 @@ def create_action_catalog(
         raise ValueError("no non-stop action meets retention threshold")
 
     action_labels = [label for label, _ in ordered if label != "stop" and label in retained]
-    action_labels.append("stop")
+    if use_stop_bucket:
+        action_labels.append("stop")
     action_ids = {label: index for index, label in enumerate(action_labels)}
 
     categories: list[ActionCategory] = []
     for label, raw_count in ordered:
-        training_count = raw_count if label == "stop" or label in retained else 0
+        training_count = raw_count if (
+            (label == "stop" and use_stop_bucket)
+            or (label != "stop" and label in retained)
+        ) else 0
         categories.append(
             ActionCategory(
                 action_id=action_ids.get(label),
@@ -390,6 +405,7 @@ def create_action_catalog(
     return ActionCatalog(
         total_raw_actions=total,
         action_categories=tuple(categories),
+        use_stop_bucket=use_stop_bucket,
     )
 
 
@@ -760,6 +776,7 @@ def build_hierarchical_motion_prototypes(
     num_workers: int,
     tol: float = 1.0e-4,
     num_threads: int = 4,
+    use_stop_bucket: bool = True,
     timing_callback: TimingCallback | None = None,
 ) -> HierarchicalPrototypeResult:
     """Learn exact action buckets and assign one nearest visual leaf per clip half."""
@@ -768,6 +785,8 @@ def build_hierarchical_motion_prototypes(
         raw_candidate_values = np.asarray(visual_half_embeddings, dtype=np.float32)
     except (TypeError, ValueError) as error:
         raise ValueError("visual half embeddings must align with clips and be finite") from error
+    if not isinstance(use_stop_bucket, bool):
+        raise ValueError("hierarchical prototype use_stop_bucket must be a boolean")
     if (
         raw_candidate_values.ndim != 3
         or raw_candidate_values.shape[0] != len(clips)
@@ -871,7 +890,11 @@ def build_hierarchical_motion_prototypes(
         raise ValueError("dataset contains no valid trajectory windows")
     if len(candidate_labels) != len(clips):
         raise ValueError("state/clip/cache length mismatch")
-    catalog = create_action_catalog(raw_counts, total_windows)
+    catalog = create_action_catalog(
+        raw_counts,
+        total_windows,
+        use_stop_bucket=use_stop_bucket,
+    )
 
     categories_by_label = {category.label: category for category in catalog.action_categories}
     categories_by_id = {
@@ -881,6 +904,8 @@ def build_hierarchical_motion_prototypes(
     }
     if sorted(categories_by_id) != list(range(len(categories_by_id))):
         raise ValueError("action ids must be contiguous")
+    if not categories_by_id:
+        raise ValueError("no enabled action bucket remains")
     requested_centers: dict[int, int] = {}
     updated_categories: dict[int, ActionCategory] = {}
     for action_id in sorted(categories_by_id):
@@ -1017,6 +1042,7 @@ def build_hierarchical_motion_prototypes(
             else category
             for category in catalog.action_categories
         ),
+        use_stop_bucket=use_stop_bucket,
         leaf_prototypes=tuple(leaves),
     )
     statistics.clear()
@@ -1034,7 +1060,13 @@ def build_hierarchical_motion_prototypes(
     for clip_index in range(len(clips)):
         half_assignments: list[tuple[int, float]] = []
         for half_index, raw_label in enumerate(candidate_labels[clip_index]):
-            parent_labels = maximum_retained_parents(raw_label, retained_counts)
+            parent_labels = maximum_retained_parents(
+                raw_label,
+                retained_counts,
+                use_stop_bucket=use_stop_bucket,
+            )
+            if not parent_labels:
+                continue
             nearest: tuple[float, int, str] | None = None
             for parent_label in parent_labels:
                 parent_category = refined_by_label.get(parent_label)
@@ -1066,7 +1098,11 @@ def build_hierarchical_motion_prototypes(
                 parent_category.nearest_distance_q90,
             )
             half_assignments.append((leaf_id, weight))
-        per_clip.append(merge_half_leaf_assignments(tuple(half_assignments)))
+        per_clip.append(
+            merge_half_leaf_assignments(tuple(half_assignments))
+            if half_assignments
+            else ()
+        )
 
     prototype_indices = np.full((len(clips), 2), -1, dtype=np.int32)
     prototype_weights = np.zeros((len(clips), 2), dtype=np.float32)
@@ -1093,6 +1129,7 @@ def build_hierarchical_motion_prototypes(
         half_action_labels=np.asarray(
             [candidate_labels[index] for index in range(len(clips))], dtype=np.str_
         ),
+        eligible_mask=np.any(prototype_indices >= 0, axis=1),
     )
     if timing_callback is not None:
         timing_callback(

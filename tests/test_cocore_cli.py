@@ -14,8 +14,8 @@ def _objective(relation: str = "cooccurrence", weight: float = 1.0) -> dict[str,
     return {"objective": {"relation": relation, "relation_weight": weight}}
 
 
-def test_package_version_matches_hybrid_kmeans_release() -> None:
-    assert cocore.__version__ == "0.13.0"
+def test_package_version_matches_optional_stop_release() -> None:
+    assert cocore.__version__ == "0.14.0"
 
 
 def test_config_requires_explicit_relation_and_weight() -> None:
@@ -45,6 +45,7 @@ def test_config_accepts_supported_relations(relation: str) -> None:
     assert resolved["prototypes"]["method"] == "motion_primitives"
     assert resolved["prototypes"]["tol"] == 1.0e-4
     assert resolved["prototypes"]["num_threads"] == 4
+    assert resolved["prototypes"]["use_stop_bucket"] is True
     assert resolved["reliability_metrics"] == ["support", "progress"]
     assert resolved["objective"] == {"relation": relation, "relation_weight": 1.0}
     assert resolved["selection"]["max_refreshes"] == 100
@@ -145,6 +146,28 @@ def test_config_rejects_unknown_prototype_controls() -> None:
                     "method": "motion_primitives",
                     "unsupported_field": 3,
                 },
+            }
+        )
+
+
+def test_config_accepts_disabled_stop_bucket() -> None:
+    resolved = resolve_config(
+        {
+            **_objective(),
+            "prototypes": {"use_stop_bucket": False},
+        }
+    )
+
+    assert resolved["prototypes"]["use_stop_bucket"] is False
+
+
+@pytest.mark.parametrize("value", [0, 1, None, "false"])
+def test_config_rejects_non_boolean_stop_bucket_control(value: object) -> None:
+    with pytest.raises(ValueError, match="prototypes.use_stop_bucket"):
+        resolve_config(
+            {
+                **_objective(),
+                "prototypes": {"use_stop_bucket": value},
             }
         )
 
@@ -284,7 +307,7 @@ def test_build_graph_cli_reports_schema_seven_graph_directory(monkeypatch, capsy
     cli.main(["build-graph", "--config", "unused.yaml"])
 
     assert capsys.readouterr().out.strip() == (
-        "cocore_output=outputs/cocore/test/graph-16-motion-hard-nearest-pca nodes=2"
+        "cocore_output=outputs/cocore/test/graph-17-motion-hard-nearest-pca nodes=2"
     )
 
 
@@ -309,6 +332,7 @@ def test_shipped_configs_resolve_to_fixed_cocore_contract(path: str) -> None:
         "max_iter",
         "tol",
         "num_threads",
+        "use_stop_bucket",
     }
     assert config["prototypes"]["num_threads"] == (
         1 if path.endswith("config_debug.yaml") else 4

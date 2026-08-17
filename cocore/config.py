@@ -46,6 +46,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 DEFAULT_CONFIG["prototypes"]["method"] = "motion_primitives"
 DEFAULT_CONFIG["prototypes"]["tol"] = 1.0e-4
 DEFAULT_CONFIG["prototypes"]["num_threads"] = 4
+DEFAULT_CONFIG["prototypes"]["use_stop_bucket"] = True
 for _obsolete_prototype_field in ("count", "top_r", "temperature"):
     DEFAULT_CONFIG["prototypes"].pop(_obsolete_prototype_field, None)
 
@@ -112,6 +113,7 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "max_iter",
             "tol",
             "num_threads",
+            "use_stop_bucket",
         }
         if unsupported:
             names = ", ".join(sorted(unsupported))
@@ -123,6 +125,10 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("cocore reliability_metrics are fixed to support,progress")
     resolved = _merge(DEFAULT_CONFIG, config)
     resolved["prototypes"]["method"] = "motion_primitives"
+    use_stop_bucket = resolved["prototypes"].get("use_stop_bucket")
+    if not isinstance(use_stop_bucket, bool):
+        raise ValueError("cocore prototypes.use_stop_bucket must be a boolean")
+    resolved["prototypes"]["use_stop_bucket"] = use_stop_bucket
     num_threads = resolved["prototypes"].get("num_threads")
     if (
         isinstance(num_threads, bool)
@@ -210,7 +216,7 @@ def to_relcore_config(resolved: Mapping[str, Any]) -> dict[str, Any]:
                 {
                     key: copy.deepcopy(value)
                     for key, value in resolved[section].items()
-                    if key not in {"num_threads", "tol"}
+                    if key not in {"num_threads", "tol", "use_stop_bucket"}
                 }
             )
         else:

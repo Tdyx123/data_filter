@@ -32,8 +32,10 @@ episode 只执行一次视觉模型前向；候选片段的视觉特征
 count >= max(400, ceil(0.005 * W))
 ```
 
-非 `stop` 桶只训练原始标签本身达到门槛的硬窗口；低频窗口不进入任何训练桶。`stop`
-只训练原始 `stop` 窗口。令 `M_a` 为桶内硬样本数，中心数固定为：
+非 `stop` 桶只训练原始标签本身达到门槛的硬窗口；低频窗口不进入任何训练桶。默认
+`prototypes.use_stop_bucket: true`，此时 `stop` 只训练原始 `stop` 窗口；设为 `false`
+时仍统计原始 `stop` 数量，但不训练 stop 桶、视觉中心或叶原型。令 `M_a` 为桶内硬样本
+数，中心数固定为：
 
 ```text
 K_a = min(M_a, min(16, max(3, floor(2 * log2(M_a) - 16))))
@@ -52,7 +54,10 @@ MiniBatchKMeans，这些大桶按动作 ID 串行拟合且每个模型固定 4 �
 构造 15 帧候选标签时，分别分类 `state[0]→state[7]` 与
 `state[7]→state[14]`，两个半段各自独立打一个叶标签。若原始动作未保留，先找原子数
 最多的保留子集；多个父动作并列时，在它们的所有中心中选欧氏距离最近的叶原型，距离
-相同取较小叶 ID。没有非空父集时回退 `stop`。
+相同取较小叶 ID。启用 stop 桶时，没有非空父集会回退 `stop`；关闭时该半段不产生
+标签。两个半段都没有标签的候选从 graph 起排除，不参与 KNN、关系图、预算计算或筛选；
+只有一个半段有标签的候选仍保留。过滤后的 sequence/cooccurrence 是原候选图的诱导
+子图，不跨无标签空洞重连，也不压缩原始共现距离。
 
 ```text
 w_r = 0.5 + 0.5 * |A_parent| / |A_raw|
@@ -128,6 +133,7 @@ prototypes:
   max_iter: 100
   tol: 1.0e-4
   num_threads: 4
+  use_stop_bucket: true
 ```
 
 片段长度固定为 15，候选数量、首尾锚定与近似均匀间隔是 Cocore 固定算法的一部分；
@@ -135,8 +141,9 @@ prototypes:
 Quality 风格编码取代了旧关系编码，因此不再接受顶层 `relation` 或 `normalization`；
 `encoding.visual_dim` 固定为 128，`pca_fit_max_samples` 可限制 PCA 拟合样本数。
 动作门槛、中心数公式、16 个中心上限、距离分位和权重公式都是 Cocore 固定算法，
-不可配置；`prototypes` 只接受 `method`、`batch_size`、`max_iter`、正数 `tol` 和正整数
-`num_threads`，并明确拒绝旧 `count`、`top_r` 或 `temperature`。`batch_size` 只影响
+不可配置；`prototypes` 只接受 `method`、`batch_size`、`max_iter`、正数 `tol`、正整数
+`num_threads` 和布尔值 `use_stop_bucket`，并明确拒绝旧 `count`、`top_r` 或
+`temperature`。`batch_size` 只影响
 超过 65,536 个训练窗口的大桶；`num_threads` 默认为 4，只并行不超过阈值的小桶，
 debug 配置固定为 1。它与 `runtime.num_workers` 相互独立，后者仍只控制 episode 读取
 进程。
@@ -146,7 +153,7 @@ debug 配置固定为 1。它与 `runtime.num_workers` 相互独立，后者仍�
 基础额外内存约为“保留窗口数 × 128 × 4 字节”：LIBERO90 约 106 MiB，Bridge V2
 约 273 MiB；完整 KMeans 拟合小桶时还会产生有界于 65,536 个窗口的工作副本。改变
 `num_threads` 不改变 graph 指纹或产物，因此可复用同一 graph 缓存；改变
-`batch_size`、`max_iter` 或 `tol` 会使 graph 缓存失效。
+`batch_size`、`max_iter`、`tol` 或 `use_stop_bucket` 会使 graph 缓存失效。
 
 可在运行时覆盖选择比例、关系类型与关系权重：
 
@@ -168,14 +175,15 @@ RelCore 的 `--reliability-metrics`、`--prototype-method` 或
 python -m cocore run --config cocore/config_debug.yaml --force
 ```
 
-Cocore 0.13.0 使用 prototype schema 8、65,536 窗口的混合 KMeans 阈值、最大间隔 3
-的动作训练窗口、裁剪 PCA 的 128 维聚类空间、近似均匀候选和顺序相邻 sequence 图，
-并按 episode 持久化完整原始逐帧 CLIP 特征。0.12.0 及更早版本的 scan、encode、graph
-和 selection 缓存不迁移；升级后必须通过 `--force` 重建全部阶段，或使用新的输出目录。
+Cocore 0.14.0 使用 prototype schema 9、可选 stop 桶、无标签候选诱导子图、65,536
+窗口的混合 KMeans 阈值、最大间隔 3 的动作训练窗口、裁剪 PCA 的 128 维聚类空间、
+近似均匀候选和原始相邻 sequence 图，并按 episode 持久化完整原始逐帧 CLIP 特征。
+0.13.0 及更早版本的 scan、encode、graph 和 selection 缓存不迁移；升级后必须通过
+`--force` 重建全部阶段，或使用新的输出目录。
 
 ## 输出与校验
 
-输出根目录包含 `scan/`、`encode/`、`graph-16-motion-hard-nearest-pca/` 和一个或多个
+输出根目录包含 `scan/`、`encode/`、`graph-17-motion-hard-nearest-pca/` 和一个或多个
 `select-<关系>-w<权重>-top<比例>pct/`。选择目录包含：
 
 - scan 目录中的 `episodes.parquet` 与 `clips.parquet`：episode 元数据和可重放的
@@ -183,6 +191,8 @@ Cocore 0.13.0 使用 prototype schema 8、65,536 窗口的混合 KMeans 阈值�
 - graph 目录中的 `prototype_catalog.json` 与 `prototype_centers.npy`：动作类别、
   原始计数、训练计数、视觉中心数量、距离 q10/q90、投影契约以及按叶 ID 对齐的
   128 维中心；
+- graph 目录中的 `source_clip_indices.npy`：每个 eligible graph 节点对应的 scan/encode
+  候选行号；关闭 stop 桶后它同时记录被排除候选形成的空洞；
 - encode 目录中的 `embeddings.npy`、`visual_pca.npz` 和
   `numeric_normalizers.npz`：Quality 融合 embedding 及其可重放参数；
 - encode 目录中的 `frame_embeddings/ep<episode_id>.npy`：每个已索引 episode（包括
@@ -192,8 +202,10 @@ Cocore 0.13.0 使用 prototype schema 8、65,536 窗口的混合 KMeans 阈值�
   graph 目录中的 `half_action_labels.npy` 记录两个半段各自的原始动作标签；
 
 - `selected_manifest.jsonl`：训练入口可直接消费的片段清单；
-- `all_clips.parquet`：全池 support、progress、reliability、运动原语与选择诊断；
-- `selection_report.json`：coverage、目标分解、任务计数与堆刷新统计；
+- `all_clips.parquet`：eligible 筛选池的 support、progress、reliability、运动原语与选择
+  诊断，不包含无标签候选；
+- `selection_report.json`：coverage、目标分解、任务计数、堆刷新统计，以及 scanned、
+  eligible、excluded-unlabeled 候选数量；
 - `manifest.json`、`run_manifest.json`：Cocore 参数、阶段目录与指纹；
 - `resolved_config.yaml`、`environment.json`：`run` 的完整配置与环境。
 

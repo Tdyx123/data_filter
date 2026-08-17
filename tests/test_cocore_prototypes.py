@@ -174,7 +174,8 @@ class _StreamingMeanAdapter(DatasetAdapter):
 
 
 class _StopFallbackAdapter(DatasetAdapter):
-    def __init__(self, *, include_stop: bool) -> None:
+    def __init__(self, *, include_stop: bool, partial_candidate: bool = False) -> None:
+        self.partial_candidate = partial_candidate
         records = [EpisodeRecord(0, 1205, 0, "forward training")]
         if include_stop:
             records.append(EpisodeRecord(1, 15, 0, "stop training"))
@@ -207,7 +208,11 @@ class _StopFallbackAdapter(DatasetAdapter):
             if record.episode_id == 0:
                 states[:, 0] = steps * np.float32(0.01)
             elif record.episode_id == 2:
-                states[:, 1] = steps * np.float32(-0.01)
+                if self.partial_candidate:
+                    states[:, 0] = np.minimum(steps, 7.0) * np.float32(0.01)
+                    states[:, 1] = np.maximum(steps - 7.0, 0.0) * np.float32(-0.01)
+                else:
+                    states[:, 1] = steps * np.float32(-0.01)
             yield EpisodeData(
                 episode_id=record.episode_id,
                 timestamps=steps.astype(np.float64) / 10.0,
@@ -296,6 +301,28 @@ def test_maximum_retained_parents_keeps_all_largest_atomic_subsets() -> None:
     )
 
 
+def test_maximum_retained_parents_does_not_fall_back_when_stop_bucket_is_disabled() -> None:
+    parents = prototypes.maximum_retained_parents(
+        "move right",
+        {"move forward": 400},
+        use_stop_bucket=False,
+    )
+
+    assert parents == ()
+
+
+@pytest.mark.parametrize("use_stop_bucket", [0, 1, None, "false"])
+def test_maximum_retained_parents_rejects_non_boolean_stop_bucket(
+    use_stop_bucket: object,
+) -> None:
+    with pytest.raises(ValueError, match="use_stop_bucket must be a boolean"):
+        prototypes.maximum_retained_parents(
+            "move right",
+            {"move forward": 400},
+            use_stop_bucket=use_stop_bucket,  # type: ignore[arg-type]
+        )
+
+
 @pytest.mark.parametrize(
     ("raw_label", "parent_label", "expected"),
     [
@@ -332,6 +359,39 @@ def test_action_catalog_accepts_pure_stop_data_below_the_count_floor() -> None:
     assert category.retained is False
     assert category.training_count == 3
     assert catalog.action_labels == ("stop",)
+
+
+def test_action_catalog_records_stop_without_enabling_its_bucket() -> None:
+    catalog = prototypes.create_action_catalog(
+        Counter({"move forward": 400, "stop": 600}),
+        total_labels=1_000,
+        use_stop_bucket=False,
+    )
+
+    by_label = {category.label: category for category in catalog.action_categories}
+    assert by_label["stop"].retained is True
+    assert by_label["stop"].action_id is None
+    assert by_label["stop"].training_count == 0
+    assert catalog.action_labels == ("move forward",)
+    assert catalog.to_dict()["use_stop_bucket"] is False
+
+
+def test_disabled_stop_bucket_rejects_pure_stop_dataset(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="no enabled action bucket remains"):
+        prototypes.build_hierarchical_motion_prototypes(
+            _StreamingMeanAdapter(),
+            [],
+            np.empty((0, 2, 2), dtype=np.float32),
+            pca_components=_identity_fragment_pca(2),
+            visual_dim=2,
+            frame_cache_dir=tmp_path,
+            batch_size=32,
+            max_iter=2,
+            seed=23,
+            max_episodes=None,
+            num_workers=0,
+            use_stop_bucket=False,
+        )
 
 
 def test_action_catalog_records_only_exact_training_memberships() -> None:
@@ -578,7 +638,7 @@ def test_episode_window_visuals_project_each_frame_before_pooling(tmp_path: Path
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-7)
 
 
-def test_action_catalog_serializes_schema_eight_sampling_strategy_and_metadata() -> None:
+def test_action_catalog_serializes_schema_nine_sampling_strategy_and_metadata() -> None:
     catalog = prototypes.create_action_catalog(
         Counter({"move forward": 400, "move right": 600}),
         total_labels=1_000,
@@ -612,9 +672,11 @@ def test_action_catalog_serializes_schema_eight_sampling_strategy_and_metadata()
 
     payload = catalog.to_dict()
 
-    assert payload["schema_version"] == 8
+    assert payload["schema_version"] == 9
+    assert payload["use_stop_bucket"] is True
     assert payload["strategy"] == (
-        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_hybrid_kmeans_nearest"
+        "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_half_visual_"
+        "hybrid_kmeans_nearest"
     )
     assert payload["constants"] == {
         "state_threshold": 0.03,
@@ -1089,6 +1151,97 @@ def test_non_stop_half_falls_back_to_stop_with_absolute_merged_confidence(
     assert result.prototypes.weights[0].tolist() == pytest.approx([0.75, 0.0])
     leaf = result.catalog.leaf_prototypes[int(result.prototypes.indices[0, 0])]
     assert leaf.action_label == "stop"
+
+
+def test_disabled_stop_bucket_marks_fully_unlabeled_candidate_ineligible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _StopFallbackAdapter(include_stop=True)
+
+    def block_visuals(
+        cache_root: Path,
+        record: EpisodeRecord,
+        *,
+        pca_components: np.ndarray,
+        visual_dim: int,
+    ) -> np.ndarray:
+        del cache_root, pca_components, visual_dim
+        values = np.asarray(
+            [1.0, 0.0] if record.episode_id == 0 else [0.0, 1.0],
+            dtype=np.float32,
+        )
+        window_count = {0: 400, 1: 4, 2: 4}[record.episode_id]
+        return np.broadcast_to(values, (window_count, 2)).copy()
+
+    monkeypatch.setattr(prototypes, "_episode_window_visuals", block_visuals)
+    result = prototypes.build_hierarchical_motion_prototypes(
+        adapter,
+        [_candidate_clip()],
+        np.asarray([[[0.0, 1.0], [0.0, 1.0]]], dtype=np.float32),
+        pca_components=_identity_fragment_pca(2),
+        visual_dim=2,
+        frame_cache_dir=tmp_path,
+        batch_size=32,
+        max_iter=2,
+        seed=23,
+        max_episodes=None,
+        num_workers=0,
+        use_stop_bucket=False,
+    )
+
+    stop = next(category for category in result.catalog.action_categories if category.label == "stop")
+    assert stop.action_id is None
+    assert stop.training_count == 0
+    assert all(leaf.action_label != "stop" for leaf in result.catalog.leaf_prototypes)
+    np.testing.assert_array_equal(result.eligible_mask, [False])
+    np.testing.assert_array_equal(result.prototypes.indices, [[-1, -1]])
+    np.testing.assert_array_equal(result.prototypes.weights, [[0.0, 0.0]])
+
+
+def test_disabled_stop_bucket_keeps_candidate_with_one_labeled_half(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _StopFallbackAdapter(include_stop=True, partial_candidate=True)
+
+    def block_visuals(
+        cache_root: Path,
+        record: EpisodeRecord,
+        *,
+        pca_components: np.ndarray,
+        visual_dim: int,
+    ) -> np.ndarray:
+        del cache_root, pca_components, visual_dim
+        values = np.asarray(
+            [1.0, 0.0] if record.episode_id == 0 else [0.0, 1.0],
+            dtype=np.float32,
+        )
+        window_count = {0: 400, 1: 4, 2: 4}[record.episode_id]
+        return np.broadcast_to(values, (window_count, 2)).copy()
+
+    monkeypatch.setattr(prototypes, "_episode_window_visuals", block_visuals)
+    result = prototypes.build_hierarchical_motion_prototypes(
+        adapter,
+        [_candidate_clip()],
+        np.asarray([[[1.0, 0.0], [0.0, 1.0]]], dtype=np.float32),
+        pca_components=_identity_fragment_pca(2),
+        visual_dim=2,
+        frame_cache_dir=tmp_path,
+        batch_size=32,
+        max_iter=2,
+        seed=23,
+        max_episodes=None,
+        num_workers=0,
+        use_stop_bucket=False,
+    )
+
+    assert result.half_action_labels.tolist() == [["move forward", "move right"]]
+    np.testing.assert_array_equal(result.eligible_mask, [True])
+    assert result.prototypes.indices[0, 0] >= 0
+    assert result.prototypes.indices[0, 1] == -1
+    assert result.prototypes.weights[0, 0] > 0.0
+    assert result.prototypes.weights[0, 1] == 0.0
 
 
 def test_non_stop_fallback_fails_when_stop_has_no_visual_center(

@@ -69,11 +69,12 @@ from cocore.selection import (
 from cocore.timing import emit_completed_timing, timed_step
 
 
-GRAPH_DIRECTORY = "graph-16-motion-hard-nearest-pca"
+GRAPH_DIRECTORY = "graph-17-motion-hard-nearest-pca"
 RELIABILITY_METRICS = ("support", "progress")
-PROTOTYPE_SCHEMA_VERSION = 8
+PROTOTYPE_SCHEMA_VERSION = 9
 PROTOTYPE_STRATEGY = (
-    "trajectory_sampled_retained_action_then_cropped_pca_half_visual_hybrid_kmeans_nearest"
+    "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_half_visual_"
+    "hybrid_kmeans_nearest"
 )
 PROTOTYPE_VISUAL_PROJECTION = "frame @ visual_pca.components[:, :frame_embedding_dim].T"
 PROTOTYPE_VISUAL_NORMALIZATION = "l2_normalized_eight_frame_mean_after_projection"
@@ -584,7 +585,8 @@ def graph_stage(
     pca_components = _load_visual_pca_components(root / "encode", visual_dim=visual_dim)
     prototype_config = resolved["prototypes"]
     prototype_fingerprint_config = {
-        key: prototype_config[key] for key in ("method", "batch_size", "max_iter", "tol")
+        key: prototype_config[key]
+        for key in ("method", "batch_size", "max_iter", "tol", "use_stop_bucket")
     }
     fingerprint = stable_hash(
         {
@@ -638,8 +640,12 @@ def graph_stage(
                 max_episodes=resolved["runtime"].get("max_episodes"),
                 num_workers=int(resolved["runtime"].get("num_workers", 0)),
                 num_threads=int(prototype_config["num_threads"]),
+                use_stop_bucket=bool(prototype_config["use_stop_bucket"]),
                 timing_callback=emit_completed_timing,
             )
+        source_clip_indices = np.flatnonzero(hierarchy.eligible_mask).astype(np.int64)
+        if len(source_clip_indices) == 0:
+            raise ValueError("no eligible candidate with a non-stop action label remains")
         graph_config = resolved["graph"]
         with timed_step("graph.sparse_graph", emit_completed_timing):
             graph = build_graph(
@@ -647,6 +653,7 @@ def graph_stage(
                 encoded.embeddings,
                 reliability.reliability,
                 hierarchy.prototypes,
+                included_indices=source_clip_indices,
                 knn=int(graph_config["knn"]),
                 similarity_threshold=float(graph_config["similarity_threshold"]),
                 cooccurrence_max_gap=int(graph_config["cooccurrence_max_gap"]),
@@ -658,14 +665,18 @@ def graph_stage(
             reliability=graph.reliability,
             prototype_indices=graph.prototype_indices,
             prototype_weights=graph.prototype_weights,
-            support=reliability.support,
-            progress=reliability.progress,
-            smoothness=reliability.smoothness,
-            noop_ratio=reliability.noop_ratio,
+            support=reliability.support[source_clip_indices],
+            progress=reliability.progress[source_clip_indices],
+            smoothness=reliability.smoothness[source_clip_indices],
+            noop_ratio=reliability.noop_ratio[source_clip_indices],
         )
+        np.save(temporary / "source_clip_indices.npy", source_clip_indices)
         assert hierarchy.prototypes.centers is not None
         np.save(temporary / "prototype_centers.npy", hierarchy.prototypes.centers)
-        np.save(temporary / "half_action_labels.npy", hierarchy.half_action_labels)
+        np.save(
+            temporary / "half_action_labels.npy",
+            hierarchy.half_action_labels[source_clip_indices],
+        )
         write_json(temporary / "prototype_catalog.json", hierarchy.catalog.to_dict())
         _save_edge_table(temporary / "sequence_edges.npz", graph.sequence_edges)
         _save_edge_table(temporary / "similarity_edges.npz", graph.similarity_edges)
@@ -685,11 +696,14 @@ def graph_stage(
                 "prototype_method": "motion_primitives",
                 "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
                 "prototype_strategy": PROTOTYPE_STRATEGY,
+                "use_stop_bucket": bool(prototype_config["use_stop_bucket"]),
                 "prototype_visual_dim": visual_dim,
                 "prototype_visual_projection": PROTOTYPE_VISUAL_PROJECTION,
                 "prototype_visual_normalization": PROTOTYPE_VISUAL_NORMALIZATION,
                 "sequence_adjacency": SEQUENCE_ADJACENCY,
                 "nodes": len(graph.sample_ids),
+                "scanned_candidate_nodes": len(encoded.clips),
+                "excluded_unlabeled_nodes": len(encoded.clips) - len(graph.sample_ids),
                 "sequence_edges": len(graph.sequence_edges.source),
                 "similarity_edges": len(graph.similarity_edges.source),
                 "runtime_seconds": time.perf_counter() - started,
@@ -702,6 +716,7 @@ def graph_stage(
         fingerprint=fingerprint,
         required=(
             "nodes.npz",
+            "source_clip_indices.npy",
             "prototype_catalog.json",
             "prototype_centers.npy",
             "half_action_labels.npy",
@@ -717,10 +732,12 @@ def graph_stage(
     if built:
         emit_completed_timing("graph", time.perf_counter() - stage_started)
     nodes = np.load(destination / "nodes.npz")
+    source_clip_indices = _load_source_clip_indices(destination, len(encoded.clips))
+    graph_clips = [encoded.clips[int(index)] for index in source_clip_indices]
     graph = GraphData(
-        sample_ids=[clip.sample_id for clip in encoded.clips],
+        sample_ids=[clip.sample_id for clip in graph_clips],
         task_indices=nodes["task_indices"],
-        embeddings=encoded.embeddings,
+        embeddings=encoded.embeddings[source_clip_indices],
         reliability=nodes["reliability"],
         prototype_indices=nodes["prototype_indices"],
         prototype_weights=nodes["prototype_weights"],
@@ -730,7 +747,7 @@ def graph_stage(
         cooccurrence_matrix=sparse.load_npz(destination / "cooccurrence_matrix.npz"),
         prototype_labels=_prototype_labels(destination),
     )
-    return root, adapter, encoded.clips, graph, fingerprint
+    return root, adapter, graph_clips, graph, fingerprint
 
 
 def _selection_budget(config: Mapping[str, Any], candidate_count: int) -> int:
@@ -741,7 +758,7 @@ def _selection_budget(config: Mapping[str, Any], candidate_count: int) -> int:
         else int(np.floor(candidate_count * float(config["selection"]["ratio"]) + 0.5))
     )
     if budget <= 0 or budget > candidate_count:
-        raise ValueError("selection budget must be within candidate count")
+        raise ValueError("selection budget must be within eligible candidate count")
     return budget
 
 
@@ -756,6 +773,24 @@ def _save_edge_table(path: Path, table: EdgeTable) -> None:
 
 def _load_clips(path: Path) -> list[ClipRecord]:
     return [ClipRecord(**row) for row in pq.read_table(path).to_pylist()]
+
+
+def _load_source_clip_indices(graph_root: Path, candidate_count: int) -> np.ndarray:
+    path = graph_root / "source_clip_indices.npy"
+    try:
+        values = np.load(path, allow_pickle=False)
+    except (OSError, ValueError) as error:
+        raise ValueError("cocore graph source clip indices are missing or invalid") from error
+    if (
+        values.dtype != np.dtype(np.int64)
+        or values.ndim != 1
+        or len(values) == 0
+        or np.any(values < 0)
+        or np.any(values >= int(candidate_count))
+        or (len(values) > 1 and np.any(np.diff(values) <= 0))
+    ):
+        raise ValueError("cocore graph source clip indices are missing or invalid")
+    return values
 
 
 def _prototype_catalog(graph_root: Path) -> Mapping[str, Any]:
@@ -789,13 +824,15 @@ def _leaf_prototype_metadata(graph_root: Path) -> tuple[Mapping[str, Any], ...]:
 
 
 def _load_graph(root: Path) -> tuple[list[ClipRecord], GraphData, Mapping[str, np.ndarray]]:
-    clips = _load_clips(root / "scan" / "clips.parquet")
+    scanned_clips = _load_clips(root / "scan" / "clips.parquet")
     graph_root = root / GRAPH_DIRECTORY
+    source_clip_indices = _load_source_clip_indices(graph_root, len(scanned_clips))
+    clips = [scanned_clips[int(index)] for index in source_clip_indices]
     nodes = np.load(graph_root / "nodes.npz")
     graph = GraphData(
         sample_ids=[clip.sample_id for clip in clips],
         task_indices=nodes["task_indices"],
-        embeddings=np.load(root / "encode" / "embeddings.npy"),
+        embeddings=np.load(root / "encode" / "embeddings.npy")[source_clip_indices],
         reliability=nodes["reliability"],
         prototype_indices=nodes["prototype_indices"],
         prototype_weights=nodes["prototype_weights"],
@@ -808,10 +845,11 @@ def _load_graph(root: Path) -> tuple[list[ClipRecord], GraphData, Mapping[str, n
     return clips, graph, nodes
 
 
-def _validate_schema_eight_catalog(
+def _validate_schema_nine_catalog(
     payload: Mapping[str, Any],
     *,
     expected_total_raw_actions: int,
+    use_stop_bucket: bool,
 ) -> tuple[Mapping[str, Any], ...]:
     expected_constants = {
         "state_threshold": STATE_THRESHOLD,
@@ -843,6 +881,7 @@ def _validate_schema_eight_catalog(
         payload.get("method") != "motion_primitives"
         or payload.get("schema_version") != PROTOTYPE_SCHEMA_VERSION
         or payload.get("strategy") != PROTOTYPE_STRATEGY
+        or payload.get("use_stop_bucket") is not use_stop_bucket
         or payload.get("constants") != expected_constants
         or not isinstance(payload.get("action_categories"), list)
         or not isinstance(payload.get("leaf_prototypes"), list)
@@ -883,7 +922,7 @@ def _validate_schema_eight_catalog(
         str(category["label"])
         for category in categories
         if category["label"] != "stop" and int(category["raw_count"]) >= threshold
-    ] + ["stop"]
+    ] + (["stop"] if use_stop_bucket else [])
     action_ids = {label: index for index, label in enumerate(assigned_labels)}
     categories_by_id: dict[int, Mapping[str, Any]] = {}
     for category in categories:
@@ -914,7 +953,10 @@ def _validate_schema_eight_catalog(
         if expected_action_id is not None:
             categories_by_id[expected_action_id] = category
 
-        expected_training = count if label == "stop" or expected_retained else 0
+        expected_training = count if (
+            (label == "stop" and use_stop_bucket)
+            or (label != "stop" and expected_retained)
+        ) else 0
         training = category.get("training_count")
         if (
             isinstance(training, bool)
@@ -1015,6 +1057,8 @@ def _validate_hierarchical_graph_artifacts(
     expected_total_raw_actions: int,
 ) -> None:
     graph_root = root / GRAPH_DIRECTORY
+    source_clip_indices = _load_source_clip_indices(graph_root, len(clips))
+    graph_count = len(source_clip_indices)
     with np.load(graph_root / "nodes.npz") as stored:
         if not {"prototype_indices", "prototype_weights"} <= set(stored.files):
             raise ValueError("hierarchical prototype node arrays are missing")
@@ -1027,16 +1071,17 @@ def _validate_hierarchical_graph_artifacts(
         or weights.dtype != np.dtype(np.float32)
         or indices.ndim != 2
         or indices.shape != weights.shape
-        or indices.shape[0] != len(clips)
+        or indices.shape[0] != graph_count
         or indices.shape[1] != 2
         or not np.all(np.isfinite(weights))
     ):
         raise ValueError("hierarchical prototype node shape or dtype is invalid")
 
     payload = json.loads((graph_root / "prototype_catalog.json").read_text(encoding="utf-8"))
-    leaves = _validate_schema_eight_catalog(
+    leaves = _validate_schema_nine_catalog(
         payload,
         expected_total_raw_actions=expected_total_raw_actions,
+        use_stop_bucket=bool(resolved["prototypes"]["use_stop_bucket"]),
     )
     visual_halves = np.load(root / "encode" / "visual_half_embeddings.npy", allow_pickle=False)
     visual_dim = int(resolved["encoding"]["visual_dim"])
@@ -1061,7 +1106,7 @@ def _validate_hierarchical_graph_artifacts(
         raise ValueError("hierarchical prototype centers are invalid")
     if (
         half_action_labels.ndim != 2
-        or half_action_labels.shape != (len(clips), 2)
+        or half_action_labels.shape != (graph_count, 2)
         or half_action_labels.dtype.kind != "U"
         or any(not str(label) for label in half_action_labels.flat)
     ):
@@ -1108,19 +1153,29 @@ def _validate_hierarchical_graph_artifacts(
         max_episodes=resolved["runtime"].get("max_episodes"),
         num_workers=int(resolved["runtime"].get("num_workers", 0)),
         num_threads=int(prototype_config["num_threads"]),
+        use_stop_bucket=bool(prototype_config["use_stop_bucket"]),
     )
     replay_centers = replay.prototypes.centers
     if replay_centers is None:
         raise ValueError("hierarchical prototype replay produced no centers")
     if payload != replay.catalog.to_dict():
         raise ValueError("hierarchical prototype catalog does not match prototype replay")
-    if not np.array_equal(half_action_labels, replay.half_action_labels):
+    expected_source_indices = np.flatnonzero(replay.eligible_mask).astype(np.int64)
+    if not np.array_equal(source_clip_indices, expected_source_indices):
+        raise ValueError("hierarchical source clip indices do not match prototype replay")
+    if not np.array_equal(
+        half_action_labels,
+        replay.half_action_labels[source_clip_indices],
+    ):
         raise ValueError("hierarchical half action labels do not match prototype replay")
     if not np.allclose(centers, replay_centers, rtol=1.0e-6, atol=1.0e-7):
         raise ValueError("hierarchical prototype centers do not match prototype replay")
-    if not np.array_equal(indices, replay.prototypes.indices) or not np.allclose(
+    if not np.array_equal(
+        indices,
+        replay.prototypes.indices[source_clip_indices],
+    ) or not np.allclose(
         weights,
-        replay.prototypes.weights,
+        replay.prototypes.weights[source_clip_indices],
         rtol=1.0e-6,
         atol=1.0e-7,
     ):
@@ -1265,10 +1320,14 @@ def select_stage(
             for task in sorted({int(value) for value in graph.task_indices})
         }
         scan_manifest = json.loads((root / "scan" / "manifest.json").read_text(encoding="utf-8"))
+        scanned_clip_count = int(scan_manifest["clips"])
         report = {
             "producer": "cocore",
             "number_of_episodes": int(scan_manifest["episodes"]),
             "number_of_clips": len(clips),
+            "number_of_scanned_clips": scanned_clip_count,
+            "eligible_clips": len(clips),
+            "excluded_unlabeled_clips": scanned_clip_count - len(clips),
             "selected_clips": len(result.selected_indices),
             "selection_ratio": len(result.selected_indices) / len(clips),
             "configured_selection_ratio": ratio,
@@ -1276,6 +1335,7 @@ def select_stage(
             "prototype_method": "motion_primitives",
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
             "prototype_strategy": PROTOTYPE_STRATEGY,
+            "use_stop_bucket": bool(resolved["prototypes"]["use_stop_bucket"]),
             "initial_set_size": len(coverage_seed.selected_indices),
             "coverage": {
                 "target": [float(value) for value in coverage_seed.target_coverage],
@@ -1333,6 +1393,7 @@ def select_stage(
                 "prototype_method": "motion_primitives",
                 "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
                 "prototype_strategy": PROTOTYPE_STRATEGY,
+                "use_stop_bucket": bool(resolved["prototypes"]["use_stop_bucket"]),
             },
         )
         emit_completed_timing("select.export", time.perf_counter() - export_started)
@@ -1377,6 +1438,7 @@ def select_stage(
             "prototype_method": "motion_primitives",
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
             "prototype_strategy": PROTOTYPE_STRATEGY,
+            "use_stop_bucket": bool(resolved["prototypes"]["use_stop_bucket"]),
             "window_policy": WINDOW_POLICY,
             "sequence_adjacency": SEQUENCE_ADJACENCY,
             "selection_ratio": ratio,
@@ -1489,6 +1551,7 @@ def validate_output(
         ),
         "graph": (
             "nodes.npz",
+            "source_clip_indices.npy",
             "prototype_catalog.json",
             "prototype_centers.npy",
             "half_action_labels.npy",
@@ -1520,6 +1583,8 @@ def validate_output(
     if (
         stage_manifests["graph"].get("prototype_schema_version") != PROTOTYPE_SCHEMA_VERSION
         or stage_manifests["graph"].get("prototype_strategy") != PROTOTYPE_STRATEGY
+        or stage_manifests["graph"].get("use_stop_bucket")
+        is not bool(run_manifest.get("use_stop_bucket"))
         or stage_manifests["graph"].get("prototype_visual_dim") != 128
         or stage_manifests["graph"].get("prototype_visual_projection")
         != PROTOTYPE_VISUAL_PROJECTION
@@ -1536,6 +1601,17 @@ def validate_output(
     ):
         raise ValueError("cocore stage window policy is incompatible")
     scan_clips = _load_clips(root / "scan" / "clips.parquet")
+    source_clip_indices = _load_source_clip_indices(root / GRAPH_DIRECTORY, len(scan_clips))
+    graph_count_contract = {
+        "nodes": len(source_clip_indices),
+        "scanned_candidate_nodes": len(scan_clips),
+        "excluded_unlabeled_nodes": len(scan_clips) - len(source_clip_indices),
+    }
+    if any(
+        stage_manifests["graph"].get(name) != value
+        for name, value in graph_count_contract.items()
+    ):
+        raise ValueError("graph manifest candidate counts do not match source clip indices")
     episode_rows = pq.read_table(root / "scan" / "episodes.parquet").to_pylist()
     expected_clips = build_clip_records(
         [
@@ -1566,6 +1642,9 @@ def validate_output(
     else:
         validation_config = config
     replay_resolved = resolve_config(validation_config)
+    expected_use_stop_bucket = bool(replay_resolved["prototypes"]["use_stop_bucket"])
+    if run_manifest.get("use_stop_bucket") is not expected_use_stop_bucket:
+        raise ValueError("cocore stop bucket configuration does not match the run manifest")
     replay_resolved["output"]["directory"] = str(root)
     replay_adapter = create_dataset(replay_resolved["dataset"])
     _validate_hierarchical_graph_artifacts(
@@ -1601,6 +1680,11 @@ def validate_output(
         or report.get("prototype_strategy") != PROTOTYPE_STRATEGY
     ):
         raise ValueError("selection prototype schema metadata mismatch")
+    if (
+        report.get("use_stop_bucket") is not expected_use_stop_bucket
+        or select_manifest.get("use_stop_bucket") is not expected_use_stop_bucket
+    ):
+        raise ValueError("selection stop bucket configuration mismatch")
     if not np.isclose(float(report.get("relation_weight", np.nan)), weight):
         raise ValueError("selection report relation weight mismatch")
     if select_manifest.get("relation_type") != relation_type:
@@ -1611,6 +1695,15 @@ def validate_output(
         raise ValueError("selected manifest contains duplicate sample ids")
     if len(selected_rows) != int(select_manifest["budget"]):
         raise ValueError("selected manifest does not match budget")
+    eligible_clips = [scan_clips[int(index)] for index in source_clip_indices]
+    expected_clip_counts = {
+        "number_of_clips": len(eligible_clips),
+        "number_of_scanned_clips": len(scan_clips),
+        "eligible_clips": len(eligible_clips),
+        "excluded_unlabeled_clips": len(scan_clips) - len(eligible_clips),
+    }
+    if any(report.get(name) != value for name, value in expected_clip_counts.items()):
+        raise ValueError("selection report candidate counts do not match graph eligibility")
     if [row["sample_id"] for row in all_rows] != sorted(row["sample_id"] for row in all_rows):
         raise ValueError("all_clips.parquet is not sorted by sample_id")
     leaf_metadata = _leaf_prototype_metadata(root / GRAPH_DIRECTORY)
@@ -1620,7 +1713,7 @@ def validate_output(
     )
     clip_index_by_id = {
         clip.sample_id: index
-        for index, clip in enumerate(_load_clips(root / "scan" / "clips.parquet"))
+        for index, clip in enumerate(eligible_clips)
     }
     if set(clip_index_by_id) != {str(row["sample_id"]) for row in all_rows}:
         raise ValueError("all-clips rows do not match the graph clip index")
