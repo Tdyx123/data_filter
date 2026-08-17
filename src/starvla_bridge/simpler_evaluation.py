@@ -16,9 +16,9 @@ class StarVLARemotePolicy:
     def __init__(self, client: Any):
         self.client = client
         metadata = dict(client.metadata())
-        if metadata.get("protocol_version") != 1:
+        if metadata.get("protocol_version") != 2:
             raise SimplerEvaluationError(
-                f"StarVLA protocol_version must be 1, found {metadata.get('protocol_version')}"
+                f"StarVLA protocol_version must be 2, found {metadata.get('protocol_version')}"
             )
         if metadata.get("native_action_chunk_size") != 16:
             raise SimplerEvaluationError(

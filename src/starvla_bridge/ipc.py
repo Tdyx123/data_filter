@@ -11,7 +11,7 @@ from typing import Any, Callable, Mapping
 import numpy as np
 
 
-IPC_PROTOCOL_VERSION = 1
+IPC_PROTOCOL_VERSION = 2
 
 
 class StarVLAIPCError(RuntimeError):
@@ -29,17 +29,75 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(value)
 
 
-def _validate_inference_input(image: Any, instruction: Any) -> tuple[np.ndarray, str]:
+def _encode_array_payload(array: Any) -> dict[str, Any]:
+    contiguous = np.ascontiguousarray(np.asarray(array))
+    return {
+        "data": contiguous.tobytes(order="C"),
+        "dtype": contiguous.dtype.name,
+        "shape": list(contiguous.shape),
+    }
+
+
+def _decode_array_payload(
+    payload: Any,
+    *,
+    name: str,
+    expected_dtype: np.dtype[Any],
+    expected_shape: tuple[int, ...],
+) -> np.ndarray:
+    if not isinstance(payload, Mapping):
+        raise StarVLAIPCError(f"{name} payload must be a mapping")
+    expected_keys = {"data", "dtype", "shape"}
+    if set(payload) != expected_keys:
+        raise StarVLAIPCError(
+            f"{name} payload keys must be {sorted(expected_keys)}, "
+            f"found {list(payload.keys())!r}"
+        )
+    dtype = payload["dtype"]
+    if type(dtype) is not str or dtype != expected_dtype.name:
+        raise StarVLAIPCError(
+            f"{name} dtype must be {expected_dtype.name}, found {dtype!r}"
+        )
+    shape = payload["shape"]
+    expected_shape_list = list(expected_shape)
+    if (
+        type(shape) is not list
+        or any(type(dimension) is not int for dimension in shape)
+        or shape != expected_shape_list
+    ):
+        raise StarVLAIPCError(
+            f"{name} shape must be {expected_shape_list}, found {shape!r}"
+        )
+    data = payload["data"]
+    if type(data) is not bytes:
+        raise StarVLAIPCError(
+            f"{name} data must be bytes, found {type(data).__name__}"
+        )
+    expected_nbytes = expected_dtype.itemsize
+    for dimension in expected_shape:
+        expected_nbytes *= dimension
+    if len(data) != expected_nbytes:
+        raise StarVLAIPCError(
+            f"{name} byte length must be {expected_nbytes}, found {len(data)}"
+        )
+    return np.frombuffer(data, dtype=expected_dtype).reshape(expected_shape).copy(order="C")
+
+
+def _validate_image_array(image: Any) -> np.ndarray:
     array = np.asarray(image)
     if array.shape != (224, 224, 3) or array.dtype != np.uint8:
         raise StarVLAIPCError(
             f"infer expected a uint8 image with shape (224, 224, 3), found "
             f"{array.shape} {array.dtype}"
         )
+    return np.ascontiguousarray(array)
+
+
+def _validate_instruction(instruction: Any) -> str:
     text = str(instruction).strip()
     if not text:
         raise StarVLAIPCError("infer instruction must be non-empty")
-    return array, text
+    return text
 
 
 def _route_request(
@@ -59,9 +117,13 @@ def _route_request(
         seed_callback(seed)
         return {"ok": True, "data": {"seed": seed}}, False
     if request_type == "infer":
-        image, instruction = _validate_inference_input(
-            request.get("image"), request.get("instruction")
+        image = _decode_array_payload(
+            request.get("image"),
+            name="image",
+            expected_dtype=np.dtype("uint8"),
+            expected_shape=(224, 224, 3),
         )
+        instruction = _validate_instruction(request.get("instruction"))
         actions = np.asarray(policy.predict_actions(image, instruction), dtype=np.float32)
         if actions.shape != (1, 16, 7):
             raise StarVLAIPCError(
@@ -69,7 +131,10 @@ def _route_request(
             )
         if not np.all(np.isfinite(actions)):
             raise StarVLAIPCError("policy returned NaN or infinite actions")
-        return {"ok": True, "data": {"actions": actions}}, False
+        return {
+            "ok": True,
+            "data": {"actions": _encode_array_payload(actions)},
+        }, False
     if request_type == "shutdown":
         return {"ok": True, "data": {"shutdown": True}}, True
     raise StarVLAIPCError(f"Unsupported IPC request type: {request_type!r}")
@@ -175,10 +240,26 @@ class StarVLAIPCClient:
         return int(data["seed"])
 
     def infer(self, image: np.ndarray, instruction: str) -> np.ndarray:
+        image_array = _validate_image_array(image)
+        text = _validate_instruction(instruction)
         data = self._request(
-            {"type": "infer", "image": np.asarray(image), "instruction": str(instruction)}
+            {
+                "type": "infer",
+                "image": _encode_array_payload(image_array),
+                "instruction": text,
+            }
         )
-        return np.asarray(data["actions"], dtype=np.float32)
+        if not isinstance(data, Mapping) or "actions" not in data:
+            raise StarVLAIPCError("Policy server response is missing the actions payload")
+        actions = _decode_array_payload(
+            data["actions"],
+            name="actions",
+            expected_dtype=np.dtype("float32"),
+            expected_shape=(1, 16, 7),
+        )
+        if not np.all(np.isfinite(actions)):
+            raise StarVLAIPCError("policy server returned NaN or infinite actions")
+        return actions
 
     def close(self) -> None:
         if not self._closed:

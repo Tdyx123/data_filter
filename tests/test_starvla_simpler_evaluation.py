@@ -9,7 +9,7 @@ class _FakeClient:
 
     def metadata(self):
         return {
-            "protocol_version": 1,
+            "protocol_version": 2,
             "model": "Qwen3VL-GR00T-Bridge-RT-1",
             "native_action_chunk_size": 16,
             "available_unnorm_keys": ["oxe_bridge"],
@@ -62,12 +62,26 @@ def test_remote_policy_rejects_server_metadata_for_wrong_checkpoint_contract():
 
     client = _FakeClient()
     client.metadata = lambda: {
-        "protocol_version": 1,
+        "protocol_version": 2,
         "native_action_chunk_size": 8,
         "available_unnorm_keys": ["oxe_bridge"],
     }
 
     with pytest.raises(Exception, match="native_action_chunk_size"):
+        StarVLARemotePolicy(client)
+
+
+def test_remote_policy_rejects_protocol_version_one():
+    from starvla_bridge.simpler_evaluation import StarVLARemotePolicy
+
+    client = _FakeClient()
+    client.metadata = lambda: {
+        "protocol_version": 1,
+        "native_action_chunk_size": 16,
+        "available_unnorm_keys": ["oxe_bridge"],
+    }
+
+    with pytest.raises(Exception, match=r"protocol_version must be 2.*found 1"):
         StarVLARemotePolicy(client)
 
 
