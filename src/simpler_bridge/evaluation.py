@@ -6,6 +6,7 @@ import json
 import math
 import os
 import platform
+import re
 import subprocess
 import tempfile
 import time
@@ -48,6 +49,7 @@ class SimplerRunSettings:
     output_dir: Path
     tasks: tuple[SimplerTaskSpec, ...] = ()
     device: str = "cuda:0"
+    sim_device: str = "cuda:0"
     action_horizon: int = 1
     policy_seeds: tuple[int, ...] = POLICY_SEEDS
     object_episode_ids: tuple[int, ...] = OBJECT_EPISODE_IDS
@@ -480,6 +482,12 @@ def _validate_settings(settings: SimplerRunSettings) -> None:
         raise SimplerEvaluationError("max_steps must be positive when provided")
     if settings.video_fps <= 0:
         raise SimplerEvaluationError("video_fps must be positive")
+    if not isinstance(settings.sim_device, str) or re.fullmatch(
+        r"cuda:[0-9]+", settings.sim_device
+    ) is None:
+        raise SimplerEvaluationError(
+            "sim_device must match cuda:<non-negative decimal integer>"
+        )
     if len(settings.policy_seeds) != len(set(settings.policy_seeds)):
         raise SimplerEvaluationError("policy_seeds must be unique")
     if len(settings.object_episode_ids) != len(set(settings.object_episode_ids)):
@@ -539,6 +547,9 @@ def _protocol(
         "control_mode": CONTROL_MODE,
         "action_horizon": settings.action_horizon,
         "execution_mode": "stepwise_first_action",
+        "sim_renderer_device": settings.sim_device,
+        "sim_renderer_offscreen_only": True,
+        "environment_lifecycle": "one_per_task",
         "planned_episodes": (
             len(settings.tasks)
             * len(settings.policy_seeds)
@@ -581,11 +592,19 @@ def evaluate_simpler_policy(
     try:
         for task in settings.tasks:
             task_failed = False
-            for policy_seed in settings.policy_seeds:
-                generator = policy.make_generator(policy_seed)
-                for object_episode_id in settings.object_episode_ids:
-                    try:
-                        environment = environment_factory(task)
+            try:
+                environment = environment_factory(task)
+            except (SimplerEvaluationError, SimplerInfrastructureError):
+                raise
+            except Exception as error:
+                raise SimplerInfrastructureError(
+                    f"Could not create SimplerEnv task {task.key}: "
+                    f"{type(error).__name__}: {error}"
+                ) from error
+            try:
+                for policy_seed in settings.policy_seeds:
+                    generator = policy.make_generator(policy_seed)
+                    for object_episode_id in settings.object_episode_ids:
                         try:
                             episode, frames = run_simpler_episode(
                                 task=task,
@@ -598,36 +617,36 @@ def evaluate_simpler_policy(
                                 max_steps=settings.max_steps or task.max_steps,
                                 capture_video=settings.save_videos_path is not None,
                             )
-                        finally:
-                            environment.close()
-                    except (SimplerEvaluationError, SimplerInfrastructureError):
-                        raise
-                    except Exception as error:
-                        task_errors.append(
-                            {
-                                "task": task.key,
-                                "policy_seed": int(policy_seed),
-                                "object_episode_id": int(object_episode_id),
-                                "error_type": type(error).__name__,
-                                "error": str(error),
-                            }
-                        )
-                        task_failed = True
+                        except (SimplerEvaluationError, SimplerInfrastructureError):
+                            raise
+                        except Exception as error:
+                            task_errors.append(
+                                {
+                                    "task": task.key,
+                                    "policy_seed": int(policy_seed),
+                                    "object_episode_id": int(object_episode_id),
+                                    "error_type": type(error).__name__,
+                                    "error": str(error),
+                                }
+                            )
+                            task_failed = True
+                            break
+                        episodes.append(episode)
+                        if settings.save_videos_path is not None:
+                            outcome = "success" if episode["success"] else "failure"
+                            video_path = (
+                                settings.save_videos_path
+                                / task.key
+                                / f"seed-{policy_seed}"
+                                / f"episode-{object_episode_id:02d}_{outcome}.mp4"
+                            )
+                            video_writer(video_path, frames, settings.video_fps)
+                            videos.append(str(video_path))
+                        _atomic_write_jsonl(partial_path, episodes)
+                    if task_failed:
                         break
-                    episodes.append(episode)
-                    if settings.save_videos_path is not None:
-                        outcome = "success" if episode["success"] else "failure"
-                        video_path = (
-                            settings.save_videos_path
-                            / task.key
-                            / f"seed-{policy_seed}"
-                            / f"episode-{object_episode_id:02d}_{outcome}.mp4"
-                        )
-                        video_writer(video_path, frames, settings.video_fps)
-                        videos.append(str(video_path))
-                    _atomic_write_jsonl(partial_path, episodes)
-                if task_failed:
-                    break
+            finally:
+                environment.close()
     except Exception as error:
         if isinstance(error, SimplerInfrastructureError):
             exit_code = 3
@@ -760,6 +779,7 @@ def create_simpler_environment(
     *,
     simpler_root: str | Path | None = None,
     builder: Callable[..., Any] | None = None,
+    sim_device: str = "cuda:0",
 ) -> Any:
     root = Path(simpler_root or default_simpler_root()).expanduser().resolve()
     if builder is None:
@@ -785,6 +805,7 @@ def create_simpler_environment(
             scene_name=task.scene_name,
             camera_cfgs={"add_segmentation": True},
             rgb_overlay_path=str(overlay),
+            renderer_kwargs={"offscreen_only": True, "device": sim_device},
         )
     except SimplerEvaluationError:
         raise

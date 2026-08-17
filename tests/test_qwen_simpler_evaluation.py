@@ -255,6 +255,7 @@ class _FakeEnvironment:
 
     def reset(self, *, options):
         self.reset_options = options
+        self.step_count = 0
         return self._observation(), {"reset": True}
 
     def step(self, action):
@@ -275,6 +276,7 @@ class _FakeEnvironment:
         )
 
     def close(self):
+        self.close_count = getattr(self, "close_count", 0) + 1
         self.closed = True
 
 
@@ -492,6 +494,14 @@ def test_full_single_task_protocol_runs_24_by_3_and_updates_partial(tmp_path):
     partial_counts = []
     made_generators = []
 
+    class PartialTrackingEnvironment(_FakeEnvironment):
+        def reset(self, *, options):
+            partial = settings.output_dir / "episodes.partial.jsonl"
+            partial_counts.append(
+                len(partial.read_text().splitlines()) if partial.exists() else 0
+            )
+            return super().reset(options=options)
+
     class TrackingPolicy(_EvaluationPolicy):
         def make_generator(self, seed):
             made_generators.append(seed)
@@ -506,9 +516,7 @@ def test_full_single_task_protocol_runs_24_by_3_and_updates_partial(tmp_path):
 
     def environment_factory(task):
         del task
-        partial = settings.output_dir / "episodes.partial.jsonl"
-        partial_counts.append(len(partial.read_text().splitlines()) if partial.exists() else 0)
-        return _FakeEnvironment(success_step=1)
+        return PartialTrackingEnvironment(success_step=1)
 
     report = evaluation.evaluate_simpler_checkpoint(
         settings,
@@ -720,6 +728,7 @@ def test_environment_factory_forwards_official_visual_matching_parameters(tmp_pa
         evaluation.SIMPLER_TASKS[0],
         simpler_root=simpler_root,
         builder=build_environment,
+        sim_device="cuda:3",
     )
 
     assert result == "environment"
@@ -736,9 +745,24 @@ def test_environment_factory_forwards_official_visual_matching_parameters(tmp_pa
                 "scene_name": "bridge_table_1_v1",
                 "camera_cfgs": {"add_segmentation": True},
                 "rgb_overlay_path": str(overlay.resolve()),
+                "renderer_kwargs": {
+                    "offscreen_only": True,
+                    "device": "cuda:3",
+                },
             },
         )
     ]
+
+    calls.clear()
+    evaluation.create_simpler_environment(
+        evaluation.SIMPLER_TASKS[0],
+        simpler_root=simpler_root,
+        builder=build_environment,
+    )
+    assert calls[0][1]["renderer_kwargs"] == {
+        "offscreen_only": True,
+        "device": "cuda:0",
+    }
 
 
 def test_evaluation_protects_existing_outputs_without_overwrite(tmp_path):
@@ -927,10 +951,20 @@ def test_task_execution_error_is_recorded_and_later_tasks_continue(tmp_path):
     environments = []
 
     class TaskFailingPolicy(_EvaluationPolicy):
+        def __init__(self):
+            super().__init__()
+            self.calls_by_instruction = {}
+
         def predict_actions(
             self, image, state, instruction, denoising_steps, *, generator
         ):
-            if instruction == "Put Spoon on Towel":
+            self.calls_by_instruction[instruction] = (
+                self.calls_by_instruction.get(instruction, 0) + 1
+            )
+            if (
+                instruction == "Put Spoon on Towel"
+                and self.calls_by_instruction[instruction] == 2
+            ):
                 raise RuntimeError("policy task failed")
             return super().predict_actions(
                 image,
@@ -950,7 +984,8 @@ def test_task_execution_error_is_recorded_and_later_tasks_continue(tmp_path):
         output_dir=tmp_path / "results",
         tasks=(evaluation.SIMPLER_TASKS[0], evaluation.SIMPLER_TASKS[1]),
         policy_seeds=(0,),
-        object_episode_ids=(0,),
+        object_episode_ids=(0, 1),
+        max_steps=1,
     )
     checkpoint = SimpleNamespace(
         config={"data": {"train_crop_size": 4, "output_image_size": 4}},
@@ -966,13 +1001,13 @@ def test_task_execution_error_is_recorded_and_later_tasks_continue(tmp_path):
     )
 
     assert report["status"] == "completed_with_errors"
-    assert report["summary"]["completed_episodes"] == 1
-    assert report["summary"]["successes"] == 1
+    assert report["summary"]["completed_episodes"] == 3
+    assert report["summary"]["successes"] == 3
     assert report["task_errors"] == [
         {
             "task": "spoon",
             "policy_seed": 0,
-            "object_episode_id": 0,
+            "object_episode_id": 1,
             "error_type": "RuntimeError",
             "error": "policy task failed",
         }
@@ -980,22 +1015,34 @@ def test_task_execution_error_is_recorded_and_later_tasks_continue(tmp_path):
     assert json.loads((settings.output_dir / "failure.json").read_text())["status"] == (
         "completed_with_errors"
     )
-    assert all(environment.closed for environment in environments)
+    assert len(environments) == 2
+    assert [environment.close_count for environment in environments] == [1, 1]
 
 
 def test_simulator_reset_error_is_immediate_infrastructure_failure(tmp_path):
     evaluation = _evaluation()
+    environments = []
 
     class BrokenEnvironment(_FakeEnvironment):
         def reset(self, *, options):
-            raise RuntimeError("renderer unavailable")
+            self.reset_calls = getattr(self, "reset_calls", 0) + 1
+            if self.reset_calls == 2:
+                raise RuntimeError("renderer unavailable")
+            return super().reset(options=options)
+
+    def environment_factory(task):
+        del task
+        environment = BrokenEnvironment(success_step=1)
+        environments.append(environment)
+        return environment
 
     settings = evaluation.SimplerEvaluationSettings(
         checkpoint=tmp_path / "step-00020000",
         output_dir=tmp_path / "results",
         tasks=(evaluation.SIMPLER_TASKS[0], evaluation.SIMPLER_TASKS[1]),
         policy_seeds=(0,),
-        object_episode_ids=(0,),
+        object_episode_ids=(0, 1),
+        max_steps=1,
     )
 
     with pytest.raises(evaluation.SimplerInfrastructureError, match="reset"):
@@ -1006,10 +1053,47 @@ def test_simulator_reset_error_is_immediate_infrastructure_failure(tmp_path):
                 as_dict=lambda: {},
             ),
             policy=_EvaluationPolicy(),
-            environment_factory=lambda task: BrokenEnvironment(),
+            environment_factory=environment_factory,
             source_versions={},
         )
     failure = json.loads((settings.output_dir / "failure.json").read_text())
+    assert failure["status"] == "failed"
+    assert failure["exit_code"] == 3
+    assert failure["summary"]["completed_episodes"] == 1
+    assert len(environments) == 1
+    assert environments[0].close_count == 1
+
+
+def test_environment_creation_error_is_immediate_infrastructure_failure(tmp_path):
+    evaluation = _evaluation()
+    factory_tasks = []
+
+    def environment_factory(task):
+        factory_tasks.append(task.key)
+        raise RuntimeError("renderer unavailable")
+
+    settings = evaluation.SimplerEvaluationSettings(
+        checkpoint=tmp_path / "step-00020000",
+        output_dir=tmp_path / "results",
+        tasks=(evaluation.SIMPLER_TASKS[0], evaluation.SIMPLER_TASKS[1]),
+        policy_seeds=(0,),
+        object_episode_ids=(0,),
+    )
+
+    with pytest.raises(evaluation.SimplerInfrastructureError, match="renderer"):
+        evaluation.evaluate_simpler_checkpoint(
+            settings,
+            checkpoint=SimpleNamespace(
+                config={"data": {"train_crop_size": 4, "output_image_size": 4}},
+                as_dict=lambda: {},
+            ),
+            policy=_EvaluationPolicy(),
+            environment_factory=environment_factory,
+            source_versions={},
+        )
+
+    failure = json.loads((settings.output_dir / "failure.json").read_text())
+    assert factory_tasks == ["spoon"]
     assert failure["status"] == "failed"
     assert failure["exit_code"] == 3
     assert failure["summary"]["completed_episodes"] == 0

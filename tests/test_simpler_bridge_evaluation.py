@@ -1,4 +1,5 @@
 import importlib
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -59,6 +60,48 @@ class _Environment:
 
     def close(self):
         self.closed = True
+
+
+class _LifecycleEnvironment(_Environment):
+    def __init__(self, task_key, partial_path):
+        super().__init__()
+        self.task_key = task_key
+        self.partial_path = partial_path
+        self.reset_episode_ids = []
+        self.partial_counts_before_reset = []
+        self.partial_count_at_close = None
+        self.close_count = 0
+
+    def _observation(self):
+        return {
+            "image": {
+                "3rd_view_camera": {
+                    "rgb": np.zeros((8, 12, 3), dtype=np.uint8),
+                }
+            }
+        }
+
+    def reset(self, *, options):
+        self.options = options
+        self.reset_episode_ids.append(options["obj_init_options"]["episode_id"])
+        self.partial_counts_before_reset.append(
+            len(self.partial_path.read_text().splitlines())
+            if self.partial_path.exists()
+            else 0
+        )
+        return self._observation(), {}
+
+    def step(self, action):
+        self.actions.append(np.asarray(action))
+        return self._observation(), 1.0, True, False, {}
+
+    def close(self):
+        self.close_count += 1
+        self.partial_count_at_close = (
+            len(self.partial_path.read_text().splitlines())
+            if self.partial_path.exists()
+            else 0
+        )
 
 
 class _Adapter:
@@ -276,6 +319,130 @@ def test_shared_evaluator_writes_model_specific_routes_and_protocol(tmp_path):
     assert report["protocol"]["diffusion_steps"] == 20
     assert report["summary"]["completed_episodes"] == 1
     assert report["task_errors"] == []
+
+
+def test_shared_evaluator_reuses_one_environment_per_task_in_episode_order(tmp_path):
+    shared = importlib.import_module("simpler_bridge.evaluation")
+    output_dir = tmp_path / "results"
+    environments = []
+    factory_tasks = []
+    made_generators = []
+
+    class TrackingAdapter(_Adapter):
+        def make_generator(self, seed):
+            made_generators.append(seed)
+            return super().make_generator(seed)
+
+    def environment_factory(task):
+        factory_tasks.append(task.key)
+        environment = _LifecycleEnvironment(
+            task.key,
+            output_dir / "episodes.partial.jsonl",
+        )
+        environments.append(environment)
+        return environment
+
+    settings = shared.SimplerRunSettings(
+        output_dir=output_dir,
+        tasks=(shared.SIMPLER_TASKS[0], shared.SIMPLER_TASKS[1]),
+        policy_seeds=(4, 0),
+        object_episode_ids=(3, 1),
+        max_steps=1,
+    )
+
+    report = shared.evaluate_simpler_policy(
+        settings,
+        checkpoint={},
+        policy=TrackingAdapter(),
+        environment_factory=environment_factory,
+        source_versions={},
+        route="lifecycle-test",
+        protocol_metadata={},
+    )
+
+    assert factory_tasks == ["spoon", "carrot"]
+    assert made_generators == [4, 0, 4, 0]
+    assert [environment.reset_episode_ids for environment in environments] == [
+        [3, 1, 3, 1],
+        [3, 1, 3, 1],
+    ]
+    assert [environment.close_count for environment in environments] == [1, 1]
+    assert [environment.partial_count_at_close for environment in environments] == [
+        4,
+        8,
+    ]
+    assert [
+        count
+        for environment in environments
+        for count in environment.partial_counts_before_reset
+    ] == list(range(8))
+    episodes = [
+        json.loads(line)
+        for line in (output_dir / "episodes.jsonl").read_text().splitlines()
+    ]
+    assert [
+        (episode["task"], episode["policy_seed"], episode["object_episode_id"])
+        for episode in episodes
+    ] == [
+        (task, seed, episode_id)
+        for task in ("spoon", "carrot")
+        for seed in (4, 0)
+        for episode_id in (3, 1)
+    ]
+    assert report["summary"]["completed_episodes"] == 8
+    assert not (output_dir / "episodes.partial.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    "sim_device",
+    ["cpu", "cuda", "cuda:-1", "cuda:+1", "cuda:1.0", "cuda: 1", "CUDA:1", "4"],
+)
+def test_shared_settings_reject_invalid_sim_renderer_devices(tmp_path, sim_device):
+    shared = importlib.import_module("simpler_bridge.evaluation")
+    settings = shared.SimplerRunSettings(
+        output_dir=tmp_path / sim_device.replace("/", "_"),
+        tasks=(shared.SIMPLER_TASKS[0],),
+        policy_seeds=(0,),
+        object_episode_ids=(0,),
+        sim_device=sim_device,
+    )
+
+    with pytest.raises(shared.SimplerEvaluationError, match="sim_device"):
+        shared.evaluate_simpler_policy(
+            settings,
+            checkpoint={},
+            policy=_Adapter(),
+            environment_factory=lambda task: _Environment(),
+            source_versions={},
+            route="invalid-sim-device-test",
+            protocol_metadata={},
+        )
+
+
+def test_shared_protocol_records_sim_renderer_and_task_lifecycle(tmp_path):
+    shared = importlib.import_module("simpler_bridge.evaluation")
+    default_settings = shared.SimplerRunSettings(output_dir=tmp_path / "default")
+    settings = shared.SimplerRunSettings(
+        output_dir=tmp_path / "results",
+        tasks=(shared.SIMPLER_TASKS[0],),
+        policy_seeds=(0,),
+        object_episode_ids=(0,),
+        sim_device="cuda:12",
+    )
+
+    assert default_settings.sim_device == "cuda:0"
+    report = shared.evaluate_simpler_policy(
+        settings,
+        checkpoint={},
+        policy=_Adapter(),
+        environment_factory=lambda task: _Environment(),
+        source_versions={},
+        route="sim-renderer-protocol-test",
+        protocol_metadata={},
+    )
+    assert report["protocol"]["sim_renderer_device"] == "cuda:12"
+    assert report["protocol"]["sim_renderer_offscreen_only"] is True
+    assert report["protocol"]["environment_lifecycle"] == "one_per_task"
 
 
 def test_shared_preflight_reports_adapter_input_metadata(tmp_path):
