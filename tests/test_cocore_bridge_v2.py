@@ -255,7 +255,13 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
         "epsilon": 1.0e-8,
     }
     assert config["prototypes"]["method"] == "motion_primitives"
-    assert set(config["prototypes"]) == {"method", "batch_size", "max_iter", "num_threads"}
+    assert set(config["prototypes"]) == {
+        "method",
+        "batch_size",
+        "max_iter",
+        "tol",
+        "num_threads",
+    }
     assert config["prototypes"]["num_threads"] == 4
     assert config["objective"] == {"relation": "sequence", "relation_weight": 1.5}
     assert config["selection"]["ratio"] == 0.2
@@ -264,6 +270,7 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
     assert config["output"]["directory"] == ("outputs/cocore_bridge_v2/bridge_orig_1.0.0")
     translated = to_relcore_config(config)
     assert "num_threads" not in translated["prototypes"]
+    assert "tol" not in translated["prototypes"]
     assert translated["selection"]["quota_mode"] == "none"
     assert translated["selection"]["minimum_per_task"] == 0
 
@@ -690,9 +697,9 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     select_manifest = json.loads((result / "manifest.json").read_text())
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert select_manifest["producer"] == "cocore"
-    assert select_manifest["cocore_version"] == "0.12.0"
+    assert select_manifest["cocore_version"] == "0.13.0"
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.12.0"
+    assert run_manifest["cocore_version"] == "0.13.0"
     assert run_manifest["stage_directories"]["graph"] == "graph-16-motion-hard-nearest-pca"
     assert validate_output(result, config=config) == {
         "status": "valid",

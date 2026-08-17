@@ -138,6 +138,7 @@ def _config(tmp_path: Path, relation: str = "cooccurrence") -> dict[str, object]
             "method": "motion_primitives",
             "batch_size": 64,
             "max_iter": 2,
+            "tol": 1.0e-4,
             "num_threads": 4,
         },
         "graph": {"knn": 2, "similarity_threshold": 0.8, "cooccurrence_max_gap": 4},
@@ -369,16 +370,16 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     for directory in ("scan", "encode", "graph-16-motion-hard-nearest-pca"):
         manifest = json.loads((root / directory / "manifest.json").read_text())
         assert manifest["producer"] == "cocore"
-        assert manifest["cocore_version"] == "0.12.0"
+        assert manifest["cocore_version"] == "0.13.0"
     scan_manifest = json.loads((root / "scan" / "manifest.json").read_text())
     assert scan_manifest["window_policy"] == "near_uniform_full_coverage"
     assert scan_manifest["clip_length"] == 15
     catalog = json.loads(
         (root / "graph-16-motion-hard-nearest-pca" / "prototype_catalog.json").read_text()
     )
-    assert catalog["schema_version"] == 7
+    assert catalog["schema_version"] == 8
     assert catalog["strategy"] == (
-        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_nearest"
+        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_hybrid_kmeans_nearest"
     )
     assert catalog["total_raw_actions"] == 400
     assert catalog["constants"] == {
@@ -386,6 +387,11 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
         "min_action_count": 400,
         "min_action_frequency": 0.005,
         "max_visual_centers": 16,
+        "full_kmeans_max_training_count": 65536,
+        "full_kmeans_openmp_threads": 1,
+        "minibatch_kmeans_openmp_threads": 4,
+        "kmeans_n_init": 1,
+        "large_bucket_parallelism": "serial",
         "trajectory_window_length": 8,
         "trajectory_window_policy": "full_coverage_max_gap_3_tail_rebalanced",
         "visual_half_windows": [[0, 8], [7, 15]],
@@ -469,9 +475,9 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert all("prototype_distance_weights" not in row for row in all_rows)
     assert all("prototype_action_weights" not in row for row in selected)
     assert all("prototype_distance_weights" not in row for row in selected)
-    assert report["prototype_schema_version"] == 7
+    assert report["prototype_schema_version"] == 8
     assert report["prototype_strategy"] == (
-        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_nearest"
+        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_hybrid_kmeans_nearest"
     )
     assert report["objective"]["total"] == (
         report["objective"]["weighted_relation"] - report["objective"]["redundancy"]
@@ -490,24 +496,24 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     }
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.12.0"
+    assert run_manifest["cocore_version"] == "0.13.0"
     assert run_manifest["relation_type"] == relation
     assert run_manifest["relation_weight"] == 1.0
-    assert run_manifest["prototype_schema_version"] == 7
+    assert run_manifest["prototype_schema_version"] == 8
     assert run_manifest["prototype_strategy"] == (
-        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_nearest"
+        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_hybrid_kmeans_nearest"
     )
     assert run_manifest["stage_directories"]["graph"] == "graph-16-motion-hard-nearest-pca"
     assert run_manifest["algorithm"] == report["algorithm"]
     assert run_manifest["window_policy"] == "near_uniform_full_coverage"
     assert run_manifest["sequence_adjacency"] == "ordered_candidates"
     select_manifest = json.loads((result / "manifest.json").read_text())
-    assert select_manifest["cocore_version"] == "0.12.0"
+    assert select_manifest["cocore_version"] == "0.13.0"
     assert select_manifest["relation_type"] == relation
     assert select_manifest["relation_weight"] == 1.0
-    assert select_manifest["prototype_schema_version"] == 7
+    assert select_manifest["prototype_schema_version"] == 8
     assert select_manifest["prototype_strategy"] == (
-        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_nearest"
+        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_hybrid_kmeans_nearest"
     )
     resolved = yaml.safe_load((result / "resolved_config.yaml").read_text())
     assert resolved["output"]["directory"] == str(root)
@@ -518,7 +524,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     (result / "manifest.json").write_text(json.dumps(select_manifest))
     with pytest.raises(ValueError, match="selection manifest Cocore version"):
         validate_output(result, config=config)
-    select_manifest["cocore_version"] = "0.12.0"
+    select_manifest["cocore_version"] = "0.13.0"
     (result / "manifest.json").write_text(json.dumps(select_manifest))
 
     report["relation_type"] = "sequence" if relation == "cooccurrence" else "cooccurrence"
@@ -821,10 +827,12 @@ def test_graph_and_validation_honor_single_prototype_thread(
     config = _config(tmp_path)
     config["prototypes"]["num_threads"] = 1  # type: ignore[index]
     thread_counts: list[int] = []
+    tolerances: list[float] = []
     real_builder = cocore_pipeline.build_hierarchical_motion_prototypes
 
     def recording_builder(*args: object, **kwargs: object):
         thread_counts.append(int(kwargs["num_threads"]))
+        tolerances.append(float(kwargs["tol"]))
         return real_builder(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -836,10 +844,13 @@ def test_graph_and_validation_honor_single_prototype_thread(
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
 
     assert thread_counts == [1]
+    assert tolerances == [1.0e-4]
     thread_counts.clear()
+    tolerances.clear()
 
     assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 6}
     assert thread_counts == [1]
+    assert tolerances == [1.0e-4]
 
 
 def test_graph_fingerprint_ignores_prototype_thread_count(tmp_path: Path) -> None:
@@ -853,6 +864,16 @@ def test_graph_fingerprint_ignores_prototype_thread_count(tmp_path: Path) -> Non
 
     assert first[0] == second[0]
     assert first[4] == second[4]
+
+
+def test_graph_fingerprint_includes_prototype_convergence_tolerance(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    graph_stage(config, visual_encoder=CocoreVisualEncoder())
+    config["prototypes"]["tol"] = 2.0e-4  # type: ignore[index]
+
+    with pytest.raises(FileExistsError, match="--force"):
+        graph_stage(config, visual_encoder=FailingCocoreVisualEncoder())
 
 
 def test_validate_rejects_tampered_visual_prototype_center(tmp_path: Path) -> None:

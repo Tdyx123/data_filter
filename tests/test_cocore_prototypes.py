@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 import threading
+from types import SimpleNamespace
+import warnings
 
 import numpy as np
 import pytest
@@ -574,7 +578,7 @@ def test_episode_window_visuals_project_each_frame_before_pooling(tmp_path: Path
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-7)
 
 
-def test_action_catalog_serializes_schema_seven_sampling_strategy_and_metadata() -> None:
+def test_action_catalog_serializes_schema_eight_sampling_strategy_and_metadata() -> None:
     catalog = prototypes.create_action_catalog(
         Counter({"move forward": 400, "move right": 600}),
         total_labels=1_000,
@@ -608,15 +612,20 @@ def test_action_catalog_serializes_schema_seven_sampling_strategy_and_metadata()
 
     payload = catalog.to_dict()
 
-    assert payload["schema_version"] == 7
+    assert payload["schema_version"] == 8
     assert payload["strategy"] == (
-        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_nearest"
+        "trajectory_sampled_retained_action_then_cropped_pca_half_visual_hybrid_kmeans_nearest"
     )
     assert payload["constants"] == {
         "state_threshold": 0.03,
         "min_action_count": 400,
         "min_action_frequency": 0.005,
         "max_visual_centers": 16,
+        "full_kmeans_max_training_count": 65536,
+        "full_kmeans_openmp_threads": 1,
+        "minibatch_kmeans_openmp_threads": 4,
+        "kmeans_n_init": 1,
+        "large_bucket_parallelism": "serial",
         "trajectory_window_length": 8,
         "trajectory_window_policy": "full_coverage_max_gap_3_tail_rebalanced",
         "visual_half_windows": [[0, 8], [7, 15]],
@@ -1122,169 +1131,128 @@ def test_non_stop_fallback_fails_when_stop_has_no_visual_center(
         )
 
 
-def test_full_trajectory_builder_allows_k_above_batch_size_and_bounds_updates(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("training_count", "expected_model_name", "expected_openmp_threads"),
+    [
+        (65_536, "KMeans", 1),
+        (65_537, "MiniBatchKMeans", 4),
+    ],
+)
+def test_action_model_switches_at_large_bucket_boundary_and_converges_early(
+    training_count: int,
+    expected_model_name: str,
+    expected_openmp_threads: int,
 ) -> None:
-    from sklearn.cluster import MiniBatchKMeans
-
-    adapter = _TrajectoryPrototypeAdapter()
-    cache = tmp_path / "frame_embeddings"
-    _write_frame_caches(cache, adapter)
-    candidate_frames = np.load(cache / "ep000002.npy", allow_pickle=False)
-    candidate_halves = np.stack(
-        [candidate_frames[:8].mean(axis=0), candidate_frames[7:].mean(axis=0)]
-    )
-    candidate_halves /= np.linalg.norm(candidate_halves, axis=1, keepdims=True)
-    fit_rows: list[int] = []
-    update_rows: list[int] = []
-    update_rows_by_seed: dict[int, list[int]] = {}
-    real_fit = MiniBatchKMeans.fit
-    real_partial_fit = MiniBatchKMeans.partial_fit
-
-    def recording_fit(
-        self: MiniBatchKMeans,
-        features: np.ndarray,
-        labels: object = None,
-        sample_weight: np.ndarray | None = None,
-    ) -> MiniBatchKMeans:
-        fit_rows.append(len(features))
-        return real_fit(self, features, labels, sample_weight=sample_weight)
-
-    def recording_partial_fit(
-        self: MiniBatchKMeans,
-        features: np.ndarray,
-        labels: object = None,
-        sample_weight: np.ndarray | None = None,
-    ) -> MiniBatchKMeans:
-        update_rows.append(len(features))
-        update_rows_by_seed.setdefault(int(self.random_state), []).append(len(features))
-        return real_partial_fit(self, features, labels, sample_weight=sample_weight)
-
-    monkeypatch.setattr(MiniBatchKMeans, "fit", recording_fit)
-    monkeypatch.setattr(MiniBatchKMeans, "partial_fit", recording_partial_fit)
-
-    result = prototypes.build_hierarchical_motion_prototypes(
-        adapter,
-        [_candidate_clip()],
-        candidate_halves[None, :, :],
-        pca_components=_identity_fragment_pca(2),
-        visual_dim=2,
-        frame_cache_dir=cache,
-        batch_size=2,
-        max_iter=3,
-        seed=23,
-        max_episodes=None,
-        num_workers=0,
+    values = np.zeros((training_count, 1), dtype=np.float32)
+    training_data = prototypes._ActionTrainingData(
+        action_id=0,
+        values=values,
+        episode_ranges=((0, training_count),),
     )
 
-    by_label = {category.label: category for category in result.catalog.action_categories}
-    assert by_label["move forward"].requested_centers == 3
-    assert by_label["move right"].requested_centers == 3
-    assert fit_rows == []
-    assert update_rows
-    assert max(update_rows) <= 3
-    assert sum(update_rows) == 802 * 3
-    expected_per_action = [
-        3,
-        *([2] * 198),
-        1,
-        1,
-        *([2] * 200),
-        1,
-        *([2] * 200),
-        1,
-    ]
-    assert update_rows_by_seed == {23: expected_per_action, 24: expected_per_action}
-
-
-def test_streaming_kmeans_consumes_every_window_once_per_epoch_without_order_bias(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from sklearn.cluster import MiniBatchKMeans
-
-    fit_rows: list[int] = []
-    consumed: list[np.ndarray] = []
-    real_fit = MiniBatchKMeans.fit
-    real_partial_fit = MiniBatchKMeans.partial_fit
-
-    def recording_fit(
-        self: MiniBatchKMeans,
-        features: np.ndarray,
-        labels: object = None,
-        sample_weight: np.ndarray | None = None,
-    ) -> MiniBatchKMeans:
-        fit_rows.append(len(features))
-        return real_fit(self, features, labels, sample_weight=sample_weight)
-
-    def recording_partial_fit(
-        self: MiniBatchKMeans,
-        features: np.ndarray,
-        labels: object = None,
-        sample_weight: np.ndarray | None = None,
-    ) -> MiniBatchKMeans:
-        consumed.append(np.asarray(features).copy())
-        return real_partial_fit(self, features, labels, sample_weight=sample_weight)
-
-    def block_visuals(
-        cache_root: Path,
-        record: EpisodeRecord,
-        *,
-        pca_components: np.ndarray,
-        visual_dim: int,
-    ) -> np.ndarray:
-        del cache_root
-        np.testing.assert_array_equal(pca_components, _identity_fragment_pca(1))
-        assert visual_dim == 1
-        return np.full(
-            (8, 1),
-            10.0 if record.episode_id == 1 else 0.0,
-            dtype=np.float32,
-        )
-
-    monkeypatch.setattr(MiniBatchKMeans, "fit", recording_fit)
-    monkeypatch.setattr(MiniBatchKMeans, "partial_fit", recording_partial_fit)
-    monkeypatch.setattr(prototypes, "cluster_count_for_training_count", lambda _: 1)
-    monkeypatch.setattr(prototypes, "_episode_window_visuals", block_visuals)
-    clip = ClipRecord(
-        sample_id="ep000000_chunk_000000_000014",
-        episode_id=0,
-        task_index=0,
-        task_name="zero block",
-        start_step=0,
-        end_step=14,
-        length=15,
-        previous_sample_id=None,
-        next_sample_id=None,
-    )
-
-    centers: list[float] = []
-    for reverse in (False, True):
-        consumed.clear()
-        result = prototypes.build_hierarchical_motion_prototypes(
-            _StreamingMeanAdapter(reverse=reverse),
-            [clip],
-            np.asarray([[[1.0], [1.0]]], dtype=np.float32),
-            pca_components=_identity_fragment_pca(1),
-            visual_dim=1,
-            frame_cache_dir=tmp_path,
-            batch_size=2,
-            max_iter=3,
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        model = prototypes._fit_action_models(
+            executor,
+            {0: training_data},
+            {0: 1},
+            batch_size=4096,
+            max_iter=100,
+            tol=1.0e-4,
             seed=23,
-            max_episodes=None,
-            num_workers=0,
+        )[0]
+
+    assert type(model).__name__ == expected_model_name
+    assert model.n_init == 1
+    assert model.n_iter_ < 100
+    assert model._n_threads == expected_openmp_threads
+
+
+def test_large_action_buckets_run_serially_after_parallel_small_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main_thread = threading.get_ident()
+    training_data = {
+        0: prototypes._ActionTrainingData(
+            action_id=0,
+            values=np.zeros((2, 1), dtype=np.float32),
+            episode_ranges=((0, 2),),
+        ),
+        1: prototypes._ActionTrainingData(
+            action_id=1,
+            values=np.zeros((65_537, 1), dtype=np.float32),
+            episode_ranges=((0, 65_537),),
+        ),
+        2: prototypes._ActionTrainingData(
+            action_id=2,
+            values=np.zeros((65_538, 1), dtype=np.float32),
+            episode_ranges=((0, 65_538),),
+        ),
+    }
+    active_openmp_threads: list[int | None] = [None]
+    calls: list[tuple[int, int, int | None]] = []
+
+    @contextmanager
+    def recording_threadpool_limits(*, limits: int, user_api: str):
+        assert user_api == "openmp"
+        active_openmp_threads[0] = limits
+        try:
+            yield
+        finally:
+            active_openmp_threads[0] = None
+
+    def recording_fit(training: object, **_: object) -> object:
+        action_id = int(getattr(training, "action_id"))
+        calls.append((action_id, threading.get_ident(), active_openmp_threads[0]))
+        return SimpleNamespace(cluster_centers_=np.zeros((1, 1), dtype=np.float32))
+
+    monkeypatch.setattr(prototypes, "threadpool_limits", recording_threadpool_limits)
+    monkeypatch.setattr(prototypes, "_fit_action_model", recording_fit)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        models = prototypes._fit_action_models(
+            executor,
+            training_data,
+            {0: 1, 1: 1, 2: 1},
+            batch_size=4096,
+            max_iter=100,
+            tol=1.0e-4,
+            seed=23,
         )
 
-        assert result.prototypes.centers is not None
-        centers.append(float(result.prototypes.centers[0, 0]))
-        all_consumed = np.concatenate(consumed, axis=0)
-        assert all_consumed.shape == (16 * 3, 1)
-        assert np.count_nonzero(all_consumed == 0.0) == 8 * 3
-        assert np.count_nonzero(all_consumed == 10.0) == 8 * 3
+    assert set(models) == {0, 1, 2}
+    assert calls[0][0] == 0
+    assert calls[0][1] != main_thread
+    assert calls[0][2] == 1
+    assert calls[1:] == [(1, main_thread, 4), (2, main_thread, 4)]
 
-    assert fit_rows == []
-    np.testing.assert_allclose(centers, [5.0, 5.0], rtol=0.0, atol=5.0e-6)
+
+def test_parallel_full_kmeans_accepts_degenerate_buckets_without_warning() -> None:
+    from sklearn.exceptions import ConvergenceWarning
+
+    training_data = {
+        action_id: prototypes._ActionTrainingData(
+            action_id=action_id,
+            values=np.zeros((400, 2), dtype=np.float32),
+            episode_ranges=((0, 400),),
+        )
+        for action_id in range(4)
+    }
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            models = prototypes._fit_action_models(
+                executor,
+                training_data,
+                {action_id: 3 for action_id in training_data},
+                batch_size=64,
+                max_iter=100,
+                tol=1.0e-4,
+                seed=23,
+            )
+
+    assert all(model.cluster_centers_.shape == (3, 2) for model in models.values())
+    assert not any(isinstance(item.message, ConvergenceWarning) for item in caught)
 
 
 def test_full_trajectory_builder_rejects_missing_frame_cache(tmp_path: Path) -> None:

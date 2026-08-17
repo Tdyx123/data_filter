@@ -11,8 +11,12 @@ from dataclasses import asdict, dataclass, replace
 from numbers import Integral, Real
 from pathlib import Path
 from typing import TypeVar
+import warnings
 
 import numpy as np
+from sklearn.cluster import KMeans, MiniBatchKMeans
+from sklearn.exceptions import ConvergenceWarning
+from threadpoolctl import threadpool_limits
 
 from libero_motion_primitives import classify_motion_primitive, make_libero_config
 from relcore.graph.prototypes import PrototypeData
@@ -29,6 +33,9 @@ MIN_ACTION_COUNT = 400
 MIN_ACTION_FREQUENCY = 0.005
 MIN_VISUAL_CENTERS = 3
 MAX_VISUAL_CENTERS = 16
+FULL_KMEANS_MAX_TRAINING_COUNT = 65_536
+FULL_KMEANS_OPENMP_THREADS = 1
+MINIBATCH_KMEANS_OPENMP_THREADS = 4
 MIN_DISTANCE_WEIGHT = 0.3
 STATE_THRESHOLD = 0.03
 STATE_KEY = "observation.state"
@@ -103,15 +110,21 @@ class ActionCatalog:
     def to_dict(self) -> dict[str, object]:
         return {
             "method": "motion_primitives",
-            "schema_version": 7,
+            "schema_version": 8,
             "strategy": (
-                "trajectory_sampled_retained_action_then_cropped_pca_half_visual_nearest"
+                "trajectory_sampled_retained_action_then_cropped_pca_half_visual_"
+                "hybrid_kmeans_nearest"
             ),
             "constants": {
                 "state_threshold": STATE_THRESHOLD,
                 "min_action_count": MIN_ACTION_COUNT,
                 "min_action_frequency": MIN_ACTION_FREQUENCY,
                 "max_visual_centers": MAX_VISUAL_CENTERS,
+                "full_kmeans_max_training_count": FULL_KMEANS_MAX_TRAINING_COUNT,
+                "full_kmeans_openmp_threads": FULL_KMEANS_OPENMP_THREADS,
+                "minibatch_kmeans_openmp_threads": MINIBATCH_KMEANS_OPENMP_THREADS,
+                "kmeans_n_init": 1,
+                "large_bucket_parallelism": "serial",
                 "trajectory_window_length": TRAJECTORY_WINDOW_LENGTH,
                 "trajectory_window_policy": TRAJECTORY_WINDOW_POLICY,
                 "visual_half_windows": [[0, 8], [7, 15]],
@@ -522,40 +535,6 @@ def _euclidean_distances(values: np.ndarray, centers: np.ndarray) -> np.ndarray:
     return np.sqrt(squared, out=squared).astype(np.float32, copy=False)
 
 
-def _initialize_action_cluster_model(
-    embeddings: np.ndarray,
-    *,
-    clusters: int,
-    batch_size: int,
-    seed: int,
-):
-    values = np.asarray(embeddings, dtype=np.float32)
-    if (
-        values.ndim != 2
-        or values.shape[0] == 0
-        or values.shape[1] == 0
-        or not np.all(np.isfinite(values))
-        or isinstance(clusters, bool)
-        or not isinstance(clusters, Integral)
-        or not 1 <= int(clusters) <= len(values)
-    ):
-        raise ValueError("invalid KMeans inputs")
-    from sklearn.cluster import MiniBatchKMeans
-
-    model = MiniBatchKMeans(
-        n_clusters=int(clusters),
-        batch_size=batch_size,
-        max_iter=1,
-        random_state=seed,
-        n_init=10,
-    )
-    model.partial_fit(values)
-    centers = np.asarray(model.cluster_centers_, dtype=np.float32)
-    if centers.shape != (int(clusters), values.shape[1]) or not np.all(np.isfinite(centers)):
-        raise ValueError("invalid KMeans outputs")
-    return model
-
-
 def _episode_exact_memberships(
     states: np.ndarray,
     categories_by_label: Mapping[str, ActionCategory],
@@ -649,43 +628,42 @@ def _fit_action_model(
     clusters: int,
     batch_size: int,
     max_iter: int,
+    tol: float,
     seed: int,
 ):
-    capacity = min(
-        len(training_data.values),
-        max(int(batch_size), int(clusters)),
-    )
-    initial_values = np.empty(
-        (capacity, training_data.values.shape[1]),
-        dtype=np.float32,
-    )
-    initial_count = 0
-    model = None
-
-    for _ in range(int(max_iter)):
-        for start, end in training_data.episode_ranges:
-            member_values = training_data.values[start:end]
-            cursor = 0
-            if model is None:
-                take = min(capacity - initial_count, len(member_values))
-                if take:
-                    initial_values[initial_count : initial_count + take] = member_values[:take]
-                    initial_count += take
-                    cursor += take
-                if initial_count == capacity:
-                    model = _initialize_action_cluster_model(
-                        initial_values,
-                        clusters=int(clusters),
-                        batch_size=int(batch_size),
-                        seed=int(seed) + training_data.action_id,
-                    )
-            if model is not None:
-                while cursor < len(member_values):
-                    batch_end = min(cursor + int(batch_size), len(member_values))
-                    model.partial_fit(member_values[cursor:batch_end])
-                    cursor = batch_end
-    if model is None:
+    values = np.asarray(training_data.values, dtype=np.float32)
+    if (
+        values.ndim != 2
+        or values.shape[0] == 0
+        or values.shape[1] == 0
+        or not np.all(np.isfinite(values))
+        or not 1 <= int(clusters) <= len(values)
+    ):
         raise ValueError("invalid KMeans inputs")
+    common = {
+        "n_clusters": int(clusters),
+        "init": "k-means++",
+        "n_init": 1,
+        "max_iter": int(max_iter),
+        "tol": float(tol),
+        "random_state": int(seed) + training_data.action_id,
+    }
+    if len(values) > FULL_KMEANS_MAX_TRAINING_COUNT:
+        model = MiniBatchKMeans(
+            **common,
+            batch_size=int(batch_size),
+            max_no_improvement=10,
+        )
+    else:
+        model = KMeans(
+            **common,
+            algorithm="lloyd",
+            copy_x=True,
+        )
+    model.fit(values)
+    centers = np.asarray(model.cluster_centers_, dtype=np.float32)
+    if centers.shape != (int(clusters), values.shape[1]) or not np.all(np.isfinite(centers)):
+        raise ValueError("invalid KMeans outputs")
     return model
 
 
@@ -725,6 +703,48 @@ def _run_action_tasks(
         raise
 
 
+def _fit_action_models(
+    executor: ThreadPoolExecutor | None,
+    training_data: Mapping[int, _ActionTrainingData],
+    requested_centers: Mapping[int, int],
+    *,
+    batch_size: int,
+    max_iter: int,
+    tol: float,
+    seed: int,
+) -> dict[int, object]:
+    action_ids = sorted(requested_centers)
+    small_action_ids = [
+        action_id
+        for action_id in action_ids
+        if len(training_data[action_id].values) <= FULL_KMEANS_MAX_TRAINING_COUNT
+    ]
+    large_action_ids = [
+        action_id
+        for action_id in action_ids
+        if len(training_data[action_id].values) > FULL_KMEANS_MAX_TRAINING_COUNT
+    ]
+
+    def fit_action(action_id: int):
+        return _fit_action_model(
+            training_data[action_id],
+            clusters=requested_centers[action_id],
+            batch_size=int(batch_size),
+            max_iter=int(max_iter),
+            tol=float(tol),
+            seed=int(seed),
+        )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        with threadpool_limits(limits=FULL_KMEANS_OPENMP_THREADS, user_api="openmp"):
+            models = _run_action_tasks(executor, small_action_ids, fit_action)
+        with threadpool_limits(limits=MINIBATCH_KMEANS_OPENMP_THREADS, user_api="openmp"):
+            for action_id in large_action_ids:
+                models[action_id] = fit_action(action_id)
+    return {action_id: models[action_id] for action_id in action_ids}
+
+
 def build_hierarchical_motion_prototypes(
     adapter: DatasetAdapter,
     clips: Sequence[ClipRecord],
@@ -738,6 +758,7 @@ def build_hierarchical_motion_prototypes(
     seed: int,
     max_episodes: int | None,
     num_workers: int,
+    tol: float = 1.0e-4,
     num_threads: int = 4,
     timing_callback: TimingCallback | None = None,
 ) -> HierarchicalPrototypeResult:
@@ -784,6 +805,10 @@ def build_hierarchical_motion_prototypes(
         or int(max_iter) <= 0
         or isinstance(seed, bool)
         or not isinstance(seed, Integral)
+        or isinstance(tol, bool)
+        or not isinstance(tol, Real)
+        or not math.isfinite(float(tol))
+        or float(tol) <= 0.0
     ):
         raise ValueError("hierarchical prototype KMeans inputs are invalid")
     if STATE_KEY not in adapter.vector_observation_keys:
@@ -864,11 +889,7 @@ def build_hierarchical_motion_prototypes(
         if training_count == 0:
             continue
         clusters = cluster_count_for_training_count(training_count)
-        capacity = min(
-            training_count,
-            max(int(batch_size), clusters),
-        )
-        if clusters <= 0 or clusters > capacity:
+        if clusters <= 0 or clusters > training_count:
             raise ValueError("invalid KMeans inputs")
         requested_centers[action_id] = clusters
 
@@ -909,17 +930,16 @@ def build_hierarchical_motion_prototypes(
         else None
     )
     try:
-        def fit_action(action_id: int):
-            return _fit_action_model(
-                training_data[action_id],
-                clusters=requested_centers[action_id],
-                batch_size=int(batch_size),
-                max_iter=int(max_iter),
-                seed=int(seed),
-            )
-
         kmeans_started = time.perf_counter()
-        models = _run_action_tasks(executor, action_ids, fit_action)
+        models = _fit_action_models(
+            executor,
+            training_data,
+            requested_centers,
+            batch_size=int(batch_size),
+            max_iter=int(max_iter),
+            tol=float(tol),
+            seed=int(seed),
+        )
 
         if timing_callback is not None:
             timing_callback("graph.prototypes.kmeans", time.perf_counter() - kmeans_started)

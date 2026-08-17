@@ -14,8 +14,8 @@ def _objective(relation: str = "cooccurrence", weight: float = 1.0) -> dict[str,
     return {"objective": {"relation": relation, "relation_weight": weight}}
 
 
-def test_package_version_matches_cropped_pca_projection_release() -> None:
-    assert cocore.__version__ == "0.12.0"
+def test_package_version_matches_hybrid_kmeans_release() -> None:
+    assert cocore.__version__ == "0.13.0"
 
 
 def test_config_requires_explicit_relation_and_weight() -> None:
@@ -43,6 +43,7 @@ def test_config_accepts_supported_relations(relation: str) -> None:
         "epsilon": 1.0e-8,
     }
     assert resolved["prototypes"]["method"] == "motion_primitives"
+    assert resolved["prototypes"]["tol"] == 1.0e-4
     assert resolved["prototypes"]["num_threads"] == 4
     assert resolved["reliability_metrics"] == ["support", "progress"]
     assert resolved["objective"] == {"relation": relation, "relation_weight": 1.0}
@@ -173,6 +174,17 @@ def test_config_rejects_non_positive_or_non_integer_prototype_thread_counts(
         )
 
 
+@pytest.mark.parametrize("tol", [0.0, -1.0e-4, float("nan"), float("inf"), True, "1e-4"])
+def test_config_rejects_invalid_prototype_convergence_tolerance(tol: object) -> None:
+    with pytest.raises(ValueError, match="prototypes.tol"):
+        resolve_config(
+            {
+                **_objective(),
+                "prototypes": {"tol": tol},
+            }
+        )
+
+
 @pytest.mark.parametrize("max_refreshes", [0, -1, 1.5, True])
 def test_config_rejects_non_positive_or_non_integer_max_refreshes(max_refreshes) -> None:
     with pytest.raises(ValueError, match="selection.max_refreshes"):
@@ -291,7 +303,13 @@ def test_shipped_configs_resolve_to_fixed_cocore_contract(path: str) -> None:
         "epsilon": 1.0e-8,
     }
     assert config["prototypes"]["method"] == "motion_primitives"
-    assert set(config["prototypes"]) == {"method", "batch_size", "max_iter", "num_threads"}
+    assert set(config["prototypes"]) == {
+        "method",
+        "batch_size",
+        "max_iter",
+        "tol",
+        "num_threads",
+    }
     assert config["prototypes"]["num_threads"] == (
         1 if path.endswith("config_debug.yaml") else 4
     )

@@ -11,10 +11,13 @@ Cocore 的编码、运动原语、关系目标或惰性最大堆算法，而是�
 - LeRobot `v2.0`、WidowX、5 Hz；
 - 只读取 `observation.images.image_0`、8 维 `observation.state` 和 7 维 `action`；
 - 排除任务名为空的 episode，再应用 `--max-episodes`；
-- 固定使用 15 帧近似均匀候选和 Cocore schema 7 两级动作原型；原型学习在完整轨迹
+- 固定使用 15 帧近似均匀候选和 Cocore schema 8 两级动作原型；原型学习在完整轨迹
   上使用首尾覆盖、起点间隔最大为 3 的八帧窗口，只用精确保留动作训练硬视觉桶；
-- 生产配置使用 `prototypes.num_threads: 4` 并行不同的活跃动作桶；它与只控制 episode
-  读取进程的 `runtime.num_workers: 4` 相互独立，改变线程数不改变 graph 指纹；
+- 不超过 65,536 个训练窗口的动作桶使用完整 KMeans，以
+  `prototypes.num_threads: 4` 并行且每个模型使用 1 个 OpenMP 线程；超过阈值的桶使用
+  MiniBatchKMeans，按动作 ID 串行且每个模型使用 4 个 OpenMP 线程；
+- `prototypes.num_threads` 与只控制 episode 读取进程的 `runtime.num_workers: 4` 相互
+  独立，改变线程数不改变 graph 指纹；
 - 候选按 `[0..7]`、`[7..14]` 独立选择最近叶原型，权重为保留比例置信度与桶内距离
   置信度的乘积；同叶合并，最终绝对权重不归一；
 - 全局选择，不施加逐任务配额。
@@ -77,18 +80,18 @@ outputs/cocore_bridge_v2/bridge_orig_1.0.0
 `embeddings.npy`、`visual_pca.npz`、`numeric_normalizers.npz`、按 episode 分片的
 `frame_embeddings/`、对应索引以及候选双半段均值
 `visual_half_embeddings.npy`。逐帧缓存覆盖所有已索引 episode，包括短 episode。
-graph 目录提供 schema 7 的 `prototype_catalog.json`、128 维
+graph 目录提供 schema 8 的 `prototype_catalog.json`、128 维
 `prototype_centers.npy` 和内部校验用 `half_action_labels.npy`。聚类复用 Encode 的
 PCA components 前半列进行逐帧纯矩阵投影，不使用 mean/scale。选择输出包含最终
 原型标签、动作标签、绝对置信度和 `half_action_labels`，不包含旧的 action/distance
-分解权重。manifest 的生产者仍为 `cocore`；Cocore 版本为 0.12.0，Bridge 包版本为
+分解权重。manifest 的生产者仍为 `cocore`；Cocore 版本为 0.13.0，Bridge 包版本为
 0.4.0。
 
-视觉中心训练只物化一次保留窗口投影，再在线程间按动作桶拟合和统计。Bridge V2
-完整生产数据的额外内存约为 273 MiB（保留窗口数 × 128 × 4 字节），不使用 memmap
-或磁盘 fallback。
+视觉中心训练只物化一次保留窗口投影；小桶并行执行完整 KMeans，大桶串行执行
+MiniBatchKMeans。Bridge V2 完整生产数据的基础额外内存约为 273 MiB（保留窗口数 ×
+128 × 4 字节），不使用 memmap 或磁盘 fallback。
 
-0.11.0 及更早的 Cocore 缓存不迁移。升级后必须重新构建 scan、encode、graph 和
+0.12.0 及更早的 Cocore 缓存不迁移。升级后必须重新构建 scan、encode、graph 和
 selection；建议使用新的输出目录，或在确认目标后使用 `--force`。
 
 验证时必须重复传入生成该选择结果时使用的目标、比例、数据集路径以及

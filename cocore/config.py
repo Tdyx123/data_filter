@@ -44,6 +44,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "output": {"directory": "outputs/cocore/libero90"},
 }
 DEFAULT_CONFIG["prototypes"]["method"] = "motion_primitives"
+DEFAULT_CONFIG["prototypes"]["tol"] = 1.0e-4
 DEFAULT_CONFIG["prototypes"]["num_threads"] = 4
 for _obsolete_prototype_field in ("count", "top_r", "temperature"):
     DEFAULT_CONFIG["prototypes"].pop(_obsolete_prototype_field, None)
@@ -109,6 +110,7 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "method",
             "batch_size",
             "max_iter",
+            "tol",
             "num_threads",
         }
         if unsupported:
@@ -129,6 +131,15 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError("cocore prototypes.num_threads must be a positive integer")
     resolved["prototypes"]["num_threads"] = int(num_threads)
+    tolerance = resolved["prototypes"].get("tol")
+    if (
+        isinstance(tolerance, bool)
+        or not isinstance(tolerance, Real)
+        or not math.isfinite(float(tolerance))
+        or float(tolerance) <= 0.0
+    ):
+        raise ValueError("cocore prototypes.tol must be a finite positive number")
+    resolved["prototypes"]["tol"] = float(tolerance)
     resolved["reliability_metrics"] = ["support", "progress"]
     relation = str(resolved["objective"]["relation"])
     if relation not in {"sequence", "cooccurrence"}:
@@ -199,7 +210,7 @@ def to_relcore_config(resolved: Mapping[str, Any]) -> dict[str, Any]:
                 {
                     key: copy.deepcopy(value)
                     for key, value in resolved[section].items()
-                    if key != "num_threads"
+                    if key not in {"num_threads", "tol"}
                 }
             )
         else:

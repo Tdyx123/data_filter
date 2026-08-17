@@ -42,8 +42,12 @@ K_a = min(M_a, min(16, max(3, floor(2 * log2(M_a) - 16))))
 外层 `min(M_a, ...)` 只在桶内不足 3 个训练窗口时降低中心数；非 `stop` 桶仍受上述
 至少 400 个窗口的动作门槛保护。
 
-MiniBatchKMeans 不使用样本权重；中心按硬归属数降序、坐标字典序稳定编号。每桶还记录
-训练窗口到最近中心的欧氏距离 q10/q90。
+聚类不使用样本权重。训练窗口数不超过 65,536 的动作桶使用完整 Lloyd KMeans，允许
+按动作桶并行且每个模型固定 1 个 OpenMP 线程；超过 65,536 的动作桶使用
+MiniBatchKMeans，这些大桶按动作 ID 串行拟合且每个模型固定 4 个 OpenMP 线程。两种
+模型都使用一次 k-means++ 初始化，并由 `tol` 收敛条件提前停止，`max_iter` 只作为迭代
+上限。中心按硬归属数降序、坐标字典序稳定编号；每桶还记录训练窗口到最近中心的欧氏
+距离 q10/q90。
 
 构造 15 帧候选标签时，分别分类 `state[0]→state[7]` 与
 `state[7]→state[14]`，两个半段各自独立打一个叶标签。若原始动作未保留，先找原子数
@@ -122,6 +126,7 @@ prototypes:
   method: motion_primitives
   batch_size: 4096
   max_iter: 100
+  tol: 1.0e-4
   num_threads: 4
 ```
 
@@ -130,15 +135,18 @@ prototypes:
 Quality 风格编码取代了旧关系编码，因此不再接受顶层 `relation` 或 `normalization`；
 `encoding.visual_dim` 固定为 128，`pca_fit_max_samples` 可限制 PCA 拟合样本数。
 动作门槛、中心数公式、16 个中心上限、距离分位和权重公式都是 Cocore 固定算法，
-不可配置；`prototypes` 只接受 `method`、`batch_size`、`max_iter` 和正整数
-`num_threads`，并明确拒绝旧 `count`、`top_r` 或 `temperature`。`num_threads`
-默认为 4，只并行不同的活跃动作桶；debug 配置固定为 1。它与
-`runtime.num_workers` 相互独立，后者仍只控制 episode 读取进程。
+不可配置；`prototypes` 只接受 `method`、`batch_size`、`max_iter`、正数 `tol` 和正整数
+`num_threads`，并明确拒绝旧 `count`、`top_r` 或 `temperature`。`batch_size` 只影响
+超过 65,536 个训练窗口的大桶；`num_threads` 默认为 4，只并行不超过阈值的小桶，
+debug 配置固定为 1。它与 `runtime.num_workers` 相互独立，后者仍只控制 episode 读取
+进程。
 
-视觉中心训练会一次物化所有保留窗口的 128 维 `float32` 投影，再按动作桶并行重放
-原有 MiniBatchKMeans 批次。额外内存约为“保留窗口数 × 128 × 4 字节”：LIBERO90
-约 106 MiB，Bridge V2 约 273 MiB。改变 `num_threads` 不改变 graph 指纹或产物，
-因此可复用同一 graph 缓存。
+视觉中心训练会一次物化所有保留窗口的 128 维 `float32` 投影。小桶用完整 KMeans
+并行拟合，大桶用 MiniBatchKMeans 串行拟合，避免多个大桶同时占用 CPU 和临时内存。
+基础额外内存约为“保留窗口数 × 128 × 4 字节”：LIBERO90 约 106 MiB，Bridge V2
+约 273 MiB；完整 KMeans 拟合小桶时还会产生有界于 65,536 个窗口的工作副本。改变
+`num_threads` 不改变 graph 指纹或产物，因此可复用同一 graph 缓存；改变
+`batch_size`、`max_iter` 或 `tol` 会使 graph 缓存失效。
 
 可在运行时覆盖选择比例、关系类型与关系权重：
 
@@ -160,11 +168,10 @@ RelCore 的 `--reliability-metrics`、`--prototype-method` 或
 python -m cocore run --config cocore/config_debug.yaml --force
 ```
 
-Cocore 0.12.0 使用 prototype schema 7、最大间隔 3 的动作训练窗口、裁剪 PCA 的
-128 维聚类空间、近似均匀候选和顺序相邻 sequence 图，并按 episode 持久化完整原始
-逐帧 CLIP 特征。0.11.0 及更早
-版本的 scan、encode、graph 和 selection 缓存不迁移；升级后必须通过 `--force`
-重建全部阶段，或使用新的输出目录。
+Cocore 0.13.0 使用 prototype schema 8、65,536 窗口的混合 KMeans 阈值、最大间隔 3
+的动作训练窗口、裁剪 PCA 的 128 维聚类空间、近似均匀候选和顺序相邻 sequence 图，
+并按 episode 持久化完整原始逐帧 CLIP 特征。0.12.0 及更早版本的 scan、encode、graph
+和 selection 缓存不迁移；升级后必须通过 `--force` 重建全部阶段，或使用新的输出目录。
 
 ## 输出与校验
 

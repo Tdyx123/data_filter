@@ -48,7 +48,10 @@ from cocore.graph import SEQUENCE_ADJACENCY, build_graph
 from cocore.index import CLIP_LENGTH, WINDOW_POLICY, build_clip_records
 from cocore.objective import CocoreObjectiveContext
 from cocore.prototypes import (
+    FULL_KMEANS_MAX_TRAINING_COUNT,
+    FULL_KMEANS_OPENMP_THREADS,
     MAX_VISUAL_CENTERS,
+    MINIBATCH_KMEANS_OPENMP_THREADS,
     MIN_ACTION_COUNT,
     MIN_DISTANCE_WEIGHT,
     MIN_ACTION_FREQUENCY,
@@ -68,9 +71,9 @@ from cocore.timing import emit_completed_timing, timed_step
 
 GRAPH_DIRECTORY = "graph-16-motion-hard-nearest-pca"
 RELIABILITY_METRICS = ("support", "progress")
-PROTOTYPE_SCHEMA_VERSION = 7
+PROTOTYPE_SCHEMA_VERSION = 8
 PROTOTYPE_STRATEGY = (
-    "trajectory_sampled_retained_action_then_cropped_pca_half_visual_nearest"
+    "trajectory_sampled_retained_action_then_cropped_pca_half_visual_hybrid_kmeans_nearest"
 )
 PROTOTYPE_VISUAL_PROJECTION = "frame @ visual_pca.components[:, :frame_embedding_dim].T"
 PROTOTYPE_VISUAL_NORMALIZATION = "l2_normalized_eight_frame_mean_after_projection"
@@ -581,7 +584,7 @@ def graph_stage(
     pca_components = _load_visual_pca_components(root / "encode", visual_dim=visual_dim)
     prototype_config = resolved["prototypes"]
     prototype_fingerprint_config = {
-        key: prototype_config[key] for key in ("method", "batch_size", "max_iter")
+        key: prototype_config[key] for key in ("method", "batch_size", "max_iter", "tol")
     }
     fingerprint = stable_hash(
         {
@@ -630,6 +633,7 @@ def graph_stage(
                 frame_cache_dir=root / "encode" / "frame_embeddings",
                 batch_size=int(prototype_config["batch_size"]),
                 max_iter=int(prototype_config["max_iter"]),
+                tol=float(prototype_config["tol"]),
                 seed=int(resolved["seed"]),
                 max_episodes=resolved["runtime"].get("max_episodes"),
                 num_workers=int(resolved["runtime"].get("num_workers", 0)),
@@ -804,7 +808,7 @@ def _load_graph(root: Path) -> tuple[list[ClipRecord], GraphData, Mapping[str, n
     return clips, graph, nodes
 
 
-def _validate_schema_seven_catalog(
+def _validate_schema_eight_catalog(
     payload: Mapping[str, Any],
     *,
     expected_total_raw_actions: int,
@@ -814,6 +818,11 @@ def _validate_schema_seven_catalog(
         "min_action_count": MIN_ACTION_COUNT,
         "min_action_frequency": MIN_ACTION_FREQUENCY,
         "max_visual_centers": MAX_VISUAL_CENTERS,
+        "full_kmeans_max_training_count": FULL_KMEANS_MAX_TRAINING_COUNT,
+        "full_kmeans_openmp_threads": FULL_KMEANS_OPENMP_THREADS,
+        "minibatch_kmeans_openmp_threads": MINIBATCH_KMEANS_OPENMP_THREADS,
+        "kmeans_n_init": 1,
+        "large_bucket_parallelism": "serial",
         "trajectory_window_length": TRAJECTORY_WINDOW_LENGTH,
         "trajectory_window_policy": TRAJECTORY_WINDOW_POLICY,
         "visual_half_windows": [[0, 8], [7, 15]],
@@ -1025,7 +1034,7 @@ def _validate_hierarchical_graph_artifacts(
         raise ValueError("hierarchical prototype node shape or dtype is invalid")
 
     payload = json.loads((graph_root / "prototype_catalog.json").read_text(encoding="utf-8"))
-    leaves = _validate_schema_seven_catalog(
+    leaves = _validate_schema_eight_catalog(
         payload,
         expected_total_raw_actions=expected_total_raw_actions,
     )
@@ -1094,6 +1103,7 @@ def _validate_hierarchical_graph_artifacts(
         frame_cache_dir=root / "encode" / "frame_embeddings",
         batch_size=int(prototype_config["batch_size"]),
         max_iter=int(prototype_config["max_iter"]),
+        tol=float(prototype_config["tol"]),
         seed=int(resolved["seed"]),
         max_episodes=resolved["runtime"].get("max_episodes"),
         num_workers=int(resolved["runtime"].get("num_workers", 0)),
