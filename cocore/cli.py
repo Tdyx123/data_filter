@@ -43,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--output-dir", default=None)
         child.add_argument("--max-episodes", type=int, default=None)
         child.add_argument("--force", action="store_true")
+        if command in {"build-graph", "select", "run"}:
+            child.add_argument("--no-use-stop-bucket", action="store_true")
         if command in {"select", "run"}:
             child.add_argument("--selection-ratio", type=_selection_ratio, default=None)
             child.add_argument("--relation", choices=("sequence", "cooccurrence"), default=None)
@@ -50,19 +52,27 @@ def build_parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate")
     validate.add_argument("--output-dir", required=True)
     validate.add_argument("--config", default=None)
+    validate.add_argument("--no-use-stop-bucket", action="store_true")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "validate":
-        config = load_config(args.config) if args.config is not None else None
+        config_path = args.config
+        if config_path is None and args.no_use_stop_bucket:
+            config_path = Path(args.output_dir).expanduser() / "resolved_config.yaml"
+        config = load_config(config_path) if config_path is not None else None
+        if args.no_use_stop_bucket:
+            config.setdefault("prototypes", {})["use_stop_bucket"] = False
         result = validate_output(args.output_dir, config=config)
         import json
 
         print(json.dumps(result, sort_keys=True))
         return
     config = load_config(args.config)
+    if getattr(args, "no_use_stop_bucket", False):
+        config.setdefault("prototypes", {})["use_stop_bucket"] = False
     if args.max_episodes is not None:
         if args.max_episodes <= 0:
             raise SystemExit("--max-episodes must be positive")

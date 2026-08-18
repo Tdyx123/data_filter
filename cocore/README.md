@@ -164,6 +164,17 @@ python -m cocore run --config cocore/config_libero90.yaml \
   --relation-weight 1.5
 ```
 
+`build-graph`、`select`、`run` 和 `validate` 还接受单向开关
+`--no-use-stop-bucket`，其优先级高于 YAML，并将
+`prototypes.use_stop_bucket` 强制覆盖为 `false`。`scan` 和 `encode` 不接受该参数。
+例如关闭 stop 桶并重建不兼容缓存：
+
+```bash
+python -m cocore run --config cocore/config_libero90.yaml \
+  --no-use-stop-bucket \
+  --force
+```
+
 上述选择写入 `outputs/cocore/libero90/select-sequence-w1p5-top20pct/`。
 `--cooccurrence-weight` 已移除；Cocore 也不接受
 RelCore 的 `--reliability-metrics`、`--prototype-method` 或
@@ -175,7 +186,7 @@ RelCore 的 `--reliability-metrics`、`--prototype-method` 或
 python -m cocore run --config cocore/config_debug.yaml --force
 ```
 
-Cocore 0.14.0 使用 prototype schema 9、可选 stop 桶、无标签候选诱导子图、65,536
+Cocore 0.14.1 使用 prototype schema 9、可选 stop 桶、无标签候选诱导子图、65,536
 窗口的混合 KMeans 阈值、最大间隔 3 的动作训练窗口、裁剪 PCA 的 128 维聚类空间、
 近似均匀候选和原始相邻 sequence 图，并按 episode 持久化完整原始逐帧 CLIP 特征。
 0.13.0 及更早版本的 scan、encode、graph 和 selection 缓存不迁移；升级后必须通过
@@ -214,8 +225,13 @@ Cocore 0.14.0 使用 prototype schema 9、可选 stop 桶、无标签候选诱�
 ```bash
 python -m cocore validate \
   --output-dir outputs/cocore/libero90/select-cooccurrence-w1-top10pct \
-  --config cocore/config_libero90.yaml
+  --config cocore/config_libero90.yaml \
+  --no-use-stop-bucket
 ```
+
+只有生成结果时关闭了 stop 桶，验证时才应传入该开关。若省略 `--config`，CLI 会从
+选择目录的 `resolved_config.yaml` 读取重放配置；复用 0.14.0 或其他 stop 设置不同的
+输出目录时，应使用 `--force` 重建全部不兼容阶段。
 
 校验还会从 episode 元数据重放近似均匀候选，逐字段核对 `clips.parquet`，逐个检查
 帧缓存文件集合、shape、dtype、有限值和 SHA-256，并使用同一 PCA components 重算

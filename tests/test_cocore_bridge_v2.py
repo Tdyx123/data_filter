@@ -213,7 +213,7 @@ def test_package_exposes_only_version() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["0.5.0", "['__version__']"]
+    assert result.stdout.splitlines() == ["0.5.1", "['__version__']"]
 
 
 def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None:
@@ -275,6 +275,31 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
     assert "tol" not in translated["prototypes"]
     assert translated["selection"]["quota_mode"] == "none"
     assert translated["selection"]["minimum_per_task"] == 0
+
+
+def test_bridge_config_can_disable_stop_bucket(tmp_path: Path) -> None:
+    from cocore_bridge_v2.config import build_config
+
+    config = build_config(
+        relation="sequence",
+        relation_weight=1.0,
+        dataset_path=tmp_path / "bridge",
+        use_stop_bucket=False,
+    )
+
+    assert config["prototypes"]["use_stop_bucket"] is False
+
+
+@pytest.mark.parametrize("value", [0, 1, None, "false"])
+def test_bridge_config_rejects_non_boolean_stop_bucket(value: object) -> None:
+    from cocore_bridge_v2.config import build_config
+
+    with pytest.raises(ValueError, match="prototypes.use_stop_bucket"):
+        build_config(
+            relation="sequence",
+            relation_weight=1.0,
+            use_stop_bucket=value,  # type: ignore[arg-type]
+        )
 
 
 def test_preflight_accepts_fixed_bridge_v2_schema(tmp_path: Path) -> None:
@@ -419,6 +444,43 @@ def test_every_command_accepts_explicit_relation_and_weight(command: str) -> Non
     assert parsed.max_episodes == 7
     if command in {"select", "run", "validate"}:
         assert parsed.selection_ratio == 0.10
+
+
+@pytest.mark.parametrize("command", ["build-graph", "select", "run", "validate"])
+def test_graph_commands_accept_stop_bucket_disable_flag(command: str) -> None:
+    from cocore_bridge_v2 import cli
+
+    arguments = [
+        command,
+        "--relation",
+        "sequence",
+        "--relation-weight",
+        "1",
+        "--no-use-stop-bucket",
+    ]
+    if command == "validate":
+        arguments += ["--output-dir", "result"]
+
+    parsed = cli.build_parser().parse_args(arguments)
+
+    assert parsed.no_use_stop_bucket is True
+
+
+@pytest.mark.parametrize("command", ["scan", "encode"])
+def test_non_graph_commands_reject_stop_bucket_disable_flag(command: str) -> None:
+    from cocore_bridge_v2 import cli
+
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            [
+                command,
+                "--relation",
+                "sequence",
+                "--relation-weight",
+                "1",
+                "--no-use-stop-bucket",
+            ]
+        )
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-0.1"])
@@ -588,6 +650,43 @@ def test_execution_commands_delegate_to_matching_cocore_stage(
     assert capsys.readouterr().out.strip() == expected.format(root=output)
 
 
+def test_run_cli_disables_stop_bucket_in_delegated_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from cocore_bridge_v2 import cli
+
+    dataset = tmp_path / "bridge"
+    output = tmp_path / "output"
+    _write_bridge_info(dataset, _bridge_info())
+    received: dict[str, object] = {}
+
+    def fake_run_pipeline(config, **kwargs):
+        received["config"] = config
+        return output / "select-sequence-w1-top10pct"
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+
+    cli.main(
+        [
+            "run",
+            "--relation",
+            "sequence",
+            "--relation-weight",
+            "1",
+            "--dataset-path",
+            str(dataset),
+            "--output-dir",
+            str(output),
+            "--no-use-stop-bucket",
+        ]
+    )
+
+    assert received["config"]["prototypes"]["use_stop_bucket"] is False
+    capsys.readouterr()
+
+
 def test_validate_cli_passes_custom_dataset_path_without_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -625,6 +724,7 @@ def test_validate_cli_passes_custom_dataset_path_without_preflight(
             "0.2",
             "--max-episodes",
             "11",
+            "--no-use-stop-bucket",
         ]
     )
 
@@ -632,6 +732,7 @@ def test_validate_cli_passes_custom_dataset_path_without_preflight(
     assert received["config"]["dataset"]["path"] == str(dataset_path)
     assert received["config"]["selection"]["ratio"] == 0.2
     assert received["config"]["runtime"]["max_episodes"] == 11
+    assert received["config"]["prototypes"]["use_stop_bucket"] is False
     assert json.loads(capsys.readouterr().out) == {
         "selected_clips": 7,
         "status": "valid",
@@ -699,9 +800,9 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     select_manifest = json.loads((result / "manifest.json").read_text())
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert select_manifest["producer"] == "cocore"
-    assert select_manifest["cocore_version"] == "0.14.0"
+    assert select_manifest["cocore_version"] == "0.14.1"
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.14.0"
+    assert run_manifest["cocore_version"] == "0.14.1"
     assert run_manifest["stage_directories"]["graph"] == "graph-17-motion-hard-nearest-pca"
     assert validate_output(result, config=config) == {
         "status": "valid",

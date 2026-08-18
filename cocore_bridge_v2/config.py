@@ -30,6 +30,7 @@ def build_config(
     selection_ratio: float = DEFAULT_SELECTION_RATIO,
     dataset_path: str | Path = DEFAULT_DATASET_PATH,
     max_episodes: int | None = None,
+    use_stop_bucket: bool = True,
 ) -> dict[str, Any]:
     """Build and validate the fixed BridgeData V2 Cocore configuration."""
 
@@ -42,4 +43,5 @@ def build_config(
     config["selection"]["ratio"] = selection_ratio
     config["selection"]["budget"] = None
     config["runtime"]["max_episodes"] = max_episodes
+    config["prototypes"]["use_stop_bucket"] = use_stop_bucket
     return resolve_config(config)

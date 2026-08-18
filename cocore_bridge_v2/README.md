@@ -13,7 +13,8 @@ Cocore 的编码、运动原语、关系目标或惰性最大堆算法，而是�
 - 排除任务名为空的 episode，再应用 `--max-episodes`；
 - 固定使用 15 帧近似均匀候选和 Cocore schema 9 两级动作原型；原型学习在完整轨迹
   上使用首尾覆盖、起点间隔最大为 3 的八帧窗口，只用精确保留动作训练硬视觉桶；
-- 固定 `prototypes.use_stop_bucket: true`，保留 Cocore 的 stop 桶与回退行为；
+- 默认 `prototypes.use_stop_bucket: true`，保留 Cocore 的 stop 桶与回退行为；graph
+  相关命令可用 `--no-use-stop-bucket` 关闭；
 - 不超过 65,536 个训练窗口的动作桶使用完整 KMeans，以
   `prototypes.num_threads: 4` 并行且每个模型使用 1 个 OpenMP 线程；超过阈值的桶使用
   MiniBatchKMeans，按动作 ID 串行且每个模型使用 4 个 OpenMP 线程；
@@ -53,7 +54,9 @@ python -m cocore_bridge_v2 select \
 
 python -m cocore_bridge_v2 run \
   --relation sequence --relation-weight 1.0 \
-  --selection-ratio 0.10
+  --selection-ratio 0.10 \
+  --no-use-stop-bucket \
+  --force
 ```
 
 关系可选择 `sequence` 或 `cooccurrence`。`select`、`run` 和 `validate` 的
@@ -63,6 +66,8 @@ python -m cocore_bridge_v2 run \
 - `--output-dir PATH`：覆盖默认输出根目录；
 - `--max-episodes N`：在排除空任务后只处理前 N 条有效 episode；
 - `--force`：按 Cocore 的缓存规则重建不兼容阶段。
+- `--no-use-stop-bucket`：仅用于 `build-graph`、`select`、`run` 和 `validate`，关闭 stop
+  桶并排除双半段均无非 stop 标签的候选；未传时保持默认启用。
 
 首版不接受任意 YAML `--config`，以防绕过固定相机、空任务策略或运动原语契约。
 
@@ -86,8 +91,8 @@ graph 目录提供 schema 9 的 `prototype_catalog.json`、128 维
 校验用 `half_action_labels.npy`。聚类复用 Encode 的
 PCA components 前半列进行逐帧纯矩阵投影，不使用 mean/scale。选择输出包含最终
 原型标签、动作标签、绝对置信度和 `half_action_labels`，不包含旧的 action/distance
-分解权重。manifest 的生产者仍为 `cocore`；Cocore 版本为 0.14.0，Bridge 包版本为
-0.5.0。
+分解权重。manifest 的生产者仍为 `cocore`；Cocore 版本为 0.14.1，Bridge 包版本为
+0.5.1。
 
 视觉中心训练只物化一次保留窗口投影；小桶并行执行完整 KMeans，大桶串行执行
 MiniBatchKMeans。Bridge V2 完整生产数据的基础额外内存约为 273 MiB（保留窗口数 ×
@@ -109,8 +114,12 @@ python -m cocore_bridge_v2 validate \
   --dataset-path /data/dwb/datasets/bridge_orig_1.0.0_lerobo \
   --relation sequence --relation-weight 1.0 \
   --selection-ratio 0.10 \
-  --max-episodes 100
+  --max-episodes 100 \
+  --no-use-stop-bucket
 ```
+
+只有生成结果时传入了 `--no-use-stop-bucket`，验证时才重复传入。升级自 0.14.0 / 0.5.0
+或切换 stop 设置并复用同一输出根目录时，应使用 `--force` 重建全部不兼容阶段。
 
 ## 运行基线
 

@@ -393,7 +393,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     for directory in ("scan", "encode", "graph-17-motion-hard-nearest-pca"):
         manifest = json.loads((root / directory / "manifest.json").read_text())
         assert manifest["producer"] == "cocore"
-        assert manifest["cocore_version"] == "0.14.0"
+        assert manifest["cocore_version"] == "0.14.1"
     scan_manifest = json.loads((root / "scan" / "manifest.json").read_text())
     assert scan_manifest["window_policy"] == "near_uniform_full_coverage"
     assert scan_manifest["clip_length"] == 15
@@ -527,7 +527,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     }
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.14.0"
+    assert run_manifest["cocore_version"] == "0.14.1"
     assert run_manifest["relation_type"] == relation
     assert run_manifest["relation_weight"] == 1.0
     assert run_manifest["prototype_schema_version"] == 9
@@ -541,7 +541,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert run_manifest["window_policy"] == "near_uniform_full_coverage"
     assert run_manifest["sequence_adjacency"] == "ordered_candidates"
     select_manifest = json.loads((result / "manifest.json").read_text())
-    assert select_manifest["cocore_version"] == "0.14.0"
+    assert select_manifest["cocore_version"] == "0.14.1"
     assert select_manifest["relation_type"] == relation
     assert select_manifest["relation_weight"] == 1.0
     assert select_manifest["prototype_schema_version"] == 9
@@ -559,7 +559,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     (result / "manifest.json").write_text(json.dumps(select_manifest))
     with pytest.raises(ValueError, match="selection manifest Cocore version"):
         validate_output(result, config=config)
-    select_manifest["cocore_version"] = "0.14.0"
+    select_manifest["cocore_version"] = "0.14.1"
     (result / "manifest.json").write_text(json.dumps(select_manifest))
 
     report["relation_type"] = "sequence" if relation == "cooccurrence" else "cooccurrence"

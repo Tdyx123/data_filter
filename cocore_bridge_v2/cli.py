@@ -65,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--output-dir", default=None)
         child.add_argument("--max-episodes", type=_positive_int, default=None)
         child.add_argument("--force", action="store_true")
+        if command in {"build-graph", "select", "run"}:
+            child.add_argument("--no-use-stop-bucket", action="store_true")
         if command in {"select", "run"}:
             child.add_argument(
                 "--selection-ratio",
@@ -82,6 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SELECTION_RATIO,
     )
     validate.add_argument("--max-episodes", type=_positive_int, default=None)
+    validate.add_argument("--no-use-stop-bucket", action="store_true")
     return parser
 
 
@@ -94,6 +97,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         selection_ratio=selection_ratio,
         dataset_path=getattr(args, "dataset_path", DEFAULT_DATASET_PATH),
         max_episodes=getattr(args, "max_episodes", None),
+        use_stop_bucket=not getattr(args, "no_use_stop_bucket", False),
     )
     if args.command == "validate":
         result = validate_output(args.output_dir, config=config)

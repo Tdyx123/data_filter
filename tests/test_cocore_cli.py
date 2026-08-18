@@ -15,7 +15,7 @@ def _objective(relation: str = "cooccurrence", weight: float = 1.0) -> dict[str,
 
 
 def test_package_version_matches_optional_stop_release() -> None:
-    assert cocore.__version__ == "0.14.0"
+    assert cocore.__version__ == "0.14.1"
 
 
 def test_config_requires_explicit_relation_and_weight() -> None:
@@ -253,6 +253,107 @@ def test_run_cli_accepts_relation_weight_and_ratio_but_rejects_old_weight() -> N
     assert arguments.selection_ratio == 0.2
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["run", "--cooccurrence-weight", "1.5"])
+
+
+@pytest.mark.parametrize("command", ["build-graph", "select", "run", "validate"])
+def test_graph_commands_accept_stop_bucket_disable_flag(command: str) -> None:
+    arguments = [command, "--no-use-stop-bucket"]
+    if command == "validate":
+        arguments += ["--output-dir", "result"]
+
+    parsed = cli.build_parser().parse_args(arguments)
+
+    assert parsed.no_use_stop_bucket is True
+
+
+@pytest.mark.parametrize("command", ["scan", "encode"])
+def test_non_graph_commands_reject_stop_bucket_disable_flag(command: str) -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args([command, "--no-use-stop-bucket"])
+
+
+def test_main_preserves_disabled_stop_bucket_without_cli_override(monkeypatch, capsys) -> None:
+    received: dict[str, object] = {}
+    configured = {
+        **_objective(),
+        "prototypes": {"use_stop_bucket": False},
+    }
+    monkeypatch.setattr(cli, "load_config", lambda _: configured)
+
+    def fake_run_pipeline(config, **kwargs):
+        received["config"] = config
+        return Path("outputs/cocore/test/select-cooccurrence-w1-top10pct")
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+
+    cli.main(["run", "--config", "unused.yaml"])
+
+    assert received["config"]["prototypes"]["use_stop_bucket"] is False
+    capsys.readouterr()
+
+
+def test_main_stop_bucket_disable_flag_overrides_enabled_yaml(monkeypatch, capsys) -> None:
+    received: dict[str, object] = {}
+    configured = {
+        **_objective(),
+        "prototypes": {"use_stop_bucket": True},
+    }
+    monkeypatch.setattr(cli, "load_config", lambda _: configured)
+
+    def fake_run_pipeline(config, **kwargs):
+        received["config"] = config
+        return Path("outputs/cocore/test/select-cooccurrence-w1-top10pct")
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+
+    cli.main(["run", "--config", "unused.yaml", "--no-use-stop-bucket"])
+
+    assert received["config"]["prototypes"]["use_stop_bucket"] is False
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("explicit_config", [False, True])
+def test_validate_stop_bucket_disable_flag_overrides_replay_config(
+    explicit_config: bool,
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    output = tmp_path / "select-cooccurrence-w1-top10pct"
+    loaded_paths: list[object] = []
+    received: dict[str, object] = {}
+
+    def fake_load_config(path):
+        loaded_paths.append(path)
+        return {
+            **_objective(),
+            "prototypes": {"use_stop_bucket": True},
+        }
+
+    def fake_validate_output(output_dir, *, config):
+        received["output_dir"] = output_dir
+        received["config"] = config
+        return {"status": "valid", "selected_clips": 1}
+
+    monkeypatch.setattr(cli, "load_config", fake_load_config)
+    monkeypatch.setattr(cli, "validate_output", fake_validate_output)
+    arguments = [
+        "validate",
+        "--output-dir",
+        str(output),
+        "--no-use-stop-bucket",
+    ]
+    if explicit_config:
+        arguments += ["--config", "custom.yaml"]
+
+    cli.main(arguments)
+
+    assert loaded_paths == [
+        "custom.yaml" if explicit_config else output / "resolved_config.yaml"
+    ]
+    assert received["output_dir"] == str(output)
+    assert received["config"]["prototypes"]["use_stop_bucket"] is False
+    assert capsys.readouterr().out.strip() == '{"selected_clips": 1, "status": "valid"}'
 
 
 def test_main_applies_cli_overrides_to_run_pipeline(monkeypatch, capsys) -> None:
