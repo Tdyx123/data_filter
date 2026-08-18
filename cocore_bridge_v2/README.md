@@ -13,6 +13,9 @@ Cocore 的编码、运动原语、关系目标或惰性最大堆算法，而是�
 - 排除任务名为空的 episode，再应用 `--max-episodes`；
 - 固定使用 15 帧近似均匀候选和 Cocore schema 9 两级动作原型；原型学习在完整轨迹
   上使用首尾覆盖、起点间隔最大为 3 的八帧窗口，只用精确保留动作训练硬视觉桶；
+- 令 `M_a` 为单动作桶的训练窗口数，视觉中心数固定为
+  `min(M_a, min(20, max(5, floor(3 * log2(M_a) - 25))))`；保留的非 stop 动作使用
+  5～20 个中心；
 - 默认 `prototypes.use_stop_bucket: true`，保留 Cocore 的 stop 桶与回退行为；graph
   相关命令可用 `--no-use-stop-bucket` 关闭；
 - 不超过 65,536 个训练窗口的动作桶使用完整 KMeans，以
@@ -91,14 +94,14 @@ graph 目录提供 schema 9 的 `prototype_catalog.json`、128 维
 校验用 `half_action_labels.npy`。聚类复用 Encode 的
 PCA components 前半列进行逐帧纯矩阵投影，不使用 mean/scale。选择输出包含最终
 原型标签、动作标签、绝对置信度和 `half_action_labels`，不包含旧的 action/distance
-分解权重。manifest 的生产者仍为 `cocore`；Cocore 版本为 0.14.1，Bridge 包版本为
-0.5.1。
+分解权重。manifest 的生产者仍为 `cocore`；Cocore 版本为 0.14.2，Bridge 包版本为
+0.5.2。
 
 视觉中心训练只物化一次保留窗口投影；小桶并行执行完整 KMeans，大桶串行执行
 MiniBatchKMeans。Bridge V2 完整生产数据的基础额外内存约为 273 MiB（保留窗口数 ×
 128 × 4 字节），不使用 memmap 或磁盘 fallback。
 
-0.13.0 及更早的 Cocore 缓存不迁移。升级后必须重新构建 scan、encode、graph 和
+0.14.1 及更早的 Cocore 缓存不迁移。升级后必须重新构建 scan、encode、graph 和
 selection；建议使用新的输出目录，或在确认目标后使用 `--force`。
 
 验证时必须重复传入生成该选择结果时使用的目标、比例、数据集路径以及
@@ -118,7 +121,7 @@ python -m cocore_bridge_v2 validate \
   --no-use-stop-bucket
 ```
 
-只有生成结果时传入了 `--no-use-stop-bucket`，验证时才重复传入。升级自 0.14.0 / 0.5.0
+只有生成结果时传入了 `--no-use-stop-bucket`，验证时才重复传入。升级自 0.14.1 / 0.5.1
 或切换 stop 设置并复用同一输出根目录时，应使用 `--force` 重建全部不兼容阶段。
 
 ## 运行基线

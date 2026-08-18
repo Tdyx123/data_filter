@@ -439,11 +439,14 @@ def test_action_helpers_reject_unknown_motion_labels(label: str) -> None:
         (1.0, 1),
         (2.0, 2),
         (3.0, 3),
-        (400.0, 3),
-        (1_023.0, 3),
-        (1_024.0, 4),
-        (65_536.0, 16),
-        (1_000_000.0, 16),
+        (4.0, 4),
+        (5.0, 5),
+        (400.0, 5),
+        (1_024.0, 5),
+        (2_048.0, 8),
+        (4_096.0, 11),
+        (32_768.0, 20),
+        (1_000_000.0, 20),
     ],
 )
 def test_cluster_count_for_training_count_uses_capped_logarithmic_formula(
@@ -682,7 +685,7 @@ def test_action_catalog_serializes_schema_nine_sampling_strategy_and_metadata() 
         "state_threshold": 0.03,
         "min_action_count": 400,
         "min_action_frequency": 0.005,
-        "max_visual_centers": 16,
+        "max_visual_centers": 20,
         "full_kmeans_max_training_count": 65536,
         "full_kmeans_openmp_threads": 1,
         "minibatch_kmeans_openmp_threads": 4,
@@ -696,8 +699,8 @@ def test_action_catalog_serializes_schema_nine_sampling_strategy_and_metadata() 
         "visual_projection_padding": "right_zero_to_128",
         "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
         "cluster_count": (
-            "min(training_count, min(16, max(3, "
-            "floor(2 * log2(training_count) - 16))))"
+            "min(training_count, min(20, max(5, "
+            "floor(3 * log2(training_count) - 25))))"
         ),
         "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
         "distance_quantiles": [0.1, 0.9],
@@ -764,14 +767,14 @@ def test_full_trajectory_builder_trains_exact_buckets_and_labels_each_half_once(
     assert by_label["move forward"].training_count == by_label["move forward"].raw_count
     assert by_label["move right"].training_count == by_label["move right"].raw_count
     assert by_label["move forward right"].training_count == 0
-    assert by_label["move forward"].requested_centers == 3
-    assert by_label["move right"].requested_centers == 3
-    assert by_label["move forward"].actual_centers == 3
-    assert by_label["move right"].actual_centers == 3
+    assert by_label["move forward"].requested_centers == 5
+    assert by_label["move right"].requested_centers == 5
+    assert by_label["move forward"].actual_centers == 5
+    assert by_label["move right"].actual_centers == 5
     assert by_label["move forward"].nearest_distance_q10 is not None
     assert by_label["move forward"].nearest_distance_q90 is not None
     assert result.prototypes.centers is not None
-    assert result.prototypes.centers.shape == (6, 128)
+    assert result.prototypes.centers.shape == (10, 128)
     np.testing.assert_array_equal(result.prototypes.centers[:, 2:], 0.0)
     assert result.prototypes.indices.shape == (1, 2)
     assert np.all(result.prototypes.indices[0] >= 0)
@@ -1144,7 +1147,7 @@ def test_non_stop_half_falls_back_to_stop_with_absolute_merged_confidence(
 
     by_label = {category.label: category for category in result.catalog.action_categories}
     assert by_label["stop"].training_count == 4
-    assert by_label["stop"].actual_centers == 3
+    assert by_label["stop"].actual_centers == 4
     assert result.half_action_labels.tolist() == [["move right", "move right"]]
     assert result.prototypes.indices[0, 0] >= 0
     assert result.prototypes.indices[0, 1] == -1

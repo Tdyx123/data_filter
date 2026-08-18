@@ -393,7 +393,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     for directory in ("scan", "encode", "graph-17-motion-hard-nearest-pca"):
         manifest = json.loads((root / directory / "manifest.json").read_text())
         assert manifest["producer"] == "cocore"
-        assert manifest["cocore_version"] == "0.14.1"
+        assert manifest["cocore_version"] == "0.14.2"
     scan_manifest = json.loads((root / "scan" / "manifest.json").read_text())
     assert scan_manifest["window_policy"] == "near_uniform_full_coverage"
     assert scan_manifest["clip_length"] == 15
@@ -411,7 +411,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
         "state_threshold": 0.03,
         "min_action_count": 400,
         "min_action_frequency": 0.005,
-        "max_visual_centers": 16,
+        "max_visual_centers": 20,
         "full_kmeans_max_training_count": 65536,
         "full_kmeans_openmp_threads": 1,
         "minibatch_kmeans_openmp_threads": 4,
@@ -425,8 +425,8 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
         "visual_projection_padding": "right_zero_to_128",
         "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
         "cluster_count": (
-            "min(training_count, min(16, max(3, "
-            "floor(2 * log2(training_count) - 16))))"
+            "min(training_count, min(20, max(5, "
+            "floor(3 * log2(training_count) - 25))))"
         ),
         "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
         "distance_quantiles": [0.1, 0.9],
@@ -527,7 +527,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     }
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.14.1"
+    assert run_manifest["cocore_version"] == "0.14.2"
     assert run_manifest["relation_type"] == relation
     assert run_manifest["relation_weight"] == 1.0
     assert run_manifest["prototype_schema_version"] == 9
@@ -541,7 +541,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert run_manifest["window_policy"] == "near_uniform_full_coverage"
     assert run_manifest["sequence_adjacency"] == "ordered_candidates"
     select_manifest = json.loads((result / "manifest.json").read_text())
-    assert select_manifest["cocore_version"] == "0.14.1"
+    assert select_manifest["cocore_version"] == "0.14.2"
     assert select_manifest["relation_type"] == relation
     assert select_manifest["relation_weight"] == 1.0
     assert select_manifest["prototype_schema_version"] == 9
@@ -559,7 +559,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     (result / "manifest.json").write_text(json.dumps(select_manifest))
     with pytest.raises(ValueError, match="selection manifest Cocore version"):
         validate_output(result, config=config)
-    select_manifest["cocore_version"] = "0.14.1"
+    select_manifest["cocore_version"] = "0.14.2"
     (result / "manifest.json").write_text(json.dumps(select_manifest))
 
     report["relation_type"] = "sequence" if relation == "cooccurrence" else "cooccurrence"
