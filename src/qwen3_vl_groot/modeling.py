@@ -360,6 +360,20 @@ def compile_policy_modules(policy: Any, model_config: dict[str, Any]) -> None:
         policy.action_head.compile(**compile_kwargs)
 
 
+# Shared Qwen inspection/LoRA mechanisms are canonical; preserve legacy imports.
+from qwen_vl_common.backbone import (  # noqa: E402
+    ModelContractError,  # noqa: F811
+    assert_full_lora_coverage,  # noqa: F811
+    assert_qwen_freeze_contract,  # noqa: F811
+    compile_policy_modules,  # noqa: F401,F811
+    inspect_qwen_config,  # noqa: F811
+    load_qwen_backbone,  # noqa: F811
+    lora_coverage,  # noqa: F811
+    lora_target_pattern,  # noqa: F811
+    resolve_compile_targets,  # noqa: F811
+)
+
+
 class Qwen3VLGrootPolicy(nn.Module):
     def __init__(
         self,

@@ -30,6 +30,7 @@ test = ["pytest==8.3.5", "pytest-timeout==2.3.1"]
 
 [project.scripts]
 qwen3-vl-groot = "qwen3_vl_groot.cli:main"
+qwen-vl-oft = "qwen_vl_oft.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -653,6 +653,60 @@ LoRA 与 GR00T 动作头使用独立 optimizer parameter group，可分别通过
 `--lora-learning-rate` 和 `--action-head-learning-rate` 覆盖；默认分别为
 `1e-5` 与 `1e-4`。
 
+### QwenVL-4B-OFT（starVLA 兼容）
+
+独立的 `qwen_vl_oft` 路径复刻 starVLA QwenOFT 的因果动作查询语义：先把当前
+8 维 proprio 按 Bridge q01/q99 归一化并离散成 256 个文本 bin，再追加 8 个
+`🔍` 查询 token；Qwen3-VL 最后一层对应 hidden state 由两层残差 MLP 并行回归
+8×7 连续动作，使用 masked L1 忽略 episode 尾部补位。该实现不是 OpenVLA-OFT
+论文中的空动作 embedding 或动作区双向注意力版本。
+
+默认配置同样面向 4×RTX 4090：每卡 micro-batch 1、梯度累积 16、全局 batch
+64、20,000 optimizer steps、ZeRO-2 和 BF16。动作头学习率为 `1e-4`，覆盖
+Qwen3-VL 全部 36 层文本 attention/MLP 的 LoRA 使用 rank 16、alpha 32、dropout
+0.05 和学习率 `1e-5`，前 2,000 步只训练动作头。
+
+```bash
+# 数据、模型、tokenizer、4 卡和单卡显存预检
+bash scripts/train_qwenvl_oft_4x4090.sh --preflight-only
+
+# 固定 20 个 optimizer step 的 smoke training
+bash scripts/train_qwenvl_oft_4x4090.sh \
+  --output-dir outputs/qwenvl_4b_oft_bridge_smoke \
+  --smoke-test
+
+# 正式训练
+bash scripts/train_qwenvl_oft_4x4090.sh \
+  --gpu-ids 0,1,2,3 \
+  --output-dir outputs/qwenvl_4b_oft_bridge_4gpu
+```
+
+从紧凑 checkpoint warm-start 时，仅恢复 OFT LoRA、MLP 动作头和归一化统计；
+optimizer、RNG 和数据迭代位置不会恢复。除新输出目录和可调整的 `max_steps`（必须
+大于 checkpoint step）外，配置必须与源 checkpoint 一致：
+
+```bash
+bash scripts/train_qwenvl_oft_4x4090.sh \
+  --output-dir outputs/qwenvl_4b_oft_bridge_warmstart \
+  --max-steps 30000 \
+  --warm-start-checkpoint \
+    outputs/qwenvl_4b_oft_bridge_4gpu/checkpoints/step-00020000
+```
+
+OFT checkpoint 格式固定为 `qwen-vl-oft-bridge-compact-v1`，不会与 GROOT checkpoint
+交叉加载。确定性推理不接收 denoising 参数：
+
+```python
+from qwen_vl_oft.inference import BridgePolicy
+
+policy = BridgePolicy.from_pretrained(
+    "outputs/qwenvl_4b_oft_bridge_4gpu/checkpoints/step-00020000",
+    model_path="/data/dwb/models/Qwen3-VL-4B-Instruct",
+)
+actions = policy.predict_actions(image, state, instruction)
+assert actions.shape == (1, 8, 7)
+```
+
 ### Qwen LIBERO 全任务训练
 
 Qwen LIBERO 使用独立的 Shell/YAML 入口，不读取 Bridge 配置。默认训练

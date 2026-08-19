@@ -118,6 +118,16 @@ def validated_lora_target_modules(
     return targets
 
 
+# Shared Qwen contracts are canonical; preserve the legacy import surface.
+from qwen_vl_common.contracts import (  # noqa: E402
+    BACKBONE_CONTRACTS,  # noqa: F401,F811
+    ConfigError,  # noqa: F811
+    backbone_contract,  # noqa: F811
+    normalized_lora_target_modules,  # noqa: F401,F811
+    validated_lora_target_modules,  # noqa: F811
+)
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
     path = Path(path).expanduser().resolve()
     with path.open("r", encoding="utf-8") as handle:
