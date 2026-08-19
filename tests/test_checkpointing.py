@@ -10,6 +10,8 @@ from torch import nn  # noqa: E402
 from safetensors.torch import load_file  # noqa: E402
 
 from qwen3_vl_groot.checkpointing import (  # noqa: E402
+    CheckpointError,
+    inspect_compact_checkpoint,
     load_compact_weights,
     save_compact_checkpoint,
 )
@@ -44,6 +46,23 @@ class DummyEngine:
     def __init__(self, module):
         self.module = module
         self.global_rank = 0
+
+
+def _save_inspectable_checkpoint(tmp_path, *, global_step=7, max_steps=None):
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_8x4090.yaml")
+    if max_steps is not None:
+        config["train"]["max_steps"] = max_steps
+    checkpoint = save_compact_checkpoint(
+        DummyEngine(DummyCompactPolicy()),
+        tmp_path / "source-run",
+        config=config,
+        model_path=config["paths"]["model"],
+        global_step=global_step,
+        validation_mae=None,
+    )
+    current_config = json.loads(json.dumps(config))
+    current_config["paths"]["output"] = str(tmp_path / "warm-start-run")
+    return checkpoint, current_config
 
 
 def test_compact_safetensors_round_trip(tmp_path):
@@ -97,6 +116,120 @@ def test_compact_safetensors_round_trip(tmp_path):
         original["backbone.base_weight"] + 10,
     )
     np.testing.assert_array_equal(policy.action_q99.cpu().numpy(), np.ones(7))
+
+
+def test_inspect_compact_checkpoint_accepts_only_output_path_change(tmp_path):
+    checkpoint, current_config = _save_inspectable_checkpoint(tmp_path)
+
+    inspected = inspect_compact_checkpoint(checkpoint, config=current_config)
+
+    assert inspected.path == checkpoint.resolve()
+    assert inspected.global_step == 7
+    assert inspected.normalization_path == checkpoint.resolve() / "normalization.json"
+
+
+def test_inspect_compact_checkpoint_rejects_source_training_output(tmp_path):
+    checkpoint, current_config = _save_inspectable_checkpoint(tmp_path)
+    current_config["paths"]["output"] = str(checkpoint.parents[1])
+
+    with pytest.raises(ValueError, match="source training output"):
+        inspect_compact_checkpoint(checkpoint, config=current_config)
+
+
+def test_inspect_compact_checkpoint_rejects_missing_required_file(tmp_path):
+    checkpoint, current_config = _save_inspectable_checkpoint(tmp_path)
+    (checkpoint / "normalization.json").unlink()
+
+    with pytest.raises(CheckpointError, match="normalization.json"):
+        inspect_compact_checkpoint(checkpoint, config=current_config)
+
+
+def test_inspect_compact_checkpoint_rejects_directory_step_mismatch(tmp_path):
+    checkpoint, current_config = _save_inspectable_checkpoint(tmp_path)
+    mismatched = checkpoint.with_name("step-00000008")
+    checkpoint.rename(mismatched)
+
+    with pytest.raises(CheckpointError, match="does not match global_step 7"):
+        inspect_compact_checkpoint(mismatched, config=current_config)
+
+
+def test_inspect_compact_checkpoint_rejects_unsupported_format(tmp_path):
+    checkpoint, current_config = _save_inspectable_checkpoint(tmp_path)
+    manifest_path = checkpoint / "policy_config.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["format"] = "unknown-format"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(CheckpointError, match="Unsupported compact checkpoint format"):
+        inspect_compact_checkpoint(checkpoint, config=current_config)
+
+
+def test_inspect_compact_checkpoint_rejects_configuration_change(tmp_path):
+    checkpoint, current_config = _save_inspectable_checkpoint(tmp_path)
+    current_config["train"]["gradient_accumulation_steps"] += 1
+
+    with pytest.raises(CheckpointError, match="only paths.output may change"):
+        inspect_compact_checkpoint(checkpoint, config=current_config)
+
+
+def test_inspect_compact_checkpoint_rejects_base_model_change(tmp_path):
+    checkpoint, current_config = _save_inspectable_checkpoint(tmp_path)
+    manifest_path = checkpoint / "policy_config.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["base_model"] = str(tmp_path / "different-base-model")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(CheckpointError, match="base model"):
+        inspect_compact_checkpoint(checkpoint, config=current_config)
+
+
+def test_inspect_compact_checkpoint_requires_later_max_steps(tmp_path):
+    checkpoint, current_config = _save_inspectable_checkpoint(
+        tmp_path,
+        global_step=7,
+        max_steps=7,
+    )
+
+    with pytest.raises(CheckpointError, match="max_steps must be greater"):
+        inspect_compact_checkpoint(checkpoint, config=current_config)
+
+
+def test_inspect_compact_checkpoint_rejects_invalid_global_step(tmp_path):
+    checkpoint, current_config = _save_inspectable_checkpoint(tmp_path)
+    manifest_path = checkpoint / "policy_config.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["global_step"] = -1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(CheckpointError, match="non-negative integer"):
+        inspect_compact_checkpoint(checkpoint, config=current_config)
+
+
+def test_inspect_compact_checkpoint_rejects_non_object_manifest(tmp_path):
+    checkpoint, current_config = _save_inspectable_checkpoint(tmp_path)
+    (checkpoint / "policy_config.json").write_text("[]\n", encoding="utf-8")
+
+    with pytest.raises(CheckpointError, match="manifest must be a JSON object"):
+        inspect_compact_checkpoint(checkpoint, config=current_config)
+
+
+def test_inspect_compact_checkpoint_rejects_non_mapping_config(tmp_path):
+    checkpoint, current_config = _save_inspectable_checkpoint(tmp_path)
+    manifest_path = checkpoint / "policy_config.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["config"] = []
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(CheckpointError, match="config must be a mapping"):
+        inspect_compact_checkpoint(checkpoint, config=current_config)
+
+
+def test_inspect_compact_checkpoint_rejects_invalid_utf8_manifest(tmp_path):
+    checkpoint, current_config = _save_inspectable_checkpoint(tmp_path)
+    (checkpoint / "policy_config.json").write_bytes(b"\xff\xfe")
+
+    with pytest.raises(CheckpointError, match="Invalid compact checkpoint manifest"):
+        inspect_compact_checkpoint(checkpoint, config=current_config)
 
 
 def test_qwen35_compact_manifest_records_backbone_family(tmp_path):

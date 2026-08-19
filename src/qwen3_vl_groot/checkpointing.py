@@ -4,6 +4,8 @@ import json
 import re
 import shutil
 from contextlib import nullcontext
+from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,99 @@ from .normalization import QuantileStats
 
 class CheckpointError(RuntimeError):
     """Raised when a checkpoint is absent or incompatible with the current run."""
+
+
+@dataclass(frozen=True)
+class CompactCheckpoint:
+    path: Path
+    global_step: int
+    base_model: Path
+    config: dict[str, Any]
+    weights_path: Path
+    normalization_path: Path
+
+
+def _config_without_output(config: dict[str, Any]) -> dict[str, Any]:
+    comparable = deepcopy(
+        {key: value for key, value in config.items() if not key.startswith("_")}
+    )
+    comparable.get("paths", {}).pop("output", None)
+    return comparable
+
+
+def inspect_compact_checkpoint(
+    checkpoint_dir: str | Path,
+    *,
+    config: dict[str, Any],
+) -> CompactCheckpoint:
+    checkpoint = Path(checkpoint_dir).expanduser().resolve()
+    manifest_path = checkpoint / "policy_config.json"
+    weights_path = checkpoint / "adapter_model.safetensors"
+    normalization_path = checkpoint / "normalization.json"
+    missing = [
+        path.name
+        for path in (manifest_path, weights_path, normalization_path)
+        if not path.is_file()
+    ]
+    if missing:
+        raise CheckpointError(
+            f"Compact checkpoint is missing required files: {', '.join(missing)}"
+        )
+
+    try:
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if not isinstance(manifest, dict):
+            raise CheckpointError("Compact checkpoint manifest must be a JSON object")
+        if manifest.get("format") != "qwen3-vl-groot-bridge-compact-v1":
+            raise CheckpointError(
+                f"Unsupported compact checkpoint format: {manifest.get('format')}"
+            )
+        global_step = manifest["global_step"]
+        if not isinstance(global_step, int) or isinstance(global_step, bool) or global_step < 0:
+            raise CheckpointError("Compact checkpoint global_step must be a non-negative integer")
+        checkpoint_config = manifest["config"]
+        if not isinstance(checkpoint_config, dict):
+            raise CheckpointError("Compact checkpoint config must be a mapping")
+        base_model = Path(manifest["base_model"]).expanduser().resolve()
+    except (KeyError, TypeError, OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise CheckpointError(f"Invalid compact checkpoint manifest: {manifest_path}") from error
+    expected_name = f"step-{global_step:08d}"
+    if checkpoint.name != expected_name:
+        raise CheckpointError(
+            f"Compact checkpoint directory {checkpoint.name!r} does not match "
+            f"global_step {global_step} ({expected_name})"
+        )
+    current_base_model = Path(config["paths"]["model"]).expanduser().resolve()
+    if base_model != current_base_model:
+        raise CheckpointError(
+            f"Compact checkpoint base model {base_model} differs from {current_base_model}"
+        )
+    if _config_without_output(checkpoint_config) != _config_without_output(config):
+        raise CheckpointError(
+            "Compact checkpoint configuration differs from this warm-start run; "
+            "only paths.output may change"
+        )
+    if int(config["train"]["max_steps"]) <= global_step:
+        raise CheckpointError(
+            f"train.max_steps must be greater than warm-start step {global_step}"
+        )
+    current_output = Path(config["paths"]["output"]).expanduser().resolve()
+    source_output = checkpoint.parents[1]
+    if current_output == source_output:
+        raise ValueError(
+            "Warm-start output must differ from the source training output "
+            f"{source_output}"
+        )
+
+    return CompactCheckpoint(
+        path=checkpoint,
+        global_step=global_step,
+        base_model=base_model,
+        config=checkpoint_config,
+        weights_path=weights_path,
+        normalization_path=normalization_path,
+    )
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:

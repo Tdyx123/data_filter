@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -11,13 +13,20 @@ from qwen3_vl_groot.training import (  # noqa: E402
     PerformanceWindow,
     RankZeroLogger,
     _lora_step_metrics,
+    _build_training_policy,
+    _initial_training_metrics,
+    _initialize_training_engine,
+    _prepare_libero_stats,
+    _prepare_stats,
     _runtime_metadata,
     _runtime_versions,
     _should_save_checkpoint,
     _should_save_final_checkpoint,
+    _validate_warm_start_output,
     build_optimizer_and_scheduler,
 )
 from qwen3_vl_groot.schedules import LoraUpdateSchedule  # noqa: E402
+from qwen3_vl_groot.normalization import QuantileStats  # noqa: E402
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -90,6 +99,218 @@ def test_optimizer_groups_receive_independent_configured_learning_rates():
     assert scheduler.base_lrs == pytest.approx([2e-4, 5e-6])
     assert optimizer.param_groups[0]["group_name"] == "action_head"
     assert optimizer.param_groups[1]["group_name"] == "qwen_lora"
+
+
+def test_warm_start_scheduler_is_aligned_to_completed_step():
+    config = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
+    )
+    config["train"]["lora_learning_rate"] = 5e-5
+
+    optimizer, scheduler = build_optimizer_and_scheduler(
+        TinyPolicy(),
+        config,
+        initial_step=12_000,
+    )
+
+    assert scheduler.last_epoch == 12_000
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(3.772572564296005e-5)
+    assert optimizer.param_groups[1]["lr"] == pytest.approx(2.164416835455862e-5)
+
+
+def test_warm_start_weights_load_before_policy_compilation(monkeypatch, tmp_path):
+    config = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
+    )
+    policy = object()
+    events = []
+    checkpoint = SimpleNamespace(path=tmp_path / "step-00000007")
+    monkeypatch.setattr(
+        "qwen3_vl_groot.training.Qwen3VLGrootPolicy.from_local_qwen",
+        lambda **kwargs: events.append("build") or policy,
+    )
+    monkeypatch.setattr(
+        "qwen3_vl_groot.training.load_compact_weights",
+        lambda loaded_policy, path: events.append(("load", loaded_policy, path)),
+    )
+    monkeypatch.setattr(
+        "qwen3_vl_groot.training.compile_policy_modules",
+        lambda loaded_policy, model_config: events.append(("compile", loaded_policy)),
+    )
+
+    result = _build_training_policy(
+        config,
+        stats=object(),
+        warm_start=checkpoint,
+    )
+
+    assert result is policy
+    assert events == [
+        "build",
+        ("load", policy, checkpoint.path),
+        ("compile", policy),
+    ]
+
+
+def test_warm_start_reuses_checkpoint_normalization(monkeypatch, tmp_path):
+    config = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
+    )
+    checkpoint_normalization = tmp_path / "checkpoint" / "normalization.json"
+    QuantileStats(
+        state_q01=np.zeros(8),
+        state_q99=np.ones(8),
+        action_q01=np.zeros(7),
+        action_q99=np.ones(7),
+    ).save(checkpoint_normalization)
+    expected_bytes = checkpoint_normalization.read_bytes()
+    monkeypatch.setattr(
+        "qwen3_vl_groot.training.distributed.barrier",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "qwen3_vl_groot.libero_data.compute_libero_quantile_stats",
+        lambda *args, **kwargs: pytest.fail("normalization must not be recomputed"),
+    )
+
+    stats, cache_path = _prepare_libero_stats(
+        tmp_path / "normalization-source",
+        tmp_path / "warm-start-output",
+        config,
+        rank=0,
+        warm_start=SimpleNamespace(normalization_path=checkpoint_normalization),
+    )
+
+    assert cache_path.read_bytes() == expected_bytes
+    np.testing.assert_array_equal(stats.action_q99, np.ones(7))
+
+
+def test_bridge_warm_start_reuses_checkpoint_normalization(monkeypatch, tmp_path):
+    checkpoint_normalization = tmp_path / "checkpoint" / "normalization.json"
+    QuantileStats(
+        state_q01=np.zeros(8),
+        state_q99=np.ones(8),
+        action_q01=np.zeros(7),
+        action_q99=np.ones(7),
+    ).save(checkpoint_normalization)
+    expected_bytes = checkpoint_normalization.read_bytes()
+    monkeypatch.setattr(
+        "qwen3_vl_groot.training.distributed.barrier",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "qwen3_vl_groot.training.compute_quantile_stats",
+        lambda *args, **kwargs: pytest.fail("normalization must not be recomputed"),
+    )
+
+    stats = _prepare_stats(
+        metadata=object(),
+        train_episodes=[],
+        output=tmp_path / "warm-start-output",
+        config={"data": {"normalization_epsilon": 1.0e-6}},
+        rank=0,
+        warm_start=SimpleNamespace(normalization_path=checkpoint_normalization),
+    )
+
+    cache_path = tmp_path / "warm-start-output" / "data_cache" / "normalization.json"
+    assert cache_path.read_bytes() == expected_bytes
+    np.testing.assert_array_equal(stats.action_q99, np.ones(7))
+
+
+def test_warm_start_output_rejects_unexpected_existing_contents(tmp_path):
+    output = tmp_path / "warm-start-output"
+    output.mkdir()
+    (output / "existing.txt").write_text("do not overwrite", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unexpected existing entries"):
+        _validate_warm_start_output(output)
+
+
+def test_warm_start_output_allows_only_launcher_artifacts(tmp_path):
+    output = tmp_path / "warm-start-output"
+    output.mkdir()
+    (output / "run_config.yaml").write_text("train: {}\n", encoding="utf-8")
+    (output / "preflight.json").write_text("{}\n", encoding="utf-8")
+
+    _validate_warm_start_output(output)
+
+
+def test_initial_metrics_record_warm_start_provenance(tmp_path):
+    train_config = {
+        "head_learning_rate": 1e-4,
+        "lora_learning_rate": 5e-5,
+    }
+    checkpoint = SimpleNamespace(
+        path=(tmp_path / "step-00012000").resolve(),
+        global_step=12_000,
+    )
+
+    metrics = _initial_training_metrics(train_config, warm_start=checkpoint)
+
+    assert metrics == {
+        "step": 12_000,
+        "config/action_head_learning_rate": 1e-4,
+        "config/lora_learning_rate": 5e-5,
+        "config/warm_start_checkpoint": str(checkpoint.path),
+        "config/warm_start_step": 12_000,
+        "config/optimizer_state_restored": 0,
+    }
+
+
+def test_training_engine_starts_at_checkpoint_global_step(monkeypatch):
+    config = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
+    )
+    checkpoint = SimpleNamespace(global_step=12_000)
+    engine = SimpleNamespace(global_steps=0)
+    optimizer = object()
+    scheduler = object()
+    policy = SimpleNamespace(set_lora_trainable=lambda enabled: None)
+    requested_steps = []
+    monkeypatch.setattr(
+        "qwen3_vl_groot.training.build_optimizer_and_scheduler",
+        lambda loaded_policy, loaded_config, *, initial_step: (
+            requested_steps.append(initial_step) or optimizer,
+            scheduler,
+        ),
+    )
+    deepspeed = SimpleNamespace(
+        initialize=lambda **kwargs: (engine, optimizer, None, scheduler)
+    )
+
+    initialized = _initialize_training_engine(
+        deepspeed,
+        policy,
+        config,
+        world_size=4,
+        warm_start=checkpoint,
+    )
+
+    assert requested_steps == [12_000]
+    assert engine.global_steps == 12_000
+    assert initialized == (engine, optimizer, scheduler, 12_000)
+
+
+def test_warm_start_training_clocks_continue_after_step_12000():
+    config = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
+    )
+    train_config = config["train"]
+    lora_schedule = LoraUpdateSchedule.from_train_config(train_config)
+    performance = PerformanceWindow(
+        effective_batch_size=64,
+        start_step=12_000,
+        started_at=10.0,
+    )
+
+    assert performance.start_step == 12_000
+    assert lora_schedule.active_steps_through(12_000) == 10_000
+    assert lora_schedule.is_active(12_001)
+    assert not any(
+        _should_save_checkpoint(step=step, save_every=1_000, improved=False)
+        for step in range(12_001, 13_000)
+    )
+    assert _should_save_checkpoint(step=13_000, save_every=1_000, improved=False)
 
 
 def test_lora_scheduler_uses_only_active_update_clock():
@@ -258,3 +479,29 @@ def test_runtime_metadata_records_resolved_attention_and_compile_targets(monkeyp
         512,
     ]
     assert metadata["effective_batch_size"] == 64
+
+
+def test_runtime_metadata_records_warm_start_provenance(monkeypatch, tmp_path):
+    config = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
+    )
+    checkpoint = SimpleNamespace(
+        path=(tmp_path / "step-00012000").resolve(),
+        global_step=12_000,
+    )
+    monkeypatch.setattr(
+        "qwen3_vl_groot.training._runtime_versions",
+        lambda: {"torch": "test"},
+    )
+
+    metadata = _runtime_metadata(
+        config,
+        world_size=4,
+        warm_start=checkpoint,
+    )
+
+    assert metadata["warm_start"] == {
+        "checkpoint": str(checkpoint.path),
+        "initial_step": 12_000,
+        "optimizer_state_restored": False,
+    }

@@ -4,6 +4,7 @@ import json
 import math
 import os
 import random
+import shutil
 import time
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
@@ -15,7 +16,12 @@ import torch.distributed as distributed
 from torch.autograd.profiler import record_function
 from torch.utils.data import DataLoader
 
-from .checkpointing import save_compact_checkpoint
+from .checkpointing import (
+    CompactCheckpoint,
+    inspect_compact_checkpoint,
+    load_compact_weights,
+    save_compact_checkpoint,
+)
 from .config import resolved_paths, save_resolved_config
 from .data import (
     BridgeEpisodeDataset,
@@ -100,13 +106,18 @@ def _runtime_versions() -> dict[str, str | None]:
     return result
 
 
-def _runtime_metadata(config: dict[str, Any], *, world_size: int) -> dict[str, Any]:
+def _runtime_metadata(
+    config: dict[str, Any],
+    *,
+    world_size: int,
+    warm_start: CompactCheckpoint | None = None,
+) -> dict[str, Any]:
     model_config = config["model"]
     train_config = config["train"]
     compile_backbone, compile_action_head = resolve_compile_targets(model_config)
     attention_requested = str(model_config["attn_implementation"])
     compile_config = model_config.get("torch_compile", {})
-    return {
+    result = {
         "packages": _runtime_versions(),
         "attention": {
             "requested": attention_requested,
@@ -134,6 +145,13 @@ def _runtime_metadata(config: dict[str, Any], *, world_size: int) -> dict[str, A
             * world_size
         ),
     }
+    if warm_start is not None:
+        result["warm_start"] = {
+            "checkpoint": str(warm_start.path),
+            "initial_step": warm_start.global_step,
+            "optimizer_state_restored": False,
+        }
+    return result
 
 
 def seed_everything(seed: int, rank: int) -> None:
@@ -173,6 +191,27 @@ def _lora_step_metrics(
     }
 
 
+def _initial_training_metrics(
+    train_config: dict[str, Any],
+    *,
+    warm_start: CompactCheckpoint | None,
+) -> dict[str, float | int | str]:
+    result: dict[str, float | int | str] = {
+        "step": warm_start.global_step if warm_start is not None else 0,
+        "config/action_head_learning_rate": float(train_config["head_learning_rate"]),
+        "config/lora_learning_rate": float(train_config["lora_learning_rate"]),
+    }
+    if warm_start is not None:
+        result.update(
+            {
+                "config/warm_start_checkpoint": str(warm_start.path),
+                "config/warm_start_step": warm_start.global_step,
+                "config/optimizer_state_restored": 0,
+            }
+        )
+    return result
+
+
 def _cosine_after_warmup(step: int, warmup: int, maximum: int) -> float:
     if step < warmup:
         return float(step + 1) / max(warmup, 1)
@@ -183,6 +222,8 @@ def _cosine_after_warmup(step: int, warmup: int, maximum: int) -> float:
 def build_optimizer_and_scheduler(
     policy: Qwen3VLGrootPolicy,
     config: dict[str, Any],
+    *,
+    initial_step: int = 0,
 ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
     train = config["train"]
     head_parameters = policy.action_head_parameters()
@@ -236,8 +277,13 @@ def build_optimizer_and_scheduler(
             maximum_lora_updates,
         )
 
+    if initial_step > 0:
+        for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
     scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=[head_schedule, lora_schedule]
+        optimizer,
+        lr_lambda=[head_schedule, lora_schedule],
+        last_epoch=initial_step - 1,
     )
     return optimizer, scheduler
 
@@ -403,21 +449,51 @@ class RankZeroLogger:
             self.writer.close()
 
 
+def _copy_checkpoint_normalization(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    shutil.copyfile(source, temporary)
+    temporary.replace(target)
+
+
+def _validate_warm_start_output(output: Path) -> None:
+    if not output.exists():
+        return
+    if not output.is_dir():
+        raise ValueError(f"Warm-start output must be a directory: {output}")
+    launcher_artifacts = {"run_config.yaml", "preflight.json"}
+    unexpected = sorted(
+        path.name
+        for path in output.iterdir()
+        if path.name not in launcher_artifacts or not path.is_file()
+    )
+    if unexpected:
+        raise ValueError(
+            "Warm-start output contains unexpected existing entries: "
+            f"{', '.join(unexpected)}"
+        )
+
+
 def _prepare_stats(
     metadata: BridgeMetadata,
     train_episodes: list[Any],
     output: Path,
     config: dict[str, Any],
     rank: int,
+    *,
+    warm_start: CompactCheckpoint | None = None,
 ) -> QuantileStats:
     cache_path = output / "data_cache" / "normalization.json"
     if rank == 0:
-        compute_quantile_stats(
-            metadata,
-            train_episodes,
-            cache_path,
-            epsilon=float(config["data"]["normalization_epsilon"]),
-        )
+        if warm_start is None:
+            compute_quantile_stats(
+                metadata,
+                train_episodes,
+                cache_path,
+                epsilon=float(config["data"]["normalization_epsilon"]),
+            )
+        else:
+            _copy_checkpoint_normalization(warm_start.normalization_path, cache_path)
     distributed.barrier()
     return QuantileStats.load(cache_path)
 
@@ -427,21 +503,72 @@ def _prepare_libero_stats(
     output: Path,
     config: dict[str, Any],
     rank: int,
+    *,
+    warm_start: CompactCheckpoint | None = None,
 ) -> tuple[QuantileStats, Path]:
     from .libero_data import compute_libero_quantile_stats
 
     cache_path = output / "data_cache" / "normalization.json"
     if rank == 0:
-        compute_libero_quantile_stats(
-            normalization_root,
-            cache_path,
-            epsilon=float(config["data"]["normalization_epsilon"]),
-        )
+        if warm_start is None:
+            compute_libero_quantile_stats(
+                normalization_root,
+                cache_path,
+                epsilon=float(config["data"]["normalization_epsilon"]),
+            )
+        else:
+            _copy_checkpoint_normalization(warm_start.normalization_path, cache_path)
     distributed.barrier()
     return QuantileStats.load(cache_path), cache_path
 
 
-def train(config: dict[str, Any]) -> None:
+def _build_training_policy(
+    config: dict[str, Any],
+    *,
+    stats: QuantileStats,
+    warm_start: CompactCheckpoint | None,
+) -> Qwen3VLGrootPolicy:
+    policy = Qwen3VLGrootPolicy.from_local_qwen(
+        model_path=config["paths"]["model"],
+        stats=stats,
+        config=config,
+    )
+    if warm_start is not None:
+        load_compact_weights(policy, warm_start.path)
+    compile_policy_modules(policy, config["model"])
+    return policy
+
+
+def _initialize_training_engine(
+    deepspeed: Any,
+    policy: Qwen3VLGrootPolicy,
+    config: dict[str, Any],
+    *,
+    world_size: int,
+    warm_start: CompactCheckpoint | None,
+) -> tuple[Any, torch.optim.Optimizer, Any, int]:
+    initial_step = warm_start.global_step if warm_start is not None else 0
+    optimizer, scheduler = build_optimizer_and_scheduler(
+        policy,
+        config,
+        initial_step=initial_step,
+    )
+    engine, optimizer, _, scheduler = deepspeed.initialize(
+        model=policy,
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        config=build_deepspeed_config(config, world_size),
+    )
+    policy.set_lora_trainable(False)
+    engine.global_steps = initial_step
+    return engine, optimizer, scheduler, initial_step
+
+
+def train(
+    config: dict[str, Any],
+    *,
+    warm_start_checkpoint: str | Path | None = None,
+) -> None:
     try:
         import deepspeed
     except ImportError as error:
@@ -458,10 +585,24 @@ def train(config: dict[str, Any]) -> None:
     seed_everything(int(config["train"]["seed"]), rank)
 
     output = Path(config["paths"]["output"]).expanduser().resolve()
+    warm_start = (
+        inspect_compact_checkpoint(warm_start_checkpoint, config=config)
+        if warm_start_checkpoint is not None
+        else None
+    )
     if rank == 0:
+        if warm_start is not None:
+            _validate_warm_start_output(output)
         output.mkdir(parents=True, exist_ok=True)
         save_resolved_config(config, output / "run_config.yaml")
-        _atomic_json(output / "runtime.json", _runtime_metadata(config, world_size=world_size))
+        _atomic_json(
+            output / "runtime.json",
+            _runtime_metadata(
+                config,
+                world_size=world_size,
+                warm_start=warm_start,
+            ),
+        )
     distributed.barrier()
 
     dataset_type = config["data"].get("dataset_type", "bridge")
@@ -480,6 +621,7 @@ def train(config: dict[str, Any]) -> None:
             output,
             config,
             rank,
+            warm_start=warm_start,
         )
         if rank == 0:
             _atomic_json(
@@ -505,7 +647,14 @@ def train(config: dict[str, Any]) -> None:
         fingerprint = metadata.fingerprint()
         if rank == 0:
             _atomic_json(output / "data_fingerprint.json", fingerprint)
-        stats = _prepare_stats(metadata, train_episodes, output, config, rank)
+        stats = _prepare_stats(
+            metadata,
+            train_episodes,
+            output,
+            config,
+            rank,
+            warm_start=warm_start,
+        )
         train_loader = _make_loader(
             metadata,
             train_episodes,
@@ -523,28 +672,25 @@ def train(config: dict[str, Any]) -> None:
             config=config,
         )
 
-    policy = Qwen3VLGrootPolicy.from_local_qwen(
-        model_path=config["paths"]["model"],
+    policy = _build_training_policy(
+        config,
         stats=stats,
-        config=config,
+        warm_start=warm_start,
     )
-    compile_policy_modules(policy, config["model"])
     # ZeRO builds one internal bit16 group per optimizer parameter group and
     # filters parameters with requires_grad=False. LoRA must therefore remain
     # trainable until deepspeed.initialize() has partitioned both groups. We
     # freeze it immediately after initialization; its scheduler LR is also zero
-    # during the configured warm-start interval.
-    optimizer, scheduler = build_optimizer_and_scheduler(policy, config)
-    engine, optimizer, _, scheduler = deepspeed.initialize(
-        model=policy,
-        optimizer=optimizer,
-        lr_scheduler=scheduler,
-        config=build_deepspeed_config(config, world_size),
+    # during the configured LoRA freeze interval.
+    engine, optimizer, scheduler, global_step = _initialize_training_engine(
+        deepspeed,
+        policy,
+        config,
+        world_size=world_size,
+        warm_start=warm_start,
     )
-    policy.set_lora_trainable(False)
 
     best_validation_mae = math.inf
-    global_step = 0
 
     train_iterator: Iterator[dict[str, Any]] = iter(train_loader)
     logger = RankZeroLogger(output, enabled=rank == 0)
@@ -562,15 +708,10 @@ def train(config: dict[str, Any]) -> None:
     try:
         if rank == 0:
             logger.log(
-                {
-                    "step": 0,
-                    "config/action_head_learning_rate": float(
-                        train_config["head_learning_rate"]
-                    ),
-                    "config/lora_learning_rate": float(
-                        train_config["lora_learning_rate"]
-                    ),
-                }
+                _initial_training_metrics(
+                    train_config,
+                    warm_start=warm_start,
+                )
             )
         engine.train()
         compile_enabled = any(resolve_compile_targets(config["model"]))

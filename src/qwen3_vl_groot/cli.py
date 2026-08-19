@@ -188,6 +188,22 @@ def _resolve_config(arguments: argparse.Namespace) -> dict[str, Any]:
 
 def launch(arguments: argparse.Namespace) -> None:
     config = _resolve_config(arguments)
+    warm_start_checkpoint: str | None = None
+    if arguments.warm_start_checkpoint:
+        from .checkpointing import inspect_compact_checkpoint
+
+        inspected = inspect_compact_checkpoint(
+            arguments.warm_start_checkpoint,
+            config=config,
+        )
+        output = Path(config["paths"]["output"]).expanduser().resolve()
+        if output.exists() and (
+            not output.is_dir() or any(output.iterdir())
+        ):
+            raise ValueError(
+                f"Warm-start output must be absent or empty: {output}"
+            )
+        warm_start_checkpoint = str(inspected.path)
     visible_devices = configure_visible_gpus(config)
     # Importing preflight imports torch. CUDA_VISIBLE_DEVICES must be set first so
     # both the memory probe and torchrun see the requested physical GPUs.
@@ -226,6 +242,8 @@ def launch(arguments: argparse.Namespace) -> None:
         "--config",
         str(runtime_config),
     ]
+    if warm_start_checkpoint is not None:
+        command.extend(["--warm-start-checkpoint", warm_start_checkpoint])
     print("Launching:", " ".join(command), flush=True)
     environment = os.environ.copy()
     project_src = str(Path(__file__).resolve().parents[1])
@@ -246,7 +264,10 @@ def distributed_train(arguments: argparse.Namespace) -> None:
     configure_visible_gpus(config)
     from .training import train
 
-    train(config)
+    train(
+        config,
+        warm_start_checkpoint=arguments.warm_start_checkpoint,
+    )
 
 
 def inspect_data(arguments: argparse.Namespace) -> None:
@@ -273,6 +294,7 @@ def build_parser() -> argparse.ArgumentParser:
     launch_parser.add_argument("--preflight-only", action="store_true")
     launch_parser.add_argument("--skip-memory-probe", action="store_true")
     launch_parser.add_argument("--smoke-test", action="store_true")
+    launch_parser.add_argument("--warm-start-checkpoint")
     _add_override_arguments(launch_parser)
     launch_parser.set_defaults(function=launch)
 
@@ -280,6 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
         "train", help=argparse.SUPPRESS
     )
     train_parser.add_argument("--config", required=True)
+    train_parser.add_argument("--warm-start-checkpoint")
     train_parser.set_defaults(function=distributed_train)
 
     inspect_parser = subparsers.add_parser(

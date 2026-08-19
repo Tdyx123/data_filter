@@ -711,6 +711,45 @@ manifest 校验。
 `--sample-weights`/`--prior-*` 混用。LIBERO 不做离线验证，因此只写周期/最终
 checkpoint 和 `latest.json`，不生成 `best.json`。
 
+#### 从紧凑 checkpoint warm-start
+
+Qwen 紧凑 checkpoint 只包含 LoRA、动作头和推理元数据，不能恢复 AdamW 动量、
+RNG 或数据迭代位置；因此这里提供的是新 optimizer 的 warm-start，而不是严格
+`--resume`。`--warm-start-checkpoint` 会从 `policy_config.json` 自动读取起始 step，
+恢复紧凑权重、沿用 checkpoint normalization，并把 scheduler 与 DeepSpeed
+`global_steps` 对齐到该 step。除 `paths.output` 外，当前运行配置必须与 checkpoint
+完全一致，且新输出目录必须不存在或为空，也不能是原训练输出目录。
+
+先使用独立临时输出目录做预检，避免预检文件占用正式输出目录：
+
+```bash
+PREFLIGHT_DIR="$(mktemp -d /tmp/qwen-warm-start-preflight.XXXXXX)"
+bash scripts/train_libero_qwen3_vl_4b_groot_all_tasks_4x4090.sh \
+  --gpu-ids 4,5,6,7 \
+  --lora-learning-rate 5e-5 \
+  --output-dir "${PREFLIGHT_DIR}" \
+  --warm-start-checkpoint \
+    /data/dwb/qwen_small_libero_all_5_10/checkpoints/step-00012000 \
+  --max-steps 20000 \
+  --preflight-only
+```
+
+预检通过后写入新的正式输出目录：
+
+```bash
+bash scripts/train_libero_qwen3_vl_4b_groot_all_tasks_4x4090.sh \
+  --gpu-ids 4,5,6,7 \
+  --lora-learning-rate 5e-5 \
+  --output-dir /data/dwb/qwen_small_libero_all_5_10_warmstart_12000_20000 \
+  --warm-start-checkpoint \
+    /data/dwb/qwen_small_libero_all_5_10/checkpoints/step-00012000 \
+  --max-steps 20000
+```
+
+该示例中的 `5e-5` 来自源 checkpoint 的训练配置；省略后会回落到 YAML 默认的
+`1e-5`，并因配置不兼容而在加载权重前被拒绝。新 run 的首条指标与
+`runtime.json` 会记录源 checkpoint、起始 step 以及 optimizer 未恢复的事实。
+
 ### 8×RTX 4090
 
 8 卡配置：
@@ -742,7 +781,8 @@ bash scripts/train_bridge_4x4090.sh --gpu-ids 0,1,2,3 --deepspeed-stage 3
 ```
 
 训练只保存 LoRA 和动作头权重，不保存优化器、scheduler、随机状态或 DeepSpeed
-分片，因此不支持 `--resume` 断点续训。
+分片，因此不支持严格的 `--resume` 断点续训；需要从紧凑权重继续时使用上面的
+`--warm-start-checkpoint` 新建输出目录。
 
 所有配置默认同时关闭 Qwen 主干与 DiT 动作头的 gradient checkpointing。全部
 Qwen3-VL-4B 配置（Bridge 4 卡、Bridge 8 卡和 Qwen LIBERO）默认使用 PyTorch

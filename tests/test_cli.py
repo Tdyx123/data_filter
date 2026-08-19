@@ -9,12 +9,37 @@ from qwen3_vl_groot.cli import (
     _resolve_config,
     build_parser,
     configure_visible_gpus,
+    distributed_train,
     launch,
     parse_gpu_ids,
 )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _write_warm_start_checkpoint(tmp_path, config, *, step=7):
+    source_run = tmp_path / "source-run"
+    checkpoint = source_run / "checkpoints" / f"step-{step:08d}"
+    checkpoint.mkdir(parents=True)
+    source_config = json.loads(json.dumps(config))
+    source_config.pop("_config_path", None)
+    source_config["paths"]["output"] = str(source_run.resolve())
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"weights")
+    (checkpoint / "normalization.json").write_text("{}", encoding="utf-8")
+    (checkpoint / "policy_config.json").write_text(
+        json.dumps(
+            {
+                "format": "qwen3-vl-groot-bridge-compact-v1",
+                "base_model": config["paths"]["model"],
+                "global_step": step,
+                "config": source_config,
+                "parameter_names": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return checkpoint
 
 
 def test_parse_gpu_ids():
@@ -46,6 +71,32 @@ def test_launch_cli_rejects_removed_resume_option():
                 "latest",
             ]
         )
+
+
+def test_warm_start_checkpoint_option_is_available_on_launch_and_train():
+    parser = build_parser()
+
+    launch_arguments = parser.parse_args(
+        [
+            "launch",
+            "--config",
+            "configs/bridge_4x4090.yaml",
+            "--warm-start-checkpoint",
+            "/tmp/step-00000007",
+        ]
+    )
+    train_arguments = parser.parse_args(
+        [
+            "train",
+            "--config",
+            "outputs/run_config.yaml",
+            "--warm-start-checkpoint",
+            "/tmp/step-00000007",
+        ]
+    )
+
+    assert launch_arguments.warm_start_checkpoint == "/tmp/step-00000007"
+    assert train_arguments.warm_start_checkpoint == "/tmp/step-00000007"
 
 
 def test_launch_cli_overrides_lora_and_action_head_learning_rates_independently(tmp_path):
@@ -183,6 +234,143 @@ def test_launch_persists_preflight_report_and_can_skip_memory_probe(
     assert json.loads((output / "preflight.json").read_text()) == {
         "gpu": {"devices": []}
     }
+
+
+def test_launch_propagates_warm_start_checkpoint_to_distributed_workers(
+    tmp_path,
+    monkeypatch,
+):
+    from qwen3_vl_groot import preflight
+
+    parser = build_parser()
+    output = tmp_path / "warm-start-run"
+    base_arguments = parser.parse_args(
+        [
+            "launch",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml"),
+            "--output-dir",
+            str(output),
+        ]
+    )
+    checkpoint = _write_warm_start_checkpoint(tmp_path, _resolve_config(base_arguments))
+    arguments = parser.parse_args(
+        [
+            "launch",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml"),
+            "--output-dir",
+            str(output),
+            "--warm-start-checkpoint",
+            str(checkpoint),
+        ]
+    )
+    commands = []
+
+    monkeypatch.setattr(
+        preflight,
+        "run_preflight",
+        lambda config, *, memory_probe: {"gpu": {"devices": []}},
+    )
+    monkeypatch.setattr(
+        "qwen3_vl_groot.cli.subprocess.run",
+        lambda command, *, check, env: commands.append(command),
+    )
+
+    launch(arguments)
+
+    assert commands[0][-2:] == [
+        "--warm-start-checkpoint",
+        str(checkpoint.resolve()),
+    ]
+
+
+def test_launch_rejects_warm_start_into_source_training_output(tmp_path, monkeypatch):
+    from qwen3_vl_groot import preflight
+
+    parser = build_parser()
+    seed_arguments = parser.parse_args(
+        [
+            "launch",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml"),
+            "--output-dir",
+            str(tmp_path / "placeholder-output"),
+        ]
+    )
+    checkpoint = _write_warm_start_checkpoint(tmp_path, _resolve_config(seed_arguments))
+    source_run = checkpoint.parents[1]
+    arguments = parser.parse_args(
+        [
+            "launch",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml"),
+            "--output-dir",
+            str(source_run),
+            "--warm-start-checkpoint",
+            str(checkpoint),
+            "--preflight-only",
+        ]
+    )
+    monkeypatch.setattr(
+        preflight,
+        "run_preflight",
+        lambda config, *, memory_probe: {"gpu": {"devices": []}},
+    )
+
+    with pytest.raises(ValueError, match="source training output"):
+        launch(arguments)
+
+
+def test_launch_rejects_nonempty_warm_start_output(tmp_path):
+    parser = build_parser()
+    output = tmp_path / "warm-start-run"
+    seed_arguments = parser.parse_args(
+        [
+            "launch",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml"),
+            "--output-dir",
+            str(output),
+        ]
+    )
+    checkpoint = _write_warm_start_checkpoint(tmp_path, _resolve_config(seed_arguments))
+    output.mkdir()
+    (output / "existing.txt").write_text("do not overwrite", encoding="utf-8")
+    arguments = parser.parse_args(
+        [
+            "launch",
+            "--config",
+            str(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml"),
+            "--output-dir",
+            str(output),
+            "--warm-start-checkpoint",
+            str(checkpoint),
+            "--preflight-only",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="must be absent or empty"):
+        launch(arguments)
+
+
+def test_distributed_train_forwards_warm_start_checkpoint(monkeypatch):
+    from qwen3_vl_groot import training
+
+    calls = []
+    monkeypatch.setattr(
+        training,
+        "train",
+        lambda config, *, warm_start_checkpoint: calls.append(warm_start_checkpoint),
+    )
+    arguments = argparse.Namespace(
+        config=str(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml"),
+        warm_start_checkpoint="/tmp/step-00000007",
+    )
+
+    distributed_train(arguments)
+
+    assert calls == ["/tmp/step-00000007"]
 
 
 @pytest.mark.parametrize(
