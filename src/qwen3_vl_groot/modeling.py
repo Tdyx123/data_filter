@@ -13,6 +13,7 @@ from torch.autograd.profiler import record_function
 
 from .config import (
     BACKBONE_CONTRACTS,
+    BRIDGE_V2_NORMALIZATION_CONTRACT,
     ConfigError,
     backbone_contract,
     validated_lora_target_modules,
@@ -383,6 +384,7 @@ class Qwen3VLGrootPolicy(nn.Module):
         self.max_context_tokens = int(model["max_context_tokens"])
         self.context_dim = int(model["context_dim"])
         self.context_forward = str(model.get("context_forward", "causal_lm"))
+        self.normalization_contract = data.get("normalization_contract")
         self._static_action_head_context_buckets_enabled = False
 
         dit = model["dit"]
@@ -445,14 +447,24 @@ class Qwen3VLGrootPolicy(nn.Module):
         high = self.state_q99.to(device=state.device, dtype=state.dtype)
         normalized = 2.0 * (state - low) / self._safe_span(low, high, self.normalization_epsilon) - 1.0
         constant = (high - low).abs() < self.normalization_epsilon
-        return torch.where(constant, torch.zeros_like(normalized), normalized).clamp(-1.0, 1.0)
+        normalized = torch.where(constant, torch.zeros_like(normalized), normalized)
+        if self.normalization_contract == BRIDGE_V2_NORMALIZATION_CONTRACT:
+            continuous = normalized[..., :-1].clamp(-2.2, 2.2)
+            gripper = (state[..., -1:] > 0.5).to(state.dtype)
+            return torch.cat([continuous, gripper], dim=-1)
+        return normalized.clamp(-1.0, 1.0)
 
     def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
         low = self.action_q01.to(device=action.device, dtype=action.dtype)
         high = self.action_q99.to(device=action.device, dtype=action.dtype)
         normalized = 2.0 * (action - low) / self._safe_span(low, high, self.normalization_epsilon) - 1.0
         constant = (high - low).abs() < self.normalization_epsilon
-        return torch.where(constant, torch.zeros_like(normalized), normalized).clamp(-1.0, 1.0)
+        normalized = torch.where(constant, torch.zeros_like(normalized), normalized)
+        if self.normalization_contract == BRIDGE_V2_NORMALIZATION_CONTRACT:
+            continuous = normalized[..., :-1].clamp(-2.2, 2.2)
+            gripper = (action[..., -1:] > 0.5).to(action.dtype)
+            return torch.cat([continuous, gripper], dim=-1)
+        return normalized.clamp(-1.0, 1.0)
 
     def denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
         low = self.action_q01.to(device=action.device, dtype=action.dtype)
@@ -461,7 +473,11 @@ class Qwen3VLGrootPolicy(nn.Module):
             low, high, self.normalization_epsilon
         ) + low
         constant = (high - low).abs() < self.normalization_epsilon
-        return torch.where(constant, low.expand_as(result), result)
+        result = torch.where(constant, low.expand_as(result), result)
+        if self.normalization_contract == BRIDGE_V2_NORMALIZATION_CONTRACT:
+            gripper = (action[..., -1:] > 0.5).to(action.dtype)
+            return torch.cat([result[..., :-1], gripper], dim=-1)
+        return result
 
     def set_lora_trainable(self, enabled: bool) -> None:
         for name, parameter in self.backbone.named_parameters():

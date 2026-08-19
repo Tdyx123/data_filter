@@ -34,12 +34,12 @@ Octo batch，缺失 wrist 使用 Octo 的缺失模态语义。
 `[0.8, 1.0]`、ratio `[0.9, 1.1]`，brightness `0.1`、contrast/saturation
 `[0.9, 1.1]`、hue `0.05`，输出 256×256；预检使用确定性 resize。
 
-proprio 和动作前六维使用 Bridge `meta/stats.json` 的 mean/std 标准化，零方差维使用
-epsilon。第七维抓手动作是 `[0,1]` 连续值，并排除统计标准化；仅接受有限值及
-`[-1e-5, 1+1e-5]` 范围，先将容差内值裁剪到 `[0,1]`，再按 `2*x-1` 转换为
-Octo Bridge 约定的 `[-1,+1]`。非有限值或明显越界值必须抛出包含 episode ID 的
-`DatasetValidationError`。episode 尾部动作窗口重复最后一个完整动作作为占位，
-同时通过 `action_pad_mask` 排除 loss。
+配置必须声明 `bridge_v2_q99_binary_v1`。proprio 的 `xyz/rpy/pad` 与动作前六维
+使用有效 episode 的 q01/q99 分维归一化并截断到 `[-2.2,2.2]`；零跨度维固定为
+`0`。状态及动作 gripper 以 `x > 0.5` 映射为严格 `0/1`；动作原值仅接受有限值及
+`[-1e-5, 1+1e-5]` 范围。精确统计原子缓存到输出目录 `normalization.json`，并用
+数据 metadata 哈希和保留计数防止陈旧复用。episode 尾部动作窗口重复最后一个完整
+动作作为占位，同时通过 `action_pad_mask` 排除 loss。
 
 ## 采样、模型与恢复
 
@@ -51,7 +51,9 @@ Parquet/AV1。索引携带 epoch、episode 和 frame position，使图像增广�
 
 sampler 的 checkpoint 状态只记录已发出的 batch 数，并能按 rank、seed 和 metadata
 重建下一批，保证续训数据顺序一致。训练 checkpoint 继续保存模型、AdamW、scheduler、
-sampler 和 RNG 状态。
+sampler 和 RNG 状态。Bridge checkpoint 还必须自包含契约 manifest 与
+`normalization.json`；缺少或不匹配该契约的旧 checkpoint 必须在加载模型权重前
+拒绝。LIBERO checkpoint 行为保持不变。
 
 `OctoSmallPolicy` 接受可选 `image_wrist`。Bridge 前向只拼接 primary、proprio 和
 readout token；加载 Bridge 训练模型时冻结所有 `wrist_*` 参数。LIBERO 仍提供双相机
@@ -66,7 +68,8 @@ batch，行为保持不变。
 
 ## 范围边界与测试
 
-首版不实现 SimplerEnv 评测，不接受 Cocore/RelCore 选择清单，不包含空语言 episode，
-也不修改源数据集。测试覆盖 Shell/CLI、schema 与预检、合成 AV1 数据、抓手转换、
-尾部 mask、sampler 多 rank 隔离/复现/恢复、单相机模型前后向、LIBERO 双相机回归、
-checkpoint round-trip 以及默认挂载真实数据的首中尾 episode 解码。
+不接受 Cocore/RelCore 选择清单，不包含空语言 episode，也不修改源数据集。Bridge
+SimplerEnv 评测只接受新契约 checkpoint。测试覆盖 Shell/CLI、schema 与预检、
+q01/q99 外推、gripper 边界、合成 AV1 数据、尾部 mask、sampler 多 rank
+隔离/复现/恢复、单相机模型前后向、LIBERO 双相机回归、checkpoint 契约
+拒绝/round-trip 以及默认挂载真实数据的首中尾 episode 解码。

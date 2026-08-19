@@ -7,26 +7,18 @@ import pytest
 
 
 def _statistics_file(tmp_path: Path) -> Path:
-    path = tmp_path / "stats.json"
-    path.write_text(
-        json.dumps(
-            {
-                "action": {
-                    "mean": [1, 2, 3, 4, 5, 6, 7],
-                    "std": [2, 2, 2, 2, 2, 2, 2],
-                    "min": [-1, -1, -1, -1, -1, -1, 0],
-                    "max": [9, 9, 9, 9, 9, 9, 1],
-                },
-                "observation.state": {
-                    "mean": [1, 2, 3, 4, 5, 6, 7, 8],
-                    "std": [1, 2, 4, 8, 16, 32, 64, 128],
-                    "min": [0, 0, 0, 0, 0, 0, 0, 0],
-                    "max": [9, 9, 9, 9, 9, 9, 9, 9],
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+    from octo_small_bridge.normalization import BridgeV2NormalizationStatistics
+
+    path = tmp_path / "normalization.json"
+    BridgeV2NormalizationStatistics(
+        state_q01=np.asarray([-1, -2, -3, -4, -5, -6, 0, 0], dtype=np.float32),
+        state_q99=np.asarray([1, 2, 3, 4, 5, 6, 0, 1], dtype=np.float32),
+        action_q01=np.asarray([-1, -2, -3, -4, -5, -6, 0], dtype=np.float32),
+        action_q99=np.asarray([1, 2, 3, 4, 5, 6, 1], dtype=np.float32),
+        metadata_sha256="a" * 64,
+        retained_episodes=2,
+        retained_frames=8,
+    ).save(path)
     return path
 
 
@@ -45,6 +37,75 @@ class _Tokenizer:
         }
 
 
+def _v2_statistics_file(tmp_path: Path) -> Path:
+    return _statistics_file(tmp_path)
+
+
+def test_octo_bridge_policy_uses_v2_quantiles_and_binary_gripper(tmp_path):
+    from octo_small_bridge.simpler_evaluation import (
+        OctoBridgeSimplerPolicy,
+        load_bridge_statistics,
+    )
+
+    statistics = load_bridge_statistics(_v2_statistics_file(tmp_path))
+    normalized_actions = np.asarray(
+        [[[2.2, -2.2, 0, 0, 0, 0, 0.50001]] * 8], dtype=np.float32
+    )
+    policy = OctoBridgeSimplerPolicy(
+        model=object(),
+        tokenizer=_Tokenizer(),
+        statistics=statistics,
+        device="cpu",
+        precision="fp32",
+        sampler=lambda prepared, generator: normalized_actions,
+    )
+
+    prepared = policy.prepare_observation(
+        np.zeros((8, 8, 3), dtype=np.uint8),
+        np.asarray([4, -8, 0, 0, 0, 0, 99, 0.5], dtype=np.float32),
+        "Put Spoon on Towel",
+    )
+    actions = policy.predict_actions(prepared, generator=None)
+
+    np.testing.assert_array_equal(
+        prepared["proprio"][0, 0],
+        np.asarray([2.2, -2.2, 0, 0, 0, 0, 0, 0], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        actions[0, 0, :6],
+        np.asarray([2.2, -4.4, 0, 0, 0, 0], dtype=np.float32),
+    )
+    assert actions[0, 0, 6] == 1.0
+    assert policy.gripper_threshold == 0.5
+
+
+def test_old_octo_bridge_checkpoint_is_rejected_before_model_loading(tmp_path):
+    from octo_small_bridge.simpler_evaluation import load_octo_bridge_policy
+    from simpler_bridge.evaluation import SimplerEvaluationError
+
+    base_model = _self_contained_base_model(tmp_path)
+    checkpoint = tmp_path / "old-checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "model.safetensors").write_bytes(b"old")
+    calls = []
+
+    with pytest.raises(SimplerEvaluationError, match="checkpoint_manifest"):
+        load_octo_bridge_policy(
+            checkpoint,
+            base_model=base_model,
+            statistics=_v2_statistics_file(tmp_path),
+            device="cpu",
+            precision="fp32",
+            model_loader=lambda *args, **kwargs: calls.append("model"),
+            weight_loader=lambda *args, **kwargs: calls.append("weights"),
+            torch_module=SimpleNamespace(
+                device=lambda value: SimpleNamespace(type="cpu")
+            ),
+        )
+
+    assert calls == []
+
+
 def test_bridge_statistics_and_octo_adapter_preserve_gripper_semantics(tmp_path):
     from octo_small_bridge.simpler_evaluation import (
         OctoBridgeSimplerPolicy,
@@ -53,9 +114,12 @@ def test_bridge_statistics_and_octo_adapter_preserve_gripper_semantics(tmp_path)
 
     statistics = load_bridge_statistics(_statistics_file(tmp_path))
     proprio = statistics.normalize_proprio(
-        np.asarray([2, 4, 7, 12, 21, 38, 71, 136], dtype=np.float32)
+        np.asarray([1, 2, 3, 4, 5, 6, 0, 1], dtype=np.float32)
     )
-    np.testing.assert_allclose(proprio, np.ones(8, dtype=np.float32))
+    np.testing.assert_allclose(
+        proprio,
+        np.asarray([1, 1, 1, 1, 1, 1, 0, 1], dtype=np.float32),
+    )
 
     normalized_actions = np.zeros((1, 8, 7), dtype=np.float32)
     normalized_actions[..., 6] = 0.75
@@ -70,7 +134,7 @@ def test_bridge_statistics_and_octo_adapter_preserve_gripper_semantics(tmp_path)
     )
     prepared = policy.prepare_observation(
         np.zeros((12, 20, 3), dtype=np.uint8),
-        np.asarray([2, 4, 7, 12, 21, 38, 71, 136], dtype=np.float32),
+        np.asarray([1, 2, 3, 4, 5, 6, 0, 1], dtype=np.float32),
         "Put Spoon on Towel",
     )
 
@@ -94,48 +158,46 @@ def test_bridge_statistics_and_octo_adapter_preserve_gripper_semantics(tmp_path)
 
     np.testing.assert_allclose(
         actions[..., :6],
-        np.broadcast_to([1, 2, 3, 4, 5, 6], (1, 8, 6)),
+        np.zeros((1, 8, 6), dtype=np.float32),
     )
-    np.testing.assert_allclose(actions[..., 6], 0.75)
+    np.testing.assert_allclose(actions[..., 6], 1.0)
     assert policy.protocol_metadata()["precision"] == "fp32"
 
 
-def test_bridge_statistics_reject_invalid_shapes_and_negative_std(tmp_path):
+def test_bridge_statistics_reject_invalid_shapes_and_reversed_quantiles(tmp_path):
     from simpler_bridge.evaluation import SimplerEvaluationError
     from octo_small_bridge.simpler_evaluation import load_bridge_statistics
 
     path = _statistics_file(tmp_path)
     value = json.loads(path.read_text(encoding="utf-8"))
-    value["action"]["std"][0] = -1
+    value["action_q01"][0] = 2
     path.write_text(json.dumps(value), encoding="utf-8")
 
-    with pytest.raises(SimplerEvaluationError, match="non-negative"):
+    with pytest.raises(SimplerEvaluationError, match="must not exceed"):
         load_bridge_statistics(path)
 
-    value["action"]["std"][0] = 1
-    value["observation.state"]["mean"] = [0, 1]
+    value["action_q01"][0] = -1
+    value["state_q01"] = [0, 1]
     path.write_text(json.dumps(value), encoding="utf-8")
     with pytest.raises(SimplerEvaluationError, match=r"shape \(8,\)"):
         load_bridge_statistics(path)
 
 
-def test_bridge_statistics_replace_zero_std_with_training_epsilon(tmp_path):
+def test_bridge_statistics_keep_constant_dimensions_at_zero(tmp_path):
     from octo_small_bridge.simpler_evaluation import load_bridge_statistics
 
     path = _statistics_file(tmp_path)
     value = json.loads(path.read_text(encoding="utf-8"))
-    value["observation.state"]["std"][0] = 0
+    value["state_q01"][0] = 1
+    value["state_q99"][0] = 1
     path.write_text(json.dumps(value), encoding="utf-8")
 
     statistics = load_bridge_statistics(path)
 
-    expected_std = np.finfo(np.float32).eps
-    assert statistics.proprio_std[0] == expected_std
     normalized = statistics.normalize_proprio(
-        np.asarray([1.0000001, 2, 3, 4, 5, 6, 7, 8], dtype=np.float32)
+        np.asarray([9, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
     )
-    expected = (np.float32(1.0000001) - np.float32(1)) / expected_std
-    assert normalized[0] == pytest.approx(expected)
+    assert normalized[0] == 0.0
 
 
 def _self_contained_base_model(tmp_path: Path) -> Path:
@@ -162,6 +224,7 @@ def _self_contained_base_model(tmp_path: Path) -> Path:
 
 
 def test_policy_loader_uses_primary_only_and_strict_checkpoint_weights(tmp_path):
+    from octo_small_bridge.checkpoint_contract import BridgeCheckpointContract
     from octo_small_bridge.simpler_evaluation import load_octo_bridge_policy
 
     base_model = _self_contained_base_model(tmp_path)
@@ -169,6 +232,7 @@ def test_policy_loader_uses_primary_only_and_strict_checkpoint_weights(tmp_path)
     checkpoint.mkdir(parents=True)
     (checkpoint / "model.safetensors").write_bytes(b"fine-tuned")
     statistics_path = _statistics_file(tmp_path)
+    BridgeCheckpointContract(statistics_path, "d" * 64).write(checkpoint)
     calls = {}
 
     class Model:
@@ -208,7 +272,6 @@ def test_policy_loader_uses_primary_only_and_strict_checkpoint_weights(tmp_path)
     spec, policy = load_octo_bridge_policy(
         checkpoint,
         base_model=base_model,
-        statistics=statistics_path,
         device="cuda:0",
         precision="bf16",
         model_loader=model_loader,
@@ -227,7 +290,7 @@ def test_policy_loader_uses_primary_only_and_strict_checkpoint_weights(tmp_path)
         {"strict": True, "device": "cpu"},
     )
     assert calls["eval"] is True
-    assert policy.statistics.path == statistics_path.resolve()
+    assert policy.statistics.path == checkpoint.resolve() / "normalization.json"
 
 
 def test_octo_simpler_runtime_contract_is_python310_and_model_specific():
@@ -299,6 +362,15 @@ def test_octo_simpler_cli_requires_all_model_paths_and_defaults_to_full_protocol
     assert arguments.sim_device == "cuda:0"
     assert arguments.precision == "bf16"
     assert arguments.action_horizon == 1
+    self_contained = parser.parse_args(
+        [
+            "--checkpoint",
+            "/models/step-00020000",
+            "--base-model",
+            "/models/octo-small-pytorch",
+        ]
+    )
+    assert self_contained.statistics is None
     assert parser.parse_args(
         [
             "--checkpoint",

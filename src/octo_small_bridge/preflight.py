@@ -13,6 +13,10 @@ from octo_small_libero.checkpoint import inspect_octo_checkpoint
 from trajectory_data import DatasetValidationError, LeRobotDatasetAdapter
 
 from .data import BridgeFrameDataset, BridgeFrameRef
+from .normalization import (
+    BridgeV2NormalizationStatistics,
+    compute_bridge_v2_statistics,
+)
 
 
 class PreflightError(RuntimeError):
@@ -37,10 +41,14 @@ def _adapter(root: Path) -> LeRobotDatasetAdapter:
     )
 
 
-def inspect_bridge_dataset(root: str | Path) -> dict[str, Any]:
+def inspect_bridge_dataset(
+    root: str | Path,
+    *,
+    adapter: LeRobotDatasetAdapter,
+    statistics: BridgeV2NormalizationStatistics,
+) -> dict[str, Any]:
     """Validate metadata/stats and decode the first/middle/last retained episodes."""
 
-    adapter = _adapter(Path(root).expanduser().resolve())
     if str(adapter.info.get("robot_type", "")).lower() != "widowx":
         raise DatasetValidationError("Bridge dataset robot_type must be widowx")
     if float(adapter.info.get("fps", 0)) != 5.0:
@@ -58,6 +66,7 @@ def inspect_bridge_dataset(root: str | Path) -> dict[str, Any]:
 
     dataset = BridgeFrameDataset(
         adapter,
+        statistics=statistics,
         dataset_name="bridge_orig_1.0.0",
         action_horizon=8,
         primary_size=(256, 256),
@@ -101,7 +110,17 @@ def inspect_bridge_dataset(root: str | Path) -> dict[str, Any]:
 def run_preflight(config: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any]:
     try:
         checkpoint = inspect_octo_checkpoint(paths["model"])
-        dataset = inspect_bridge_dataset(paths["dataset"])
+        adapter = _adapter(paths["dataset"])
+        statistics = compute_bridge_v2_statistics(
+            adapter,
+            paths["normalization"],
+            epsilon=float(config["data"]["normalization_epsilon"]),
+        )
+        dataset = inspect_bridge_dataset(
+            paths["dataset"],
+            adapter=adapter,
+            statistics=statistics,
+        )
     except (OSError, RuntimeError, ValueError) as error:
         raise PreflightError(str(error)) from error
     expected = config["data"]["expected_counts"]
@@ -133,6 +152,13 @@ def run_preflight(config: dict[str, Any], paths: dict[str, Path]) -> dict[str, A
         "route": "octo-small-bridge-v2-pytorch",
         "checkpoint": checkpoint,
         "dataset": dataset,
+        "normalization": {
+            "contract": statistics.contract,
+            "path": str(paths["normalization"]),
+            "metadata_sha256": statistics.metadata_sha256,
+            "retained_episodes": statistics.retained_episodes,
+            "retained_frames": statistics.retained_frames,
+        },
         "runtime": {
             "torch_version": torch.__version__,
             "transformers_version": transformers.__version__,
@@ -148,4 +174,3 @@ def run_preflight(config: dict[str, Any], paths: dict[str, Path]) -> dict[str, A
     if int(os.environ.get("RANK", "0")) == 0:
         print(json.dumps(report, indent=2, ensure_ascii=False))
     return report
-

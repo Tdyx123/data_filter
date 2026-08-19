@@ -17,6 +17,8 @@ from PIL import Image, ImageEnhance
 from trajectory_data import DatasetValidationError, EpisodeData, EpisodeRecord
 from trajectory_data.lerobot import LeRobotDatasetAdapter
 
+from .normalization import BridgeV2NormalizationStatistics
+
 
 @dataclass(frozen=True)
 class BridgeFrameRef:
@@ -45,7 +47,7 @@ def _normalize_gripper_actions(
             "[-1e-5, 1+1e-5]"
         )
     clipped = np.clip(gripper, np.float32(0.0), np.float32(1.0))
-    return clipped * np.float32(2.0) - np.float32(1.0)
+    return (clipped > np.float32(0.5)).astype(np.float32)
 
 
 class BridgeDistributedBatchSampler:
@@ -173,33 +175,6 @@ class BridgeDistributedBatchSampler:
         self._batches_committed = batches_emitted
 
 
-def _read_statistics(root: Path, key: str, dimension: int) -> tuple[np.ndarray, np.ndarray]:
-    path = root / "meta" / "stats.json"
-    try:
-        statistics = json.loads(path.read_text(encoding="utf-8"))
-        values = statistics[key]
-        mean = np.asarray(values["mean"], dtype=np.float32)
-        std = np.asarray(values["std"], dtype=np.float32)
-        minimum = np.asarray(values["min"], dtype=np.float32)
-        maximum = np.asarray(values["max"], dtype=np.float32)
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        raise DatasetValidationError(f"Could not read {dimension}D statistics for {key!r}: {error}") from error
-    arrays = {"mean": mean, "std": std, "min": minimum, "max": maximum}
-    invalid_shapes = {
-        name: value.shape for name, value in arrays.items() if value.shape != (dimension,)
-    }
-    if invalid_shapes:
-        raise DatasetValidationError(
-            f"Statistics for {key!r} must have shape ({dimension},): {invalid_shapes}"
-        )
-    if any(not np.all(np.isfinite(value)) for value in arrays.values()) or np.any(std < 0):
-        raise DatasetValidationError(f"Statistics for {key!r} must be finite with non-negative std")
-    if np.any(minimum > maximum):
-        raise DatasetValidationError(f"Statistics for {key!r} have min values above max")
-    safe_std = np.maximum(std, np.finfo(np.float32).eps)
-    return mean, safe_std.astype(np.float32, copy=False)
-
-
 class BridgeFrameDataset:
     """Decode Bridge V2 episodes lazily and emit Octo-small training samples."""
 
@@ -207,6 +182,7 @@ class BridgeFrameDataset:
         self,
         adapter: LeRobotDatasetAdapter,
         *,
+        statistics: BridgeV2NormalizationStatistics,
         dataset_name: str,
         action_horizon: int,
         primary_size: tuple[int, int] = (256, 256),
@@ -231,6 +207,7 @@ class BridgeFrameDataset:
                 "Bridge Octo-small requires exactly one primary image observation feature"
             )
         self.adapter = adapter
+        self.statistics = statistics
         self.dataset_name = str(dataset_name)
         self.action_horizon = int(action_horizon)
         self.primary_size = tuple(int(value) for value in primary_size)
@@ -244,12 +221,6 @@ class BridgeFrameDataset:
         self._token_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._state_key = adapter.vector_observation_keys[0]
         self._image_key = adapter.image_observation_keys[0]
-        self._state_mean, self._state_std = _read_statistics(
-            adapter.root, self._state_key, 8
-        )
-        self._action_mean, self._action_std = _read_statistics(
-            adapter.root, adapter.action_key, 7
-        )
 
     def __len__(self) -> int:
         return sum(record.length for record in self._records.values())
@@ -364,10 +335,7 @@ class BridgeFrameDataset:
                 ],
                 axis=0,
             )
-        normalized_action = np.empty_like(action_window)
-        normalized_action[:, :6] = (
-            action_window[:, :6] - self._action_mean[None, :6]
-        ) / self._action_std[None, :6]
+        normalized_action = self.statistics.normalize_action(action_window)
         normalized_action[:, 6] = _normalize_gripper_actions(
             action_window[:, 6],
             episode_id=episode.episode_id,
@@ -380,7 +348,7 @@ class BridgeFrameDataset:
             raise DatasetValidationError(
                 f"Episode {episode.episode_id} state must have shape (8,), got {state.shape}"
             )
-        proprio = (state - self._state_mean) / self._state_std
+        proprio = self.statistics.normalize_state(state)
         image = self._primary_image(
             episode.observations[self._image_key][position], reference
         )
@@ -412,6 +380,7 @@ class BridgeTrainingData:
     batch_sampler: BridgeDistributedBatchSampler
     dataloader: Any
     selection_sha256: str
+    normalization_path: Path
 
 
 def _selection_sha256(
@@ -420,6 +389,7 @@ def _selection_sha256(
     dataset_name: str,
     action_horizon: int,
     sampling_contract: Mapping[str, Any],
+    normalization_path: Path,
 ) -> str:
     digest = hashlib.sha256()
     digest.update(adapter.fingerprint().encode("ascii"))
@@ -430,7 +400,7 @@ def _selection_sha256(
             "utf-8"
         )
     )
-    with (adapter.root / "meta" / "stats.json").open("rb") as handle:
+    with normalization_path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     for record in adapter.episodes():
@@ -474,8 +444,20 @@ def make_training_dataset(
             },
         }
     )
+    normalization_path = Path(paths["normalization"])
+    statistics = BridgeV2NormalizationStatistics.load(normalization_path)
+    retained_frames = sum(record.length for record in adapter.episodes())
+    if (
+        statistics.metadata_sha256 != adapter.fingerprint()
+        or statistics.retained_episodes != len(adapter.episodes())
+        or statistics.retained_frames != retained_frames
+    ):
+        raise DatasetValidationError(
+            "Bridge normalization statistics do not match the filtered dataset"
+        )
     dataset = BridgeFrameDataset(
         adapter,
+        statistics=statistics,
         dataset_name=data["dataset_name"],
         action_horizon=int(data["action_horizon"]),
         primary_size=tuple(data["resize"]["primary"]),
@@ -512,6 +494,7 @@ def make_training_dataset(
             adapter,
             dataset_name=data["dataset_name"],
             action_horizon=int(data["action_horizon"]),
+            normalization_path=normalization_path,
             sampling_contract={
                 "seed": int(train["seed"]),
                 "world_size": int(world_size),
@@ -525,4 +508,5 @@ def make_training_dataset(
                 "action_key": data["action_key"],
             },
         ),
+        normalization_path=normalization_path,
     )

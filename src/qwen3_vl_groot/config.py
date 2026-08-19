@@ -16,6 +16,19 @@ class ConfigError(ValueError):
     """Raised when the run configuration violates a model/data invariant."""
 
 
+BRIDGE_V2_NORMALIZATION_CONTRACT = "bridge_v2_q99_binary_v1"
+
+
+def require_bridge_v2_normalization_contract(data_config: dict[str, Any]) -> str:
+    contract = data_config.get("normalization_contract")
+    if contract != BRIDGE_V2_NORMALIZATION_CONTRACT:
+        raise ConfigError(
+            "Bridge data.normalization_contract must be "
+            f"{BRIDGE_V2_NORMALIZATION_CONTRACT!r}, found {contract!r}"
+        )
+    return BRIDGE_V2_NORMALIZATION_CONTRACT
+
+
 BACKBONE_CONTRACTS: dict[str, dict[str, Any]] = {
     "qwen3_vl": {
         "display_name": "Qwen3-VL-4B",
@@ -226,6 +239,8 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ConfigError(f"{dataset_type} requires state_dim=8 and action_dim=7")
     if data["action_horizon"] <= 0:
         raise ConfigError("action_horizon must be positive")
+    if dataset_type == "bridge":
+        require_bridge_v2_normalization_contract(data)
     contract = backbone_contract(model)
     expected_layers = int(contract["text_layers"])
     expected_context_dim = int(contract["context_dim"])

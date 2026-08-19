@@ -218,16 +218,42 @@ def _rotate(quaternion, vector):
     return _multiply_quaternion(_multiply_quaternion(quaternion, pure), conjugate)[1:]
 
 
+def _xyz_euler_quaternion(roll, pitch, yaw):
+    half_roll = roll * 0.5
+    half_pitch = pitch * 0.5
+    half_yaw = yaw * 0.5
+    cr, sr = math.cos(half_roll), math.sin(half_roll)
+    cp, sp = math.cos(half_pitch), math.sin(half_pitch)
+    cy, sy = math.cos(half_yaw), math.sin(half_yaw)
+    return np.asarray(
+        [
+            cr * cp * cy + sr * sp * sy,
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+        ],
+        dtype=np.float64,
+    )
+
+
 def test_environment_to_bridge_proprio_uses_tcp_pose_in_robot_base_frame():
     evaluation = _evaluation()
     half_turn_z = np.asarray([math.cos(math.pi / 4), 0, 0, math.sin(math.pi / 4)])
+    bridge_tcp_alignment = np.asarray(
+        [math.cos(math.pi / 4), 0, math.sin(math.pi / 4), 0]
+    )
     agent = SimpleNamespace(
         robot=SimpleNamespace(pose=_Pose([1.0, 2.0, 0.0], half_turn_z)),
         get_gripper_closedness=lambda: 0.25,
     )
     environment = SimpleNamespace(
         agent=agent,
-        tcp=SimpleNamespace(pose=_Pose([1.0, 3.0, 0.5], half_turn_z)),
+        tcp=SimpleNamespace(
+            pose=_Pose(
+                [1.0, 3.0, 0.5],
+                _multiply_quaternion(half_turn_z, bridge_tcp_alignment),
+            )
+        ),
     )
 
     proprio = evaluation.environment_to_bridge_proprio(environment)
@@ -237,6 +263,9 @@ def test_environment_to_bridge_proprio_uses_tcp_pose_in_robot_base_frame():
 
 def test_environment_to_bridge_proprio_uses_sapien_pose_multiplication():
     evaluation = _evaluation()
+    bridge_tcp_alignment = np.asarray(
+        [math.cos(math.pi / 4), 0, math.sin(math.pi / 4), 0]
+    )
 
     class MultiplicationOnlyPose(_Pose):
         transform = None
@@ -257,7 +286,7 @@ def test_environment_to_bridge_proprio_uses_sapien_pose_multiplication():
             get_gripper_closedness=lambda: 0.0,
         ),
         tcp=SimpleNamespace(
-            pose=MultiplicationOnlyPose([0.1, 0.2, 0.3], [1, 0, 0, 0])
+            pose=MultiplicationOnlyPose([0.1, 0.2, 0.3], bridge_tcp_alignment)
         ),
     )
 
@@ -266,6 +295,31 @@ def test_environment_to_bridge_proprio_uses_sapien_pose_multiplication():
         [0.1, 0.2, 0.3, 0, 0, 0, 0, 1],
         atol=1e-6,
     )
+
+
+def test_environment_to_bridge_proprio_removes_tcp_alignment_for_mixed_euler_pose():
+    evaluation = _evaluation()
+    expected_euler = np.asarray([0.25, -0.2, 0.4], dtype=np.float64)
+    bridge_tcp_alignment = np.asarray(
+        [math.cos(math.pi / 4), 0, math.sin(math.pi / 4), 0]
+    )
+    tcp_quaternion = _multiply_quaternion(
+        _xyz_euler_quaternion(*expected_euler),
+        bridge_tcp_alignment,
+    )
+    environment = SimpleNamespace(
+        agent=SimpleNamespace(
+            robot=SimpleNamespace(pose=_Pose([0, 0, 0], [1, 0, 0, 0])),
+            get_gripper_closedness=lambda: 0.25,
+        ),
+        tcp=SimpleNamespace(pose=_Pose([0.3, -0.1, 0.2], tcp_quaternion)),
+    )
+
+    proprio = evaluation.environment_to_bridge_proprio(environment)
+
+    np.testing.assert_allclose(proprio[:3], [0.3, -0.1, 0.2], atol=1e-6)
+    np.testing.assert_allclose(proprio[3:6], expected_euler, atol=1e-6)
+    np.testing.assert_allclose(proprio[6:], [0.0, 0.75], atol=1e-6)
 
 
 def test_bridge_action_conversion_uses_axis_angle_and_binary_absolute_gripper():
