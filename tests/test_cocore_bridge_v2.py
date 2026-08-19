@@ -213,7 +213,7 @@ def test_package_exposes_only_version() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["0.5.2", "['__version__']"]
+    assert result.stdout.splitlines() == ["0.5.3", "['__version__']"]
 
 
 def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None:
@@ -800,9 +800,9 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     select_manifest = json.loads((result / "manifest.json").read_text())
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert select_manifest["producer"] == "cocore"
-    assert select_manifest["cocore_version"] == "0.14.2"
+    assert select_manifest["cocore_version"] == "0.14.3"
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.14.2"
+    assert run_manifest["cocore_version"] == "0.14.3"
     assert run_manifest["stage_directories"]["graph"] == "graph-17-motion-hard-nearest-pca"
     assert validate_output(result, config=config) == {
         "status": "valid",

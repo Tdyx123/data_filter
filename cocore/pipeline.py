@@ -869,8 +869,8 @@ def _validate_schema_nine_catalog(
         "visual_projection_padding": "right_zero_to_128",
         "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
         "cluster_count": (
-            "min(training_count, min(20, max(5, "
-            "floor(3 * log2(training_count) - 25))))"
+            "min(training_count, min(30, max(10, "
+            "floor(4 * log2(training_count) - 30))))"
         ),
         "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
         "distance_quantiles": [0.1, 0.9],

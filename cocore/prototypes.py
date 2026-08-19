@@ -31,8 +31,8 @@ _ActionResult = TypeVar("_ActionResult")
 
 MIN_ACTION_COUNT = 400
 MIN_ACTION_FREQUENCY = 0.005
-MIN_VISUAL_CENTERS = 5
-MAX_VISUAL_CENTERS = 20
+MIN_VISUAL_CENTERS = 10
+MAX_VISUAL_CENTERS = 30
 FULL_KMEANS_MAX_TRAINING_COUNT = 65_536
 FULL_KMEANS_OPENMP_THREADS = 1
 MINIBATCH_KMEANS_OPENMP_THREADS = 4
@@ -135,8 +135,8 @@ class ActionCatalog:
                 "visual_projection_padding": "right_zero_to_128",
                 "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
                 "cluster_count": (
-                    "min(training_count, min(20, max(5, "
-                    "floor(3 * log2(training_count) - 25))))"
+                    "min(training_count, min(30, max(10, "
+                    "floor(4 * log2(training_count) - 30))))"
                 ),
                 "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
                 "distance_quantiles": [0.1, 0.9],
@@ -237,7 +237,7 @@ def cluster_count_for_training_count(training_count: float) -> int:
         raise ValueError("training count must be a finite positive number")
     clusters = min(
         MAX_VISUAL_CENTERS,
-        max(MIN_VISUAL_CENTERS, math.floor(3.0 * math.log2(value) - 25.0)),
+        max(MIN_VISUAL_CENTERS, math.floor(4.0 * math.log2(value) - 30.0)),
     )
     return min(int(value), clusters)
 

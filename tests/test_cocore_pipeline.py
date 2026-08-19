@@ -167,7 +167,7 @@ def _config(tmp_path: Path, relation: str = "cooccurrence") -> dict[str, object]
         "objective": {"relation": relation, "relation_weight": 1.0},
         "selection": {
             "ratio": 0.5,
-            "budget": 6,
+            "budget": 10,
             "max_refreshes": 2,
         },
         "runtime": {"num_workers": 0, "max_episodes": None, "resume": True},
@@ -346,7 +346,7 @@ def test_encode_stage_caches_every_indexed_episode_including_short_episodes(
         (2, 5),
     ]
     result = run_pipeline(config, visual_encoder=FailingCocoreVisualEncoder())
-    assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 6}
+    assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 10}
 
 
 def test_interrupted_encode_does_not_publish_partial_frame_cache(
@@ -393,7 +393,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     for directory in ("scan", "encode", "graph-17-motion-hard-nearest-pca"):
         manifest = json.loads((root / directory / "manifest.json").read_text())
         assert manifest["producer"] == "cocore"
-        assert manifest["cocore_version"] == "0.14.2"
+        assert manifest["cocore_version"] == "0.14.3"
     scan_manifest = json.loads((root / "scan" / "manifest.json").read_text())
     assert scan_manifest["window_policy"] == "near_uniform_full_coverage"
     assert scan_manifest["clip_length"] == 15
@@ -411,7 +411,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
         "state_threshold": 0.03,
         "min_action_count": 400,
         "min_action_frequency": 0.005,
-        "max_visual_centers": 20,
+        "max_visual_centers": 30,
         "full_kmeans_max_training_count": 65536,
         "full_kmeans_openmp_threads": 1,
         "minibatch_kmeans_openmp_threads": 4,
@@ -425,8 +425,8 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
         "visual_projection_padding": "right_zero_to_128",
         "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
         "cluster_count": (
-            "min(training_count, min(20, max(5, "
-            "floor(3 * log2(training_count) - 25))))"
+            "min(training_count, min(30, max(10, "
+            "floor(4 * log2(training_count) - 30))))"
         ),
         "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
         "distance_quantiles": [0.1, 0.9],
@@ -474,7 +474,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     ]
     all_rows = pq.read_table(result / "all_clips.parquet").to_pylist()
     report = json.loads((result / "selection_report.json").read_text())
-    assert len(selected) == 6
+    assert len(selected) == 10
     assert len(all_rows) == 82
     assert {row["selection_phase"] for row in selected} == {"coverage_seed", "heap"}
     assert all(
@@ -527,7 +527,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     }
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.14.2"
+    assert run_manifest["cocore_version"] == "0.14.3"
     assert run_manifest["relation_type"] == relation
     assert run_manifest["relation_weight"] == 1.0
     assert run_manifest["prototype_schema_version"] == 9
@@ -541,7 +541,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert run_manifest["window_policy"] == "near_uniform_full_coverage"
     assert run_manifest["sequence_adjacency"] == "ordered_candidates"
     select_manifest = json.loads((result / "manifest.json").read_text())
-    assert select_manifest["cocore_version"] == "0.14.2"
+    assert select_manifest["cocore_version"] == "0.14.3"
     assert select_manifest["relation_type"] == relation
     assert select_manifest["relation_weight"] == 1.0
     assert select_manifest["prototype_schema_version"] == 9
@@ -553,13 +553,13 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     resolved = yaml.safe_load((result / "resolved_config.yaml").read_text())
     assert resolved["output"]["directory"] == str(root)
     assert resolved["objective"] == {"relation": relation, "relation_weight": 1.0}
-    assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 6}
+    assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 10}
 
     select_manifest["cocore_version"] = "0.7.0"
     (result / "manifest.json").write_text(json.dumps(select_manifest))
     with pytest.raises(ValueError, match="selection manifest Cocore version"):
         validate_output(result, config=config)
-    select_manifest["cocore_version"] = "0.14.2"
+    select_manifest["cocore_version"] = "0.14.3"
     (result / "manifest.json").write_text(json.dumps(select_manifest))
 
     report["relation_type"] = "sequence" if relation == "cooccurrence" else "cooccurrence"
@@ -963,7 +963,7 @@ def test_graph_and_validation_honor_single_prototype_thread(
     thread_counts.clear()
     tolerances.clear()
 
-    assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 6}
+    assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 10}
     assert thread_counts == [1]
     assert tolerances == [1.0e-4]
 
@@ -1240,11 +1240,11 @@ def test_sequence_and_cooccurrence_outputs_can_coexist(tmp_path: Path) -> None:
     assert sequence.is_dir()
     assert validate_output(cooccurrence, config=_config(tmp_path, "cooccurrence")) == {
         "status": "valid",
-        "selected_clips": 6,
+        "selected_clips": 10,
     }
     assert validate_output(sequence, config=_config(tmp_path, "sequence")) == {
         "status": "valid",
-        "selected_clips": 6,
+        "selected_clips": 10,
     }
 
 
@@ -1255,4 +1255,4 @@ def test_validate_aligns_sorted_output_rows_by_sample_id(tmp_path: Path) -> None
 
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
 
-    assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 6}
+    assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 10}

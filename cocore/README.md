@@ -38,11 +38,11 @@ count >= max(400, ceil(0.005 * W))
 数，中心数固定为：
 
 ```text
-K_a = min(M_a, min(20, max(5, floor(3 * log2(M_a) - 25))))
+K_a = min(M_a, min(30, max(10, floor(4 * log2(M_a) - 30))))
 ```
 
-外层 `min(M_a, ...)` 只在桶内不足 5 个训练窗口时降低中心数；非 `stop` 桶仍受上述
-至少 400 个窗口的动作门槛保护，因此其中心数范围为 5～20。
+外层 `min(M_a, ...)` 只在桶内不足 10 个训练窗口时降低中心数；非 `stop` 桶仍受上述
+至少 400 个窗口的动作门槛保护，因此其中心数范围为 10～30。
 
 聚类不使用样本权重。训练窗口数不超过 65,536 的动作桶使用完整 Lloyd KMeans，允许
 按动作桶并行且每个模型固定 1 个 OpenMP 线程；超过 65,536 的动作桶使用
@@ -140,7 +140,7 @@ prototypes:
 配置中不接受 `clip` section。
 Quality 风格编码取代了旧关系编码，因此不再接受顶层 `relation` 或 `normalization`；
 `encoding.visual_dim` 固定为 128，`pca_fit_max_samples` 可限制 PCA 拟合样本数。
-动作门槛、中心数公式、20 个中心上限、距离分位和权重公式都是 Cocore 固定算法，
+动作门槛、中心数公式、30 个中心上限、距离分位和权重公式都是 Cocore 固定算法，
 不可配置；`prototypes` 只接受 `method`、`batch_size`、`max_iter`、正数 `tol`、正整数
 `num_threads` 和布尔值 `use_stop_bucket`，并明确拒绝旧 `count`、`top_r` 或
 `temperature`。`batch_size` 只影响
@@ -186,10 +186,10 @@ RelCore 的 `--reliability-metrics`、`--prototype-method` 或
 python -m cocore run --config cocore/config_debug.yaml --force
 ```
 
-Cocore 0.14.2 使用 prototype schema 9、5～20 个桶内视觉中心、可选 stop 桶、无标签
+Cocore 0.14.3 使用 prototype schema 9、10～30 个桶内视觉中心、可选 stop 桶、无标签
 候选诱导子图、65,536 窗口的混合 KMeans 阈值、最大间隔 3 的动作训练窗口、裁剪 PCA
 的 128 维聚类空间、近似均匀候选和原始相邻 sequence 图，并按 episode 持久化完整原始
-逐帧 CLIP 特征。0.14.1 及更早版本的 scan、encode、graph 和 selection 缓存不迁移；
+逐帧 CLIP 特征。0.14.2 及更早版本的 scan、encode、graph 和 selection 缓存不迁移；
 升级后必须通过 `--force` 重建全部阶段，或使用新的输出目录。
 
 ## 输出与校验

@@ -15,7 +15,7 @@ def _objective(relation: str = "cooccurrence", weight: float = 1.0) -> dict[str,
 
 
 def test_package_version_matches_optional_stop_release() -> None:
-    assert cocore.__version__ == "0.14.2"
+    assert cocore.__version__ == "0.14.3"
 
 
 def test_config_requires_explicit_relation_and_weight() -> None:
