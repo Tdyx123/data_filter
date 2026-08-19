@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ import pytest
 from scipy import sparse
 
 from cocore.objective import CocoreObjectiveContext, recompute_objective
+from cocore.random_multibranch import RandomMultiBranchSelector
 from cocore.selection import (
     LazyHeapSelector,
     build_max_coverage_seed,
@@ -189,6 +191,90 @@ def test_cocore_marginal_relation_gain_matches_relcore(relation: str) -> None:
     )
 
 
+@pytest.mark.parametrize("relation", ["sequence", "cooccurrence"])
+def test_objective_update_state_materializes_without_mutating_shared_main(
+    relation: str,
+) -> None:
+    graph = _graph()
+    graph.sequence_edges = _edges([(0, 1, 1.0), (1, 2, 1.0)], "sequence")
+    graph.transition_matrix = sparse.csr_matrix(
+        np.asarray([[0.0, 0.6], [0.4, 0.0]], dtype=np.float32)
+    )
+    context = CocoreObjectiveContext(
+        graph, relation, relation_weight=1.0, similarity_threshold=0.8
+    )
+    main = context.state_from_indices([0])
+    main_snapshot = context.clone_state(main)
+
+    root = context.empty_update_state(main)
+    first = context.extend_update_state(
+        root,
+        (1,),
+        similarity_main_indices=(0,),
+    )
+    second = context.extend_update_state(
+        root,
+        (2,),
+        similarity_main_indices=(0,),
+    )
+    materialized = context.materialize_update_state(first)
+    expected = context.state_from_indices([0, 1])
+
+    assert first.main_state is main
+    assert second.main_state is main
+    assert first.selected_indices == (1,)
+    assert second.selected_indices == (2,)
+    np.testing.assert_array_equal(materialized.selected_mask, expected.selected_mask)
+    np.testing.assert_array_equal(materialized.prototype_coverage, expected.prototype_coverage)
+    np.testing.assert_array_equal(
+        materialized.sequence_relation_counts,
+        expected.sequence_relation_counts,
+    )
+    np.testing.assert_array_equal(materialized.task_counts, expected.task_counts)
+    assert materialized.relation == expected.relation
+    assert materialized.redundancy == expected.redundancy
+    assert materialized.score == expected.score
+    np.testing.assert_array_equal(main.selected_mask, main_snapshot.selected_mask)
+    np.testing.assert_array_equal(main.prototype_coverage, main_snapshot.prototype_coverage)
+    np.testing.assert_array_equal(
+        main.sequence_relation_counts,
+        main_snapshot.sequence_relation_counts,
+    )
+    np.testing.assert_array_equal(main.task_counts, main_snapshot.task_counts)
+    assert main.relation == main_snapshot.relation
+    assert main.redundancy == main_snapshot.redundancy
+    assert main.score == main_snapshot.score
+
+
+def test_objective_update_state_penalizes_only_sampled_main_plus_active_pairs() -> None:
+    graph = _heap_graph(103)
+    graph.reliability = np.ones(103, dtype=np.float32)
+    graph.similarity_edges = _edges(
+        [
+            (0, 1, 0.9),
+            (0, 101, 0.9),
+            (101, 102, 0.9),
+            (100, 101, 0.9),
+        ],
+        "similarity",
+    )
+    context = CocoreObjectiveContext(
+        graph, "cooccurrence", relation_weight=1.0, similarity_threshold=0.8
+    )
+    main = context.state_from_indices(list(range(101)))
+
+    update = context.extend_update_state(
+        context.empty_update_state(main),
+        (101, 102),
+        similarity_main_indices=tuple(range(100)),
+    )
+
+    assert update.similarity_main_indices == tuple(range(100))
+    assert update.relation == pytest.approx(1.0)
+    assert update.redundancy == pytest.approx(0.75)
+    assert update.score == pytest.approx(0.25)
+
+
 def test_max_coverage_seed_uses_reliable_soft_assignments_and_stable_ties() -> None:
     graph = _graph()
     graph.sample_ids[0] = "z"
@@ -231,6 +317,291 @@ def _heap_graph(count: int = 14) -> GraphData:
         cooccurrence_matrix=sparse.csr_matrix(np.ones((1, 1), dtype=np.float32)),
         prototype_labels=("move forward",),
     )
+
+
+def test_random_multibranch_returns_coverage_without_starting_search() -> None:
+    context = CocoreObjectiveContext(
+        _heap_graph(), "cooccurrence", 1.0, similarity_threshold=0.8
+    )
+    seed = build_max_coverage_seed(context, budget=1)
+
+    result = RandomMultiBranchSelector(context, seed=7).select(
+        1, initial_indices=seed.selected_indices
+    )
+
+    assert result.selected_indices == seed.selected_indices
+    assert result.selection_phases == ("coverage_seed",)
+    assert result.selection_steps == (0,)
+    assert result.heap_refreshes == (None,)
+    assert result.rounds == 0
+    assert result.evaluated_branches == 0
+    assert result.recombinations == 0
+    assert result.committed_clips == 0
+    assert result.final_active_clips == 0
+
+
+def test_random_multibranch_fills_a_partial_final_batch_reproducibly() -> None:
+    graph = _heap_graph(30)
+    first_context = CocoreObjectiveContext(
+        graph, "cooccurrence", 1.0, similarity_threshold=0.8
+    )
+    first_seed = build_max_coverage_seed(first_context, budget=17)
+    first = RandomMultiBranchSelector(first_context, seed=11).select(
+        17, initial_indices=first_seed.selected_indices
+    )
+    second_context = CocoreObjectiveContext(
+        graph, "cooccurrence", 1.0, similarity_threshold=0.8
+    )
+    second_seed = build_max_coverage_seed(second_context, budget=17)
+    second = RandomMultiBranchSelector(second_context, seed=11).select(
+        17, initial_indices=second_seed.selected_indices
+    )
+
+    assert first == second
+    assert first.selected_indices == (
+        29,
+        21,
+        6,
+        12,
+        27,
+        4,
+        0,
+        24,
+        2,
+        23,
+        18,
+        16,
+        5,
+        1,
+        25,
+        9,
+        15,
+    )
+    assert len(first.selected_indices) == 17
+    assert len(set(first.selected_indices)) == 17
+    assert first.rounds == 2
+    assert first.evaluated_branches == 40
+    assert first.recombinations == 0
+    assert first.committed_clips == 0
+    assert first.final_active_clips == 16
+    assert first.selection_phases.count("coverage_seed") == 1
+    assert first.selection_phases.count("branch_final") == 16
+    assert first.selection_steps[-16:] == (2,) * 16
+
+
+def test_random_multibranch_does_not_clone_complete_branch_states(monkeypatch) -> None:
+    context = CocoreObjectiveContext(
+        _heap_graph(30), "cooccurrence", 1.0, similarity_threshold=0.8
+    )
+    coverage = build_max_coverage_seed(context, budget=17)
+
+    def reject_clone(state):
+        del state
+        raise AssertionError("random multibranch copied a complete branch state")
+
+    monkeypatch.setattr(context, "clone_state", reject_clone)
+
+    result = RandomMultiBranchSelector(context, seed=11).select(
+        17,
+        initial_indices=coverage.selected_indices,
+    )
+
+    assert result.selected_indices == (
+        29,
+        21,
+        6,
+        12,
+        27,
+        4,
+        0,
+        24,
+        2,
+        23,
+        18,
+        16,
+        5,
+        1,
+        25,
+        9,
+        15,
+    )
+    assert result.similarity_penalty_indices == result.selected_indices
+
+
+def test_random_multibranch_similarity_sampling_uses_strict_100_clip_threshold() -> None:
+    context = CocoreObjectiveContext(
+        _heap_graph(101), "cooccurrence", 1.0, similarity_threshold=0.8
+    )
+    selector = RandomMultiBranchSelector(context, seed=17)
+
+    class RejectingGenerator:
+        def choice(self, *args, **kwargs):
+            del args, kwargs
+            raise AssertionError("100 fixed clips must not consume the similarity RNG")
+
+    fixed_100 = tuple(range(100))
+    assert selector._sample_similarity_main(RejectingGenerator(), fixed_100) == fixed_100
+
+    sampled = selector._sample_similarity_main(
+        np.random.default_rng(17),
+        tuple(range(101)),
+    )
+    assert len(sampled) == 100
+    assert len(set(sampled)) == 100
+    assert set(sampled) < set(range(101))
+
+
+def test_random_multibranch_resamples_similarity_main_for_every_new_branch() -> None:
+    context = CocoreObjectiveContext(
+        _heap_graph(112), "cooccurrence", 1.0, similarity_threshold=0.8
+    )
+
+    class RecordingSelector(RandomMultiBranchSelector):
+        def __init__(self) -> None:
+            super().__init__(context, seed=29)
+            self.similarity_samples: list[tuple[int, ...]] = []
+
+        def _sample_similarity_main(self, rng, fixed):
+            sample = super()._sample_similarity_main(rng, fixed)
+            self.similarity_samples.append(sample)
+            return sample
+
+    selector = RecordingSelector()
+    result = selector.select(112, initial_indices=tuple(range(101)))
+
+    assert len(selector.similarity_samples) == 8 + 32
+    assert all(len(sample) == 100 for sample in selector.similarity_samples)
+    assert all(set(sample) < set(range(101)) for sample in selector.similarity_samples)
+    assert len(result.similarity_penalty_indices) == 100 + result.final_active_clips
+
+
+def test_random_multibranch_final_result_uses_winner_similarity_sample() -> None:
+    graph = _heap_graph(103)
+    graph.reliability = np.ones(103, dtype=np.float32)
+    graph.similarity_edges = _edges(
+        [
+            (0, 1, 0.9),
+            (0, 101, 0.9),
+            (101, 102, 0.9),
+            (100, 101, 0.9),
+        ],
+        "similarity",
+    )
+    context = CocoreObjectiveContext(
+        graph, "cooccurrence", 1.0, similarity_threshold=0.8
+    )
+
+    result = RandomMultiBranchSelector(context, seed=31).select(
+        103,
+        initial_indices=tuple(range(101)),
+    )
+
+    assert set(result.selected_indices[-2:]) == {101, 102}
+    assert result.similarity_penalty_indices[-2:] == result.selected_indices[-2:]
+    assert len(result.similarity_penalty_indices) == 102
+    assert len(set(result.similarity_penalty_indices[:-2])) == 100
+    assert set(result.similarity_penalty_indices[:-2]) < set(range(101))
+    assert result.redundancy == pytest.approx(
+        context.redundancy_from_indices(result.similarity_penalty_indices)
+    )
+    assert result.objective_value == pytest.approx(
+        result.relation - result.redundancy
+    )
+    assert sum(result.score_deltas) == pytest.approx(result.objective_value)
+
+
+def test_random_multibranch_uses_seed_to_break_equal_branch_scores() -> None:
+    graph = _heap_graph(30)
+
+    selected = []
+    for random_seed in (3, 19):
+        context = CocoreObjectiveContext(
+            graph, "cooccurrence", 1.0, similarity_threshold=0.8
+        )
+        coverage = build_max_coverage_seed(context, budget=17)
+        selected.append(
+            RandomMultiBranchSelector(context, seed=random_seed).select(
+                17, initial_indices=coverage.selected_indices
+            ).selected_indices
+        )
+
+    assert selected[0] != selected[1]
+
+
+def test_random_multibranch_selects_the_highest_scoring_initial_branch() -> None:
+    graph = _heap_graph(9)
+    graph.similarity_edges = _edges(
+        [(8, index, 0.9) for index in range(1, 8)], "similarity"
+    )
+    context = CocoreObjectiveContext(
+        graph, "cooccurrence", 1.0, similarity_threshold=0.8
+    )
+    coverage = build_max_coverage_seed(context, budget=2)
+
+    class ScheduledSelector(RandomMultiBranchSelector):
+        def __init__(self) -> None:
+            super().__init__(context, seed=5)
+            self.samples = iter(range(8))
+
+        def _sample(self, rng, *, fixed, active, size):
+            del rng, fixed, active
+            assert size == 1
+            return (next(self.samples),)
+
+    result = ScheduledSelector().select(2, initial_indices=coverage.selected_indices)
+
+    assert result.selected_indices == (8, 0)
+
+
+def test_random_multibranch_ranks_recombination_clips_by_branch_frequency() -> None:
+    context = CocoreObjectiveContext(
+        _heap_graph(5), "cooccurrence", 1.0, similarity_threshold=0.8
+    )
+    selector = RandomMultiBranchSelector(context, seed=13)
+
+    ranked = selector._rank_indices(
+        [0, 1, 2, 3],
+        Counter({0: 8, 1: 4, 2: 4, 3: 1}),
+        np.random.default_rng(13),
+        limit=3,
+    )
+
+    assert ranked[0] == 0
+    assert set(ranked[1:]) == {1, 2}
+
+
+def test_random_multibranch_recombines_first_at_20_then_every_10_rounds() -> None:
+    graph = _heap_graph(340)
+    context = CocoreObjectiveContext(
+        graph, "cooccurrence", 1.0, similarity_threshold=0.8
+    )
+    coverage = build_max_coverage_seed(context, budget=326)
+
+    result = RandomMultiBranchSelector(context, seed=23).select(
+        326, initial_indices=coverage.selected_indices
+    )
+
+    assert len(result.selected_indices) == 326
+    assert len(set(result.selected_indices)) == 326
+    assert result.rounds == 33
+    assert result.evaluated_branches == 8 + 32 * 32
+    assert result.recombinations == 2
+    assert result.committed_clips == 200
+    assert result.final_active_clips == 125
+    commit_steps = [
+        step
+        for phase, step in zip(result.selection_phases, result.selection_steps, strict=True)
+        if phase == "branch_commit"
+    ]
+    assert commit_steps == [20] * 100 + [30] * 100
+    assert result.selection_phases.count("branch_final") == 125
+    assert result.selection_steps[-125:] == (33,) * 125
+    replay = CocoreObjectiveContext(
+        graph, "cooccurrence", 1.0, similarity_threshold=0.8
+    ).state_from_indices(result.selected_indices)
+    assert result.objective_value == pytest.approx(replay.score)
+    assert result.relation == pytest.approx(replay.relation)
+    assert result.redundancy == pytest.approx(replay.redundancy)
 
 
 def test_lazy_heap_selects_current_top_then_refreshes_the_next_stale_top() -> None:

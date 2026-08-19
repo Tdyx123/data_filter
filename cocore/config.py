@@ -24,6 +24,8 @@ _SHARED_SECTIONS = (
     "runtime",
 )
 
+SELECTION_METHODS = ("lazy_heap", "random_multibranch")
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "seed": 42,
     **{section: copy.deepcopy(RELCORE_DEFAULT_CONFIG[section]) for section in _SHARED_SECTIONS},
@@ -37,6 +39,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "reliability_metrics": ["support", "progress"],
     "objective": {},
     "selection": {
+        "method": "lazy_heap",
         "ratio": 0.1,
         "budget": None,
         "max_refreshes": 100,
@@ -192,6 +195,12 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not 0.0 < ratio <= 1.0:
         raise ValueError("selection.ratio must be in (0, 1]")
     resolved["selection"]["ratio"] = ratio
+    selection_method = str(resolved["selection"].get("method", "lazy_heap"))
+    if selection_method not in SELECTION_METHODS:
+        raise ValueError(
+            f"selection.method must be one of {', '.join(SELECTION_METHODS)}"
+        )
+    resolved["selection"]["method"] = selection_method
     budget = resolved["selection"].get("budget")
     if budget is not None and int(budget) <= 0:
         raise ValueError("selection.budget must be positive or null")

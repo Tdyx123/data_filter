@@ -71,7 +71,7 @@ w_half = w_r * w_d
 
 可靠性固定为 `sqrt(support * progress)`。初始集合为每个可达运动原语选择
 `reliability * assignment` 最大的片段并取并集，使所有原型 coverage 达到全池最大值。
-其余预算使用确定性的惰性最大堆近似优化：
+`selection.method` 默认使用 `lazy_heap`，其余预算使用确定性的惰性最大堆近似优化：
 
 ```text
 c_p(S) = max_{i in S}(reliability_i * assignment_{i,p})
@@ -100,6 +100,19 @@ score(S) = relation_weight * relation(S) - redundancy(S)
 
 堆阶段不施加任务配额，所有剩余片段全局竞争。由于 sequence 项可能使边际增益随集合增长，
 旧堆值不一定是严格上界，因此这是有界近似算法，不保证与全量贪心或旧束搜索结果一致。
+
+`selection.method: random_multibranch` 改用可复现的随机多分支搜索。coverage seed 始终作为
+固定集合；初始化 8 个活动分支，各无放回抽取 10 个片段并记作第 1 轮。以后每个父分支
+生成 4 个各补入 10 个片段的子分支，从 32 个子分支中保留 8 个。关系项始终使用全部
+固定片段和当前分支片段；固定片段超过 100 后，每个初始化、子或重组分支都使用独立
+随机流无放回重抽 100 个固定片段，并与该分支全部活动片段组成相似性惩罚集合。惩罚
+覆盖该诱导集合内的所有相似对，最终目标和逐条增益使用获胜分支的同一惩罚集合。
+
+首次在第 20 轮重组，之后每 10 轮重组：统计活动片段在 8 个分支中的出现次数，从最高
+得分分支内取计数最高的 100 个加入固定集合，再让每个分支从自己的未固定片段中保留
+计数最高的 100 个。计数或分支得分相同时由 `seed` 随机破平局；最后一批不足 10 个时
+只补足预算，达到预算后直接采用最高得分分支。主状态只保存一份，分支仅保存稀疏更新；
+8、4、10、20、10 和两个用途不同的 100 都是固定算法常量，不提供额外配置项。
 
 ## 运行
 
@@ -134,6 +147,12 @@ prototypes:
   tol: 1.0e-4
   num_threads: 4
   use_stop_bucket: true
+
+selection:
+  method: lazy_heap  # 或 random_multibranch
+  ratio: 0.10
+  budget: null
+  max_refreshes: 100  # 仅 lazy_heap 使用
 ```
 
 片段长度固定为 15，候选数量、首尾锚定与近似均匀间隔是 Cocore 固定算法的一部分；
@@ -155,10 +174,11 @@ debug 配置固定为 1。它与 `runtime.num_workers` 相互独立，后者仍�
 `num_threads` 不改变 graph 指纹或产物，因此可复用同一 graph 缓存；改变
 `batch_size`、`max_iter`、`tol` 或 `use_stop_bucket` 会使 graph 缓存失效。
 
-可在运行时覆盖选择比例、关系类型与关系权重：
+可在运行时覆盖选择方法、选择比例、关系类型与关系权重：
 
 ```bash
 python -m cocore run --config cocore/config_libero90.yaml \
+  --selection-method random_multibranch \
   --selection-ratio 0.20 \
   --relation sequence \
   --relation-weight 1.5
@@ -175,7 +195,9 @@ python -m cocore run --config cocore/config_libero90.yaml \
   --force
 ```
 
-上述选择写入 `outputs/cocore/libero90/select-sequence-w1p5-top20pct/`。
+上述选择写入
+`outputs/cocore/libero90/select-sequence-w1p5-top20pct-random-multibranch/`；默认
+`lazy_heap` 仍写入原目录名。
 `--cooccurrence-weight` 已移除；Cocore 也不接受
 RelCore 的 `--reliability-metrics`、`--prototype-method` 或
 `--prototype-gain-metrics` 参数。
@@ -186,16 +208,18 @@ RelCore 的 `--reliability-metrics`、`--prototype-method` 或
 python -m cocore run --config cocore/config_debug.yaml --force
 ```
 
-Cocore 0.14.3 使用 prototype schema 9、10～30 个桶内视觉中心、可选 stop 桶、无标签
+Cocore 0.15.0 使用 prototype schema 9、10～30 个桶内视觉中心、可选 stop 桶、无标签
 候选诱导子图、65,536 窗口的混合 KMeans 阈值、最大间隔 3 的动作训练窗口、裁剪 PCA
 的 128 维聚类空间、近似均匀候选和原始相邻 sequence 图，并按 episode 持久化完整原始
-逐帧 CLIP 特征。0.14.2 及更早版本的 scan、encode、graph 和 selection 缓存不迁移；
+逐帧 CLIP 特征，并提供 lazy heap 与随机多分支两种选择方法。0.14.x 及更早版本的
+scan、encode、graph 和 selection 缓存不迁移；
 升级后必须通过 `--force` 重建全部阶段，或使用新的输出目录。
 
 ## 输出与校验
 
 输出根目录包含 `scan/`、`encode/`、`graph-17-motion-hard-nearest-pca/` 和一个或多个
-`select-<关系>-w<权重>-top<比例>pct/`。选择目录包含：
+`select-<关系>-w<权重>-top<比例>pct/`；随机多分支方法追加
+`-random-multibranch`。选择目录包含：
 
 - scan 目录中的 `episodes.parquet` 与 `clips.parquet`：episode 元数据和可重放的
   近似均匀候选；Cocore scan 不再生成未被后续阶段消费的 `normalization.npz`；
@@ -215,22 +239,26 @@ Cocore 0.14.3 使用 prototype schema 9、10～30 个桶内视觉中心、可选
 - `selected_manifest.jsonl`：训练入口可直接消费的片段清单；
 - `all_clips.parquet`：eligible 筛选池的 support、progress、reliability、运动原语与选择
   诊断，不包含无标签候选；
-- `selection_report.json`：coverage、目标分解、任务计数、堆刷新统计，以及 scanned、
+- `selection_report.json`：coverage、目标分解、任务计数、lazy heap 刷新统计或
+  `branch_search` 轮次/评估/重组统计及最终相似性惩罚 sample IDs，以及 scanned、
   eligible、excluded-unlabeled 候选数量；
 - `manifest.json`、`run_manifest.json`：Cocore 参数、阶段目录与指纹；
 - `resolved_config.yaml`、`environment.json`：`run` 的完整配置与环境。
 
-使用以下命令独立重算 coverage、逐步边际增益、目标、预算、唯一性、堆统计和清单一致性：
+使用以下命令独立重算 coverage、逐步边际增益、目标、预算、唯一性、方法统计和清单一致性：
 
 ```bash
 python -m cocore validate \
   --output-dir outputs/cocore/libero90/select-cooccurrence-w1-top10pct \
   --config cocore/config_libero90.yaml \
+  --selection-method lazy_heap \
   --no-use-stop-bucket
 ```
 
 只有生成结果时关闭了 stop 桶，验证时才应传入该开关。若省略 `--config`，CLI 会从
-选择目录的 `resolved_config.yaml` 读取重放配置；复用 0.14.0 或其他 stop 设置不同的
+选择目录的 `resolved_config.yaml` 读取重放配置；验证随机多分支结果时必须使用生成时
+相同的方法和 seed，校验器会重放每个分支的相似性抽样并核对最终惩罚集合。复用
+0.14.x 或其他 stop 设置不同的
 输出目录时，应使用 `--force` 重建全部不兼容阶段。
 
 校验还会从 episode 元数据重放近似均匀候选，逐字段核对 `clips.parquet`，逐个检查

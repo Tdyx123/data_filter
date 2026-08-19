@@ -54,6 +54,7 @@ objective:
   relation_weight: 1.0
 
 selection:
+  method: lazy_heap
   ratio: 0.10
   budget: null
   max_refreshes: 100

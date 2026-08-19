@@ -1,0 +1,399 @@
+"""Seeded random multi-branch selection with periodic recombination."""
+
+from __future__ import annotations
+
+import math
+from collections import Counter
+from dataclasses import dataclass
+
+import numpy as np
+
+from .objective import CocoreObjectiveContext, CocoreObjectiveUpdateState
+
+
+BRANCH_COUNT = 8
+CHILDREN_PER_BRANCH = 4
+BATCH_SIZE = 10
+FIRST_RECOMBINATION_ROUND = 20
+RECOMBINATION_INTERVAL = 10
+COMMIT_SIZE = 100
+RETAINED_SIZE = 100
+SIMILARITY_MAIN_SAMPLE_SIZE = 100
+SIMILARITY_RNG_STREAM = 1
+
+
+@dataclass(frozen=True)
+class RandomMultiBranchSelectionResult:
+    selected_indices: tuple[int, ...]
+    score_deltas: tuple[float, ...]
+    selection_phases: tuple[str, ...]
+    selection_steps: tuple[int, ...]
+    heap_refreshes: tuple[None, ...]
+    similarity_penalty_indices: tuple[int, ...]
+    objective_value: float
+    relation: float
+    redundancy: float
+    rounds: int
+    evaluated_branches: int
+    recombinations: int
+    committed_clips: int
+    final_active_clips: int
+
+
+@dataclass(frozen=True)
+class _Branch:
+    update_state: CocoreObjectiveUpdateState
+    serial: int
+
+    @property
+    def active_indices(self) -> tuple[int, ...]:
+        return self.update_state.selected_indices
+
+
+class RandomMultiBranchSelector:
+    """Search sparse branch updates over one shared main objective state."""
+
+    def __init__(self, context: CocoreObjectiveContext, *, seed: int = 42) -> None:
+        self.context = context
+        self.seed = int(seed)
+
+    @staticmethod
+    def _finite_score(state: CocoreObjectiveUpdateState) -> float:
+        score = float(state.score)
+        if not math.isfinite(score):
+            raise ValueError("random multibranch produced a non-finite branch score")
+        return score
+
+    def _sample(
+        self,
+        rng: np.random.Generator,
+        *,
+        fixed: set[int],
+        active: tuple[int, ...],
+        size: int,
+    ) -> tuple[int, ...]:
+        candidate_count = len(self.context.graph.sample_ids)
+        active_set = set(active)
+        available_count = candidate_count - len(fixed) - len(active_set)
+        if size > available_count:
+            raise ValueError("not enough unselected candidates to fill a branch batch")
+        if size == 0:
+            return ()
+        if available_count <= 1_024 or available_count * 4 < candidate_count:
+            available = [
+                index
+                for index in range(candidate_count)
+                if index not in fixed and index not in active_set
+            ]
+            chosen = rng.choice(
+                np.asarray(available, dtype=np.int64), size=size, replace=False
+            )
+            return tuple(int(index) for index in chosen.tolist())
+
+        chosen: list[int] = []
+        chosen_set: set[int] = set()
+        while len(chosen) < size:
+            draw_count = max(16, 2 * (size - len(chosen)))
+            draws = rng.integers(0, candidate_count, size=draw_count)
+            for raw_index in draws:
+                index = int(raw_index)
+                if (
+                    index in fixed
+                    or index in active_set
+                    or index in chosen_set
+                ):
+                    continue
+                chosen.append(index)
+                chosen_set.add(index)
+                if len(chosen) == size:
+                    break
+        return tuple(chosen)
+
+    def _extend_update_state(
+        self,
+        update_state: CocoreObjectiveUpdateState,
+        indices: tuple[int, ...],
+        *,
+        similarity_main_indices: tuple[int, ...],
+    ) -> CocoreObjectiveUpdateState:
+        extended = self.context.extend_update_state(
+            update_state,
+            indices,
+            similarity_main_indices=similarity_main_indices,
+        )
+        self._finite_score(extended)
+        return extended
+
+    @staticmethod
+    def _sample_similarity_main(
+        rng: np.random.Generator,
+        fixed: tuple[int, ...] | list[int],
+    ) -> tuple[int, ...]:
+        if len(fixed) <= SIMILARITY_MAIN_SAMPLE_SIZE:
+            return tuple(fixed)
+        sampled = rng.choice(
+            np.asarray(fixed, dtype=np.int64),
+            size=SIMILARITY_MAIN_SAMPLE_SIZE,
+            replace=False,
+        )
+        return tuple(int(index) for index in sampled.tolist())
+
+    def _rank_branches(
+        self,
+        branches: list[_Branch],
+        rng: np.random.Generator,
+        *,
+        limit: int,
+    ) -> list[_Branch]:
+        tie_breakers = {branch.serial: float(rng.random()) for branch in branches}
+        return sorted(
+            branches,
+            key=lambda branch: (
+                -self._finite_score(branch.update_state),
+                tie_breakers[branch.serial],
+                branch.serial,
+            ),
+        )[:limit]
+
+    def _rank_indices(
+        self,
+        indices: tuple[int, ...] | list[int],
+        counts: Counter[int],
+        rng: np.random.Generator,
+        *,
+        limit: int,
+    ) -> tuple[int, ...]:
+        tie_breakers = {index: float(rng.random()) for index in indices}
+        ranked = sorted(
+            indices,
+            key=lambda index: (
+                -counts[index],
+                tie_breakers[index],
+                self.context.graph.sample_ids[index],
+            ),
+        )
+        return tuple(ranked[:limit])
+
+    @staticmethod
+    def _is_recombination_round(round_number: int) -> bool:
+        return round_number >= FIRST_RECOMBINATION_ROUND and (
+            round_number - FIRST_RECOMBINATION_ROUND
+        ) % RECOMBINATION_INTERVAL == 0
+
+    def _result(
+        self,
+        selected: list[int],
+        phases: list[str],
+        steps: list[int],
+        similarity_penalty_indices: tuple[int, ...],
+        *,
+        rounds: int,
+        evaluated_branches: int,
+        recombinations: int,
+        committed_clips: int,
+        final_active_clips: int,
+    ) -> RandomMultiBranchSelectionResult:
+        penalty_set = set(similarity_penalty_indices)
+        if len(penalty_set) != len(similarity_penalty_indices):
+            raise ValueError("similarity penalty indices cannot contain duplicates")
+        if not penalty_set.issubset(selected):
+            raise ValueError("similarity penalty indices must belong to the selection")
+        state = self.context.empty_state()
+        penalty_selected: set[int] = set()
+        gains: list[float] = []
+        for index in selected:
+            previous_relation = float(state.relation)
+            self.context.add_candidate(state, index)
+            relation_delta = float(state.relation) - previous_relation
+            redundancy_delta = 0.0
+            if index in penalty_set:
+                redundancy_delta = (
+                    sum(
+                        penalty
+                        for other, penalty in self.context.redundancy_adjacency[index]
+                        if other in penalty_selected
+                    )
+                    / self.context.redundancy_normalizer
+                )
+                penalty_selected.add(index)
+            gain = self.context.relation_weight * relation_delta - redundancy_delta
+            if not math.isfinite(gain):
+                raise ValueError(f"candidate {index} has a non-finite marginal gain")
+            gains.append(float(gain))
+        redundancy = self.context.redundancy_from_indices(similarity_penalty_indices)
+        score = self.context.relation_weight * float(state.relation) - redundancy
+        return RandomMultiBranchSelectionResult(
+            selected_indices=tuple(selected),
+            score_deltas=tuple(gains),
+            selection_phases=tuple(phases),
+            selection_steps=tuple(steps),
+            heap_refreshes=(None,) * len(selected),
+            similarity_penalty_indices=similarity_penalty_indices,
+            objective_value=float(score),
+            relation=float(state.relation),
+            redundancy=float(redundancy),
+            rounds=rounds,
+            evaluated_branches=evaluated_branches,
+            recombinations=recombinations,
+            committed_clips=committed_clips,
+            final_active_clips=final_active_clips,
+        )
+
+    def select(
+        self,
+        budget: int,
+        *,
+        initial_indices: list[int] | tuple[int, ...],
+    ) -> RandomMultiBranchSelectionResult:
+        candidate_count = len(self.context.graph.sample_ids)
+        initial = tuple(int(index) for index in initial_indices)
+        if len(initial) != len(set(initial)):
+            raise ValueError("initial_indices cannot contain duplicates")
+        if any(index < 0 or index >= candidate_count for index in initial):
+            raise ValueError("initial_indices must contain in-range values")
+        if not 0 < len(initial) <= budget <= candidate_count:
+            raise ValueError("budget must contain a non-empty initial selection")
+
+        fixed = list(initial)
+        fixed_set = set(initial)
+        phases = ["coverage_seed"] * len(initial)
+        steps = [0] * len(initial)
+        rng = np.random.default_rng(self.seed)
+        similarity_rng = np.random.default_rng(
+            np.random.SeedSequence([self.seed, SIMILARITY_RNG_STREAM])
+        )
+        if len(fixed) == budget:
+            similarity_main = self._sample_similarity_main(similarity_rng, fixed)
+            return self._result(
+                fixed,
+                phases,
+                steps,
+                similarity_main,
+                rounds=0,
+                evaluated_branches=0,
+                recombinations=0,
+                committed_clips=0,
+                final_active_clips=0,
+            )
+
+        main_state = self.context.state_from_indices(fixed)
+        root_update = self.context.empty_update_state(main_state)
+        initial_batch_size = min(BATCH_SIZE, budget - len(fixed))
+        branches: list[_Branch] = []
+        next_serial = 0
+        for _ in range(BRANCH_COUNT):
+            active = self._sample(
+                rng,
+                fixed=fixed_set,
+                active=(),
+                size=initial_batch_size,
+            )
+            similarity_main = self._sample_similarity_main(similarity_rng, fixed)
+            update_state = self._extend_update_state(
+                root_update,
+                active,
+                similarity_main_indices=similarity_main,
+            )
+            branches.append(_Branch(update_state, next_serial))
+            next_serial += 1
+
+        rounds = 1
+        evaluated_branches = BRANCH_COUNT
+        recombinations = 0
+        committed_clips = 0
+
+        while True:
+            active_size = len(branches[0].active_indices)
+            if len(fixed) + active_size == budget:
+                winner = self._rank_branches(branches, rng, limit=1)[0]
+                selected = fixed + list(winner.active_indices)
+                similarity_penalty = (
+                    winner.update_state.similarity_main_indices + winner.active_indices
+                )
+                return self._result(
+                    selected,
+                    phases + ["branch_final"] * active_size,
+                    steps + [rounds] * active_size,
+                    similarity_penalty,
+                    rounds=rounds,
+                    evaluated_branches=evaluated_branches,
+                    recombinations=recombinations,
+                    committed_clips=committed_clips,
+                    final_active_clips=active_size,
+                )
+
+            batch_size = min(BATCH_SIZE, budget - len(fixed) - active_size)
+            children: list[_Branch] = []
+            for branch in branches:
+                for _ in range(CHILDREN_PER_BRANCH):
+                    added = self._sample(
+                        rng,
+                        fixed=fixed_set,
+                        active=branch.active_indices,
+                        size=batch_size,
+                    )
+                    similarity_main = self._sample_similarity_main(
+                        similarity_rng,
+                        fixed,
+                    )
+                    update_state = self._extend_update_state(
+                        branch.update_state,
+                        added,
+                        similarity_main_indices=similarity_main,
+                    )
+                    children.append(_Branch(update_state, next_serial))
+                    next_serial += 1
+            rounds += 1
+            evaluated_branches += len(children)
+            branches = self._rank_branches(children, rng, limit=BRANCH_COUNT)
+
+            active_size = len(branches[0].active_indices)
+            if len(fixed) + active_size == budget:
+                continue
+            if not self._is_recombination_round(rounds):
+                continue
+
+            counts = Counter(
+                index for branch in branches for index in branch.active_indices
+            )
+            winner = branches[0]
+            committed = self._rank_indices(
+                winner.active_indices,
+                counts,
+                rng,
+                limit=COMMIT_SIZE,
+            )
+            fixed.extend(committed)
+            fixed_set.update(committed)
+            phases.extend(["branch_commit"] * len(committed))
+            steps.extend([rounds] * len(committed))
+            committed_clips += len(committed)
+            recombinations += 1
+
+            main_state = self.context.state_from_indices(fixed)
+            root_update = self.context.empty_update_state(main_state)
+            recombined: list[_Branch] = []
+            for branch in branches:
+                remaining = [
+                    index for index in branch.active_indices if index not in fixed_set
+                ]
+                retained = self._rank_indices(
+                    remaining,
+                    counts,
+                    rng,
+                    limit=RETAINED_SIZE,
+                )
+                if len(retained) != RETAINED_SIZE:
+                    raise ValueError("recombination could not retain 100 active clips")
+                similarity_main = self._sample_similarity_main(
+                    similarity_rng,
+                    fixed,
+                )
+                update_state = self._extend_update_state(
+                    root_update,
+                    retained,
+                    similarity_main_indices=similarity_main,
+                )
+                recombined.append(_Branch(update_state, next_serial))
+                next_serial += 1
+            branches = recombined

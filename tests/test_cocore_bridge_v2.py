@@ -213,7 +213,7 @@ def test_package_exposes_only_version() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["0.5.3", "['__version__']"]
+    assert result.stdout.splitlines() == ["0.6.0", "['__version__']"]
 
 
 def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None:
@@ -268,6 +268,7 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
     assert config["objective"] == {"relation": "sequence", "relation_weight": 1.5}
     assert config["selection"]["ratio"] == 0.2
     assert config["selection"]["budget"] is None
+    assert config["selection"]["method"] == "lazy_heap"
     assert config["runtime"]["max_episodes"] == 100
     assert config["output"]["directory"] == ("outputs/cocore_bridge_v2/bridge_orig_1.0.0")
     translated = to_relcore_config(config)
@@ -275,6 +276,19 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
     assert "tol" not in translated["prototypes"]
     assert translated["selection"]["quota_mode"] == "none"
     assert translated["selection"]["minimum_per_task"] == 0
+
+
+def test_bridge_config_accepts_random_multibranch_selection(tmp_path: Path) -> None:
+    from cocore_bridge_v2.config import build_config
+
+    config = build_config(
+        relation="sequence",
+        relation_weight=1.0,
+        selection_method="random_multibranch",
+        dataset_path=tmp_path / "bridge",
+    )
+
+    assert config["selection"]["method"] == "random_multibranch"
 
 
 def test_bridge_config_can_disable_stop_bucket(tmp_path: Path) -> None:
@@ -444,6 +458,28 @@ def test_every_command_accepts_explicit_relation_and_weight(command: str) -> Non
     assert parsed.max_episodes == 7
     if command in {"select", "run", "validate"}:
         assert parsed.selection_ratio == 0.10
+        assert parsed.selection_method == "lazy_heap"
+
+
+@pytest.mark.parametrize("command", ["select", "run", "validate"])
+def test_bridge_selection_commands_accept_random_multibranch_method(command: str) -> None:
+    from cocore_bridge_v2 import cli
+
+    arguments = [
+        command,
+        "--relation",
+        "sequence",
+        "--relation-weight",
+        "1",
+        "--selection-method",
+        "random_multibranch",
+    ]
+    if command == "validate":
+        arguments += ["--output-dir", "result"]
+
+    parsed = cli.build_parser().parse_args(arguments)
+
+    assert parsed.selection_method == "random_multibranch"
 
 
 @pytest.mark.parametrize("command", ["build-graph", "select", "run", "validate"])
@@ -771,7 +807,7 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     config["quality"]["knn"] = 2
     config["graph"]["knn"] = 2
     config["prototypes"]["max_iter"] = 2
-    config["selection"]["budget"] = 6
+    config["selection"]["budget"] = 10
 
     result = run_pipeline(config, output_dir=output, visual_encoder=DummyVisualEncoder())
 
@@ -796,17 +832,17 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     selected = [
         json.loads(line) for line in (result / "selected_manifest.jsonl").read_text().splitlines()
     ]
-    assert len(selected) == 6
+    assert len(selected) == 10
     select_manifest = json.loads((result / "manifest.json").read_text())
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert select_manifest["producer"] == "cocore"
-    assert select_manifest["cocore_version"] == "0.14.3"
+    assert select_manifest["cocore_version"] == "0.15.0"
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.14.3"
+    assert run_manifest["cocore_version"] == "0.15.0"
     assert run_manifest["stage_directories"]["graph"] == "graph-17-motion-hard-nearest-pca"
     assert validate_output(result, config=config) == {
         "status": "valid",
-        "selected_clips": 6,
+        "selected_clips": 10,
     }
 
 

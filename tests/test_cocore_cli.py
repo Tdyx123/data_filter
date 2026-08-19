@@ -15,7 +15,7 @@ def _objective(relation: str = "cooccurrence", weight: float = 1.0) -> dict[str,
 
 
 def test_package_version_matches_optional_stop_release() -> None:
-    assert cocore.__version__ == "0.14.3"
+    assert cocore.__version__ == "0.15.0"
 
 
 def test_config_requires_explicit_relation_and_weight() -> None:
@@ -48,7 +48,21 @@ def test_config_accepts_supported_relations(relation: str) -> None:
     assert resolved["prototypes"]["use_stop_bucket"] is True
     assert resolved["reliability_metrics"] == ["support", "progress"]
     assert resolved["objective"] == {"relation": relation, "relation_weight": 1.0}
+    assert resolved["selection"]["method"] == "lazy_heap"
     assert resolved["selection"]["max_refreshes"] == 100
+
+
+def test_config_accepts_random_multibranch_selection_method() -> None:
+    resolved = resolve_config(
+        {**_objective(), "selection": {"method": "random_multibranch"}}
+    )
+
+    assert resolved["selection"]["method"] == "random_multibranch"
+
+
+def test_config_rejects_unknown_selection_method() -> None:
+    with pytest.raises(ValueError, match="selection.method"):
+        resolve_config({**_objective(), "selection": {"method": "beam"}})
 
 
 @pytest.mark.parametrize("weight", [-1.0, float("nan"), float("inf")])
@@ -233,6 +247,20 @@ def test_selection_directory_encodes_relation_weight_and_ratio() -> None:
     assert (
         selection_directory_name("cooccurrence", 0.0, 0.125) == "select-cooccurrence-w0-top12p5pct"
     )
+    assert selection_directory_name(
+        "sequence", 1.0, 0.1, "random_multibranch"
+    ) == "select-sequence-w1-top10pct-random-multibranch"
+
+
+@pytest.mark.parametrize("command", ["select", "run", "validate"])
+def test_selection_commands_accept_random_multibranch_method(command: str) -> None:
+    arguments = [command, "--selection-method", "random_multibranch"]
+    if command == "validate":
+        arguments += ["--output-dir", "result"]
+
+    parsed = cli.build_parser().parse_args(arguments)
+
+    assert parsed.selection_method == "random_multibranch"
 
 
 def test_run_cli_accepts_relation_weight_and_ratio_but_rejects_old_weight() -> None:

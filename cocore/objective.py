@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -20,6 +21,23 @@ class CocoreObjectiveState:
     relation: float = 0.0
     redundancy: float = 0.0
     score: float = 0.0
+
+
+@dataclass(frozen=True)
+class CocoreObjectiveUpdateState:
+    """Sparse branch-local changes relative to one shared main state."""
+
+    main_state: CocoreObjectiveState
+    selected_indices: tuple[int, ...]
+    similarity_main_indices: tuple[int, ...]
+    prototype_override_indices: np.ndarray
+    prototype_override_values: np.ndarray
+    sequence_override_flat_indices: np.ndarray
+    sequence_override_values: np.ndarray
+    task_count_deltas: np.ndarray
+    relation: float
+    redundancy: float
+    score: float
 
 
 class CocoreObjectiveContext:
@@ -93,6 +111,122 @@ class CocoreObjectiveContext:
             prototype_coverage=state.prototype_coverage.copy(),
             sequence_relation_counts=state.sequence_relation_counts.copy(),
             task_counts=state.task_counts.copy(),
+            relation=float(state.relation),
+            redundancy=float(state.redundancy),
+            score=float(state.score),
+        )
+
+    def empty_update_state(
+        self,
+        main_state: CocoreObjectiveState,
+    ) -> CocoreObjectiveUpdateState:
+        return CocoreObjectiveUpdateState(
+            main_state=main_state,
+            selected_indices=(),
+            similarity_main_indices=(),
+            prototype_override_indices=np.empty(0, dtype=np.int64),
+            prototype_override_values=np.empty(0, dtype=np.float64),
+            sequence_override_flat_indices=np.empty(0, dtype=np.int64),
+            sequence_override_values=np.empty(0, dtype=np.float64),
+            task_count_deltas=np.zeros_like(main_state.task_counts),
+            relation=float(main_state.relation),
+            redundancy=float(main_state.redundancy),
+            score=float(main_state.score),
+        )
+
+    def materialize_update_state(
+        self,
+        update_state: CocoreObjectiveUpdateState,
+    ) -> CocoreObjectiveState:
+        main = update_state.main_state
+        selected_mask = main.selected_mask.copy()
+        if update_state.selected_indices:
+            selected_mask[np.asarray(update_state.selected_indices, dtype=np.int64)] = True
+        prototype_coverage = main.prototype_coverage.copy()
+        prototype_coverage[update_state.prototype_override_indices] = (
+            update_state.prototype_override_values
+        )
+        sequence_relation_counts = main.sequence_relation_counts.copy()
+        sequence_relation_counts.ravel()[update_state.sequence_override_flat_indices] = (
+            update_state.sequence_override_values
+        )
+        return CocoreObjectiveState(
+            selected_mask=selected_mask,
+            prototype_coverage=prototype_coverage,
+            sequence_relation_counts=sequence_relation_counts,
+            task_counts=main.task_counts + update_state.task_count_deltas,
+            relation=float(update_state.relation),
+            redundancy=float(update_state.redundancy),
+            score=float(update_state.score),
+        )
+
+    def redundancy_from_indices(self, indices: Sequence[int]) -> float:
+        normalized = tuple(int(index) for index in indices)
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("similarity penalty indices cannot contain duplicates")
+        candidate_count = len(self.graph.sample_ids)
+        if any(index < 0 or index >= candidate_count for index in normalized):
+            raise ValueError("similarity penalty indices must contain in-range values")
+        selected: set[int] = set()
+        redundancy = 0.0
+        for index in normalized:
+            redundancy_delta = (
+                sum(
+                    penalty
+                    for other, penalty in self.redundancy_adjacency[index]
+                    if other in selected
+                )
+                / self.redundancy_normalizer
+            )
+            redundancy += redundancy_delta
+            selected.add(index)
+        return float(redundancy)
+
+    def extend_update_state(
+        self,
+        update_state: CocoreObjectiveUpdateState,
+        indices: Sequence[int],
+        *,
+        similarity_main_indices: Sequence[int],
+    ) -> CocoreObjectiveUpdateState:
+        main = update_state.main_state
+        sample = tuple(int(index) for index in similarity_main_indices)
+        if len(sample) != len(set(sample)):
+            raise ValueError("similarity main indices cannot contain duplicates")
+        if any(
+            index < 0
+            or index >= len(self.graph.sample_ids)
+            or not main.selected_mask[index]
+            for index in sample
+        ):
+            raise ValueError("similarity main indices must belong to the main state")
+
+        added = tuple(int(index) for index in indices)
+        state = self.materialize_update_state(update_state)
+        for index in added:
+            self.add_candidate(state, index)
+        selected_indices = update_state.selected_indices + added
+        state.redundancy = self.redundancy_from_indices(sample + selected_indices)
+        state.score = self.relation_weight * state.relation - state.redundancy
+
+        prototype_indices = np.flatnonzero(
+            state.prototype_coverage != main.prototype_coverage
+        ).astype(np.int64, copy=False)
+        sequence_flat = state.sequence_relation_counts.ravel()
+        main_sequence_flat = main.sequence_relation_counts.ravel()
+        sequence_indices = np.flatnonzero(sequence_flat != main_sequence_flat).astype(
+            np.int64,
+            copy=False,
+        )
+        return CocoreObjectiveUpdateState(
+            main_state=main,
+            selected_indices=selected_indices,
+            similarity_main_indices=sample,
+            prototype_override_indices=prototype_indices,
+            prototype_override_values=state.prototype_coverage[prototype_indices].copy(),
+            sequence_override_flat_indices=sequence_indices,
+            sequence_override_values=sequence_flat[sequence_indices].copy(),
+            task_count_deltas=(state.task_counts - main.task_counts).copy(),
             relation=float(state.relation),
             redundancy=float(state.redundancy),
             score=float(state.score),

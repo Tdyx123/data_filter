@@ -393,7 +393,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     for directory in ("scan", "encode", "graph-17-motion-hard-nearest-pca"):
         manifest = json.loads((root / directory / "manifest.json").read_text())
         assert manifest["producer"] == "cocore"
-        assert manifest["cocore_version"] == "0.14.3"
+        assert manifest["cocore_version"] == "0.15.0"
     scan_manifest = json.loads((root / "scan" / "manifest.json").read_text())
     assert scan_manifest["window_policy"] == "near_uniform_full_coverage"
     assert scan_manifest["clip_length"] == 15
@@ -527,7 +527,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     }
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.14.3"
+    assert run_manifest["cocore_version"] == "0.15.0"
     assert run_manifest["relation_type"] == relation
     assert run_manifest["relation_weight"] == 1.0
     assert run_manifest["prototype_schema_version"] == 9
@@ -541,7 +541,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert run_manifest["window_policy"] == "near_uniform_full_coverage"
     assert run_manifest["sequence_adjacency"] == "ordered_candidates"
     select_manifest = json.loads((result / "manifest.json").read_text())
-    assert select_manifest["cocore_version"] == "0.14.3"
+    assert select_manifest["cocore_version"] == "0.15.0"
     assert select_manifest["relation_type"] == relation
     assert select_manifest["relation_weight"] == 1.0
     assert select_manifest["prototype_schema_version"] == 9
@@ -559,7 +559,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     (result / "manifest.json").write_text(json.dumps(select_manifest))
     with pytest.raises(ValueError, match="selection manifest Cocore version"):
         validate_output(result, config=config)
-    select_manifest["cocore_version"] = "0.14.3"
+    select_manifest["cocore_version"] = "0.15.0"
     (result / "manifest.json").write_text(json.dumps(select_manifest))
 
     report["relation_type"] = "sequence" if relation == "cooccurrence" else "cooccurrence"
@@ -571,6 +571,81 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     report["heap"]["total_refreshes"] += 1
     (result / "selection_report.json").write_text(json.dumps(report))
     with pytest.raises(ValueError, match="heap total refreshes"):
+        validate_output(result, config=config)
+
+
+def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
+    tmp_path: Path,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path, "sequence")
+    config["selection"]["method"] = "random_multibranch"
+    root = tmp_path / "random-multibranch-output"
+
+    result = run_pipeline(config, output_dir=root, visual_encoder=CocoreVisualEncoder())
+
+    assert result == root / "select-sequence-w1-top50pct-random-multibranch"
+    selected = [
+        json.loads(line)
+        for line in (result / "selected_manifest.jsonl").read_text().splitlines()
+    ]
+    report = json.loads((result / "selection_report.json").read_text())
+    algorithm = {
+        "type": "random_multibranch",
+        "branches": 8,
+        "children_per_branch": 4,
+        "batch_size": 10,
+        "first_recombination_round": 20,
+        "recombination_interval": 10,
+        "commit_size": 100,
+        "retained_size": 100,
+        "seed": 7,
+        "similarity_penalty": {
+            "main_sample_size": 100,
+            "sampling": "per_new_branch_without_replacement",
+            "rng": "seed_sequence_stream_1",
+            "scope": "sampled_main_plus_all_active",
+            "pairs": "all_induced_pairs",
+            "final_objective": "winner_sample",
+        },
+    }
+    assert report["algorithm"] == algorithm
+    assert "heap" not in report
+    assert report["branch_search"] == {
+        "rounds": 1,
+        "evaluated_branches": 8,
+        "recombinations": 0,
+        "committed_clips": 0,
+        "final_active_clips": len(selected) - report["initial_set_size"],
+        "final_similarity_penalty_sample_ids": [
+            row["sample_id"] for row in selected
+        ],
+    }
+    assert {row["selection_phase"] for row in selected} == {
+        "coverage_seed",
+        "branch_final",
+    }
+    assert all(row["heap_refreshes"] is None for row in selected)
+    assert json.loads((result / "manifest.json").read_text())["algorithm"] == algorithm
+    assert json.loads((result / "run_manifest.json").read_text())["algorithm"] == algorithm
+    assert validate_output(result, config=config) == {
+        "status": "valid",
+        "selected_clips": 10,
+    }
+
+    report["branch_search"]["final_similarity_penalty_sample_ids"] = report[
+        "branch_search"
+    ]["final_similarity_penalty_sample_ids"][:-1]
+    (result / "selection_report.json").write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="branch search"):
+        validate_output(result, config=config)
+
+    report["branch_search"]["final_similarity_penalty_sample_ids"] = [
+        row["sample_id"] for row in selected
+    ]
+    report["branch_search"]["rounds"] += 1
+    (result / "selection_report.json").write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="branch search"):
         validate_output(result, config=config)
 
 

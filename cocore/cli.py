@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 from typing import Sequence
 
-from .config import load_config
+from .config import SELECTION_METHODS, load_config
 from .pipeline import (
     GRAPH_DIRECTORY,
     encode_stage,
@@ -46,12 +46,14 @@ def build_parser() -> argparse.ArgumentParser:
         if command in {"build-graph", "select", "run"}:
             child.add_argument("--no-use-stop-bucket", action="store_true")
         if command in {"select", "run"}:
+            child.add_argument("--selection-method", choices=SELECTION_METHODS, default=None)
             child.add_argument("--selection-ratio", type=_selection_ratio, default=None)
             child.add_argument("--relation", choices=("sequence", "cooccurrence"), default=None)
             child.add_argument("--relation-weight", type=_relation_weight, default=None)
     validate = subparsers.add_parser("validate")
     validate.add_argument("--output-dir", required=True)
     validate.add_argument("--config", default=None)
+    validate.add_argument("--selection-method", choices=SELECTION_METHODS, default=None)
     validate.add_argument("--no-use-stop-bucket", action="store_true")
     return parser
 
@@ -60,9 +62,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "validate":
         config_path = args.config
-        if config_path is None and args.no_use_stop_bucket:
+        if config_path is None and (args.no_use_stop_bucket or args.selection_method is not None):
             config_path = Path(args.output_dir).expanduser() / "resolved_config.yaml"
         config = load_config(config_path) if config_path is not None else None
+        if args.selection_method is not None:
+            assert config is not None
+            config.setdefault("selection", {})["method"] = args.selection_method
         if args.no_use_stop_bucket:
             config.setdefault("prototypes", {})["use_stop_bucket"] = False
         result = validate_output(args.output_dir, config=config)
@@ -78,6 +83,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise SystemExit("--max-episodes must be positive")
         config.setdefault("runtime", {})["max_episodes"] = args.max_episodes
     if args.command in {"select", "run"}:
+        if args.selection_method is not None:
+            config.setdefault("selection", {})["method"] = args.selection_method
         if args.selection_ratio is not None:
             config.setdefault("selection", {})["ratio"] = args.selection_ratio
             config["selection"]["budget"] = None

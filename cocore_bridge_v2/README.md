@@ -1,7 +1,7 @@
 # Cocore BridgeV2
 
 `cocore_bridge_v2` 是仓库内的 BridgeData V2 专用 Cocore 命令包。它不复制
-Cocore 的编码、运动原语、关系目标或惰性最大堆算法，而是固定 Bridge 数据契约后
+Cocore 的编码、运动原语、关系目标或选择算法，而是固定 Bridge 数据契约后
 调用现有 `cocore.pipeline`。输出仍是 Cocore artifact，可直接交给现有训练入口和
 `cocore` 校验器消费。
 
@@ -53,6 +53,7 @@ python -m cocore_bridge_v2 build-graph \
 
 python -m cocore_bridge_v2 select \
   --relation sequence --relation-weight 1.0 \
+  --selection-method random_multibranch \
   --selection-ratio 0.10
 
 python -m cocore_bridge_v2 run \
@@ -63,6 +64,7 @@ python -m cocore_bridge_v2 run \
 ```
 
 关系可选择 `sequence` 或 `cooccurrence`。`select`、`run` 和 `validate` 的
+`--selection-method` 可选 `lazy_heap`（默认）或 `random_multibranch`，
 `--selection-ratio` 默认是 `0.10`。执行阶段还支持：
 
 - `--dataset-path PATH`：覆盖默认挂载点，但目标必须满足同一 Bridge schema；
@@ -83,7 +85,8 @@ outputs/cocore_bridge_v2/bridge_orig_1.0.0
 ```
 
 其中包含 `scan/`、`encode/`、`graph-17-motion-hard-nearest-pca/` 和
-`select-<relation>-w<weight>-top<ratio>pct/`。选择目录继续提供
+`select-<relation>-w<weight>-top<ratio>pct/`；随机多分支结果追加
+`-random-multibranch`。选择目录继续提供
 `selected_manifest.jsonl`、`all_clips.parquet`、`selection_report.json`、
 `manifest.json` 和 `run_manifest.json`；encode 目录提供 Quality 融合
 `embeddings.npy`、`visual_pca.npz`、`numeric_normalizers.npz`、按 episode 分片的
@@ -94,14 +97,14 @@ graph 目录提供 schema 9 的 `prototype_catalog.json`、128 维
 校验用 `half_action_labels.npy`。聚类复用 Encode 的
 PCA components 前半列进行逐帧纯矩阵投影，不使用 mean/scale。选择输出包含最终
 原型标签、动作标签、绝对置信度和 `half_action_labels`，不包含旧的 action/distance
-分解权重。manifest 的生产者仍为 `cocore`；Cocore 版本为 0.14.3，Bridge 包版本为
-0.5.3。
+分解权重。manifest 的生产者仍为 `cocore`；Cocore 版本为 0.15.0，Bridge 包版本为
+0.6.0。
 
 视觉中心训练只物化一次保留窗口投影；小桶并行执行完整 KMeans，大桶串行执行
 MiniBatchKMeans。Bridge V2 完整生产数据的基础额外内存约为 273 MiB（保留窗口数 ×
 128 × 4 字节），不使用 memmap 或磁盘 fallback。
 
-0.14.2 及更早的 Cocore 缓存不迁移。升级后必须重新构建 scan、encode、graph 和
+0.14.x 及更早的 Cocore 缓存不迁移。升级后必须重新构建 scan、encode、graph 和
 selection；建议使用新的输出目录，或在确认目标后使用 `--force`。
 
 验证时必须重复传入生成该选择结果时使用的目标、比例、数据集路径以及
@@ -116,12 +119,13 @@ python -m cocore_bridge_v2 validate \
     outputs/cocore_bridge_v2/bridge_orig_1.0.0/select-sequence-w1-top10pct \
   --dataset-path /data/dwb/datasets/bridge_orig_1.0.0_lerobo \
   --relation sequence --relation-weight 1.0 \
+  --selection-method lazy_heap \
   --selection-ratio 0.10 \
   --max-episodes 100 \
   --no-use-stop-bucket
 ```
 
-只有生成结果时传入了 `--no-use-stop-bucket`，验证时才重复传入。升级自 0.14.2 / 0.5.2
+只有生成结果时传入了 `--no-use-stop-bucket`，验证时才重复传入。升级自 0.14.x / 0.5.x
 或切换 stop 设置并复用同一输出根目录时，应使用 `--force` 重建全部不兼容阶段。
 
 ## 运行基线

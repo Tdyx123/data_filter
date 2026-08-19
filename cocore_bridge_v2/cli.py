@@ -17,8 +17,14 @@ from cocore.pipeline import (
     select_stage,
     validate_output,
 )
+from cocore.config import SELECTION_METHODS
 
-from .config import DEFAULT_DATASET_PATH, DEFAULT_SELECTION_RATIO, build_config
+from .config import (
+    DEFAULT_DATASET_PATH,
+    DEFAULT_SELECTION_METHOD,
+    DEFAULT_SELECTION_RATIO,
+    build_config,
+)
 from .preflight import validate_bridge_dataset
 
 
@@ -69,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
             child.add_argument("--no-use-stop-bucket", action="store_true")
         if command in {"select", "run"}:
             child.add_argument(
+                "--selection-method",
+                choices=SELECTION_METHODS,
+                default=DEFAULT_SELECTION_METHOD,
+            )
+            child.add_argument(
                 "--selection-ratio",
                 type=_selection_ratio,
                 default=DEFAULT_SELECTION_RATIO,
@@ -83,6 +94,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=_selection_ratio,
         default=DEFAULT_SELECTION_RATIO,
     )
+    validate.add_argument(
+        "--selection-method",
+        choices=SELECTION_METHODS,
+        default=DEFAULT_SELECTION_METHOD,
+    )
     validate.add_argument("--max-episodes", type=_positive_int, default=None)
     validate.add_argument("--no-use-stop-bucket", action="store_true")
     return parser
@@ -91,10 +107,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     selection_ratio = getattr(args, "selection_ratio", DEFAULT_SELECTION_RATIO)
+    selection_method = getattr(args, "selection_method", DEFAULT_SELECTION_METHOD)
     config = build_config(
         relation=args.relation,
         relation_weight=args.relation_weight,
         selection_ratio=selection_ratio,
+        selection_method=selection_method,
         dataset_path=getattr(args, "dataset_path", DEFAULT_DATASET_PATH),
         max_episodes=getattr(args, "max_episodes", None),
         use_stop_bucket=not getattr(args, "no_use_stop_bucket", False),
