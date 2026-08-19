@@ -119,7 +119,6 @@ done
 if ((help_requested == 0)); then
   ((checkpoint_seen)) || fail "--checkpoint is required"
   ((base_model_seen)) || fail "--base-model is required"
-  ((statistics_seen)) || fail "--statistics is required"
 fi
 
 simpler_root="${project_root}/third_party/SimplerEnv"

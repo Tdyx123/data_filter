@@ -15,6 +15,12 @@ from packaging.version import InvalidVersion, Version
 
 from simpler_bridge.evaluation import SimplerEvaluationError
 
+from .checkpoint_contract import (
+    BridgeCheckpointContractError,
+    validate_bridge_checkpoint,
+)
+from .normalization import BridgeV2NormalizationStatistics
+
 
 ACTION_DIM = 7
 ACTION_HORIZON = 8
@@ -58,62 +64,27 @@ def _sha256(path: Path) -> str:
 @dataclass(frozen=True)
 class BridgeNormalizationStatistics:
     path: Path
-    action_mean: np.ndarray
-    action_std: np.ndarray
-    proprio_mean: np.ndarray
-    proprio_std: np.ndarray
+    values: BridgeV2NormalizationStatistics
     sha256: str
 
     def normalize_proprio(self, value: Any) -> np.ndarray:
-        array = np.asarray(value, dtype=np.float32)
-        if array.shape[-1] != PROPRIO_DIM:
-            raise SimplerEvaluationError(
-                f"Expected Bridge proprio[..., {PROPRIO_DIM}], found {array.shape}"
-            )
-        result = (array - self.proprio_mean) / self.proprio_std
-        if not np.all(np.isfinite(result)):
-            raise SimplerEvaluationError("Bridge proprio normalization produced invalid values")
-        return result.astype(np.float32, copy=False)
+        try:
+            return self.values.normalize_state(value)
+        except ValueError as error:
+            raise SimplerEvaluationError(str(error)) from error
 
     def actions_to_bridge(self, value: Any) -> np.ndarray:
-        array = np.asarray(value, dtype=np.float32)
-        if array.shape[-1] != ACTION_DIM:
-            raise SimplerEvaluationError(
-                f"Expected Octo actions[..., {ACTION_DIM}], found {array.shape}"
-            )
-        if not np.all(np.isfinite(array)):
-            raise SimplerEvaluationError("Octo actions contain NaN or infinite values")
-        result = array.copy()
-        result[..., :6] = (
-            result[..., :6] * self.action_std[None, :6]
-            + self.action_mean[None, :6]
-        )
-        if not np.all(np.isfinite(result)):
-            raise SimplerEvaluationError("Bridge action denormalization produced invalid values")
-        return result
+        try:
+            return self.values.denormalize_action(value)
+        except ValueError as error:
+            raise SimplerEvaluationError(str(error)) from error
 
     def as_dict(self) -> dict[str, Any]:
-        return {"path": str(self.path), "sha256": self.sha256}
-
-
-def _statistics_array(
-    value: Mapping[str, Any],
-    *,
-    key: str,
-    statistic: str,
-    dimension: int,
-) -> np.ndarray:
-    try:
-        array = np.asarray(value[key][statistic], dtype=np.float32)
-    except (KeyError, TypeError, ValueError) as error:
-        raise SimplerEvaluationError(
-            f"Bridge statistics require {key}.{statistic} with length {dimension}"
-        ) from error
-    if array.shape != (dimension,) or not np.all(np.isfinite(array)):
-        raise SimplerEvaluationError(
-            f"Bridge statistics require finite {key}.{statistic} with shape ({dimension},)"
-        )
-    return array
+        return {
+            "path": str(self.path),
+            "sha256": self.sha256,
+            "contract": self.values.contract,
+        }
 
 
 def load_bridge_statistics(path: str | Path) -> BridgeNormalizationStatistics:
@@ -121,33 +92,14 @@ def load_bridge_statistics(path: str | Path) -> BridgeNormalizationStatistics:
     if not target.is_file():
         raise SimplerEvaluationError(f"Bridge statistics file does not exist: {target}")
     try:
-        value = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise SimplerEvaluationError(f"Could not read Bridge statistics: {target}") from error
-    if not isinstance(value, Mapping):
-        raise SimplerEvaluationError("Bridge statistics root must be a mapping")
-
-    arrays: dict[tuple[str, str], np.ndarray] = {}
-    for key, dimension in (("action", ACTION_DIM), ("observation.state", PROPRIO_DIM)):
-        for statistic in ("mean", "std", "min", "max"):
-            arrays[(key, statistic)] = _statistics_array(
-                value,
-                key=key,
-                statistic=statistic,
-                dimension=dimension,
-            )
-        if np.any(arrays[(key, "std")] < 0):
-            raise SimplerEvaluationError(f"Bridge statistics {key}.std must be non-negative")
-        if np.any(arrays[(key, "min")] > arrays[(key, "max")]):
-            raise SimplerEvaluationError(f"Bridge statistics {key} min values exceed max")
-
-    epsilon = np.finfo(np.float32).eps
+        values = BridgeV2NormalizationStatistics.load(target)
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise SimplerEvaluationError(
+            f"Could not read Bridge V2 normalization: {target}: {error}"
+        ) from error
     return BridgeNormalizationStatistics(
         path=target,
-        action_mean=arrays[("action", "mean")],
-        action_std=np.maximum(arrays[("action", "std")], epsilon),
-        proprio_mean=arrays[("observation.state", "mean")],
-        proprio_std=np.maximum(arrays[("observation.state", "std")], epsilon),
+        values=values,
         sha256=_sha256(target),
     )
 
@@ -227,7 +179,7 @@ def preprocess_primary_image(value: Any) -> np.ndarray:
 
 class OctoBridgeSimplerPolicy:
     policy_name = "Octo-small Bridge checkpoint"
-    gripper_threshold = 0.0
+    gripper_threshold = 0.5
 
     def __init__(
         self,
@@ -368,7 +320,7 @@ def load_octo_bridge_policy(
     checkpoint: str | Path,
     *,
     base_model: str | Path,
-    statistics: str | Path,
+    statistics: str | Path | None = None,
     device: str,
     precision: str,
     model_loader: Callable[..., tuple[Any, Any]] | None = None,
@@ -386,7 +338,16 @@ def load_octo_bridge_policy(
     except EvaluationError as error:
         raise SimplerEvaluationError(str(error)) from error
 
-    bridge_statistics = load_bridge_statistics(statistics)
+    try:
+        checkpoint_statistics = validate_bridge_checkpoint(
+            checkpoint_spec.weights_path.parent,
+            expected_normalization_path=statistics,
+        )
+    except BridgeCheckpointContractError as error:
+        raise SimplerEvaluationError(str(error)) from error
+    bridge_statistics = load_bridge_statistics(
+        checkpoint_statistics if statistics is None else statistics
+    )
     if torch_module is None:
         try:
             import torch as torch_module

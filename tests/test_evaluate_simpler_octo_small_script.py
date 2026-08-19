@@ -54,12 +54,26 @@ def _run_script(tmp_path: Path, *arguments: str):
     return completed, calls
 
 
-def test_launcher_requires_all_three_model_paths_before_starting_python(tmp_path):
+def test_launcher_requires_checkpoint_and_base_model_before_starting_python(tmp_path):
     completed, calls = _run_script(tmp_path, "--checkpoint", CHECKPOINT)
 
     assert completed.returncode == 2
     assert calls == []
     assert "--base-model is required" in completed.stderr
+
+
+def test_launcher_uses_self_contained_checkpoint_statistics_by_default(tmp_path):
+    completed, calls = _run_script(
+        tmp_path,
+        "--checkpoint",
+        CHECKPOINT,
+        "--base-model",
+        BASE_MODEL,
+    )
+
+    assert completed.returncode == 0
+    assert len(calls) == 1
+    assert "--statistics" not in calls[0]
 
 
 def test_launcher_sets_simpler_sources_and_forwards_octo_options(tmp_path):

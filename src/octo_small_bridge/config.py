@@ -14,6 +14,9 @@ class ConfigError(ValueError):
     """Raised when a Bridge training configuration is invalid."""
 
 
+BRIDGE_V2_NORMALIZATION_CONTRACT = "bridge_v2_q99_binary_v1"
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
     target = Path(path).expanduser().resolve()
     with target.open("r", encoding="utf-8") as handle:
@@ -62,6 +65,19 @@ def validate_config(config: dict[str, Any]) -> None:
     for key, expected in expected_data.items():
         if data.get(key) != expected:
             raise ConfigError(f"data.{key} must equal {expected!r}")
+    if data.get("normalization_contract") != BRIDGE_V2_NORMALIZATION_CONTRACT:
+        raise ConfigError(
+            "data.normalization_contract must equal "
+            f"{BRIDGE_V2_NORMALIZATION_CONTRACT!r}"
+        )
+    normalization_epsilon = data.get("normalization_epsilon")
+    if (
+        isinstance(normalization_epsilon, bool)
+        or not isinstance(normalization_epsilon, (int, float))
+        or not math.isfinite(float(normalization_epsilon))
+        or float(normalization_epsilon) <= 0
+    ):
+        raise ConfigError("data.normalization_epsilon must be a finite positive number")
     expected_counts = data.get("expected_counts")
     if not isinstance(expected_counts, dict):
         raise ConfigError("data.expected_counts must be a mapping")
@@ -183,6 +199,6 @@ def resolved_paths(config: dict[str, Any]) -> dict[str, Path]:
         "project_root": project_root,
         "model": resolve(config["paths"]["model"]),
         "dataset": dataset,
-        "statistics": dataset / "meta" / "stats.json",
         "output": resolve(output),
+        "normalization": resolve(output) / "normalization.json",
     }

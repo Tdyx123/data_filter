@@ -16,6 +16,34 @@ from libero_lerobot.selection import resolve_prior_selection
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 QWEN35_CONFIG = PROJECT_ROOT / "configs" / "qwen3_5_0_8b_groot_libero_4x4090.yaml"
+BRIDGE_V2_NORMALIZATION_CONTRACT = "bridge_v2_q99_binary_v1"
+
+
+@pytest.mark.parametrize("name", ["bridge_4x4090.yaml", "bridge_8x4090.yaml"])
+def test_bridge_configs_require_bridge_v2_normalization_contract(name):
+    config = load_config(PROJECT_ROOT / "configs" / name)
+
+    assert (
+        config["data"]["normalization_contract"]
+        == BRIDGE_V2_NORMALIZATION_CONTRACT
+    )
+
+
+def test_bridge_config_rejects_missing_normalization_contract():
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
+    config["data"].pop("normalization_contract", None)
+
+    with pytest.raises(ConfigError, match="normalization_contract"):
+        validate_config(config)
+
+
+def test_libero_config_does_not_require_bridge_normalization_contract():
+    config = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
+    )
+
+    assert "normalization_contract" not in config["data"]
+    validate_config(config)
 
 
 @pytest.mark.parametrize(

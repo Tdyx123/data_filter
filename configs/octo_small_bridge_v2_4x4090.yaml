@@ -12,6 +12,8 @@ data:
   action_dim: 7
   window_size: 1
   action_horizon: 8
+  normalization_contract: bridge_v2_q99_binary_v1
+  normalization_epsilon: 1.0e-6
   absolute_action_mask: [false, false, false, false, false, false, true]
   action_normalization_mask: [true, true, true, true, true, true, false]
   resize:
@@ -51,4 +53,3 @@ train:
   max_grad_norm: 1.0
   log_every_steps: 100
   save_every_steps: 1000
-

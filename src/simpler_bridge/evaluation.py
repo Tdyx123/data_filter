@@ -178,13 +178,26 @@ def _matrix_to_xyz_euler(matrix: np.ndarray) -> np.ndarray:
     return np.asarray([roll, pitch, yaw], dtype=np.float32)
 
 
+_BRIDGE_TCP_ALIGNMENT = np.asarray(
+    [
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+        [-1.0, 0.0, 0.0],
+    ],
+    dtype=np.float64,
+)
+
+
 def environment_to_bridge_proprio(environment: Any) -> np.ndarray:
     try:
         base_pose = environment.agent.robot.pose
         tcp_pose = environment.tcp.pose
         relative = base_pose.inv() * tcp_pose
         position = np.asarray(relative.p, dtype=np.float32)
-        euler = _matrix_to_xyz_euler(_quaternion_wxyz_to_matrix(relative.q))
+        bridge_rotation = (
+            _quaternion_wxyz_to_matrix(relative.q) @ _BRIDGE_TCP_ALIGNMENT.T
+        )
+        euler = _matrix_to_xyz_euler(bridge_rotation)
         closedness = float(environment.agent.get_gripper_closedness())
     except SimplerEvaluationError:
         raise

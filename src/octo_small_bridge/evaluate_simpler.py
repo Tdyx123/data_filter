@@ -77,8 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--statistics",
         type=Path,
-        required=True,
-        help="Bridge LeRobot meta/stats.json used during fine-tuning.",
+        default=None,
+        help=(
+            "Optional Bridge V2 normalization.json override; it must match the "
+            "checkpoint manifest. Defaults to the checkpoint copy."
+        ),
     )
     parser.add_argument(
         "--tasks",

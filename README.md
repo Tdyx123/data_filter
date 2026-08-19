@@ -130,10 +130,11 @@ PYTHONPATH=src pytest -q \
 Octo-small 可直接读取默认的
 `/data/dwb/datasets/bridge_orig_1.0.0_lerobo`，无需转换或复制数据。独立入口只使用
 `observation.images.image_0` 作为主相机、8 维 `observation.state` 和 7 维
-`action`；空语言 episode 会被排除。第七维抓手动作是 `[0,1]` 连续值（接受
-`[-1e-5, 1+1e-5]` 的浮点容差并裁剪回 `[0,1]`），按 `2*x-1` 映射到
-`[-1,+1]` 且不参与统计标准化；非有限值或明显越界值会触发包含 episode ID 的数据
-校验错误。管线不伪造 wrist 图像。
+`action`；空语言 episode 会被排除。状态 `xyz/rpy/pad` 和动作 `Δxyz/Δrpy`
+按有效 episode 精确计算的 q01/q99 分维归一化并截断到 `[-2.2,2.2]`，常量
+`pad` 固定为 `0`。状态及动作 gripper 均以 `x > 0.5` 转为严格 `0/1`；动作原值
+仍接受 `[-1e-5, 1+1e-5]` 的浮点容差，非有限值或明显越界值会触发包含 episode
+ID 的数据校验错误。管线不伪造 wrist 图像。
 
 先运行只读预检，再执行两步 smoke test 或正式训练；`--output-dir` 始终必填：
 
@@ -153,7 +154,8 @@ bash scripts/train_bridge_octo_small_4x4090.sh \
 默认使用 GPU `0,1,2,3`、每卡 micro-batch 8、梯度累积 4、全局 batch 128、
 10,000 optimizer steps、400 步 warmup、峰值学习率 `3e-4` 和 BF16。预检会验证
 LeRobot v2/WidowX/5 Hz/AV1、特征和统计维度、源数据计数，并解码有效 episode 的
-首、中、尾样本。自定义路径和续训示例：
+首、中、尾样本。精确 q01/q99 缓存写入输出目录的 `normalization.json`。自定义路径
+和续训示例：
 
 ```bash
 bash scripts/train_bridge_octo_small_4x4090.sh \
@@ -166,8 +168,9 @@ bash scripts/train_bridge_octo_small_4x4090.sh \
 
 首版使用全部 38,660 条非空语言 episode（1,305,714 帧），不划分验证集，也不接收
 Cocore/RelCore 筛选清单或运行 SimplerEnv 评测。训练输出沿用 Octo 的配置、数据和
-模型 manifest、metrics、latest/best checkpoint 指针；续训会恢复采样顺序和随机数
-状态。
+模型 manifest、metrics、latest/best checkpoint 指针；每个 checkpoint 都自包含并
+校验 `normalization.json` 与 `bridge_v2_q99_binary_v1` 契约。缺少该契约的旧 Octo
+Bridge checkpoint 会在加载模型权重前被拒绝；续训会恢复采样顺序和随机数状态。
 
 #### 转换 LIBERO
 
@@ -986,15 +989,15 @@ uv pip install --python .venv-octo-simpler/bin/python \
 
 构建约束只固定 `ruckig==0.14.0` 所需的旧版构建后端，不会安装进评测运行时。
 
-checkpoint 只包含微调权重，因此 checkpoint、基础模型和训练时使用的 Bridge
-统计文件都是必填参数。先用独立输出目录运行四任务预检：
+checkpoint 包含微调权重及训练时使用的 Bridge V2 归一化统计，因此只需 checkpoint
+和基础模型。可选 `--statistics` 仅用于显式指定相同文件，内容哈希不一致会被拒绝。
+先用独立输出目录运行四任务预检：
 
 ```bash
 bash scripts/evaluate_simpler_octo_small.sh \
   --python .venv-octo-simpler/bin/python \
   --checkpoint /data/dwb/octo_small_bridge_v2/checkpoints/step-00020000 \
   --base-model /data/dwb/models/octo-small-pytorch \
-  --statistics /data/dwb/datasets/bridge_orig_1.0.0_lerobo/meta/stats.json \
   --output-dir outputs/octo_small_bridge_simpler_preflight \
   --preflight-only
 ```
@@ -1006,7 +1009,6 @@ bash scripts/evaluate_simpler_octo_small.sh \
   --python .venv-octo-simpler/bin/python \
   --checkpoint /data/dwb/octo_small_bridge_v2/checkpoints/step-00020000 \
   --base-model /data/dwb/models/octo-small-pytorch \
-  --statistics /data/dwb/datasets/bridge_orig_1.0.0_lerobo/meta/stats.json \
   --output-dir outputs/octo_small_bridge_simpler_smoke \
   --smoke-test
 ```
@@ -1019,15 +1021,14 @@ bash scripts/evaluate_simpler_octo_small.sh \
   --python .venv-octo-simpler/bin/python \
   --checkpoint /data/dwb/octo_small_bridge_v2/checkpoints/step-00020000 \
   --base-model /data/dwb/models/octo-small-pytorch \
-  --statistics /data/dwb/datasets/bridge_orig_1.0.0_lerobo/meta/stats.json \
   --tasks all \
   --output-dir outputs/octo_small_bridge_simpler_eval
 ```
 
-评测只启用 primary 图像 tokenizer，使用 Bridge stats 标准化 proprio、反标准化前六维
-动作，并保持训练时的 `[-1,+1]` 抓手语义（以 0 为开合阈值）。默认不录像；输出文件、
-覆盖保护和退出码与 Qwen SimplerEnv 入口一致。Octo-small 同样在每个环境步重新预测
-原生 8 步动作块，并且只执行第一个动作。
+评测只启用 primary 图像 tokenizer，使用 checkpoint 内 Bridge V2 q01/q99 统计标准化
+proprio、反归一化前六维动作；gripper 以严格 `>0.5` 输出 `0/1`。默认不录像；输出
+文件、覆盖保护和退出码与 Qwen SimplerEnv 入口一致。Octo-small 同样在每个环境步
+重新预测原生 8 步动作块，并且只执行第一个动作。
 
 ### StarVLA Qwen3VL-GR00T Bridge 的 SimplerEnv 评测
 

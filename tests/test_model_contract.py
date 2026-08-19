@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import sys
 from types import ModuleType, SimpleNamespace
 import re
@@ -203,6 +204,67 @@ def _tiny_context_policy(context_forward):
         ),
         config=_tiny_policy_config(context_forward),
     )
+
+
+def _tiny_bridge_v2_policy():
+    config = _tiny_policy_config()
+    config["data"].update(
+        {
+            "dataset_type": "bridge",
+            "normalization_contract": "bridge_v2_q99_binary_v1",
+        }
+    )
+    return Qwen3VLGrootPolicy(
+        backbone=FakePeftBackbone(),
+        processor=FakeProcessor(),
+        stats=QuantileStats(
+            state_q01=np.asarray([0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32),
+            state_q99=np.asarray([1, 1, 1, 1, 1, 1, 0, 1], dtype=np.float32),
+            action_q01=np.asarray([-1, -1, -1, -1, -1, -1, 0], dtype=np.float32),
+            action_q99=np.asarray([1, 1, 1, 1, 1, 1, 1], dtype=np.float32),
+        ),
+        config=config,
+    )
+
+
+def test_bridge_v2_normalization_uses_q99_pose_range_and_binary_grippers():
+    policy = _tiny_bridge_v2_policy()
+    states = torch.tensor(
+        [
+            [1.6, -0.6, 0.5, 0.5, 0.5, 0.5, 99.0, 0.5],
+            [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, -99.0, 0.5001],
+        ]
+    )
+    actions = torch.tensor(
+        [
+            [2.2, -2.2, 0.0, 0.0, 0.0, 0.0, 0.5],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5001],
+        ]
+    )
+
+    normalized_states = policy.normalize_state(states)
+    normalized_actions = policy.normalize_action(actions)
+
+    torch.testing.assert_close(normalized_states[0, :2], torch.tensor([2.2, -2.2]))
+    torch.testing.assert_close(normalized_states[:, 6], torch.zeros(2))
+    torch.testing.assert_close(normalized_states[:, 7], torch.tensor([0.0, 1.0]))
+    torch.testing.assert_close(normalized_actions[0, :2], torch.tensor([2.2, -2.2]))
+    torch.testing.assert_close(normalized_actions[:, 6], torch.tensor([0.0, 1.0]))
+
+
+def test_bridge_v2_action_denormalization_extrapolates_pose_and_binarizes_gripper():
+    policy = _tiny_bridge_v2_policy()
+    normalized_actions = torch.tensor(
+        [
+            [2.2, -2.2, 0.0, 0.0, 0.0, 0.0, 0.5],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5001],
+        ]
+    )
+
+    actions = policy.denormalize_action(normalized_actions)
+
+    torch.testing.assert_close(actions[0, :2], torch.tensor([2.2, -2.2]))
+    torch.testing.assert_close(actions[:, 6], torch.tensor([0.0, 1.0]))
 
 
 QWEN3_VL_LORA_TARGETS = {
@@ -688,6 +750,72 @@ def test_bridge_policy_forwards_the_inference_generator():
 
     assert actions.shape == (1, 8, 7)
     assert recording.generator is generator
+
+
+def test_bridge_policy_rejects_legacy_checkpoint_before_loading_model(tmp_path):
+    (tmp_path / "policy_config.json").write_text(
+        json.dumps(
+            {
+                "format": "qwen3-vl-groot-bridge-compact-v1",
+                "base_model": "/unused/base-model",
+                "config": {
+                    "data": {
+                        "dataset_type": "bridge",
+                        "state_dim": 8,
+                        "action_dim": 7,
+                        "action_horizon": 8,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="normalization_contract"):
+        BridgePolicy.from_pretrained(tmp_path, device="cpu")
+
+
+def test_compact_policy_loader_keeps_libero_q99_checkpoint_compatible(
+    tmp_path,
+    monkeypatch,
+):
+    (tmp_path / "policy_config.json").write_text(
+        json.dumps(
+            {
+                "format": "qwen3-vl-groot-bridge-compact-v1",
+                "base_model": "/unused/base-model",
+                "config": {
+                    "data": {
+                        "dataset_type": "libero",
+                        "state_dim": 8,
+                        "action_dim": 7,
+                        "action_horizon": 8,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    QuantileStats(
+        state_q01=np.zeros(8),
+        state_q99=np.ones(8),
+        action_q01=np.zeros(7),
+        action_q99=np.ones(7),
+    ).save(tmp_path / "normalization.json")
+    fake_policy = nn.Linear(1, 1)
+    monkeypatch.setattr(
+        Qwen3VLGrootPolicy,
+        "from_local_qwen",
+        classmethod(lambda cls, **kwargs: fake_policy),
+    )
+    monkeypatch.setattr(
+        "qwen3_vl_groot.inference.load_compact_weights",
+        lambda policy, checkpoint: None,
+    )
+
+    loaded = BridgePolicy.from_pretrained(tmp_path, device="cpu")
+
+    assert loaded.policy is fake_policy
 
 
 def test_qwen_policy_forwards_the_inference_generator_to_flow(monkeypatch):

@@ -265,6 +265,7 @@ def _save_checkpoint(
     config: dict[str, Any],
     selection_signature: str | None = None,
     rank_runtime_states: list[dict[str, Any]] | None = None,
+    checkpoint_contract: Any | None = None,
 ) -> Path:
     import torch
     from safetensors.torch import save_model
@@ -286,6 +287,8 @@ def _save_checkpoint(
     temporary.mkdir()
     unwrapped = model.module if hasattr(model, "module") else model
     save_model(unwrapped, str(temporary / "model.safetensors"))
+    if checkpoint_contract is not None:
+        checkpoint_contract.write(temporary)
     if rank_runtime_states is None:
         rank_runtime_states = [_capture_rank_runtime_state(sampler)]
     if not rank_runtime_states:
@@ -419,6 +422,7 @@ def train(
     resume: str | None = None,
     training_data_builder: Any | None = None,
     dataset_manifest_builder: Any | None = None,
+    checkpoint_contract_builder: Any | None = None,
     observation_tokenizers: tuple[str, ...] = ("primary", "wrist"),
 ) -> None:
     import torch
@@ -471,6 +475,11 @@ def train(
         world_size=world_size,
     )
     selection_signature = train_data.selection_sha256
+    checkpoint_contract = (
+        checkpoint_contract_builder(config, paths, train_data)
+        if checkpoint_contract_builder is not None
+        else None
+    )
     if world_size > 1:
         model = DistributedDataParallel(
             model,
@@ -539,6 +548,8 @@ def train(
     start_step = 0
     resume_path = _resolve_resume(output, resume)
     if resume_path is not None:
+        if checkpoint_contract is not None:
+            checkpoint_contract.validate(resume_path)
         unwrapped = model.module if hasattr(model, "module") else model
         start_step = _load_training_state(
             resume_path,
@@ -659,6 +670,7 @@ def train(
                     config=config,
                     selection_signature=selection_signature,
                     rank_runtime_states=gathered_runtime_states,
+                    checkpoint_contract=checkpoint_contract,
                 )
             if world_size > 1:
                 dist.barrier()

@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from .checkpointing import load_compact_weights
+from .config import ConfigError, require_bridge_v2_normalization_contract
 from .modeling import Qwen3VLGrootPolicy
 from .normalization import QuantileStats
 
@@ -30,6 +31,12 @@ class BridgePolicy:
         if manifest.get("format") != "qwen3-vl-groot-bridge-compact-v1":
             raise ValueError(f"Unsupported inference checkpoint format: {manifest.get('format')}")
         config = manifest["config"]
+        try:
+            data_config = config["data"]
+            if data_config.get("dataset_type", "bridge") == "bridge":
+                require_bridge_v2_normalization_contract(data_config)
+        except (ConfigError, KeyError, TypeError) as error:
+            raise ValueError(f"Unsupported Bridge normalization contract: {error}") from error
         base_model = str(model_path or manifest["base_model"])
         stats = QuantileStats.load(checkpoint / "normalization.json")
         policy = Qwen3VLGrootPolicy.from_local_qwen(

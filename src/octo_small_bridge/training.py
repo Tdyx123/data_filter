@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .data import BridgeTrainingData, make_training_dataset
+from .checkpoint_contract import build_checkpoint_contract
 
 
 def _file_sha256(path: Path) -> str:
@@ -27,13 +28,16 @@ def build_dataset_manifest(
 
     adapter = training_data.dataset.adapter
     summary = adapter.dataset_summary()
-    stats_path = Path(paths["dataset"]) / "meta" / "stats.json"
+    normalization_path = Path(training_data.normalization_path)
     return {
         "dataset": config["data"]["dataset_name"],
         "path": str(Path(paths["dataset"]).resolve()),
         "metadata_sha256": adapter.fingerprint(),
-        "statistics_path": str(stats_path.resolve()),
-        "statistics_sha256": _file_sha256(stats_path),
+        "normalization": {
+            "contract": config["data"]["normalization_contract"],
+            "path": str(normalization_path.resolve()),
+            "sha256": _file_sha256(normalization_path),
+        },
         "selection_sha256": training_data.selection_sha256,
         "source_episodes": summary["source_episodes"],
         "retained_episodes": summary["retained_episodes"],
@@ -65,5 +69,6 @@ def train(
         resume=resume,
         training_data_builder=make_training_dataset,
         dataset_manifest_builder=build_dataset_manifest,
+        checkpoint_contract_builder=build_checkpoint_contract,
         observation_tokenizers=("primary",),
     )
