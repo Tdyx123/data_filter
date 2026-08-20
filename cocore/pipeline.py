@@ -135,9 +135,11 @@ def _selection_algorithm(
                 "main_sample_size": SIMILARITY_MAIN_SAMPLE_SIZE,
                 "sampling": "per_new_branch_without_replacement",
                 "rng": f"seed_sequence_stream_{SIMILARITY_RNG_STREAM}",
-                "scope": "sampled_main_plus_all_active",
-                "pairs": "all_induced_pairs",
-                "final_objective": "winner_sample",
+                "scope": "new_active_to_sampled_main_and_previous_active",
+                "pairs": "incremental_cross_pairs_only",
+                "accumulation": "parent_plus_child_delta",
+                "recombination": "reset_then_replay_retained",
+                "final_objective": "winner_accumulated_incremental_redundancy",
             },
         }
     raise ValueError(f"unknown selection method {method!r}")
@@ -1575,10 +1577,6 @@ def select_stage(
                 "recombinations": result.recombinations,
                 "committed_clips": result.committed_clips,
                 "final_active_clips": result.final_active_clips,
-                "final_similarity_penalty_sample_ids": [
-                    graph.sample_ids[index]
-                    for index in result.similarity_penalty_indices
-                ],
                 "timings": branch_search_timings,
             }
         for stage, stage_directory in {
@@ -2071,10 +2069,6 @@ def validate_output(
             "recombinations": replayed_random.recombinations,
             "committed_clips": replayed_random.committed_clips,
             "final_active_clips": replayed_random.final_active_clips,
-            "final_similarity_penalty_sample_ids": [
-                graph.sample_ids[index]
-                for index in replayed_random.similarity_penalty_indices
-            ],
         }
         branch_search = report.get("branch_search")
         if not isinstance(branch_search, Mapping):

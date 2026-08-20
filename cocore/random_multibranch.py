@@ -30,7 +30,6 @@ class RandomMultiBranchSelectionResult:
     selection_phases: tuple[str, ...]
     selection_steps: tuple[int, ...]
     heap_refreshes: tuple[None, ...]
-    similarity_penalty_indices: tuple[int, ...]
     objective_value: float
     relation: float
     redundancy: float
@@ -188,8 +187,9 @@ class RandomMultiBranchSelector:
         selected: list[int],
         phases: list[str],
         steps: list[int],
-        similarity_penalty_indices: tuple[int, ...],
         *,
+        active_redundancy_deltas: tuple[float, ...],
+        redundancy: float,
         rounds: int,
         evaluated_branches: int,
         recombinations: int,
@@ -202,42 +202,38 @@ class RandomMultiBranchSelector:
             raise ValueError("round timing count must match completed rounds")
         if len(recombination_runtime_seconds) != recombinations:
             raise ValueError("recombination timing count must match completed recombinations")
-        penalty_set = set(similarity_penalty_indices)
-        if len(penalty_set) != len(similarity_penalty_indices):
-            raise ValueError("similarity penalty indices cannot contain duplicates")
-        if not penalty_set.issubset(selected):
-            raise ValueError("similarity penalty indices must belong to the selection")
+        if len(active_redundancy_deltas) != final_active_clips:
+            raise ValueError("active redundancy deltas must match final active clips")
+        fixed_count = len(selected) - final_active_clips
+        redundancy_deltas = (0.0,) * fixed_count + active_redundancy_deltas
+        if not math.isclose(
+            math.fsum(redundancy_deltas),
+            float(redundancy),
+            rel_tol=1.0e-12,
+            abs_tol=1.0e-12,
+        ):
+            raise ValueError("active redundancy deltas do not match branch redundancy")
         state = self.context.empty_state()
-        penalty_selected: set[int] = set()
         gains: list[float] = []
-        for index in selected:
+        for index, redundancy_delta in zip(
+            selected,
+            redundancy_deltas,
+            strict=True,
+        ):
             previous_relation = float(state.relation)
             self.context.add_candidate(state, index)
             relation_delta = float(state.relation) - previous_relation
-            redundancy_delta = 0.0
-            if index in penalty_set:
-                redundancy_delta = (
-                    sum(
-                        penalty
-                        for other, penalty in self.context.redundancy_adjacency[index]
-                        if other in penalty_selected
-                    )
-                    / self.context.redundancy_normalizer
-                )
-                penalty_selected.add(index)
             gain = self.context.relation_weight * relation_delta - redundancy_delta
             if not math.isfinite(gain):
                 raise ValueError(f"candidate {index} has a non-finite marginal gain")
             gains.append(float(gain))
-        redundancy = self.context.redundancy_from_indices(similarity_penalty_indices)
-        score = self.context.relation_weight * float(state.relation) - redundancy
+        score = self.context.relation_weight * float(state.relation) - float(redundancy)
         return RandomMultiBranchSelectionResult(
             selected_indices=tuple(selected),
             score_deltas=tuple(gains),
             selection_phases=tuple(phases),
             selection_steps=tuple(steps),
             heap_refreshes=(None,) * len(selected),
-            similarity_penalty_indices=similarity_penalty_indices,
             objective_value=float(score),
             relation=float(state.relation),
             redundancy=float(redundancy),
@@ -276,12 +272,12 @@ class RandomMultiBranchSelector:
         round_runtime_seconds: list[float] = []
         recombination_runtime_seconds: list[tuple[int, float]] = []
         if len(fixed) == budget:
-            similarity_main = self._sample_similarity_main(similarity_rng, fixed)
             return self._result(
                 fixed,
                 phases,
                 steps,
-                similarity_main,
+                active_redundancy_deltas=(),
+                redundancy=0.0,
                 rounds=0,
                 evaluated_branches=0,
                 recombinations=0,
@@ -324,14 +320,12 @@ class RandomMultiBranchSelector:
             if len(fixed) + active_size == budget:
                 winner = self._rank_branches(branches, rng, limit=1)[0]
                 selected = fixed + list(winner.active_indices)
-                similarity_penalty = (
-                    winner.update_state.similarity_main_indices + winner.active_indices
-                )
                 return self._result(
                     selected,
                     phases + ["branch_final"] * active_size,
                     steps + [rounds] * active_size,
-                    similarity_penalty,
+                    active_redundancy_deltas=winner.update_state.redundancy_deltas,
+                    redundancy=winner.update_state.redundancy,
                     rounds=rounds,
                     evaluated_branches=evaluated_branches,
                     recombinations=recombinations,

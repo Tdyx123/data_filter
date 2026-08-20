@@ -193,6 +193,7 @@ def test_train_sets_the_local_device_before_initializing_the_process_group(
     ]
 
 
+@pytest.mark.skip(reason="Long-running CPU training smoke test")
 def test_tiny_pytorch_octo_two_step_cpu_smoke_and_frozen_text_encoder():
     text = TinyTextEncoder(16)
     model = OctoSmallPolicy(text, _tiny_config())

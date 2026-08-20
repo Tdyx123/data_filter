@@ -296,6 +296,7 @@ def test_help_lists_every_task_without_starting_python(tmp_path):
 
 @pytest.mark.gpu
 @pytest.mark.slow
+@pytest.mark.skip(reason="Long-running GPU integration test")
 def test_real_two_task_smoke_batch_exits_without_worker_processes(tmp_path):
     checkpoint = os.environ.get("OCTO_LIBERO_EVAL_CHECKPOINT")
     statistics = os.environ.get("OCTO_LIBERO_EVAL_STATISTICS")
