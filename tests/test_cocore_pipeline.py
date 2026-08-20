@@ -613,6 +613,13 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
             "recombination": "reset_then_replay_retained",
             "final_objective": "winner_accumulated_incremental_redundancy",
         },
+        "sequence_relation": {
+            "scope": "new_active_to_all_main_and_previous_active",
+            "pairs": "incremental_cross_edges_only",
+            "accumulation": "parent_plus_child_delta",
+            "recombination": "reset_then_replay_retained",
+            "final_objective": "winner_accumulated_incremental_sequence",
+        },
     }
     assert report["algorithm"] == algorithm
     assert "heap" not in report

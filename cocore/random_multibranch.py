@@ -188,6 +188,7 @@ class RandomMultiBranchSelector:
         phases: list[str],
         steps: list[int],
         *,
+        active_relation_deltas: tuple[float, ...],
         active_redundancy_deltas: tuple[float, ...],
         redundancy: float,
         rounds: int,
@@ -202,9 +203,23 @@ class RandomMultiBranchSelector:
             raise ValueError("round timing count must match completed rounds")
         if len(recombination_runtime_seconds) != recombinations:
             raise ValueError("recombination timing count must match completed recombinations")
+        if len(active_relation_deltas) != final_active_clips:
+            raise ValueError("active relation deltas must match final active clips")
         if len(active_redundancy_deltas) != final_active_clips:
             raise ValueError("active redundancy deltas must match final active clips")
         fixed_count = len(selected) - final_active_clips
+        if self.context.relation_type == "sequence":
+            fixed_relation_deltas = [0.0] * fixed_count
+        else:
+            fixed_relation_deltas = []
+            fixed_state = self.context.empty_state()
+            for index in selected[:fixed_count]:
+                previous_relation = float(fixed_state.relation)
+                self.context.add_candidate(fixed_state, index)
+                fixed_relation_deltas.append(
+                    float(fixed_state.relation) - previous_relation
+                )
+        relation_deltas = tuple(fixed_relation_deltas) + active_relation_deltas
         redundancy_deltas = (0.0,) * fixed_count + active_redundancy_deltas
         if not math.isclose(
             math.fsum(redundancy_deltas),
@@ -213,21 +228,26 @@ class RandomMultiBranchSelector:
             abs_tol=1.0e-12,
         ):
             raise ValueError("active redundancy deltas do not match branch redundancy")
-        state = self.context.empty_state()
-        gains: list[float] = []
-        for index, redundancy_delta in zip(
-            selected,
-            redundancy_deltas,
-            strict=True,
-        ):
-            previous_relation = float(state.relation)
-            self.context.add_candidate(state, index)
-            relation_delta = float(state.relation) - previous_relation
-            gain = self.context.relation_weight * relation_delta - redundancy_delta
+        relation = math.fsum(relation_deltas)
+        gains = [
+            self.context.relation_weight * relation_delta - redundancy_delta
+            for relation_delta, redundancy_delta in zip(
+                relation_deltas,
+                redundancy_deltas,
+                strict=True,
+            )
+        ]
+        for index, gain in zip(selected, gains, strict=True):
             if not math.isfinite(gain):
                 raise ValueError(f"candidate {index} has a non-finite marginal gain")
-            gains.append(float(gain))
-        score = self.context.relation_weight * float(state.relation) - float(redundancy)
+        score = self.context.relation_weight * relation - float(redundancy)
+        if not math.isclose(
+            math.fsum(gains),
+            score,
+            rel_tol=1.0e-12,
+            abs_tol=1.0e-12,
+        ):
+            raise ValueError("incremental score deltas do not match branch objective")
         return RandomMultiBranchSelectionResult(
             selected_indices=tuple(selected),
             score_deltas=tuple(gains),
@@ -235,7 +255,7 @@ class RandomMultiBranchSelector:
             selection_steps=tuple(steps),
             heap_refreshes=(None,) * len(selected),
             objective_value=float(score),
-            relation=float(state.relation),
+            relation=float(relation),
             redundancy=float(redundancy),
             rounds=rounds,
             evaluated_branches=evaluated_branches,
@@ -276,6 +296,7 @@ class RandomMultiBranchSelector:
                 fixed,
                 phases,
                 steps,
+                active_relation_deltas=(),
                 active_redundancy_deltas=(),
                 redundancy=0.0,
                 rounds=0,
@@ -287,7 +308,11 @@ class RandomMultiBranchSelector:
                 recombination_runtime_seconds=recombination_runtime_seconds,
             )
 
-        main_state = self.context.state_from_indices(fixed)
+        main_state = (
+            self.context.extend_sequence_main_state(self.context.empty_state(), fixed)
+            if self.context.relation_type == "sequence"
+            else self.context.state_from_indices(fixed)
+        )
         root_update = self.context.empty_update_state(main_state)
         initial_batch_size = min(BATCH_SIZE, budget - len(fixed))
         branches: list[_Branch] = []
@@ -324,6 +349,7 @@ class RandomMultiBranchSelector:
                     selected,
                     phases + ["branch_final"] * active_size,
                     steps + [rounds] * active_size,
+                    active_relation_deltas=winner.update_state.relation_deltas,
                     active_redundancy_deltas=winner.update_state.redundancy_deltas,
                     redundancy=winner.update_state.redundancy,
                     rounds=rounds,
@@ -386,7 +412,11 @@ class RandomMultiBranchSelector:
             committed_clips += len(committed)
             recombinations += 1
 
-            main_state = self.context.extend_state(main_state, committed)
+            main_state = (
+                self.context.extend_sequence_main_state(main_state, committed)
+                if self.context.relation_type == "sequence"
+                else self.context.extend_state(main_state, committed)
+            )
             root_update = self.context.empty_update_state(main_state)
             recombined: list[_Branch] = []
             for branch in branches:

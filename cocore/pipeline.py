@@ -141,6 +141,13 @@ def _selection_algorithm(
                 "recombination": "reset_then_replay_retained",
                 "final_objective": "winner_accumulated_incremental_redundancy",
             },
+            "sequence_relation": {
+                "scope": "new_active_to_all_main_and_previous_active",
+                "pairs": "incremental_cross_edges_only",
+                "accumulation": "parent_plus_child_delta",
+                "recombination": "reset_then_replay_retained",
+                "final_objective": "winner_accumulated_incremental_sequence",
+            },
         }
     raise ValueError(f"unknown selection method {method!r}")
 
@@ -2141,6 +2148,11 @@ def validate_output(
     ):
         raise ValueError("selection report coverage does not match artifacts")
     objective = report.get("objective", {})
+    expected_relation = (
+        replayed_random.relation
+        if replayed_random is not None
+        else state.relation
+    )
     expected_redundancy = (
         replayed_random.redundancy
         if replayed_random is not None
@@ -2152,7 +2164,7 @@ def validate_output(
         else state.score
     )
     for name, actual in {
-        "relation": state.relation,
+        "relation": expected_relation,
         "redundancy": expected_redundancy,
         "total": expected_total,
     }.items():
@@ -2160,7 +2172,7 @@ def validate_output(
             raise ValueError(f"selection report objective {name} mismatch")
     if not np.isclose(
         float(objective.get("weighted_relation", np.nan)),
-        weight * state.relation,
+        weight * expected_relation,
         rtol=1.0e-7,
         atol=1.0e-8,
     ):

@@ -29,6 +29,7 @@ class CocoreObjectiveUpdateState:
 
     main_state: CocoreObjectiveState
     selected_indices: tuple[int, ...]
+    relation_deltas: tuple[float, ...]
     redundancy_deltas: tuple[float, ...]
     prototype_override_indices: np.ndarray
     prototype_override_values: np.ndarray
@@ -126,22 +127,46 @@ class CocoreObjectiveContext:
             self.add_candidate(extended, int(index))
         return extended
 
+    def extend_sequence_main_state(
+        self,
+        state: CocoreObjectiveState,
+        indices: Sequence[int],
+    ) -> CocoreObjectiveState:
+        if self.relation_type != "sequence":
+            raise ValueError("sequence main state requires sequence relation type")
+        extended = self.clone_state(state)
+        for raw_index in indices:
+            index = int(raw_index)
+            if extended.selected_mask[index]:
+                raise ValueError("candidate is already selected")
+            np.maximum(
+                extended.prototype_coverage,
+                self.prototype_mass[index],
+                out=extended.prototype_coverage,
+            )
+            task = int(self.graph.task_indices[index])
+            extended.task_counts[self.task_position[task]] += 1
+            extended.selected_mask[index] = True
+        return extended
+
     def empty_update_state(
         self,
         main_state: CocoreObjectiveState,
     ) -> CocoreObjectiveUpdateState:
+        relation = 0.0 if self.relation_type == "sequence" else float(main_state.relation)
         return CocoreObjectiveUpdateState(
             main_state=main_state,
             selected_indices=(),
+            relation_deltas=(),
             redundancy_deltas=(),
             prototype_override_indices=np.empty(0, dtype=np.int64),
             prototype_override_values=np.empty(0, dtype=np.float64),
             sequence_override_flat_indices=np.empty(0, dtype=np.int64),
             sequence_override_values=np.empty(0, dtype=np.float64),
             task_count_deltas=np.zeros_like(main_state.task_counts),
-            relation=float(main_state.relation),
+            relation=relation,
             redundancy=0.0,
-            score=self.relation_weight * float(main_state.relation),
+            score=self.relation_weight * relation,
         )
 
     def materialize_update_state(
@@ -156,7 +181,11 @@ class CocoreObjectiveContext:
         prototype_coverage[update_state.prototype_override_indices] = (
             update_state.prototype_override_values
         )
-        sequence_relation_counts = main.sequence_relation_counts.copy()
+        sequence_relation_counts = (
+            self.relation_metrics.empty_sequence_counts()
+            if self.relation_type == "sequence"
+            else main.sequence_relation_counts.copy()
+        )
         sequence_relation_counts.ravel()[update_state.sequence_override_flat_indices] = (
             update_state.sequence_override_values
         )
@@ -215,8 +244,10 @@ class CocoreObjectiveContext:
         state = self.materialize_update_state(update_state)
         penalty_selected = set(sample)
         penalty_selected.update(update_state.selected_indices)
+        relation_deltas = list(update_state.relation_deltas)
         redundancy_deltas = list(update_state.redundancy_deltas)
         for index in added:
+            previous_relation = float(state.relation)
             previous_redundancy = float(state.redundancy)
             self.add_candidate(state, index)
             redundancy_delta = (
@@ -230,6 +261,7 @@ class CocoreObjectiveContext:
             state.redundancy = previous_redundancy + redundancy_delta
             state.score = self.relation_weight * state.relation - state.redundancy
             penalty_selected.add(index)
+            relation_deltas.append(float(state.relation) - previous_relation)
             redundancy_deltas.append(float(redundancy_delta))
         selected_indices = update_state.selected_indices + added
 
@@ -237,14 +269,19 @@ class CocoreObjectiveContext:
             state.prototype_coverage != main.prototype_coverage
         ).astype(np.int64, copy=False)
         sequence_flat = state.sequence_relation_counts.ravel()
-        main_sequence_flat = main.sequence_relation_counts.ravel()
-        sequence_indices = np.flatnonzero(sequence_flat != main_sequence_flat).astype(
+        sequence_base_flat = (
+            np.zeros_like(sequence_flat)
+            if self.relation_type == "sequence"
+            else main.sequence_relation_counts.ravel()
+        )
+        sequence_indices = np.flatnonzero(sequence_flat != sequence_base_flat).astype(
             np.int64,
             copy=False,
         )
         return CocoreObjectiveUpdateState(
             main_state=main,
             selected_indices=selected_indices,
+            relation_deltas=tuple(relation_deltas),
             redundancy_deltas=tuple(redundancy_deltas),
             prototype_override_indices=prototype_indices,
             prototype_override_values=state.prototype_coverage[prototype_indices].copy(),

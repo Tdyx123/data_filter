@@ -262,6 +262,79 @@ def test_objective_empty_update_state_resets_branch_redundancy() -> None:
     assert update.score == pytest.approx(2.0 * main.relation)
 
 
+def test_sequence_empty_update_state_resets_branch_relation_and_counts() -> None:
+    graph = _heap_graph(3)
+    graph.reliability = np.ones(3, dtype=np.float32)
+    graph.sequence_edges = _edges([(0, 1, 1.0), (0, 2, 1.0)], "sequence")
+    graph.transition_matrix = sparse.csr_matrix(
+        np.ones((1, 1), dtype=np.float32)
+    )
+    context = CocoreObjectiveContext(
+        graph, "sequence", relation_weight=2.0, similarity_threshold=0.8
+    )
+    main = context.state_from_indices([0, 1])
+
+    update = context.empty_update_state(main)
+    materialized = context.materialize_update_state(update)
+
+    assert main.relation > 0.0
+    assert update.relation == pytest.approx(0.0)
+    assert update.relation_deltas == ()
+    assert update.score == pytest.approx(0.0)
+    np.testing.assert_array_equal(
+        materialized.sequence_relation_counts,
+        np.zeros_like(main.sequence_relation_counts),
+    )
+
+
+def test_sequence_update_state_accumulates_only_current_to_previous_edges() -> None:
+    graph = _heap_graph(5)
+    graph.reliability = np.ones(5, dtype=np.float32)
+    graph.sequence_edges = _edges(
+        [
+            (0, 1, 1.0),
+            (0, 2, 1.0),
+            (3, 1, 1.0),
+            (2, 3, 1.0),
+            (4, 0, 1.0),
+            (3, 4, 1.0),
+        ],
+        "sequence",
+    )
+    graph.transition_matrix = sparse.csr_matrix(
+        np.ones((1, 1), dtype=np.float32)
+    )
+    context = CocoreObjectiveContext(
+        graph, "sequence", relation_weight=1.0, similarity_threshold=0.8
+    )
+    main = context.state_from_indices([0, 1])
+    root = context.empty_update_state(main)
+
+    parent = context.extend_update_state(
+        root,
+        (2,),
+        similarity_main_indices=(0, 1),
+    )
+    child = context.extend_update_state(
+        parent,
+        (3, 4),
+        similarity_main_indices=(0, 1),
+    )
+    materialized = context.materialize_update_state(child)
+    denominator = np.log1p(6.0) + context.epsilon
+
+    assert materialized.sequence_relation_counts[0, 0] == pytest.approx(5.0)
+    assert child.relation == pytest.approx(np.log1p(5.0) / denominator)
+    assert child.relation_deltas == pytest.approx(
+        (
+            np.log1p(1.0) / denominator,
+            (np.log1p(3.0) - np.log1p(1.0)) / denominator,
+            (np.log1p(5.0) - np.log1p(3.0)) / denominator,
+        )
+    )
+    assert sum(child.relation_deltas) == pytest.approx(child.relation)
+
+
 @pytest.mark.parametrize("relation", ["sequence", "cooccurrence"])
 def test_objective_extend_state_matches_full_ordered_replay_without_mutating_base(
     relation: str,
@@ -373,6 +446,48 @@ def test_objective_recombination_resets_and_replays_retained_redundancy() -> Non
     assert recombined_root.redundancy == pytest.approx(0.0)
     assert replayed_retained.redundancy == pytest.approx(2.0 / 3.0)
     assert replayed_retained.redundancy_deltas == pytest.approx((2.0 / 3.0,))
+
+
+def test_sequence_recombination_resets_and_replays_retained_relation() -> None:
+    graph = _heap_graph(4)
+    graph.reliability = np.ones(4, dtype=np.float32)
+    graph.sequence_edges = _edges(
+        [(0, 1, 1.0), (0, 2, 1.0), (1, 3, 1.0), (2, 3, 1.0)],
+        "sequence",
+    )
+    graph.transition_matrix = sparse.csr_matrix(
+        np.ones((1, 1), dtype=np.float32)
+    )
+    context = CocoreObjectiveContext(
+        graph, "sequence", relation_weight=1.0, similarity_threshold=0.8
+    )
+    main = context.state_from_indices([0, 1])
+    before_recombination = context.extend_update_state(
+        context.empty_update_state(main),
+        (2, 3),
+        similarity_main_indices=(0, 1),
+    )
+
+    recombined_main = context.extend_state(main, [2])
+    recombined_root = context.empty_update_state(recombined_main)
+    replayed_retained = context.extend_update_state(
+        recombined_root,
+        (3,),
+        similarity_main_indices=(0, 1, 2),
+    )
+    denominator = np.log1p(4.0) + context.epsilon
+
+    assert before_recombination.relation == pytest.approx(
+        np.log1p(3.0) / denominator
+    )
+    assert recombined_root.relation == pytest.approx(0.0)
+    assert recombined_root.relation_deltas == ()
+    assert replayed_retained.relation == pytest.approx(
+        np.log1p(2.0) / denominator
+    )
+    assert replayed_retained.relation_deltas == pytest.approx(
+        (np.log1p(2.0) / denominator,)
+    )
 
 
 def test_objective_update_state_penalizes_only_new_active_pairs() -> None:
@@ -487,6 +602,63 @@ def test_random_multibranch_coverage_only_result_has_zero_redundancy() -> None:
     assert result.rounds == 0
     assert result.redundancy == pytest.approx(0.0)
     assert result.objective_value == pytest.approx(result.relation)
+    assert sum(result.score_deltas) == pytest.approx(result.objective_value)
+
+
+def test_random_multibranch_sequence_coverage_only_result_has_zero_objective() -> None:
+    graph = _heap_graph(2)
+    graph.reliability = np.ones(2, dtype=np.float32)
+    graph.sequence_edges = _edges([(0, 1, 1.0)], "sequence")
+    graph.transition_matrix = sparse.csr_matrix(
+        np.ones((1, 1), dtype=np.float32)
+    )
+    context = CocoreObjectiveContext(
+        graph, "sequence", relation_weight=2.0, similarity_threshold=0.8
+    )
+
+    result = RandomMultiBranchSelector(context, seed=7).select(
+        2,
+        initial_indices=(0, 1),
+    )
+
+    assert result.relation == pytest.approx(0.0)
+    assert result.redundancy == pytest.approx(0.0)
+    assert result.objective_value == pytest.approx(0.0)
+    assert result.score_deltas == pytest.approx((0.0, 0.0))
+
+
+def test_random_multibranch_sequence_result_uses_winner_incremental_deltas() -> None:
+    graph = _heap_graph(4)
+    graph.reliability = np.ones(4, dtype=np.float32)
+    graph.sequence_edges = _edges(
+        [(0, 1, 1.0), (0, 2, 1.0), (2, 3, 1.0), (3, 1, 1.0)],
+        "sequence",
+    )
+    graph.similarity_edges = _edges(
+        [(0, 2, 1.0), (2, 3, 1.0)],
+        "similarity",
+    )
+    graph.transition_matrix = sparse.csr_matrix(
+        np.ones((1, 1), dtype=np.float32)
+    )
+    context = CocoreObjectiveContext(
+        graph, "sequence", relation_weight=2.0, similarity_threshold=0.8
+    )
+
+    result = RandomMultiBranchSelector(context, seed=11).select(
+        4,
+        initial_indices=(0, 1),
+    )
+    canonical = context.state_from_indices(result.selected_indices)
+    expected_relation = np.log1p(3.0) / (np.log1p(4.0) + context.epsilon)
+
+    assert result.relation == pytest.approx(expected_relation)
+    assert result.relation < canonical.relation
+    assert result.redundancy == pytest.approx(1.0)
+    assert result.score_deltas[:2] == pytest.approx((0.0, 0.0))
+    assert sum(result.score_deltas[2:]) == pytest.approx(
+        2.0 * result.relation - result.redundancy
+    )
     assert sum(result.score_deltas) == pytest.approx(result.objective_value)
 
 
@@ -823,6 +995,34 @@ def test_random_multibranch_builds_main_state_from_scratch_only_once() -> None:
 
     assert result.recombinations == 2
     assert context.full_replay_sizes == [len(coverage.selected_indices)]
+
+
+def test_random_multibranch_sequence_does_not_replay_fixed_sequence_state() -> None:
+    graph = _heap_graph(3)
+    graph.reliability = np.ones(3, dtype=np.float32)
+    graph.sequence_edges = _edges([(0, 1, 1.0), (1, 2, 1.0)], "sequence")
+    graph.transition_matrix = sparse.csr_matrix(
+        np.ones((1, 1), dtype=np.float32)
+    )
+
+    class RejectingContext(CocoreObjectiveContext):
+        def state_from_indices(self, selected_indices):
+            del selected_indices
+            raise AssertionError("sequence branch main state must not replay fixed pairs")
+
+    context = RejectingContext(
+        graph, "sequence", relation_weight=1.0, similarity_threshold=0.8
+    )
+
+    result = RandomMultiBranchSelector(context, seed=23).select(
+        3,
+        initial_indices=(0, 1),
+    )
+
+    assert result.selected_indices[:2] == (0, 1)
+    assert result.relation == pytest.approx(
+        np.log1p(1.0) / (np.log1p(2.0) + context.epsilon)
+    )
 
 
 def test_lazy_heap_selects_current_top_then_refreshes_the_next_stale_top() -> None:
