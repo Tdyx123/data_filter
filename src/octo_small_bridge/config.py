@@ -177,6 +177,10 @@ def apply_overrides(config: dict[str, Any], **overrides: Any) -> dict[str, Any]:
             continue
         section, key = mapping[name]
         result[section][key] = value
+    if overrides.get("learning_rate") is not None:
+        result["train"]["learning_rate"]["peak_value"] = overrides["learning_rate"]
+    if overrides.get("warmup_steps") is not None:
+        result["train"]["learning_rate"]["warmup_steps"] = overrides["warmup_steps"]
     validate_config(result)
     return result
 

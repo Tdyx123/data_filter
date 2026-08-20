@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from collections.abc import Sequence
 
@@ -32,6 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--gpu-ids", type=_gpu_ids)
     parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--warmup-steps", type=int)
     parser.add_argument("--resume")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
@@ -42,6 +45,12 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     arguments = build_parser().parse_args(argv)
     if arguments.max_steps is not None and arguments.max_steps <= 0:
         raise SystemExit("--max-steps must be positive")
+    if arguments.learning_rate is not None and (
+        not math.isfinite(arguments.learning_rate) or arguments.learning_rate <= 0
+    ):
+        raise SystemExit("--learning-rate must be a positive finite number")
+    if arguments.warmup_steps is not None and arguments.warmup_steps < 0:
+        raise SystemExit("--warmup-steps must be non-negative")
     return arguments
 
 
@@ -56,6 +65,8 @@ def main() -> None:
         output_dir=arguments.output_dir,
         gpu_ids=arguments.gpu_ids,
         max_steps=max_steps,
+        learning_rate=arguments.learning_rate,
+        warmup_steps=arguments.warmup_steps,
     )
     if arguments.smoke_test:
         config["train"]["log_every_steps"] = 1
@@ -75,4 +86,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

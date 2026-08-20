@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -728,7 +729,7 @@ def test_bridge_training_wrapper_selects_primary_only(monkeypatch: pytest.Monkey
 
 
 def test_bridge_default_config_and_cli_contract(tmp_path: Path) -> None:
-    from octo_small_bridge.cli import build_parser
+    from octo_small_bridge.cli import build_parser, parse_arguments
     from octo_small_bridge.config import apply_overrides, load_config, resolved_paths
 
     project_root = Path(__file__).resolve().parents[1]
@@ -750,6 +751,7 @@ def test_bridge_default_config_and_cli_contract(tmp_path: Path) -> None:
     assert config["train"]["max_steps"] == 10_000
     assert config["train"]["learning_rate"]["warmup_steps"] == 400
     assert config["train"]["learning_rate"]["peak_value"] == pytest.approx(3.0e-4)
+    assert config["data"]["action_horizon"] == 8
 
     parser = build_parser()
     with pytest.raises(SystemExit):
@@ -767,6 +769,16 @@ def test_bridge_default_config_and_cli_contract(tmp_path: Path) -> None:
     )
     assert arguments.output_dir == str(tmp_path / "run")
     assert arguments.gpu_ids == [0, 1, 2, 3]
+    override_arguments = parse_arguments(
+        [
+            "--output-dir",
+            str(tmp_path / "override-run"),
+            "--learning-rate",
+            "1e-4",
+            "--warmup-steps",
+            "800",
+        ]
+    )
     updated = apply_overrides(
         config,
         output_dir=arguments.output_dir,
@@ -780,8 +792,109 @@ def test_bridge_default_config_and_cli_contract(tmp_path: Path) -> None:
     assert paths["normalization"] == (
         tmp_path / "run" / "normalization.json"
     ).resolve()
+    overridden = apply_overrides(
+        config,
+        learning_rate=override_arguments.learning_rate,
+        warmup_steps=override_arguments.warmup_steps,
+    )
+    assert overridden["train"]["learning_rate"]["peak_value"] == pytest.approx(1.0e-4)
+    assert overridden["train"]["learning_rate"]["warmup_steps"] == 800
     with pytest.raises(ValueError, match="gpu_ids length"):
         apply_overrides(config, gpu_ids=[0, 1])
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_peak", "expected_warmup"),
+    [
+        ({"learning_rate": 2.0e-4}, 2.0e-4, 400),
+        ({"warmup_steps": 0}, 3.0e-4, 0),
+    ],
+)
+def test_bridge_learning_rate_overrides_preserve_unspecified_yaml_default(
+    overrides: dict[str, float | int],
+    expected_peak: float,
+    expected_warmup: int,
+) -> None:
+    from octo_small_bridge.config import apply_overrides, load_config
+
+    project_root = Path(__file__).resolve().parents[1]
+    config = load_config(
+        project_root / "configs" / "octo_small_bridge_v2_4x4090.yaml"
+    )
+
+    updated = apply_overrides(config, **overrides)
+
+    assert updated["train"]["learning_rate"]["peak_value"] == pytest.approx(
+        expected_peak
+    )
+    assert updated["train"]["learning_rate"]["warmup_steps"] == expected_warmup
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--learning-rate", "0"),
+        ("--learning-rate", "-1e-4"),
+        ("--learning-rate", "nan"),
+        ("--learning-rate", "inf"),
+        ("--warmup-steps", "-1"),
+    ],
+)
+def test_bridge_cli_rejects_invalid_learning_rate_overrides(
+    option: str,
+    value: str,
+) -> None:
+    from octo_small_bridge.cli import parse_arguments
+
+    with pytest.raises(SystemExit):
+        parse_arguments(["--output-dir", "outputs/test", option, value])
+
+
+def test_bridge_cli_main_applies_learning_rate_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from octo_small_bridge import cli
+    from octo_small_bridge.config import load_config
+
+    project_root = Path(__file__).resolve().parents[1]
+    config = load_config(
+        project_root / "configs" / "octo_small_bridge_v2_4x4090.yaml"
+    )
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(cli, "load_config", lambda _path: config)
+    monkeypatch.setattr(
+        cli,
+        "resolved_paths",
+        lambda _config: {"output": tmp_path / "run"},
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_preflight",
+        lambda resolved, _paths: observed.update(config=resolved),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "octo-small-bridge",
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--learning-rate",
+            "1e-4",
+            "--warmup-steps",
+            "0",
+            "--preflight-only",
+        ],
+    )
+    monkeypatch.setenv("RANK", "0")
+
+    cli.main()
+
+    resolved = observed["config"]
+    assert isinstance(resolved, dict)
+    assert resolved["train"]["learning_rate"]["peak_value"] == pytest.approx(1.0e-4)
+    assert resolved["train"]["learning_rate"]["warmup_steps"] == 0
 
 
 def test_bridge_config_rejects_missing_normalization_contract() -> None:

@@ -37,6 +37,10 @@ def test_bridge_octo_script_uses_single_process_for_preflight(tmp_path: Path) ->
             "outputs/preflight",
             "--dataset-path",
             "/data/bridge",
+            "--learning-rate",
+            "2e-4",
+            "--warmup-steps",
+            "400",
             "--preflight-only",
         ],
         cwd=tmp_path,
@@ -50,6 +54,8 @@ def test_bridge_octo_script_uses_single_process_for_preflight(tmp_path: Path) ->
         PROJECT_ROOT / "configs" / "octo_small_bridge_v2_4x4090.yaml"
     )
     assert arguments[arguments.index("--output-dir") + 1] == "outputs/preflight"
+    assert arguments[arguments.index("--learning-rate") + 1] == "2e-4"
+    assert arguments[arguments.index("--warmup-steps") + 1] == "400"
     assert "--preflight-only" in arguments
 
 
@@ -64,6 +70,10 @@ def test_bridge_octo_script_uses_four_torchrun_processes(tmp_path: Path) -> None
             "outputs/train",
             "--max-steps",
             "7",
+            "--learning-rate",
+            "1e-4",
+            "--warmup-steps",
+            "0",
         ],
         cwd=PROJECT_ROOT,
         env=environment,
@@ -75,3 +85,5 @@ def test_bridge_octo_script_uses_four_torchrun_processes(tmp_path: Path) -> None
     assert arguments[3] == "octo_small_bridge.cli"
     assert arguments[arguments.index("--output-dir") + 1] == "outputs/train"
     assert arguments[arguments.index("--max-steps") + 1] == "7"
+    assert arguments[arguments.index("--learning-rate") + 1] == "1e-4"
+    assert arguments[arguments.index("--warmup-steps") + 1] == "0"
