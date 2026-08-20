@@ -976,24 +976,38 @@ ensemble。`--action-horizon` 的唯一合法值为 `1`；旧值 `8` 会在启�
 git submodule update --init --recursive third_party/SimplerEnv
 ```
 
-评测必须使用预先准备的 Python 3.10 或 3.11 单进程环境。不要把当前项目的
-Python 3.12 `pyproject.toml` 安装进该环境；按专用约束安装 Qwen、SAPIEN 和
-ManiSkill2 依赖即可，启动器会直接设置两个源码目录的 `PYTHONPATH`：
+启动器把模型与仿真拆成两个进程：模型默认通过
+`/home/dwb/.pyenv/bin/pyenv exec python` 运行并继承当前选中的 pyenv，仿真默认使用
+`.venv-octo-simpler/bin/python`。模型 pyenv 应按本项目的 Python 3.12 和 Qwen 推理依赖
+准备；仿真使用独立的 Python 3.10/3.11 环境，可按 Octo-small 入口的固定依赖创建：
 
 ```bash
-python3.10 -m venv .venv-simpler
-.venv-simpler/bin/pip install -r requirements-qwen-simpler-eval.txt
+uv venv --python /usr/bin/python3.10 .venv-octo-simpler
+uv pip install --python .venv-octo-simpler/bin/python \
+  torch==2.4.1 torchvision==0.19.1 \
+  --index-url https://download.pytorch.org/whl/cu121
+uv pip install --python .venv-octo-simpler/bin/python \
+  -r requirements-octo-simpler-eval.txt \
+  --build-constraints requirements-octo-simpler-build.txt
 ```
 
-脚本不会安装或改写依赖，并会严格检查 Python 版本、NumPy 1.24.4、Qwen 推理栈、
-SAPIEN/CUDA、两个源码 commit、overlay 资源以及 checkpoint 契约。先运行预检；它会
-对四类环境分别创建、reset、读取相机/base-frame proprio 并执行一次安全零动作，且
-让模型完成一次推理：
+脚本不会安装或改写依赖，也不会固定 `PYENV_VERSION`。如需覆盖解释器入口，分别传
+`--pyenv-bin PATH` 和 `--sim-python PATH`。`--device` 控制模型服务 GPU，
+`--sim-device` 控制渲染 GPU；`--model-path` 可覆盖 checkpoint 记录的基础模型，
+`--denoising-steps` 默认是 `4`。
+
+启动器为两个进程创建带随机认证密钥的私有 Unix socket；模型加载 checkpoint 并完成
+一次黑图推理后才启动仿真客户端。模型输出持久写入评测目录的 `model-server.log`，
+模型启动失败、超时或评测期间崩溃时会在终端显示日志尾部；退出或收到信号时启动器会
+回收两个子进程并清理 socket。
+
+先运行预检；它会对四类环境分别创建、reset、读取相机/base-frame proprio 并执行
+一次安全零动作，同时通过远程模型服务完成推理：
 
 ```bash
 bash scripts/evaluate_simpler_qwen.sh \
-  --python .venv-simpler/bin/python \
   --checkpoint /data/dwb/qwen_bridge/checkpoints/step-00020000 \
+  --output-dir outputs/qwen_simpler_preflight \
   --preflight-only
 ```
 
@@ -1001,8 +1015,8 @@ bash scripts/evaluate_simpler_qwen.sh \
 
 ```bash
 bash scripts/evaluate_simpler_qwen.sh \
-  --python .venv-simpler/bin/python \
   --checkpoint /data/dwb/qwen_bridge/checkpoints/step-00020000 \
+  --output-dir outputs/qwen_simpler_smoke \
   --smoke-test
 ```
 
@@ -1012,7 +1026,6 @@ bash scripts/evaluate_simpler_qwen.sh \
 
 ```bash
 bash scripts/evaluate_simpler_qwen.sh \
-  --python .venv-simpler/bin/python \
   --checkpoint /data/dwb/qwen_bridge/checkpoints/step-00020000 \
   --tasks all \
   --output-dir outputs/qwen_simpler_eval
@@ -1149,7 +1162,8 @@ bash scripts/evaluate_simpler_starvla.sh \
 ```bash
 pytest
 pytest -m real_data
-pytest -q tests/test_qwen_simpler_evaluation.py tests/test_evaluate_simpler_qwen_script.py
+pytest -q tests/test_qwen_ipc.py tests/test_qwen_simpler_server.py \
+  tests/test_qwen_simpler_evaluation.py tests/test_evaluate_simpler_qwen_script.py
 bash -n scripts/evaluate_simpler_qwen.sh
 pytest -q tests/test_simpler_bridge_evaluation.py \
   tests/test_octo_small_simpler_evaluation.py \

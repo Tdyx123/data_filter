@@ -64,21 +64,39 @@ def test_task_selection_preserves_requested_order_and_rejects_duplicates():
         evaluation.resolve_task_selection("spoon,drawer")
 
 
-def test_qwen_simpler_cli_only_accepts_stepwise_action_horizon():
+def test_qwen_simpler_client_requires_socket_and_defaults_to_full_protocol():
     from qwen3_vl_groot.evaluate_simpler import build_parser
 
     parser = build_parser()
-    arguments = parser.parse_args(["--checkpoint", "/models/checkpoint"])
+    arguments = parser.parse_args(
+        ["--socket", "/tmp/qwen.sock", "--auth-key-hex", "abcd"]
+    )
 
     assert arguments.action_horizon == 1
     assert arguments.sim_device == "cuda:0"
     assert parser.parse_args(
-        ["--checkpoint", "/models/checkpoint", "--sim-device", "cuda:12"]
+        [
+            "--socket",
+            "/tmp/qwen.sock",
+            "--auth-key-hex",
+            "abcd",
+            "--sim-device",
+            "cuda:12",
+        ]
     ).sim_device == "cuda:12"
     with pytest.raises(SystemExit):
         parser.parse_args(
-            ["--checkpoint", "/models/checkpoint", "--action-horizon", "8"]
+            [
+                "--socket",
+                "/tmp/qwen.sock",
+                "--auth-key-hex",
+                "abcd",
+                "--action-horizon",
+                "8",
+            ]
         )
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--socket", "/tmp/qwen.sock"])
 
 
 @pytest.mark.parametrize(
@@ -90,8 +108,150 @@ def test_qwen_simpler_cli_rejects_non_logical_cuda_sim_devices(sim_device):
 
     with pytest.raises(SystemExit):
         build_parser().parse_args(
-            ["--checkpoint", "/models/checkpoint", "--sim-device", sim_device]
+            [
+                "--socket",
+                "/tmp/qwen.sock",
+                "--auth-key-hex",
+                "abcd",
+                "--sim-device",
+                sim_device,
+            ]
         )
+
+
+def test_qwen_simpler_cli_applies_smoke_protocol_and_model_metadata(
+    tmp_path, monkeypatch
+):
+    from qwen3_vl_groot import evaluate_simpler
+
+    captured = {}
+    client = SimpleNamespace(shutdown=lambda: captured.setdefault("shutdown", True))
+    policy = SimpleNamespace(
+        checkpoint_report={"requested_path": "/models/step-00020000"},
+        model_device="cuda:3",
+        protocol_metadata=lambda: {
+            "native_action_chunk_size": 8,
+            "denoising_steps": 6,
+        },
+    )
+    monkeypatch.setattr(evaluate_simpler, "validate_simpler_source", lambda path: {})
+    monkeypatch.setattr(evaluate_simpler, "QwenIPCClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(evaluate_simpler, "QwenRemotePolicy", lambda value: policy)
+
+    def evaluate(settings, **kwargs):
+        captured["settings"] = settings
+        captured["kwargs"] = kwargs
+        return {"status": "complete"}
+
+    monkeypatch.setattr(evaluate_simpler, "evaluate_simpler_policy", evaluate)
+
+    status = evaluate_simpler.main(
+        [
+            "--socket",
+            "/tmp/qwen.sock",
+            "--auth-key-hex",
+            "abcd",
+            "--tasks",
+            "eggplant,spoon",
+            "--output-dir",
+            str(tmp_path / "results"),
+            "--smoke-test",
+        ]
+    )
+
+    assert status == 0
+    assert [task.key for task in captured["settings"].tasks] == ["eggplant", "spoon"]
+    assert captured["settings"].policy_seeds == (0,)
+    assert captured["settings"].object_episode_ids == (0,)
+    assert captured["settings"].max_steps == 8
+    assert captured["settings"].device == "remote-pyenv:cuda:3"
+    assert captured["kwargs"]["checkpoint"] == policy.checkpoint_report
+    assert captured["kwargs"]["route"] == "qwen3-vl-groot-simpler-widowx-eval"
+    assert captured["kwargs"]["protocol_metadata"] == {
+        "native_action_chunk_size": 8,
+        "denoising_steps": 6,
+    }
+    assert captured["shutdown"] is True
+
+
+@pytest.mark.parametrize("preflight_only", (False, True), ids=("evaluation", "preflight"))
+def test_qwen_cli_forwards_sim_device_to_environment_builder(
+    tmp_path, monkeypatch, preflight_only
+):
+    from qwen3_vl_groot import evaluate_simpler
+
+    captured = {}
+    client = SimpleNamespace(shutdown=lambda: None)
+    policy = SimpleNamespace(
+        checkpoint_report={},
+        model_device="cuda:0",
+        protocol_metadata=lambda: {},
+    )
+    monkeypatch.setattr(evaluate_simpler, "validate_simpler_source", lambda path: {})
+    monkeypatch.setattr(evaluate_simpler, "QwenIPCClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(evaluate_simpler, "QwenRemotePolicy", lambda value: policy)
+    monkeypatch.setattr(
+        evaluate_simpler,
+        "create_simpler_environment",
+        lambda task, *, sim_device: captured.setdefault(
+            "builder", (task.key, sim_device)
+        ),
+    )
+
+    def run(settings, **kwargs):
+        captured["settings"] = settings
+        kwargs["environment_factory"](settings.tasks[0])
+        return {"status": "complete"}
+
+    monkeypatch.setattr(evaluate_simpler, "evaluate_simpler_policy", run)
+    monkeypatch.setattr(evaluate_simpler, "run_simpler_preflight", run)
+    arguments = [
+        "--socket",
+        "/tmp/qwen.sock",
+        "--auth-key-hex",
+        "abcd",
+        "--tasks",
+        "spoon",
+        "--output-dir",
+        str(tmp_path / "output"),
+        "--sim-device",
+        "cuda:7",
+    ]
+    if preflight_only:
+        arguments.append("--preflight-only")
+
+    assert evaluate_simpler.main(arguments) == 0
+    assert captured["settings"].sim_device == "cuda:7"
+    assert captured["builder"] == ("spoon", "cuda:7")
+
+
+def test_qwen_simpler_cli_writes_contract_failures(tmp_path, monkeypatch):
+    from qwen3_vl_groot import evaluate_simpler
+
+    monkeypatch.setattr(
+        evaluate_simpler,
+        "validate_simpler_source",
+        lambda path: (_ for _ in ()).throw(
+            evaluate_simpler.SimplerEvaluationError("source mismatch")
+        ),
+    )
+    output_dir = tmp_path / "output"
+
+    status = evaluate_simpler.main(
+        [
+            "--socket",
+            "/tmp/qwen.sock",
+            "--auth-key-hex",
+            "abcd",
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    failure = json.loads((output_dir / "failure.json").read_text(encoding="utf-8"))
+    assert status == 2
+    assert failure["exit_code"] == 2
+    assert failure["error"] == "SimplerEvaluationError: source mismatch"
 
 
 def test_qwen_simpler_settings_default_sim_device(tmp_path):
@@ -100,6 +260,69 @@ def test_qwen_simpler_settings_default_sim_device(tmp_path):
     settings = evaluation.SimplerEvaluationSettings(checkpoint=tmp_path / "checkpoint")
 
     assert settings.sim_device == "cuda:0"
+
+
+def test_remote_policy_preserves_raw_observations_rng_and_server_metadata():
+    from qwen3_vl_groot.ipc import IPC_PROTOCOL_VERSION
+    from qwen3_vl_groot.remote_policy import QwenRemotePolicy
+
+    class Client:
+        def __init__(self):
+            self.resets = []
+            self.inferences = []
+
+        def metadata(self):
+            return {
+                "protocol_version": IPC_PROTOCOL_VERSION,
+                "model": "Qwen Bridge checkpoint",
+                "native_action_chunk_size": 8,
+                "action_dim": 7,
+                "device": "cuda:3",
+                "checkpoint": {"requested_path": "/models/checkpoint"},
+                "model_image_shape": [224, 224, 3],
+                "train_crop_size": 224,
+                "protocol": {
+                    "denoising_steps": 6,
+                    "native_action_chunk_size": 8,
+                },
+                "startup_preflight": {"action_shape": [1, 8, 7], "finite": True},
+            }
+
+        def reset_rng(self, seed):
+            self.resets.append(seed)
+            return seed
+
+        def infer(self, image, proprio, instruction):
+            self.inferences.append((image, proprio, instruction))
+            return np.zeros((1, 8, 7), dtype=np.float32)
+
+    client = Client()
+    policy = QwenRemotePolicy(client)
+    image = np.zeros((480, 640, 3), dtype=np.uint8)
+    proprio = np.arange(8, dtype=np.float64)
+
+    generator = policy.make_generator(4)
+    prepared = policy.prepare_observation(image, proprio, "Put Spoon on Towel")
+    actions = policy.predict_actions(prepared, generator=generator)
+
+    assert generator == 4
+    assert client.resets == [4]
+    assert client.inferences[0][0] is image
+    assert client.inferences[0][1].dtype == np.float32
+    assert client.inferences[0][2] == "Put Spoon on Towel"
+    assert actions.shape == (1, 8, 7)
+    assert policy.describe_observation(prepared) == {
+        "source_image_shape": [480, 640, 3],
+        "model_image_shape": [224, 224, 3],
+    }
+    assert policy.checkpoint_report == {"requested_path": "/models/checkpoint"}
+    assert policy.model_device == "cuda:3"
+    assert policy.protocol_metadata() == {
+        "denoising_steps": 6,
+        "native_action_chunk_size": 8,
+        "ipc_protocol_version": IPC_PROTOCOL_VERSION,
+        "startup_preflight": {"action_shape": [1, 8, 7], "finite": True},
+    }
 
 
 def test_qwen_settings_preserve_sim_device_for_both_shared_runners(tmp_path, monkeypatch):

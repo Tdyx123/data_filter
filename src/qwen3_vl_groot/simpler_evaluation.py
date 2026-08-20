@@ -157,7 +157,7 @@ def preprocess_bridge_image(
     return np.asarray(image, dtype=np.uint8).copy()
 
 
-class _QwenPolicyAdapter:
+class QwenPolicyAdapter:
     policy_name = "Qwen checkpoint"
     gripper_threshold = 0.5
 
@@ -239,7 +239,7 @@ def run_simpler_episode(
             "Bridge checkpoint requires integer train_crop_size and output_image_size"
         ) from error
 
-    adapter = _QwenPolicyAdapter(
+    adapter = QwenPolicyAdapter(
         policy=policy,
         crop_size=crop_size,
         output_size=output_size,
@@ -356,7 +356,7 @@ def run_simpler_preflight(
         video_fps=settings.video_fps,
         overwrite=settings.overwrite,
     )
-    adapter = _QwenPolicyAdapter(
+    adapter = QwenPolicyAdapter(
         policy=policy,
         crop_size=crop_size,
         output_size=output_size,
@@ -405,7 +405,7 @@ def evaluate_simpler_checkpoint(
         video_fps=settings.video_fps,
         overwrite=settings.overwrite,
     )
-    adapter = _QwenPolicyAdapter(
+    adapter = QwenPolicyAdapter(
         policy=policy,
         crop_size=crop_size,
         output_size=output_size,
