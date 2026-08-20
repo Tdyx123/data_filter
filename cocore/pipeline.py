@@ -72,6 +72,7 @@ from cocore.random_multibranch import (
     RETAINED_SIZE,
     SIMILARITY_MAIN_SAMPLE_SIZE,
     SIMILARITY_RNG_STREAM,
+    RandomMultiBranchSelectionResult,
     RandomMultiBranchSelector,
 )
 from cocore.selection import (
@@ -90,6 +91,7 @@ PROTOTYPE_STRATEGY = (
 )
 PROTOTYPE_VISUAL_PROJECTION = "frame @ visual_pca.components[:, :frame_embedding_dim].T"
 PROTOTYPE_VISUAL_NORMALIZATION = "l2_normalized_eight_frame_mean_after_projection"
+RANDOM_MULTIBRANCH_TIMING_SCHEMA_VERSION = 1
 
 
 def _number_tag(value: float) -> str:
@@ -139,6 +141,119 @@ def _selection_algorithm(
             },
         }
     raise ValueError(f"unknown selection method {method!r}")
+
+
+def _average_runtime_seconds(values: tuple[float, ...]) -> float | None:
+    if not values:
+        return None
+    return math.fsum(values) / len(values)
+
+
+def _random_multibranch_timing_report(
+    result: RandomMultiBranchSelectionResult,
+) -> dict[str, Any]:
+    round_seconds = result.round_runtime_seconds
+    recombination_seconds = tuple(
+        seconds for _, seconds in result.recombination_runtime_seconds
+    )
+    return {
+        "rounds": [
+            {"round": round_number, "seconds": seconds}
+            for round_number, seconds in enumerate(round_seconds, start=1)
+        ],
+        "recombinations": [
+            {"round": round_number, "seconds": seconds}
+            for round_number, seconds in result.recombination_runtime_seconds
+        ],
+        "average_round_seconds": _average_runtime_seconds(round_seconds),
+        "average_recombination_seconds": _average_runtime_seconds(
+            recombination_seconds
+        ),
+    }
+
+
+_BRANCH_TIMING_ERROR = "selection report branch search timing metadata is invalid"
+
+
+def _validated_runtime_seconds(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(_BRANCH_TIMING_ERROR)
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0.0:
+        raise ValueError(_BRANCH_TIMING_ERROR)
+    return seconds
+
+
+def _validate_recorded_average(value: object, seconds: list[float]) -> None:
+    if not seconds:
+        if value is not None:
+            raise ValueError(_BRANCH_TIMING_ERROR)
+        return
+    recorded = _validated_runtime_seconds(value)
+    expected = math.fsum(seconds) / len(seconds)
+    if not math.isclose(recorded, expected, rel_tol=1.0e-12, abs_tol=1.0e-12):
+        raise ValueError(_BRANCH_TIMING_ERROR)
+
+
+def _validate_random_multibranch_timing_report(
+    payload: object,
+    replayed: RandomMultiBranchSelectionResult,
+) -> None:
+    expected_keys = {
+        "rounds",
+        "recombinations",
+        "average_round_seconds",
+        "average_recombination_seconds",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != expected_keys:
+        raise ValueError(_BRANCH_TIMING_ERROR)
+    round_rows = payload["rounds"]
+    recombination_rows = payload["recombinations"]
+    if not isinstance(round_rows, list) or not isinstance(recombination_rows, list):
+        raise ValueError(_BRANCH_TIMING_ERROR)
+    if len(round_rows) != replayed.rounds:
+        raise ValueError(_BRANCH_TIMING_ERROR)
+
+    round_seconds: list[float] = []
+    for expected_round, row in enumerate(round_rows, start=1):
+        if not isinstance(row, Mapping) or set(row) != {"round", "seconds"}:
+            raise ValueError(_BRANCH_TIMING_ERROR)
+        round_number = row["round"]
+        if (
+            isinstance(round_number, bool)
+            or not isinstance(round_number, int)
+            or round_number != expected_round
+        ):
+            raise ValueError(_BRANCH_TIMING_ERROR)
+        round_seconds.append(_validated_runtime_seconds(row["seconds"]))
+
+    expected_recombination_rounds = [
+        round_number for round_number, _ in replayed.recombination_runtime_seconds
+    ]
+    if len(recombination_rows) != len(expected_recombination_rounds):
+        raise ValueError(_BRANCH_TIMING_ERROR)
+    recombination_seconds: list[float] = []
+    for expected_round, row in zip(
+        expected_recombination_rounds,
+        recombination_rows,
+        strict=True,
+    ):
+        if not isinstance(row, Mapping) or set(row) != {"round", "seconds"}:
+            raise ValueError(_BRANCH_TIMING_ERROR)
+        round_number = row["round"]
+        if (
+            isinstance(round_number, bool)
+            or not isinstance(round_number, int)
+            or round_number != expected_round
+        ):
+            raise ValueError(_BRANCH_TIMING_ERROR)
+        recombination_seconds.append(_validated_runtime_seconds(row["seconds"]))
+
+    _validate_recorded_average(payload["average_round_seconds"], round_seconds)
+    _validate_recorded_average(
+        payload["average_recombination_seconds"],
+        recombination_seconds,
+    )
 
 
 def _output_root(config: Mapping[str, Any], output_dir: str | Path | None) -> Path:
@@ -1318,20 +1433,29 @@ def select_stage(
         max_refreshes=max_refreshes,
         seed=int(resolved["seed"]),
     )
-    fingerprint = stable_hash(
-        {
-            "producer": "cocore",
-            "version": __version__,
-            "stage": "select",
-            "upstream": graph_fingerprint,
-            "objective": resolved["objective"],
-            "selection": resolved["selection"],
-            "seed": resolved["seed"],
-            "algorithm": algorithm,
-            "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
-            "prototype_strategy": PROTOTYPE_STRATEGY,
-        }
+    fingerprint_payload = {
+        "producer": "cocore",
+        "version": __version__,
+        "stage": "select",
+        "upstream": graph_fingerprint,
+        "objective": resolved["objective"],
+        "selection": resolved["selection"],
+        "seed": resolved["seed"],
+        "algorithm": algorithm,
+        "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
+        "prototype_strategy": PROTOTYPE_STRATEGY,
+    }
+    legacy_random_fingerprint = (
+        stable_hash(fingerprint_payload) if method == "random_multibranch" else None
     )
+    if (
+        method == "random_multibranch"
+        and RANDOM_MULTIBRANCH_TIMING_SCHEMA_VERSION > 0
+    ):
+        fingerprint_payload["random_multibranch_timing_schema_version"] = (
+            RANDOM_MULTIBRANCH_TIMING_SCHEMA_VERSION
+        )
+    fingerprint = stable_hash(fingerprint_payload)
 
     def build(temporary: Path) -> None:
         started = time.perf_counter()
@@ -1357,6 +1481,25 @@ def select_stage(
                     seed=int(resolved["seed"]),
                 )
             result = selector.select(budget, initial_indices=coverage_seed.selected_indices)
+
+        branch_search_timings: dict[str, Any] | None = None
+        if method == "random_multibranch":
+            assert isinstance(result, RandomMultiBranchSelectionResult)
+            branch_search_timings = _random_multibranch_timing_report(result)
+            average_round_seconds = branch_search_timings["average_round_seconds"]
+            if average_round_seconds is not None:
+                emit_completed_timing(
+                    "select.random_multibranch.round_average",
+                    float(average_round_seconds),
+                )
+            average_recombination_seconds = branch_search_timings[
+                "average_recombination_seconds"
+            ]
+            if average_recombination_seconds is not None:
+                emit_completed_timing(
+                    "select.random_multibranch.recombination_average",
+                    float(average_recombination_seconds),
+                )
 
         export_started = time.perf_counter()
         graph_nodes = np.load(root / GRAPH_DIRECTORY / "nodes.npz")
@@ -1425,6 +1568,7 @@ def select_stage(
                 "max_refreshes_observed": result.max_refreshes_observed,
             }
         else:
+            assert branch_search_timings is not None
             report["branch_search"] = {
                 "rounds": result.rounds,
                 "evaluated_branches": result.evaluated_branches,
@@ -1435,6 +1579,7 @@ def select_stage(
                     graph.sample_ids[index]
                     for index in result.similarity_penalty_indices
                 ],
+                "timings": branch_search_timings,
             }
         for stage, stage_directory in {
             "scan": "scan",
@@ -1474,12 +1619,23 @@ def select_stage(
         )
         emit_completed_timing("select.export", time.perf_counter() - export_started)
 
+    selection_required = (
+        "selected_manifest.jsonl",
+        "all_clips.parquet",
+        "selection_report.json",
+    )
+    upgrade_legacy_random_cache = (
+        method == "random_multibranch"
+        and legacy_random_fingerprint is not None
+        and legacy_random_fingerprint != fingerprint
+        and cache_is_valid(destination, legacy_random_fingerprint, selection_required)
+    )
     stage_started = time.perf_counter()
     built = publish_stage(
         destination,
         fingerprint=fingerprint,
-        required=("selected_manifest.jsonl", "all_clips.parquet", "selection_report.json"),
-        force=force,
+        required=selection_required,
+        force=force or upgrade_legacy_random_cache,
         resume=bool(resolved["runtime"].get("resume", True)),
         build=build,
     )
@@ -1920,8 +2076,18 @@ def validate_output(
                 for index in replayed_random.similarity_penalty_indices
             ],
         }
-        if report.get("branch_search") != expected_branch_search or "heap" in report:
+        branch_search = report.get("branch_search")
+        if not isinstance(branch_search, Mapping):
             raise ValueError("selection report branch search metadata is invalid")
+        recorded_branch_search = {
+            key: value for key, value in branch_search.items() if key != "timings"
+        }
+        if recorded_branch_search != expected_branch_search or "heap" in report:
+            raise ValueError("selection report branch search metadata is invalid")
+        _validate_random_multibranch_timing_report(
+            branch_search.get("timings"),
+            replayed_random,
+        )
     elif "branch_search" in report:
         raise ValueError("selection report branch search metadata is invalid")
 

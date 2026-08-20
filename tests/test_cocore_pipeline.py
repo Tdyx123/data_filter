@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import re
 from collections.abc import Iterator, Mapping, Sequence
@@ -576,6 +577,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
 
 def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path, "sequence")
@@ -583,6 +585,7 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
     root = tmp_path / "random-multibranch-output"
 
     result = run_pipeline(config, output_dir=root, visual_encoder=CocoreVisualEncoder())
+    first = capsys.readouterr()
 
     assert result == root / "select-sequence-w1-top50pct-random-multibranch"
     selected = [
@@ -611,7 +614,8 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
     }
     assert report["algorithm"] == algorithm
     assert "heap" not in report
-    assert report["branch_search"] == {
+    branch_search = report["branch_search"]
+    assert {key: value for key, value in branch_search.items() if key != "timings"} == {
         "rounds": 1,
         "evaluated_branches": 8,
         "recombinations": 0,
@@ -621,6 +625,23 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
             row["sample_id"] for row in selected
         ],
     }
+    timings = branch_search["timings"]
+    assert len(timings["rounds"]) == 1
+    assert timings["rounds"][0]["round"] == 1
+    assert np.isfinite(timings["rounds"][0]["seconds"])
+    assert timings["rounds"][0]["seconds"] >= 0.0
+    assert timings["recombinations"] == []
+    assert timings["average_round_seconds"] == timings["rounds"][0]["seconds"]
+    assert timings["average_recombination_seconds"] is None
+    random_timing_steps = [
+        line.split(" step=", 1)[1].split(" ", 1)[0]
+        for line in first.err.splitlines()
+        if " step=select.random_multibranch" in line
+    ]
+    assert random_timing_steps == [
+        "select.random_multibranch",
+        "select.random_multibranch.round_average",
+    ]
     assert {row["selection_phase"] for row in selected} == {
         "coverage_seed",
         "branch_final",
@@ -632,6 +653,16 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
         "status": "valid",
         "selected_clips": 10,
     }
+
+    cached = run_pipeline(
+        config,
+        output_dir=root,
+        visual_encoder=FailingCocoreVisualEncoder(),
+    )
+    cached_output = capsys.readouterr()
+    assert cached == result
+    assert cached_output.out == ""
+    assert "cocore_timing" not in cached_output.err
 
     report["branch_search"]["final_similarity_penalty_sample_ids"] = report[
         "branch_search"
@@ -647,6 +678,140 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
     (result / "selection_report.json").write_text(json.dumps(report))
     with pytest.raises(ValueError, match="branch search"):
         validate_output(result, config=config)
+
+
+def test_validate_rejects_invalid_random_multibranch_timings(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path, "sequence")
+    config["selection"]["method"] = "random_multibranch"
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    report_path = result / "selection_report.json"
+    report = json.loads(report_path.read_text())
+    valid = report["branch_search"]["timings"]
+
+    corruptions: list[dict[str, object]] = []
+    wrong_round = copy.deepcopy(valid)
+    wrong_round["rounds"][0]["round"] = 2
+    corruptions.append(wrong_round)
+    boolean_seconds = copy.deepcopy(valid)
+    boolean_seconds["rounds"][0]["seconds"] = True
+    corruptions.append(boolean_seconds)
+    negative_seconds = copy.deepcopy(valid)
+    negative_seconds["rounds"][0]["seconds"] = -0.1
+    corruptions.append(negative_seconds)
+    nonfinite_seconds = copy.deepcopy(valid)
+    nonfinite_seconds["rounds"][0]["seconds"] = float("nan")
+    corruptions.append(nonfinite_seconds)
+    wrong_average = copy.deepcopy(valid)
+    wrong_average["average_round_seconds"] = float(valid["average_round_seconds"]) + 1.0
+    corruptions.append(wrong_average)
+    unexpected_recombination = copy.deepcopy(valid)
+    unexpected_recombination["recombinations"] = [{"round": 20, "seconds": 0.1}]
+    corruptions.append(unexpected_recombination)
+    wrong_empty_average = copy.deepcopy(valid)
+    wrong_empty_average["average_recombination_seconds"] = 0.0
+    corruptions.append(wrong_empty_average)
+
+    for corrupted in corruptions:
+        report["branch_search"]["timings"] = corrupted
+        report_path.write_text(json.dumps(report))
+        with pytest.raises(ValueError, match="branch search timing"):
+            validate_output(result, config=config)
+
+
+def test_random_multibranch_reports_recombination_detail_and_average_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path, "sequence")
+    config["selection"]["method"] = "random_multibranch"
+    config["selection"]["budget"] = 13
+    monkeypatch.setattr("cocore.random_multibranch.BATCH_SIZE", 1)
+    monkeypatch.setattr("cocore.random_multibranch.FIRST_RECOMBINATION_ROUND", 2)
+    monkeypatch.setattr("cocore.random_multibranch.RECOMBINATION_INTERVAL", 10)
+    monkeypatch.setattr("cocore.random_multibranch.COMMIT_SIZE", 1)
+    monkeypatch.setattr("cocore.random_multibranch.RETAINED_SIZE", 1)
+
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    captured = capsys.readouterr()
+    timings = json.loads((result / "selection_report.json").read_text())["branch_search"][
+        "timings"
+    ]
+
+    assert len(timings["recombinations"]) == 1
+    assert timings["recombinations"][0]["round"] == 2
+    assert timings["recombinations"][0]["seconds"] >= 0.0
+    assert timings["average_recombination_seconds"] == timings["recombinations"][0][
+        "seconds"
+    ]
+    random_timing_steps = [
+        line.split(" step=", 1)[1].split(" ", 1)[0]
+        for line in captured.err.splitlines()
+        if " step=select.random_multibranch" in line
+    ]
+    assert random_timing_steps == [
+        "select.random_multibranch",
+        "select.random_multibranch.round_average",
+        "select.random_multibranch.recombination_average",
+    ]
+
+
+def test_random_multibranch_timing_schema_rebuilds_legacy_select_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path, "sequence")
+    config["selection"]["method"] = "random_multibranch"
+    root = tmp_path / "random-multibranch-schema-upgrade"
+    monkeypatch.setattr(
+        cocore_pipeline,
+        "RANDOM_MULTIBRANCH_TIMING_SCHEMA_VERSION",
+        0,
+    )
+    legacy_result = run_pipeline(
+        config,
+        output_dir=root,
+        visual_encoder=CocoreVisualEncoder(),
+    )
+    legacy_run = json.loads((legacy_result / "run_manifest.json").read_text())
+    legacy_fingerprint = json.loads((legacy_result / "manifest.json").read_text())[
+        "fingerprint"
+    ]
+    legacy_report_path = legacy_result / "selection_report.json"
+    legacy_report = json.loads(legacy_report_path.read_text())
+    del legacy_report["branch_search"]["timings"]
+    legacy_report_path.write_text(json.dumps(legacy_report))
+
+    monkeypatch.setattr(
+        cocore_pipeline,
+        "RANDOM_MULTIBRANCH_TIMING_SCHEMA_VERSION",
+        1,
+    )
+    upgraded_result = run_pipeline(
+        config,
+        output_dir=root,
+        visual_encoder=FailingCocoreVisualEncoder(),
+    )
+    upgraded_run = json.loads((upgraded_result / "run_manifest.json").read_text())
+    upgraded_fingerprint = json.loads((upgraded_result / "manifest.json").read_text())[
+        "fingerprint"
+    ]
+
+    assert upgraded_result == legacy_result
+    assert upgraded_fingerprint != legacy_fingerprint
+    assert upgraded_run["stage_fingerprints"]["select"] == upgraded_fingerprint
+    assert {
+        stage: upgraded_run["stage_fingerprints"][stage]
+        for stage in ("scan", "encode", "graph")
+    } == {
+        stage: legacy_run["stage_fingerprints"][stage]
+        for stage in ("scan", "encode", "graph")
+    }
+    upgraded_report = json.loads((upgraded_result / "selection_report.json").read_text())
+    assert "timings" in upgraded_report["branch_search"]
 
 
 def test_disabled_stop_bucket_excludes_unlabeled_candidates_from_graph_and_selection(

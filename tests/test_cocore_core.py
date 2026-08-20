@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import time
 from collections import Counter
 from dataclasses import dataclass
+from itertools import count
 from types import SimpleNamespace
 
 import numpy as np
@@ -338,6 +340,8 @@ def test_random_multibranch_returns_coverage_without_starting_search() -> None:
     assert result.recombinations == 0
     assert result.committed_clips == 0
     assert result.final_active_clips == 0
+    assert result.round_runtime_seconds == ()
+    assert result.recombination_runtime_seconds == ()
 
 
 def test_random_multibranch_fills_a_partial_final_batch_reproducibly() -> None:
@@ -387,6 +391,32 @@ def test_random_multibranch_fills_a_partial_final_batch_reproducibly() -> None:
     assert first.selection_phases.count("coverage_seed") == 1
     assert first.selection_phases.count("branch_final") == 16
     assert first.selection_steps[-16:] == (2,) * 16
+
+
+def test_random_multibranch_times_rounds_separately_from_recombination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = CocoreObjectiveContext(
+        _heap_graph(10), "cooccurrence", 1.0, similarity_threshold=0.8
+    )
+    coverage = build_max_coverage_seed(context, budget=4)
+    ticks = count(step=0.25)
+    monkeypatch.setattr("cocore.random_multibranch.BATCH_SIZE", 1)
+    monkeypatch.setattr("cocore.random_multibranch.FIRST_RECOMBINATION_ROUND", 2)
+    monkeypatch.setattr("cocore.random_multibranch.RECOMBINATION_INTERVAL", 10)
+    monkeypatch.setattr("cocore.random_multibranch.COMMIT_SIZE", 1)
+    monkeypatch.setattr("cocore.random_multibranch.RETAINED_SIZE", 1)
+    monkeypatch.setattr(time, "perf_counter", lambda: next(ticks))
+
+    result = RandomMultiBranchSelector(context, seed=11).select(
+        4,
+        initial_indices=coverage.selected_indices,
+    )
+
+    assert result.rounds == 3
+    assert result.recombinations == 1
+    assert result.round_runtime_seconds == pytest.approx((0.25, 0.25, 0.25))
+    assert result.recombination_runtime_seconds == ((2, 0.25),)
 
 
 def test_random_multibranch_does_not_clone_complete_branch_states(monkeypatch) -> None:

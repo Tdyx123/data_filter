@@ -114,6 +114,27 @@ score(S) = relation_weight * relation(S) - redundancy(S)
 只补足预算，达到预算后直接采用最高得分分支。主状态只保存一份，分支仅保存稀疏更新；
 8、4、10、20、10 和两个用途不同的 100 都是固定算法常量，不提供额外配置项。
 
+随机多分支选择会用单调高精度时钟记录每轮分支生成、评分与保留耗时；发生重组时，
+计数、提交、主状态重建、片段保留及重组分支重建单独计时，不计入普通轮次。最终结果
+重算与导出也不计入轮次，而由既有的选择总耗时和 `select.export` 覆盖。
+`selection_report.json` 的 `branch_search.timings` 保存完整明细与算术平均值：
+
+```json
+{
+  "rounds": [{"round": 1, "seconds": 0.125}],
+  "recombinations": [{"round": 20, "seconds": 0.5}],
+  "average_round_seconds": 0.125,
+  "average_recombination_seconds": 0.5
+}
+```
+
+命令行不打印逐轮或逐次重组明细，只在存在对应样本时输出
+`select.random_multibranch.round_average` 和
+`select.random_multibranch.recombination_average` 两条 `cocore_timing` 平均值；既有的
+`select.random_multibranch` 总耗时保持不变。没有轮次或重组时，报告中的列表为空、
+平均值为 `null`，命令行省略相应平均值。首次使用该计时 schema 时，兼容的旧随机选择
+缓存会仅重建 select 产物，继续复用 scan、encode 和 graph。
+
 ## 运行
 
 ```bash
@@ -240,8 +261,8 @@ scan、encode、graph 和 selection 缓存不迁移；
 - `all_clips.parquet`：eligible 筛选池的 support、progress、reliability、运动原语与选择
   诊断，不包含无标签候选；
 - `selection_report.json`：coverage、目标分解、任务计数、lazy heap 刷新统计或
-  `branch_search` 轮次/评估/重组统计及最终相似性惩罚 sample IDs，以及 scanned、
-  eligible、excluded-unlabeled 候选数量；
+  `branch_search` 轮次/评估/重组统计、逐轮与逐次重组耗时及最终相似性惩罚 sample IDs，
+  以及 scanned、eligible、excluded-unlabeled 候选数量；
 - `manifest.json`、`run_manifest.json`：Cocore 参数、阶段目录与指纹；
 - `resolved_config.yaml`、`environment.json`：`run` 的完整配置与环境。
 

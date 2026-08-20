@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -38,6 +39,8 @@ class RandomMultiBranchSelectionResult:
     recombinations: int
     committed_clips: int
     final_active_clips: int
+    round_runtime_seconds: tuple[float, ...] = field(compare=False)
+    recombination_runtime_seconds: tuple[tuple[int, float], ...] = field(compare=False)
 
 
 @dataclass(frozen=True)
@@ -192,7 +195,13 @@ class RandomMultiBranchSelector:
         recombinations: int,
         committed_clips: int,
         final_active_clips: int,
+        round_runtime_seconds: list[float],
+        recombination_runtime_seconds: list[tuple[int, float]],
     ) -> RandomMultiBranchSelectionResult:
+        if len(round_runtime_seconds) != rounds:
+            raise ValueError("round timing count must match completed rounds")
+        if len(recombination_runtime_seconds) != recombinations:
+            raise ValueError("recombination timing count must match completed recombinations")
         penalty_set = set(similarity_penalty_indices)
         if len(penalty_set) != len(similarity_penalty_indices):
             raise ValueError("similarity penalty indices cannot contain duplicates")
@@ -237,6 +246,8 @@ class RandomMultiBranchSelector:
             recombinations=recombinations,
             committed_clips=committed_clips,
             final_active_clips=final_active_clips,
+            round_runtime_seconds=tuple(round_runtime_seconds),
+            recombination_runtime_seconds=tuple(recombination_runtime_seconds),
         )
 
     def select(
@@ -262,6 +273,8 @@ class RandomMultiBranchSelector:
         similarity_rng = np.random.default_rng(
             np.random.SeedSequence([self.seed, SIMILARITY_RNG_STREAM])
         )
+        round_runtime_seconds: list[float] = []
+        recombination_runtime_seconds: list[tuple[int, float]] = []
         if len(fixed) == budget:
             similarity_main = self._sample_similarity_main(similarity_rng, fixed)
             return self._result(
@@ -274,6 +287,8 @@ class RandomMultiBranchSelector:
                 recombinations=0,
                 committed_clips=0,
                 final_active_clips=0,
+                round_runtime_seconds=round_runtime_seconds,
+                recombination_runtime_seconds=recombination_runtime_seconds,
             )
 
         main_state = self.context.state_from_indices(fixed)
@@ -281,6 +296,7 @@ class RandomMultiBranchSelector:
         initial_batch_size = min(BATCH_SIZE, budget - len(fixed))
         branches: list[_Branch] = []
         next_serial = 0
+        round_started = time.perf_counter()
         for _ in range(BRANCH_COUNT):
             active = self._sample(
                 rng,
@@ -296,6 +312,7 @@ class RandomMultiBranchSelector:
             )
             branches.append(_Branch(update_state, next_serial))
             next_serial += 1
+        round_runtime_seconds.append(time.perf_counter() - round_started)
 
         rounds = 1
         evaluated_branches = BRANCH_COUNT
@@ -320,10 +337,13 @@ class RandomMultiBranchSelector:
                     recombinations=recombinations,
                     committed_clips=committed_clips,
                     final_active_clips=active_size,
+                    round_runtime_seconds=round_runtime_seconds,
+                    recombination_runtime_seconds=recombination_runtime_seconds,
                 )
 
             batch_size = min(BATCH_SIZE, budget - len(fixed) - active_size)
             children: list[_Branch] = []
+            round_started = time.perf_counter()
             for branch in branches:
                 for _ in range(CHILDREN_PER_BRANCH):
                     added = self._sample(
@@ -346,6 +366,7 @@ class RandomMultiBranchSelector:
             rounds += 1
             evaluated_branches += len(children)
             branches = self._rank_branches(children, rng, limit=BRANCH_COUNT)
+            round_runtime_seconds.append(time.perf_counter() - round_started)
 
             active_size = len(branches[0].active_indices)
             if len(fixed) + active_size == budget:
@@ -353,6 +374,7 @@ class RandomMultiBranchSelector:
             if not self._is_recombination_round(rounds):
                 continue
 
+            recombination_started = time.perf_counter()
             counts = Counter(
                 index for branch in branches for index in branch.active_indices
             )
@@ -397,3 +419,6 @@ class RandomMultiBranchSelector:
                 recombined.append(_Branch(update_state, next_serial))
                 next_serial += 1
             branches = recombined
+            recombination_runtime_seconds.append(
+                (rounds, time.perf_counter() - recombination_started)
+            )
