@@ -607,9 +607,11 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
             "main_sample_size": 100,
             "sampling": "per_new_branch_without_replacement",
             "rng": "seed_sequence_stream_1",
-            "scope": "sampled_main_plus_all_active",
-            "pairs": "all_induced_pairs",
-            "final_objective": "winner_sample",
+            "scope": "new_active_to_sampled_main_and_previous_active",
+            "pairs": "incremental_cross_pairs_only",
+            "accumulation": "parent_plus_child_delta",
+            "recombination": "reset_then_replay_retained",
+            "final_objective": "winner_accumulated_incremental_redundancy",
         },
     }
     assert report["algorithm"] == algorithm
@@ -621,9 +623,6 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
         "recombinations": 0,
         "committed_clips": 0,
         "final_active_clips": len(selected) - report["initial_set_size"],
-        "final_similarity_penalty_sample_ids": [
-            row["sample_id"] for row in selected
-        ],
     }
     timings = branch_search["timings"]
     assert len(timings["rounds"]) == 1
@@ -664,16 +663,6 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
     assert cached_output.out == ""
     assert "cocore_timing" not in cached_output.err
 
-    report["branch_search"]["final_similarity_penalty_sample_ids"] = report[
-        "branch_search"
-    ]["final_similarity_penalty_sample_ids"][:-1]
-    (result / "selection_report.json").write_text(json.dumps(report))
-    with pytest.raises(ValueError, match="branch search"):
-        validate_output(result, config=config)
-
-    report["branch_search"]["final_similarity_penalty_sample_ids"] = [
-        row["sample_id"] for row in selected
-    ]
     report["branch_search"]["rounds"] += 1
     (result / "selection_report.json").write_text(json.dumps(report))
     with pytest.raises(ValueError, match="branch search"):

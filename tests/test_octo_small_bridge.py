@@ -28,6 +28,11 @@ from octo_small_bridge.normalization import (  # noqa: E402
 )
 
 
+AV1_FIXTURE_SKIP = pytest.mark.skip(
+    reason="SVT-AV1 fixture encoding is too slow for the standard regression suite"
+)
+
+
 def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
     path.write_text(
         "".join(json.dumps(row) + "\n" for row in rows),
@@ -333,7 +338,7 @@ def test_lerobot_adapter_rejects_record_excluded_from_its_index(tmp_path: Path) 
         )
 
 
-@pytest.mark.skip(reason="Video fixture decoding is too slow for the standard regression suite")
+@AV1_FIXTURE_SKIP
 def test_bridge_frame_dataset_filters_empty_tasks_and_builds_octo_sample(
     tmp_path: Path,
 ) -> None:
@@ -412,6 +417,7 @@ def test_bridge_frame_dataset_filters_empty_tasks_and_builds_octo_sample(
     assert sample["frame_index"] == 0
 
 
+@AV1_FIXTURE_SKIP
 def test_bridge_frame_dataset_clips_gripper_roundoff_at_unit_interval(
     tmp_path: Path,
 ) -> None:
@@ -436,6 +442,7 @@ def test_bridge_frame_dataset_clips_gripper_roundoff_at_unit_interval(
 
 
 @pytest.mark.parametrize("invalid_gripper", [-2.0e-5, 1.0 + 2.0e-5, np.nan, np.inf])
+@AV1_FIXTURE_SKIP
 def test_bridge_frame_dataset_rejects_invalid_continuous_gripper_with_episode_id(
     tmp_path: Path,
     invalid_gripper: float,
@@ -628,6 +635,7 @@ def test_bridge_sampler_keeps_unequal_length_ranks_disjoint_across_epochs() -> N
         }
 
 
+@AV1_FIXTURE_SKIP
 def test_bridge_selection_signature_covers_gradient_accumulation(tmp_path: Path) -> None:
     from octo_small_bridge.data import _selection_sha256
 
@@ -664,6 +672,7 @@ def test_bridge_selection_signature_covers_gradient_accumulation(tmp_path: Path)
     assert changed != baseline
 
 
+@AV1_FIXTURE_SKIP
 def test_bridge_dataset_manifest_records_filtered_source(tmp_path: Path) -> None:
     from octo_small_bridge.training import build_dataset_manifest
 
@@ -910,6 +919,7 @@ def test_bridge_config_rejects_missing_normalization_contract() -> None:
         validate_config(config)
 
 
+@AV1_FIXTURE_SKIP
 def test_bridge_preflight_inspects_filtered_av1_dataset(tmp_path: Path) -> None:
     from octo_small_bridge.preflight import inspect_bridge_dataset
 

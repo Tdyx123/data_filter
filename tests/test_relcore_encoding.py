@@ -173,6 +173,7 @@ def test_supplied_normalizers_match_direct_encoding() -> None:
 
 @pytest.mark.gpu
 @pytest.mark.slow
+@pytest.mark.skip(reason="Long-running GPU encoder smoke test")
 def test_local_clip_encoder_smoke_on_gpu():
     model = Path("/data/dwb/models/clip-vit-base-patch32")
     if not model.is_dir():

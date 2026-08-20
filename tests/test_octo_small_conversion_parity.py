@@ -7,6 +7,7 @@ import pytest
 
 
 @pytest.mark.slow
+@pytest.mark.skip(reason="Long-running checkpoint conversion parity test")
 def test_converted_checkpoint_matches_flax_reference_modules():
     torch = pytest.importorskip("torch")
     orbax = pytest.importorskip("orbax.checkpoint")

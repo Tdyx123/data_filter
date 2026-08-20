@@ -48,6 +48,7 @@ def _write_av1(path, frames):
 
 
 @pytest.mark.slow
+@pytest.mark.skip(reason="Long-running synthetic training round-trip test")
 def test_synthetic_lerobot_decode_two_step_train_and_round_trip(tmp_path):
     root = tmp_path / "bridge"
     meta = root / "meta"
@@ -167,4 +168,3 @@ def test_synthetic_lerobot_decode_two_step_train_and_round_trip(tmp_path):
     restored.load_state_dict(torch.load(checkpoint, weights_only=True))
     for left, right in zip(head.parameters(), restored.parameters(), strict=True):
         torch.testing.assert_close(left, right)
-

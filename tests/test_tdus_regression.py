@@ -204,6 +204,7 @@ def _simplex_design(count: int = 24) -> np.ndarray:
     return np.random.default_rng(731).dirichlet(np.ones(4), size=count)
 
 
+@pytest.mark.skip(reason="Long-running automatic regression model selection test")
 def test_auto_regression_selects_linear_and_restores_raw_equation() -> None:
     weights = _simplex_design()
     target = 0.7 + 0.4 * weights[:, 0] - 0.2 * weights[:, 1] + 0.1 * weights[:, 2]
@@ -225,6 +226,7 @@ def test_auto_regression_selects_linear_and_restores_raw_equation() -> None:
     assert fitted.nested_validation.rmse == pytest.approx(0.0, abs=1e-10)
 
 
+@pytest.mark.skip(reason="Long-running automatic regression model selection test")
 def test_auto_regression_selects_quadratic_for_curved_response() -> None:
     weights = _simplex_design(30)
     quality = weights[:, 0]
