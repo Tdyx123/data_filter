@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -63,6 +64,9 @@ class SimplerRunSettings:
     save_videos_path: Path | None = None
     video_fps: int = 5
     overwrite: bool = False
+    shard_index: int = 0
+    shard_count: int = 1
+    rng_scope: str = "per_policy_seed_stream"
 
 
 class SimplerPolicyAdapter(Protocol):
@@ -132,6 +136,56 @@ SIMPLER_TASKS = (
 _TASKS_BY_KEY = {task.key: task for task in SIMPLER_TASKS}
 
 
+@dataclass(frozen=True)
+class SimplerEpisodeSpec:
+    task: SimplerTaskSpec
+    policy_seed: int
+    object_episode_id: int
+    canonical_index: int
+
+
+def episode_inference_seed(
+    task_key: str,
+    policy_seed: int,
+    object_episode_id: int,
+) -> int:
+    payload = "\0".join(
+        (
+            "octo-simpler-episode-v1",
+            str(task_key),
+            str(int(policy_seed)),
+            str(int(object_episode_id)),
+        )
+    ).encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+
+
+def canonical_episode_plan(settings: SimplerRunSettings) -> tuple[SimplerEpisodeSpec, ...]:
+    return tuple(
+        SimplerEpisodeSpec(
+            task=task,
+            policy_seed=int(policy_seed),
+            object_episode_id=int(object_episode_id),
+            canonical_index=canonical_index,
+        )
+        for canonical_index, (task, policy_seed, object_episode_id) in enumerate(
+            (task, policy_seed, object_episode_id)
+            for task in settings.tasks
+            for policy_seed in settings.policy_seeds
+            for object_episode_id in settings.object_episode_ids
+        )
+    )
+
+
+def assigned_episode_plan(settings: SimplerRunSettings) -> tuple[SimplerEpisodeSpec, ...]:
+    return tuple(
+        episode
+        for episode in canonical_episode_plan(settings)
+        if episode.canonical_index % settings.shard_count == settings.shard_index
+    )
+
+
 def resolve_task_selection(value: str) -> tuple[SimplerTaskSpec, ...]:
     selection = str(value).strip().lower()
     if selection == "all":
@@ -194,15 +248,15 @@ def environment_to_bridge_proprio(environment: Any) -> np.ndarray:
         tcp_pose = environment.tcp.pose
         relative = base_pose.inv() * tcp_pose
         position = np.asarray(relative.p, dtype=np.float32)
-        bridge_rotation = (
-            _quaternion_wxyz_to_matrix(relative.q) @ _BRIDGE_TCP_ALIGNMENT.T
-        )
+        bridge_rotation = _quaternion_wxyz_to_matrix(relative.q) @ _BRIDGE_TCP_ALIGNMENT.T
         euler = _matrix_to_xyz_euler(bridge_rotation)
         closedness = float(environment.agent.get_gripper_closedness())
     except SimplerEvaluationError:
         raise
     except Exception as error:
-        raise SimplerEvaluationError(f"Could not construct WidowX proprioception: {error}") from error
+        raise SimplerEvaluationError(
+            f"Could not construct WidowX proprioception: {error}"
+        ) from error
     if position.shape != (3,) or not np.all(np.isfinite(position)):
         raise SimplerEvaluationError(f"WidowX TCP position is invalid: {position}")
     if not math.isfinite(closedness):
@@ -272,9 +326,7 @@ def bridge_actions_to_simpler(
     flattened = actions.reshape(-1, 7)
     converted = result.reshape(-1, 7)
     for index, action in enumerate(flattened):
-        converted[index, 3:6] = _matrix_to_rotation_vector(
-            _xyz_euler_to_matrix(action[3:6])
-        )
+        converted[index, 3:6] = _matrix_to_rotation_vector(_xyz_euler_to_matrix(action[3:6]))
     result[..., 6] = np.where(
         actions[..., 6] > gripper_threshold,
         1.0,
@@ -336,8 +388,7 @@ def _create_task_environment(
         raise
     except Exception as error:
         raise SimplerInfrastructureError(
-            f"Could not create SimplerEnv task {task.key}: "
-            f"{type(error).__name__}: {error}"
+            f"Could not create SimplerEnv task {task.key}: {type(error).__name__}: {error}"
         ) from error
 
 
@@ -350,10 +401,7 @@ def _close_simpler_environment(
     try:
         environment.close()
     except Exception as error:
-        message = (
-            f"SimplerEnv close failed for task {task.key}: "
-            f"{type(error).__name__}: {error}"
-        )
+        message = f"SimplerEnv close failed for task {task.key}: {type(error).__name__}: {error}"
         if primary_error is not None:
             add_note = getattr(primary_error, "add_note", None)
             if add_note is not None:
@@ -390,6 +438,7 @@ def run_simpler_episode(
     action_horizon: int,
     max_steps: int,
     capture_video: bool,
+    inference_seed: int | None = None,
 ) -> tuple[dict[str, Any], list[np.ndarray]]:
     """Run one official WidowX episode through a model-specific adapter."""
 
@@ -425,7 +474,12 @@ def run_simpler_episode(
         if hasattr(predicted, "detach"):
             predicted = predicted.detach().float().cpu().numpy()
         actions = np.asarray(predicted, dtype=np.float32)
-        if actions.ndim != 3 or actions.shape[0] != 1 or actions.shape[1] < 1 or actions.shape[2] != 7:
+        if (
+            actions.ndim != 3
+            or actions.shape[0] != 1
+            or actions.shape[1] < 1
+            or actions.shape[2] != 7
+        ):
             policy_name = str(getattr(policy, "policy_name", "policy"))
             raise SimplerEvaluationError(
                 f"{policy_name} returned actions with shape {actions.shape}; "
@@ -435,9 +489,7 @@ def run_simpler_episode(
             actions[0, 0],
             gripper_threshold=float(getattr(policy, "gripper_threshold", 0.5)),
         )
-        observation, success, truncated, last_info = _step_environment(
-            environment, simpler_action
-        )
+        observation, success, truncated, last_info = _step_environment(environment, simpler_action)
         steps += 1
         if capture_video:
             frames.append(image_from_simpler_observation(observation))
@@ -446,20 +498,20 @@ def run_simpler_episode(
     if not isinstance(episode_stats, Mapping):
         episode_stats = {}
     termination = "success" if success else "truncated" if truncated else "max_steps"
-    return (
-        {
-            "task": task.key,
-            "instruction": task.instruction,
-            "seed": int(policy_seed),
-            "policy_seed": int(policy_seed),
-            "object_episode_id": int(object_episode_id),
-            "success": bool(success),
-            "steps": int(steps),
-            "termination": termination,
-            "episode_stats": _json_compatible(dict(episode_stats)),
-        },
-        frames,
-    )
+    episode = {
+        "task": task.key,
+        "instruction": task.instruction,
+        "seed": int(policy_seed),
+        "policy_seed": int(policy_seed),
+        "object_episode_id": int(object_episode_id),
+        "success": bool(success),
+        "steps": int(steps),
+        "termination": termination,
+        "episode_stats": _json_compatible(dict(episode_stats)),
+    }
+    if inference_seed is not None:
+        episode["inference_seed"] = int(inference_seed)
+    return episode, frames
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -509,9 +561,7 @@ def _summary(
         )
     by_policy_seed = []
     for seed in sorted({int(episode["policy_seed"]) for episode in episodes}):
-        selected = [
-            episode for episode in episodes if int(episode["policy_seed"]) == seed
-        ]
+        selected = [episode for episode in episodes if int(episode["policy_seed"]) == seed]
         seed_successes = sum(bool(episode["success"]) for episode in selected)
         by_policy_seed.append(
             {
@@ -553,6 +603,22 @@ def _validate_settings(settings: SimplerRunSettings) -> None:
         raise SimplerEvaluationError("object_episode_ids must be unique")
     if any(episode_id not in OBJECT_EPISODE_IDS for episode_id in settings.object_episode_ids):
         raise SimplerEvaluationError("object_episode_ids must be in [0, 23]")
+    if (
+        isinstance(settings.shard_count, bool)
+        or not isinstance(settings.shard_count, int)
+        or settings.shard_count <= 0
+    ):
+        raise SimplerEvaluationError("shard_count must be a positive integer")
+    if (
+        isinstance(settings.shard_index, bool)
+        or not isinstance(settings.shard_index, int)
+        or not 0 <= settings.shard_index < settings.shard_count
+    ):
+        raise SimplerEvaluationError("shard_index must be in [0, shard_count)")
+    if settings.rng_scope not in {"per_policy_seed_stream", "per_episode"}:
+        raise SimplerEvaluationError("rng_scope must be per_policy_seed_stream or per_episode")
+    if settings.shard_count > 1 and settings.rng_scope != "per_episode":
+        raise SimplerEvaluationError("episode sharding requires rng_scope=per_episode")
 
 
 def _check_output_targets(settings: SimplerRunSettings) -> None:
@@ -574,9 +640,7 @@ def _check_output_targets(settings: SimplerRunSettings) -> None:
             for outcome in ("success", "failure")
         )
     if not settings.overwrite and any(path.exists() for path in targets):
-        raise SimplerEvaluationError(
-            "Evaluation output or video already exists; use --overwrite"
-        )
+        raise SimplerEvaluationError("Evaluation output or video already exists; use --overwrite")
 
 
 def _write_video(path: Path, frames: Sequence[np.ndarray], fps: int) -> None:
@@ -610,12 +674,19 @@ def _protocol(
         "sim_renderer_offscreen_only": True,
         "environment_lifecycle": "one_per_task",
         "planned_episodes": (
-            len(settings.tasks)
-            * len(settings.policy_seeds)
-            * len(settings.object_episode_ids)
+            len(settings.tasks) * len(settings.policy_seeds) * len(settings.object_episode_ids)
         ),
         "max_steps_override": settings.max_steps,
     }
+    if settings.rng_scope == "per_episode":
+        protocol.update(
+            {
+                "rng_scope": "per_episode",
+                "rng_seed_derivation": "sha256-octo-simpler-episode-v1",
+                "shard_index": settings.shard_index,
+                "shard_count": settings.shard_count,
+            }
+        )
     overlap = sorted(set(protocol).intersection(metadata))
     if overlap:
         raise SimplerEvaluationError(
@@ -648,58 +719,72 @@ def evaluate_simpler_policy(
     started = time.monotonic()
     partial_path = settings.output_dir / "episodes.partial.jsonl"
     videos: list[str] = []
+    planned_by_task: dict[str, list[SimplerEpisodeSpec]] = {task.key: [] for task in settings.tasks}
+    for episode_spec in assigned_episode_plan(settings):
+        planned_by_task[episode_spec.task.key].append(episode_spec)
     try:
         for task in settings.tasks:
-            task_failed = False
+            task_plan = planned_by_task[task.key]
+            if not task_plan:
+                continue
             environment = _create_task_environment(
                 environment_factory,
                 task=task,
             )
             primary_error: BaseException | None = None
             try:
-                for policy_seed in settings.policy_seeds:
-                    generator = policy.make_generator(policy_seed)
-                    for object_episode_id in settings.object_episode_ids:
-                        try:
-                            episode, frames = run_simpler_episode(
-                                task=task,
-                                object_episode_id=object_episode_id,
-                                policy_seed=policy_seed,
-                                policy=policy,
-                                environment=environment,
-                                generator=generator,
-                                action_horizon=settings.action_horizon,
-                                max_steps=settings.max_steps or task.max_steps,
-                                capture_video=settings.save_videos_path is not None,
-                            )
-                        except (SimplerEvaluationError, SimplerInfrastructureError):
-                            raise
-                        except Exception as error:
-                            task_errors.append(
-                                {
-                                    "task": task.key,
-                                    "policy_seed": int(policy_seed),
-                                    "object_episode_id": int(object_episode_id),
-                                    "error_type": type(error).__name__,
-                                    "error": str(error),
-                                }
-                            )
-                            task_failed = True
-                            break
-                        episodes.append(episode)
-                        if settings.save_videos_path is not None:
-                            outcome = "success" if episode["success"] else "failure"
-                            video_path = (
-                                settings.save_videos_path
-                                / task.key
-                                / f"seed-{policy_seed}"
-                                / f"episode-{object_episode_id:02d}_{outcome}.mp4"
-                            )
-                            video_writer(video_path, frames, settings.video_fps)
-                            videos.append(str(video_path))
-                        _atomic_write_jsonl(partial_path, episodes)
-                    if task_failed:
+                active_policy_seed: int | None = None
+                generator: Any | None = None
+                for episode_spec in task_plan:
+                    inference_seed: int | None = None
+                    if settings.rng_scope == "per_episode":
+                        inference_seed = episode_inference_seed(
+                            task.key,
+                            episode_spec.policy_seed,
+                            episode_spec.object_episode_id,
+                        )
+                        generator = policy.make_generator(inference_seed)
+                    elif episode_spec.policy_seed != active_policy_seed:
+                        active_policy_seed = episode_spec.policy_seed
+                        generator = policy.make_generator(active_policy_seed)
+                    try:
+                        episode, frames = run_simpler_episode(
+                            task=task,
+                            object_episode_id=episode_spec.object_episode_id,
+                            policy_seed=episode_spec.policy_seed,
+                            policy=policy,
+                            environment=environment,
+                            generator=generator,
+                            action_horizon=settings.action_horizon,
+                            max_steps=settings.max_steps or task.max_steps,
+                            capture_video=settings.save_videos_path is not None,
+                            inference_seed=inference_seed,
+                        )
+                    except (SimplerEvaluationError, SimplerInfrastructureError):
+                        raise
+                    except Exception as error:
+                        task_errors.append(
+                            {
+                                "task": task.key,
+                                "policy_seed": episode_spec.policy_seed,
+                                "object_episode_id": episode_spec.object_episode_id,
+                                "error_type": type(error).__name__,
+                                "error": str(error),
+                            }
+                        )
                         break
+                    episodes.append(episode)
+                    if settings.save_videos_path is not None:
+                        outcome = "success" if episode["success"] else "failure"
+                        video_path = (
+                            settings.save_videos_path
+                            / task.key
+                            / f"seed-{episode_spec.policy_seed}"
+                            / f"episode-{episode_spec.object_episode_id:02d}_{outcome}.mp4"
+                        )
+                        video_writer(video_path, frames, settings.video_fps)
+                        videos.append(str(video_path))
+                    _atomic_write_jsonl(partial_path, episodes)
             except BaseException as error:
                 primary_error = error
                 raise
@@ -914,9 +999,7 @@ def run_simpler_preflight(
                     options={
                         "robot_init_options": {
                             "init_xy": np.asarray(task.robot_init_xy, dtype=np.float64),
-                            "init_rot_quat": np.asarray(
-                                [0.0, 0.0, 0.0, 1.0], dtype=np.float64
-                            ),
+                            "init_rot_quat": np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float64),
                         },
                         "obj_init_options": {"episode_id": 0},
                     }
@@ -952,9 +1035,7 @@ def run_simpler_preflight(
                     )
                 bridge_actions_to_simpler(
                     predicted_actions[0, 0],
-                    gripper_threshold=float(
-                        getattr(policy, "gripper_threshold", 0.5)
-                    ),
+                    gripper_threshold=float(getattr(policy, "gripper_threshold", 0.5)),
                 )
                 inference = {
                     "task": task.key,

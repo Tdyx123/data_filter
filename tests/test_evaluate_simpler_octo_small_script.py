@@ -59,6 +59,13 @@ set -euo pipefail
   for argument in "$@"; do printf '%s\037' "${argument}"; done
   printf '\n'
 } >> "${OCTO_TEST_MODEL_CALLS:?}"
+if [[ " $* " == *" octo_small_bridge.parallel_evaluation "* ]]; then
+  if [[ -n "${OCTO_TEST_EXPECT_PARALLEL_PYTHONPATH:-}" ]]; then
+    [[ "${PYTHONPATH:-}" == "${OCTO_TEST_EXPECT_PARALLEL_PYTHONPATH}" ]] || exit 31
+    [[ "${MS2_REAL2SIM_ASSET_DIR:-}" == "${OCTO_TEST_EXPECT_PARALLEL_ASSET_DIR}" ]] || exit 32
+  fi
+  exit "${OCTO_TEST_PARALLEL_STATUS:-0}"
+fi
 if [[ "${OCTO_TEST_MODEL_CRASH:-0}" == "1" ]]; then
   exit 23
 fi
@@ -122,9 +129,7 @@ def _run(
     environment_updates=None,
     include_required=True,
 ):
-    pyenv, sim_python, environment, model_calls, sim_calls, stopped = (
-        _make_fake_processes(tmp_path)
-    )
+    pyenv, sim_python, environment, model_calls, sim_calls, stopped = _make_fake_processes(tmp_path)
     environment.update(environment_updates or {})
     output_dir = tmp_path / "output"
     command = [
@@ -181,8 +186,7 @@ def test_launcher_starts_current_pyenv_model_then_dedicated_simulator(tmp_path):
         f"{PROJECT_ROOT / 'third_party/SimplerEnv/ManiSkill2_real2sim'}"
     )
     assert sim_call[1] == (
-        "MS2_REAL2SIM_ASSET_DIR="
-        f"{PROJECT_ROOT / 'third_party/SimplerEnv/ManiSkill2_real2sim/data'}"
+        f"MS2_REAL2SIM_ASSET_DIR={PROJECT_ROOT / 'third_party/SimplerEnv/ManiSkill2_real2sim/data'}"
     )
     assert sim_call[2:4] == ["-m", "octo_small_bridge.evaluate_simpler"]
     socket_path = Path(sim_call[sim_call.index("--socket") + 1])
@@ -218,6 +222,69 @@ def test_launcher_omits_optional_statistics_and_separates_devices(tmp_path):
     assert "--precision" not in sim_call
 
 
+def test_launcher_delegates_explicit_model_devices_to_parallel_coordinator(tmp_path):
+    simpler_root = PROJECT_ROOT / "third_party/SimplerEnv"
+    maniskill_root = simpler_root / "ManiSkill2_real2sim"
+    completed, model_calls, sim_calls, _stopped, output_dir = _run(
+        tmp_path,
+        "--model-devices",
+        "cuda:0,cuda:2",
+        "--sim-device",
+        "cuda:7",
+        "--tasks",
+        "spoon",
+        environment_updates={
+            "OCTO_TEST_EXPECT_PARALLEL_PYTHONPATH": (
+                f"{PROJECT_ROOT / 'src'}:{simpler_root}:{maniskill_root}"
+            ),
+            "OCTO_TEST_EXPECT_PARALLEL_ASSET_DIR": str(maniskill_root / "data"),
+        },
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert len(model_calls) == 1
+    call = model_calls[0]
+    assert call[2:6] == [
+        "exec",
+        "python",
+        "-m",
+        "octo_small_bridge.parallel_evaluation",
+    ]
+    assert call[call.index("--model-devices") + 1] == "cuda:0,cuda:2"
+    assert call[call.index("--sim-device") + 1] == "cuda:7"
+    assert call[call.index("--output-dir") + 1] == str(output_dir)
+    assert call[call.index("--checkpoint") + 1] == CHECKPOINT
+    assert call[call.index("--base-model") + 1] == BASE_MODEL
+    assert call[call.index("--") + 1 :] == ["--tasks", "spoon"]
+    assert sim_calls == []
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (("--model-devices", ""), "non-empty"),
+        (("--model-devices", "cuda:0,"), "unique cuda:<index>"),
+        (("--model-devices", "cuda:0,cuda:0"), "unique cuda:<index>"),
+        (("--model-devices", "cuda:0", "--device", "cuda:1"), "cannot be combined"),
+        (("--model-devices", "cpu,cuda:1"), "unique cuda:<index>"),
+    ],
+)
+def test_launcher_rejects_invalid_or_conflicting_model_devices_before_startup(
+    tmp_path,
+    arguments,
+    message,
+):
+    completed, model_calls, sim_calls, _stopped, _output_dir = _run(
+        tmp_path,
+        *arguments,
+    )
+
+    assert completed.returncode == 2
+    assert model_calls == []
+    assert sim_calls == []
+    assert message in completed.stderr
+
+
 @pytest.mark.parametrize(
     ("arguments", "message"),
     [
@@ -234,9 +301,7 @@ def test_launcher_omits_optional_statistics_and_separates_devices(tmp_path):
 def test_launcher_rejects_invalid_evaluation_options_before_starting_processes(
     tmp_path, arguments, message
 ):
-    completed, model_calls, sim_calls, _stopped, _output_dir = _run(
-        tmp_path, *arguments
-    )
+    completed, model_calls, sim_calls, _stopped, _output_dir = _run(tmp_path, *arguments)
 
     assert completed.returncode == 2
     assert model_calls == []
@@ -359,8 +424,8 @@ def test_launcher_help_does_not_start_processes_and_documents_defaults(tmp_path)
 
 
 def test_launcher_term_signal_reaps_both_managed_processes(tmp_path):
-    pyenv, sim_python, environment, _model_calls, sim_calls, stopped = (
-        _make_fake_processes(tmp_path)
+    pyenv, sim_python, environment, _model_calls, sim_calls, stopped = _make_fake_processes(
+        tmp_path
     )
     environment["OCTO_TEST_SIM_PAUSE"] = "1"
     process = subprocess.Popen(
@@ -399,9 +464,9 @@ def test_launcher_term_signal_reaps_both_managed_processes(tmp_path):
 def test_octo_readme_documents_split_default_runtimes():
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
 
-    octo_section = readme.split(
-        "### Octo-small Bridge 的 SimplerEnv 四任务闭环评测", 1
-    )[1].split("### StarVLA", 1)[0]
+    octo_section = readme.split("### Octo-small Bridge 的 SimplerEnv 四任务闭环评测", 1)[1].split(
+        "### StarVLA", 1
+    )[0]
     assert "model-server.log" in octo_section
     assert "/home/dwb/.pyenv/bin/pyenv" in octo_section
     assert ".venv-octo-simpler/bin/python" in octo_section

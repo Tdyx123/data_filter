@@ -1,3 +1,4 @@
+import dataclasses
 import importlib
 import json
 from types import SimpleNamespace
@@ -85,9 +86,7 @@ class _LifecycleEnvironment(_Environment):
         self.options = options
         self.reset_episode_ids.append(options["obj_init_options"]["episode_id"])
         self.partial_counts_before_reset.append(
-            len(self.partial_path.read_text().splitlines())
-            if self.partial_path.exists()
-            else 0
+            len(self.partial_path.read_text().splitlines()) if self.partial_path.exists() else 0
         )
         return self._observation(), {}
 
@@ -98,9 +97,7 @@ class _LifecycleEnvironment(_Environment):
     def close(self):
         self.close_count += 1
         self.partial_count_at_close = (
-            len(self.partial_path.read_text().splitlines())
-            if self.partial_path.exists()
-            else 0
+            len(self.partial_path.read_text().splitlines()) if self.partial_path.exists() else 0
         )
 
 
@@ -177,9 +174,7 @@ class _VariableChunkAdapter(_Adapter):
         self.generators.append(generator)
         call_index = len(self.generators) - 1
         actions = np.full((1, self.chunk_size, 7), 99.0, dtype=np.float32)
-        actions[0, 0] = np.asarray(
-            [call_index, 0, 0, 0, 0, 0, 1], dtype=np.float32
-        )
+        actions[0, 0] = np.asarray([call_index, 0, 0, 0, 0, 0, 1], dtype=np.float32)
         return actions
 
 
@@ -397,13 +392,10 @@ def test_shared_evaluator_reuses_one_environment_per_task_in_episode_order(tmp_p
         8,
     ]
     assert [
-        count
-        for environment in environments
-        for count in environment.partial_counts_before_reset
+        count for environment in environments for count in environment.partial_counts_before_reset
     ] == list(range(8))
     episodes = [
-        json.loads(line)
-        for line in (output_dir / "episodes.jsonl").read_text().splitlines()
+        json.loads(line) for line in (output_dir / "episodes.jsonl").read_text().splitlines()
     ]
     assert [
         (episode["task"], episode["policy_seed"], episode["object_episode_id"])
@@ -416,6 +408,161 @@ def test_shared_evaluator_reuses_one_environment_per_task_in_episode_order(tmp_p
     ]
     assert report["summary"]["completed_episodes"] == 8
     assert not (output_dir / "episodes.partial.jsonl").exists()
+
+
+def test_episode_inference_seed_uses_the_versioned_task_seed_episode_contract():
+    shared = importlib.import_module("simpler_bridge.evaluation")
+
+    assert shared.episode_inference_seed("spoon", 2, 3) == 1475198320439424009
+    assert shared.episode_inference_seed("carrot", 2, 3) != 1475198320439424009
+
+
+def test_shared_episode_plan_round_robins_the_canonical_matrix_without_gaps(tmp_path):
+    shared = importlib.import_module("simpler_bridge.evaluation")
+    settings = shared.SimplerRunSettings(
+        output_dir=tmp_path / "results",
+        tasks=shared.SIMPLER_TASKS[:2],
+        policy_seeds=(0, 2),
+        object_episode_ids=(0, 1, 2),
+        shard_count=4,
+        rng_scope="per_episode",
+    )
+
+    assignments = []
+    for shard_index in range(4):
+        shard = shared.assigned_episode_plan(dataclasses.replace(settings, shard_index=shard_index))
+        assignments.extend(
+            (
+                episode.canonical_index,
+                shard_index,
+                episode.task.key,
+                episode.policy_seed,
+                episode.object_episode_id,
+            )
+            for episode in shard
+        )
+
+    assert sorted(assignments) == [
+        (0, 0, "spoon", 0, 0),
+        (1, 1, "spoon", 0, 1),
+        (2, 2, "spoon", 0, 2),
+        (3, 3, "spoon", 2, 0),
+        (4, 0, "spoon", 2, 1),
+        (5, 1, "spoon", 2, 2),
+        (6, 2, "carrot", 0, 0),
+        (7, 3, "carrot", 0, 1),
+        (8, 0, "carrot", 0, 2),
+        (9, 1, "carrot", 2, 0),
+        (10, 2, "carrot", 2, 1),
+        (11, 3, "carrot", 2, 2),
+    ]
+
+
+def test_shared_parallel_runner_reseeds_each_episode_and_records_the_seed(tmp_path):
+    shared = importlib.import_module("simpler_bridge.evaluation")
+    adapter = _Adapter()
+    settings = shared.SimplerRunSettings(
+        output_dir=tmp_path / "results",
+        tasks=(shared.SIMPLER_TASKS[0],),
+        policy_seeds=(2,),
+        object_episode_ids=(3, 4),
+        max_steps=1,
+        rng_scope="per_episode",
+    )
+
+    report = shared.evaluate_simpler_policy(
+        settings,
+        checkpoint={},
+        policy=adapter,
+        environment_factory=lambda task: _Environment(),
+        source_versions={},
+        route="parallel-rng-test",
+        protocol_metadata={},
+    )
+
+    assert adapter.generators == [
+        "generator-1475198320439424009",
+        "generator-5734274001812672943",
+    ]
+    episodes = [
+        json.loads(line)
+        for line in (settings.output_dir / "episodes.jsonl").read_text().splitlines()
+    ]
+    assert [episode["inference_seed"] for episode in episodes] == [
+        1475198320439424009,
+        5734274001812672943,
+    ]
+    assert report["protocol"]["rng_scope"] == "per_episode"
+    assert report["protocol"]["rng_seed_derivation"] == "sha256-octo-simpler-episode-v1"
+
+
+def test_shared_runner_rejects_sharding_a_continuous_policy_seed_stream(tmp_path):
+    shared = importlib.import_module("simpler_bridge.evaluation")
+    settings = shared.SimplerRunSettings(
+        output_dir=tmp_path / "results",
+        tasks=(shared.SIMPLER_TASKS[0],),
+        policy_seeds=(0,),
+        object_episode_ids=(0,),
+        shard_count=2,
+    )
+
+    with pytest.raises(shared.SimplerEvaluationError, match="per_episode"):
+        shared.evaluate_simpler_policy(
+            settings,
+            checkpoint={},
+            policy=_Adapter(),
+            environment_factory=lambda task: _Environment(),
+            source_versions={},
+            route="invalid-shard-rng-test",
+            protocol_metadata={},
+        )
+
+
+def test_shared_task_execution_error_does_not_prevent_later_tasks(tmp_path):
+    shared = importlib.import_module("simpler_bridge.evaluation")
+    environments = []
+
+    class TaskFailingAdapter(_Adapter):
+        def predict_actions(self, prepared, *, generator):
+            if prepared["instruction"] == "Put Spoon on Towel" and len(self.generators) == 1:
+                raise RuntimeError("policy task failed")
+            return super().predict_actions(prepared, generator=generator)
+
+    def environment_factory(task):
+        environment = _Environment()
+        environments.append(environment)
+        return environment
+
+    settings = shared.SimplerRunSettings(
+        output_dir=tmp_path / "results",
+        tasks=shared.SIMPLER_TASKS[:2],
+        policy_seeds=(0,),
+        object_episode_ids=(0, 1),
+        max_steps=1,
+    )
+
+    report = shared.evaluate_simpler_policy(
+        settings,
+        checkpoint={},
+        policy=TaskFailingAdapter(),
+        environment_factory=environment_factory,
+        source_versions={},
+        route="task-error-test",
+        protocol_metadata={},
+    )
+
+    assert report["status"] == "completed_with_errors"
+    assert report["summary"]["completed_episodes"] == 3
+    assert report["task_errors"] == [
+        {
+            "task": "spoon",
+            "policy_seed": 0,
+            "object_episode_id": 1,
+            "error_type": "RuntimeError",
+            "error": "policy task failed",
+        }
+    ]
+    assert len(environments) == 2
 
 
 @pytest.mark.parametrize(
