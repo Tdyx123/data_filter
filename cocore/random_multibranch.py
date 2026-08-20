@@ -392,7 +392,7 @@ class RandomMultiBranchSelector:
             committed_clips += len(committed)
             recombinations += 1
 
-            main_state = self.context.state_from_indices(fixed)
+            main_state = self.context.extend_state(main_state, committed)
             root_update = self.context.empty_update_state(main_state)
             recombined: list[_Branch] = []
             for branch in branches:

@@ -248,6 +248,46 @@ def test_objective_update_state_materializes_without_mutating_shared_main(
     assert main.score == main_snapshot.score
 
 
+@pytest.mark.parametrize("relation", ["sequence", "cooccurrence"])
+def test_objective_extend_state_matches_full_ordered_replay_without_mutating_base(
+    relation: str,
+) -> None:
+    graph = _graph()
+    graph.sequence_edges = _edges([(0, 1, 1.0), (1, 2, 1.0)], "sequence")
+    graph.transition_matrix = sparse.csr_matrix(
+        np.asarray([[0.0, 0.6], [0.4, 0.0]], dtype=np.float32)
+    )
+    context = CocoreObjectiveContext(
+        graph, relation, relation_weight=1.0, similarity_threshold=0.8
+    )
+    base = context.state_from_indices([0])
+    base_snapshot = context.clone_state(base)
+
+    extended = context.extend_state(base, [1, 2])
+    replayed = context.state_from_indices([0, 1, 2])
+
+    np.testing.assert_array_equal(extended.selected_mask, replayed.selected_mask)
+    np.testing.assert_array_equal(extended.prototype_coverage, replayed.prototype_coverage)
+    np.testing.assert_array_equal(
+        extended.sequence_relation_counts,
+        replayed.sequence_relation_counts,
+    )
+    np.testing.assert_array_equal(extended.task_counts, replayed.task_counts)
+    assert extended.relation == replayed.relation
+    assert extended.redundancy == replayed.redundancy
+    assert extended.score == replayed.score
+    np.testing.assert_array_equal(base.selected_mask, base_snapshot.selected_mask)
+    np.testing.assert_array_equal(base.prototype_coverage, base_snapshot.prototype_coverage)
+    np.testing.assert_array_equal(
+        base.sequence_relation_counts,
+        base_snapshot.sequence_relation_counts,
+    )
+    np.testing.assert_array_equal(base.task_counts, base_snapshot.task_counts)
+    assert base.relation == base_snapshot.relation
+    assert base.redundancy == base_snapshot.redundancy
+    assert base.score == base_snapshot.score
+
+
 def test_objective_update_state_penalizes_only_sampled_main_plus_active_pairs() -> None:
     graph = _heap_graph(103)
     graph.reliability = np.ones(103, dtype=np.float32)
@@ -632,6 +672,35 @@ def test_random_multibranch_recombines_first_at_20_then_every_10_rounds() -> Non
     assert result.objective_value == pytest.approx(replay.score)
     assert result.relation == pytest.approx(replay.relation)
     assert result.redundancy == pytest.approx(replay.redundancy)
+
+
+def test_random_multibranch_builds_main_state_from_scratch_only_once() -> None:
+    graph = _heap_graph(340)
+
+    class RecordingContext(CocoreObjectiveContext):
+        def __init__(self) -> None:
+            super().__init__(
+                graph,
+                "cooccurrence",
+                relation_weight=1.0,
+                similarity_threshold=0.8,
+            )
+            self.full_replay_sizes: list[int] = []
+
+        def state_from_indices(self, selected_indices):
+            self.full_replay_sizes.append(len(selected_indices))
+            return super().state_from_indices(selected_indices)
+
+    context = RecordingContext()
+    coverage = build_max_coverage_seed(context, budget=326)
+
+    result = RandomMultiBranchSelector(context, seed=23).select(
+        326,
+        initial_indices=coverage.selected_indices,
+    )
+
+    assert result.recombinations == 2
+    assert context.full_replay_sizes == [len(coverage.selected_indices)]
 
 
 def test_lazy_heap_selects_current_top_then_refreshes_the_next_stale_top() -> None:

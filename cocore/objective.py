@@ -116,6 +116,16 @@ class CocoreObjectiveContext:
             score=float(state.score),
         )
 
+    def extend_state(
+        self,
+        state: CocoreObjectiveState,
+        indices: Sequence[int],
+    ) -> CocoreObjectiveState:
+        extended = self.clone_state(state)
+        for index in indices:
+            self.add_candidate(extended, int(index))
+        return extended
+
     def empty_update_state(
         self,
         main_state: CocoreObjectiveState,
