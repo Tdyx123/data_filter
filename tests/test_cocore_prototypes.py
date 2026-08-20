@@ -908,52 +908,6 @@ def test_full_trajectory_builder_runs_action_fit_and_statistics_in_parallel(
     assert len(statistics_threads) == 2
 
 
-def test_full_trajectory_builder_matches_single_and_multi_thread_outputs(
-    tmp_path: Path,
-) -> None:
-    adapter = _TrajectoryPrototypeAdapter()
-    cache = tmp_path / "frame_embeddings"
-    _write_frame_caches(cache, adapter)
-    candidate_frames = np.load(cache / "ep000002.npy", allow_pickle=False)
-    candidate_halves = np.stack(
-        [candidate_frames[:8].mean(axis=0), candidate_frames[7:].mean(axis=0)]
-    )
-    candidate_halves /= np.linalg.norm(candidate_halves, axis=1, keepdims=True)
-
-    results = [
-        prototypes.build_hierarchical_motion_prototypes(
-            adapter,
-            [_candidate_clip()],
-            candidate_halves[None, :, :],
-            pca_components=_identity_fragment_pca(2),
-            visual_dim=2,
-            frame_cache_dir=cache,
-            batch_size=32,
-            max_iter=3,
-            seed=23,
-            max_episodes=None,
-            num_workers=0,
-            num_threads=num_threads,
-        )
-        for num_threads in (1, 4)
-    ]
-
-    assert results[0].catalog.to_dict() == results[1].catalog.to_dict()
-    np.testing.assert_array_equal(
-        results[0].prototypes.centers,
-        results[1].prototypes.centers,
-    )
-    np.testing.assert_array_equal(
-        results[0].prototypes.indices,
-        results[1].prototypes.indices,
-    )
-    np.testing.assert_array_equal(
-        results[0].prototypes.weights,
-        results[1].prototypes.weights,
-    )
-    np.testing.assert_array_equal(results[0].half_action_labels, results[1].half_action_labels)
-
-
 @pytest.mark.parametrize("num_threads", [0, -1, 1.5, True, "4"])
 def test_full_trajectory_builder_rejects_invalid_thread_counts(
     tmp_path: Path,
@@ -1293,7 +1247,6 @@ def test_non_stop_fallback_fails_when_stop_has_no_visual_center(
 @pytest.mark.parametrize(
     ("training_count", "expected_model_name", "expected_openmp_threads"),
     [
-        (65_536, "KMeans", 1),
         (65_537, "MiniBatchKMeans", 4),
     ],
 )

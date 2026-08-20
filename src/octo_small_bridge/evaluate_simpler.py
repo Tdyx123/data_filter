@@ -1,4 +1,4 @@
-"""Command-line entry point for Octo-small Bridge evaluation in SimplerEnv."""
+"""SimplerEnv client CLI for the managed Octo-small model service."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import os
 import sys
 from pathlib import Path
 from typing import Sequence
+
+import numpy as np
 
 from simpler_bridge.evaluation import (
     OBJECT_EPISODE_IDS,
@@ -24,10 +26,8 @@ from simpler_bridge.evaluation import (
     validate_simpler_source,
 )
 
-from .simpler_evaluation import (
-    load_octo_bridge_policy,
-    validate_runtime_contract,
-)
+from .ipc import OctoIPCClient, OctoIPCError
+from .remote_policy import OctoRemotePolicy
 
 
 EVALUATION_ROUTE = "octo-small-bridge-simpler-widowx-eval"
@@ -60,29 +60,10 @@ def _write_failure(output_dir: Path, *, error: Exception, exit_code: int) -> Non
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate an Octo-small Bridge checkpoint on four fixed SimplerEnv tasks."
+        description="Evaluate a remote Octo-small Bridge policy on SimplerEnv."
     )
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        required=True,
-        help="Concrete Octo Bridge step-XXXXXXXX checkpoint directory.",
-    )
-    parser.add_argument(
-        "--base-model",
-        type=Path,
-        required=True,
-        help="Self-contained converted Octo-small PyTorch base model.",
-    )
-    parser.add_argument(
-        "--statistics",
-        type=Path,
-        default=None,
-        help=(
-            "Optional Bridge V2 normalization.json override; it must match the "
-            "checkpoint manifest. Defaults to the checkpoint copy."
-        ),
-    )
+    parser.add_argument("--socket", type=Path, required=True)
+    parser.add_argument("--auth-key-hex", required=True)
     parser.add_argument(
         "--tasks",
         default="all",
@@ -93,9 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("outputs/octo_small_bridge_simpler_eval"),
     )
-    parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--sim-device", type=parse_sim_device, default="cuda:0")
-    parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--action-horizon", type=int, choices=(1,), default=1)
     parser.add_argument("--save-videos-path", type=Path, default=None)
     parser.add_argument("--video-fps", type=int, default=5)
@@ -109,34 +88,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _checkpoint_report(checkpoint: object, policy: object) -> dict[str, object]:
-    report = dict(checkpoint.as_dict())
-    report["statistics"] = policy.statistics.as_dict()
-    return report
-
-
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    arguments = parser.parse_args(argv)
+    arguments = build_parser().parse_args(argv)
+    client: OctoIPCClient | None = None
     if arguments.overwrite:
         (arguments.output_dir / "failure.json").unlink(missing_ok=True)
     try:
+        try:
+            authkey = bytes.fromhex(arguments.auth_key_hex)
+        except ValueError as error:
+            raise SimplerEvaluationError(
+                "--auth-key-hex must contain valid hex bytes"
+            ) from error
+        if not authkey:
+            raise SimplerEvaluationError("--auth-key-hex must be non-empty")
         tasks = resolve_task_selection(arguments.tasks)
         if arguments.video_fps <= 0:
             raise SimplerEvaluationError("--video-fps must be positive")
         source_versions = validate_simpler_source(default_simpler_root())
-        package_versions = validate_runtime_contract(device=arguments.device)
-        checkpoint, policy = load_octo_bridge_policy(
-            arguments.checkpoint,
-            base_model=arguments.base_model,
-            statistics=arguments.statistics,
-            device=arguments.device,
-            precision=arguments.precision,
-        )
+        client = OctoIPCClient(arguments.socket, authkey=authkey)
+        policy = OctoRemotePolicy(client)
         settings = SimplerRunSettings(
             output_dir=arguments.output_dir,
             tasks=tasks,
-            device=arguments.device,
+            device=f"remote-pyenv:{policy.model_device}",
             sim_device=arguments.sim_device,
             action_horizon=arguments.action_horizon,
             policy_seeds=(0,) if arguments.smoke_test else POLICY_SEEDS,
@@ -146,30 +121,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             video_fps=arguments.video_fps,
             overwrite=arguments.overwrite,
         )
-        checkpoint_report = _checkpoint_report(checkpoint, policy)
+        sim_packages = {"numpy": np.__version__}
         if arguments.preflight_only:
             report = run_simpler_preflight(
                 settings,
-                checkpoint=checkpoint_report,
+                checkpoint=policy.checkpoint_report,
                 policy=policy,
                 environment_factory=lambda task: create_simpler_environment(
                     task, sim_device=settings.sim_device
                 ),
                 source_versions=source_versions,
-                package_versions=package_versions,
+                package_versions=sim_packages,
                 route=PREFLIGHT_ROUTE,
             )
         else:
             report = evaluate_simpler_policy(
                 settings,
-                checkpoint=checkpoint_report,
+                checkpoint=policy.checkpoint_report,
                 policy=policy,
                 environment_factory=lambda task: create_simpler_environment(
                     task, sim_device=settings.sim_device
                 ),
                 source_versions={
                     **source_versions,
-                    "package_versions": package_versions,
+                    "package_versions": sim_packages,
                 },
                 route=EVALUATION_ROUTE,
                 protocol_metadata=policy.protocol_metadata(),
@@ -178,17 +153,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_failure(arguments.output_dir, error=error, exit_code=3)
         print(f"SimplerEnv infrastructure error: {error}", file=sys.stderr)
         return 3
-    except SimplerEvaluationError as error:
+    except (SimplerEvaluationError, OctoIPCError) as error:
         _write_failure(arguments.output_dir, error=error, exit_code=2)
-        print(f"SimplerEnv evaluation error: {error}", file=sys.stderr)
+        print(f"Octo SimplerEnv evaluation error: {error}", file=sys.stderr)
         return 2
     except Exception as error:
         _write_failure(arguments.output_dir, error=error, exit_code=1)
         print(
-            f"SimplerEnv task execution failed: {type(error).__name__}: {error}",
+            f"Octo SimplerEnv execution failed: {type(error).__name__}: {error}",
             file=sys.stderr,
         )
         return 1
+    finally:
+        if client is not None:
+            try:
+                client.shutdown()
+            except Exception:
+                client.close()
     print(json.dumps(report, indent=2, sort_keys=True))
     return 1 if report.get("status") == "completed_with_errors" else 0
 

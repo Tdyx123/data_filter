@@ -1028,8 +1028,9 @@ bash scripts/evaluate_simpler_qwen.sh \
 ### Octo-small Bridge 的 SimplerEnv 四任务闭环评测
 
 Octo-small 使用与 Qwen 相同的固定 WidowX 协议和 SimplerEnv/ManiSkill2_real2sim
-源码版本，但必须使用独立的 Python 3.10/3.11 环境。不要在 Qwen 的 Transformers
-5.x 环境中运行 Octo checkpoint：
+源码版本。启动器把模型与仿真拆成两个进程：模型默认通过
+`/home/dwb/.pyenv/bin/pyenv exec python` 运行并继承当前选中的 pyenv，仿真默认使用
+`.venv-octo-simpler/bin/python`。先准备 Python 3.10/3.11 的仿真环境：
 
 ```bash
 uv venv --python /usr/bin/python3.10 .venv-octo-simpler
@@ -1042,14 +1043,19 @@ uv pip install --python .venv-octo-simpler/bin/python \
 ```
 
 构建约束只固定 `ruckig==0.14.0` 所需的旧版构建后端，不会安装进评测运行时。
+模型 pyenv 必须已经具备加载 Octo checkpoint 所需的 Torch、Transformers 和
+safetensors 等依赖；启动器不会安装依赖、固定 `PYENV_VERSION` 或校验包版本。
+如需覆盖默认入口，分别传 `--pyenv-bin PATH` 和 `--sim-python PATH`。
 
 checkpoint 包含微调权重及训练时使用的 Bridge V2 归一化统计，因此只需 checkpoint
 和基础模型。可选 `--statistics` 仅用于显式指定相同文件，内容哈希不一致会被拒绝。
+启动器为两个进程创建带随机认证密钥的私有 Unix socket；模型完成一次黑图推理后才
+启动仿真客户端。模型输出持久写入评测目录的 `model-server.log`，退出或收到信号时
+启动器会回收两个子进程并清理 socket。
 先用独立输出目录运行四任务预检：
 
 ```bash
 bash scripts/evaluate_simpler_octo_small.sh \
-  --python .venv-octo-simpler/bin/python \
   --checkpoint /data/dwb/octo_small_bridge_v2/checkpoints/step-00020000 \
   --base-model /data/dwb/models/octo-small-pytorch \
   --output-dir outputs/octo_small_bridge_simpler_preflight \
@@ -1060,7 +1066,6 @@ bash scripts/evaluate_simpler_octo_small.sh \
 
 ```bash
 bash scripts/evaluate_simpler_octo_small.sh \
-  --python .venv-octo-simpler/bin/python \
   --checkpoint /data/dwb/octo_small_bridge_v2/checkpoints/step-00020000 \
   --base-model /data/dwb/models/octo-small-pytorch \
   --output-dir outputs/octo_small_bridge_simpler_smoke \
@@ -1072,7 +1077,6 @@ bash scripts/evaluate_simpler_octo_small.sh \
 
 ```bash
 bash scripts/evaluate_simpler_octo_small.sh \
-  --python .venv-octo-simpler/bin/python \
   --checkpoint /data/dwb/octo_small_bridge_v2/checkpoints/step-00020000 \
   --base-model /data/dwb/models/octo-small-pytorch \
   --tasks all \

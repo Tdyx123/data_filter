@@ -293,92 +293,91 @@ def test_policy_loader_uses_primary_only_and_strict_checkpoint_weights(tmp_path)
     assert policy.statistics.path == checkpoint.resolve() / "normalization.json"
 
 
-def test_octo_simpler_runtime_contract_is_python310_and_model_specific():
-    from octo_small_bridge.simpler_evaluation import (
-        OCTO_SIMPLER_RUNTIME_PACKAGE_VERSIONS,
-        validate_runtime_contract,
-    )
+def test_remote_policy_preserves_raw_observations_rng_and_server_metadata():
+    from octo_small_bridge.ipc import IPC_PROTOCOL_VERSION
+    from octo_small_bridge.remote_policy import OctoRemotePolicy
 
-    versions = dict(OCTO_SIMPLER_RUNTIME_PACKAGE_VERSIONS)
-    assert versions["torch"] == "2.4.1"
-    assert versions["transformers"] == "4.44.2"
-    assert versions["sapien"] == "2.2.2"
-    assert versions["setuptools"] == "75.8.0"
-    assert validate_runtime_contract(
-        version_info=(3, 10),
-        package_versions=versions,
-        device="cpu",
-    ) == versions
+    class Client:
+        def __init__(self):
+            self.resets = []
+            self.inferences = []
 
-    cuda_versions = {
-        **versions,
-        "torch": "2.4.1+cu121",
-        "torchvision": "0.19.1+cu121",
+        def metadata(self):
+            return {
+                "protocol_version": IPC_PROTOCOL_VERSION,
+                "model": "Octo-small Bridge checkpoint",
+                "native_action_chunk_size": 8,
+                "action_dim": 7,
+                "device": "cuda:3",
+                "precision": "bf16",
+                "checkpoint": {
+                    "requested_path": "/models/checkpoint",
+                    "statistics": {"path": "/models/checkpoint/normalization.json"},
+                },
+                "protocol": {
+                    "native_action_chunk_size": 8,
+                    "precision": "bf16",
+                },
+                "startup_preflight": {"action_shape": [1, 8, 7], "finite": True},
+            }
+
+        def reset_rng(self, seed):
+            self.resets.append(seed)
+            return seed
+
+        def infer(self, image, proprio, instruction):
+            self.inferences.append((image, proprio, instruction))
+            return np.zeros((1, 8, 7), dtype=np.float32)
+
+    client = Client()
+    policy = OctoRemotePolicy(client)
+    image = np.zeros((480, 640, 3), dtype=np.uint8)
+    proprio = np.arange(8, dtype=np.float64)
+
+    generator = policy.make_generator(4)
+    prepared = policy.prepare_observation(image, proprio, "Put Spoon on Towel")
+    actions = policy.predict_actions(prepared, generator=generator)
+
+    assert generator == 4
+    assert client.resets == [4]
+    assert client.inferences[0][0] is image
+    assert client.inferences[0][1].dtype == np.float32
+    assert client.inferences[0][2] == "Put Spoon on Towel"
+    assert actions.shape == (1, 8, 7)
+    assert policy.checkpoint_report["requested_path"] == "/models/checkpoint"
+    assert policy.model_device == "cuda:3"
+    assert policy.protocol_metadata() == {
+        "native_action_chunk_size": 8,
+        "precision": "bf16",
+        "ipc_protocol_version": IPC_PROTOCOL_VERSION,
+        "startup_preflight": {"action_shape": [1, 8, 7], "finite": True},
     }
-    assert validate_runtime_contract(
-        version_info=(3, 10),
-        package_versions=cuda_versions,
-        device="cpu",
-    ) == cuda_versions
-
-    incompatible_versions = {**cuda_versions, "torch": "2.4.1.post1+cu121"}
-    with pytest.raises(Exception, match="requires torch==2.4.1"):
-        validate_runtime_contract(
-            version_info=(3, 10),
-            package_versions=incompatible_versions,
-            device="cpu",
-        )
-
-    try:
-        validate_runtime_contract(
-            version_info=(3, 12),
-            package_versions=versions,
-            device="cpu",
-        )
-    except Exception as error:
-        assert "Python 3.10 or 3.11" in str(error)
-    else:
-        raise AssertionError("Python 3.12 must be rejected")
 
 
-def test_octo_simpler_cli_requires_all_model_paths_and_defaults_to_full_protocol():
+def test_octo_simpler_client_requires_socket_and_defaults_to_full_protocol():
     from octo_small_bridge.evaluate_simpler import build_parser
 
     parser = build_parser()
     arguments = parser.parse_args(
         [
-            "--checkpoint",
-            "/models/step-00020000",
-            "--base-model",
-            "/models/octo-small-pytorch",
-            "--statistics",
-            "/data/bridge/meta/stats.json",
+            "--socket",
+            "/tmp/octo.sock",
+            "--auth-key-hex",
+            "abcd",
         ]
     )
 
+    assert arguments.socket == Path("/tmp/octo.sock")
     assert arguments.tasks == "all"
     assert arguments.output_dir == Path("outputs/octo_small_bridge_simpler_eval")
-    assert arguments.device == "cuda:0"
     assert arguments.sim_device == "cuda:0"
-    assert arguments.precision == "bf16"
     assert arguments.action_horizon == 1
-    self_contained = parser.parse_args(
-        [
-            "--checkpoint",
-            "/models/step-00020000",
-            "--base-model",
-            "/models/octo-small-pytorch",
-        ]
-    )
-    assert self_contained.statistics is None
     assert parser.parse_args(
         [
-            "--checkpoint",
-            "/models/step-00020000",
-            "--base-model",
-            "/models/octo-small-pytorch",
-            "--statistics",
-            "/data/bridge/meta/stats.json",
+            "--socket",
+            "/tmp/octo.sock",
+            "--auth-key-hex",
+            "abcd",
             "--sim-device",
             "cuda:12",
         ]
@@ -386,19 +385,17 @@ def test_octo_simpler_cli_requires_all_model_paths_and_defaults_to_full_protocol
     with pytest.raises(SystemExit):
         parser.parse_args(
             [
-                "--checkpoint",
-                "/models/step-00020000",
-                "--base-model",
-                "/models/octo-small-pytorch",
-                "--statistics",
-                "/data/bridge/meta/stats.json",
+                "--socket",
+                "/tmp/octo.sock",
+                "--auth-key-hex",
+                "abcd",
                 "--action-horizon",
                 "8",
             ]
         )
     assert arguments.smoke_test is False
     with pytest.raises(SystemExit):
-        parser.parse_args(["--checkpoint", "/models/step-00020000"])
+        parser.parse_args(["--socket", "/tmp/octo.sock"])
 
 
 @pytest.mark.parametrize(
@@ -411,12 +408,10 @@ def test_octo_simpler_cli_rejects_non_logical_cuda_sim_devices(sim_device):
     with pytest.raises(SystemExit):
         build_parser().parse_args(
             [
-                "--checkpoint",
-                "/models/step-00020000",
-                "--base-model",
-                "/models/octo-small-pytorch",
-                "--statistics",
-                "/data/bridge/meta/stats.json",
+                "--socket",
+                "/tmp/octo.sock",
+                "--auth-key-hex",
+                "abcd",
                 "--sim-device",
                 sim_device,
             ]
@@ -427,28 +422,22 @@ def test_octo_simpler_cli_applies_smoke_protocol_and_model_metadata(tmp_path, mo
     from octo_small_bridge import evaluate_simpler
 
     captured = {}
-    checkpoint = SimpleNamespace(
-        as_dict=lambda: {"requested_path": "/models/step-00020000"}
+    client = SimpleNamespace(shutdown=lambda: captured.setdefault("shutdown", True))
+    policy = SimpleNamespace(
+        checkpoint_report={
+            "requested_path": "/models/step-00020000",
+            "statistics": {"path": "/data/bridge/meta/stats.json", "sha256": "abc"},
+        },
+        model_device="cuda:3",
+        protocol_metadata=lambda: {"native_action_chunk_size": 8},
     )
-    statistics = SimpleNamespace(
-        as_dict=lambda: {"path": "/data/bridge/meta/stats.json", "sha256": "abc"}
-    )
-    policy = SimpleNamespace(statistics=statistics, protocol_metadata=lambda: {})
     monkeypatch.setattr(
         evaluate_simpler,
         "validate_simpler_source",
         lambda path: {"simpler_env_commit": "06accaca9353"},
     )
-    monkeypatch.setattr(
-        evaluate_simpler,
-        "validate_runtime_contract",
-        lambda device: {"torch": "2.4.1"},
-    )
-    monkeypatch.setattr(
-        evaluate_simpler,
-        "load_octo_bridge_policy",
-        lambda *args, **kwargs: (checkpoint, policy),
-    )
+    monkeypatch.setattr(evaluate_simpler, "OctoIPCClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(evaluate_simpler, "OctoRemotePolicy", lambda value: policy)
 
     def evaluate(settings, **kwargs):
         captured["settings"] = settings
@@ -459,12 +448,10 @@ def test_octo_simpler_cli_applies_smoke_protocol_and_model_metadata(tmp_path, mo
 
     status = evaluate_simpler.main(
         [
-            "--checkpoint",
-            "/models/step-00020000",
-            "--base-model",
-            "/models/octo-small-pytorch",
-            "--statistics",
-            "/data/bridge/meta/stats.json",
+            "--socket",
+            "/tmp/octo.sock",
+            "--auth-key-hex",
+            "abcd",
             "--tasks",
             "eggplant,spoon",
             "--output-dir",
@@ -478,11 +465,13 @@ def test_octo_simpler_cli_applies_smoke_protocol_and_model_metadata(tmp_path, mo
     assert captured["settings"].policy_seeds == (0,)
     assert captured["settings"].object_episode_ids == (0,)
     assert captured["settings"].max_steps == 8
-    assert captured["kwargs"]["checkpoint"] == {
-        "requested_path": "/models/step-00020000",
-        "statistics": {"path": "/data/bridge/meta/stats.json", "sha256": "abc"},
-    }
+    assert captured["settings"].device == "remote-pyenv:cuda:3"
+    assert captured["kwargs"]["checkpoint"] == policy.checkpoint_report
     assert captured["kwargs"]["route"] == "octo-small-bridge-simpler-widowx-eval"
+    assert captured["kwargs"]["protocol_metadata"] == {
+        "native_action_chunk_size": 8
+    }
+    assert captured["shutdown"] is True
 
 
 @pytest.mark.parametrize("preflight_only", (False, True), ids=("evaluation", "preflight"))
@@ -492,20 +481,15 @@ def test_octo_cli_forwards_sim_device_to_environment_builder(
     from octo_small_bridge import evaluate_simpler
 
     captured = {}
-    checkpoint = SimpleNamespace(as_dict=lambda: {})
     policy = SimpleNamespace(
-        statistics=SimpleNamespace(as_dict=lambda: {}),
+        checkpoint_report={},
+        model_device="cuda:0",
         protocol_metadata=lambda: {},
     )
+    client = SimpleNamespace(shutdown=lambda: None)
     monkeypatch.setattr(evaluate_simpler, "validate_simpler_source", lambda path: {})
-    monkeypatch.setattr(
-        evaluate_simpler, "validate_runtime_contract", lambda device: {}
-    )
-    monkeypatch.setattr(
-        evaluate_simpler,
-        "load_octo_bridge_policy",
-        lambda *args, **kwargs: (checkpoint, policy),
-    )
+    monkeypatch.setattr(evaluate_simpler, "OctoIPCClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(evaluate_simpler, "OctoRemotePolicy", lambda value: policy)
     monkeypatch.setattr(
         evaluate_simpler,
         "create_simpler_environment",
@@ -522,12 +506,10 @@ def test_octo_cli_forwards_sim_device_to_environment_builder(
     monkeypatch.setattr(evaluate_simpler, "evaluate_simpler_policy", run)
     monkeypatch.setattr(evaluate_simpler, "run_simpler_preflight", run)
     arguments = [
-        "--checkpoint",
-        "/models/step-00020000",
-        "--base-model",
-        "/models/octo-small-pytorch",
-        "--statistics",
-        "/data/bridge/meta/stats.json",
+        "--socket",
+        "/tmp/octo.sock",
+        "--auth-key-hex",
+        "abcd",
         "--tasks",
         "spoon",
         "--output-dir",
@@ -558,12 +540,10 @@ def test_octo_simpler_cli_writes_contract_failures(tmp_path, monkeypatch):
 
     status = evaluate_simpler.main(
         [
-            "--checkpoint",
-            "/models/step-00020000",
-            "--base-model",
-            "/models/octo-small-pytorch",
-            "--statistics",
-            "/data/bridge/meta/stats.json",
+            "--socket",
+            "/tmp/octo.sock",
+            "--auth-key-hex",
+            "abcd",
             "--output-dir",
             str(output_dir),
         ]
