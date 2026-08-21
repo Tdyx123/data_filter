@@ -48,9 +48,7 @@ def test_octo_bridge_policy_uses_v2_quantiles_and_binary_gripper(tmp_path):
     )
 
     statistics = load_bridge_statistics(_v2_statistics_file(tmp_path))
-    normalized_actions = np.asarray(
-        [[[2.2, -2.2, 0, 0, 0, 0, 0.50001]] * 8], dtype=np.float32
-    )
+    normalized_actions = np.asarray([[[2.2, -2.2, 0, 0, 0, 0, 0.50001]] * 8], dtype=np.float32)
     policy = OctoBridgeSimplerPolicy(
         model=object(),
         tokenizer=_Tokenizer(),
@@ -98,9 +96,7 @@ def test_old_octo_bridge_checkpoint_is_rejected_before_model_loading(tmp_path):
             precision="fp32",
             model_loader=lambda *args, **kwargs: calls.append("model"),
             weight_loader=lambda *args, **kwargs: calls.append("weights"),
-            torch_module=SimpleNamespace(
-                device=lambda value: SimpleNamespace(type="cpu")
-            ),
+            torch_module=SimpleNamespace(device=lambda value: SimpleNamespace(type="cpu")),
         )
 
     assert calls == []
@@ -113,9 +109,7 @@ def test_bridge_statistics_and_octo_adapter_preserve_gripper_semantics(tmp_path)
     )
 
     statistics = load_bridge_statistics(_statistics_file(tmp_path))
-    proprio = statistics.normalize_proprio(
-        np.asarray([1, 2, 3, 4, 5, 6, 0, 1], dtype=np.float32)
-    )
+    proprio = statistics.normalize_proprio(np.asarray([1, 2, 3, 4, 5, 6, 0, 1], dtype=np.float32))
     np.testing.assert_allclose(
         proprio,
         np.asarray([1, 1, 1, 1, 1, 1, 0, 1], dtype=np.float32),
@@ -372,16 +366,22 @@ def test_octo_simpler_client_requires_socket_and_defaults_to_full_protocol():
     assert arguments.output_dir == Path("outputs/octo_small_bridge_simpler_eval")
     assert arguments.sim_device == "cuda:0"
     assert arguments.action_horizon == 1
-    assert parser.parse_args(
-        [
-            "--socket",
-            "/tmp/octo.sock",
-            "--auth-key-hex",
-            "abcd",
-            "--sim-device",
-            "cuda:12",
-        ]
-    ).sim_device == "cuda:12"
+    assert arguments.shard_index == 0
+    assert arguments.shard_count == 1
+    assert arguments.rng_scope == "per_policy_seed_stream"
+    assert (
+        parser.parse_args(
+            [
+                "--socket",
+                "/tmp/octo.sock",
+                "--auth-key-hex",
+                "abcd",
+                "--sim-device",
+                "cuda:12",
+            ]
+        ).sim_device
+        == "cuda:12"
+    )
     with pytest.raises(SystemExit):
         parser.parse_args(
             [
@@ -457,6 +457,12 @@ def test_octo_simpler_cli_applies_smoke_protocol_and_model_metadata(tmp_path, mo
             "--output-dir",
             str(tmp_path / "results"),
             "--smoke-test",
+            "--shard-index",
+            "1",
+            "--shard-count",
+            "2",
+            "--rng-scope",
+            "per_episode",
         ]
     )
 
@@ -466,18 +472,17 @@ def test_octo_simpler_cli_applies_smoke_protocol_and_model_metadata(tmp_path, mo
     assert captured["settings"].object_episode_ids == (0,)
     assert captured["settings"].max_steps == 8
     assert captured["settings"].device == "remote-pyenv:cuda:3"
+    assert captured["settings"].shard_index == 1
+    assert captured["settings"].shard_count == 2
+    assert captured["settings"].rng_scope == "per_episode"
     assert captured["kwargs"]["checkpoint"] == policy.checkpoint_report
     assert captured["kwargs"]["route"] == "octo-small-bridge-simpler-widowx-eval"
-    assert captured["kwargs"]["protocol_metadata"] == {
-        "native_action_chunk_size": 8
-    }
+    assert captured["kwargs"]["protocol_metadata"] == {"native_action_chunk_size": 8}
     assert captured["shutdown"] is True
 
 
 @pytest.mark.parametrize("preflight_only", (False, True), ids=("evaluation", "preflight"))
-def test_octo_cli_forwards_sim_device_to_environment_builder(
-    tmp_path, monkeypatch, preflight_only
-):
+def test_octo_cli_forwards_sim_device_to_environment_builder(tmp_path, monkeypatch, preflight_only):
     from octo_small_bridge import evaluate_simpler
 
     captured = {}
@@ -493,9 +498,7 @@ def test_octo_cli_forwards_sim_device_to_environment_builder(
     monkeypatch.setattr(
         evaluate_simpler,
         "create_simpler_environment",
-        lambda task, *, sim_device: captured.setdefault(
-            "builder", (task.key, sim_device)
-        ),
+        lambda task, *, sim_device: captured.setdefault("builder", (task.key, sim_device)),
     )
 
     def run(settings, **kwargs):

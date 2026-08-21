@@ -85,6 +85,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run one seed and one object episode per task for at most eight steps.",
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--shard-index", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--shard-count", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--rng-scope",
+        choices=("per_policy_seed_stream", "per_episode"),
+        default="per_policy_seed_stream",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -97,9 +105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             authkey = bytes.fromhex(arguments.auth_key_hex)
         except ValueError as error:
-            raise SimplerEvaluationError(
-                "--auth-key-hex must contain valid hex bytes"
-            ) from error
+            raise SimplerEvaluationError("--auth-key-hex must contain valid hex bytes") from error
         if not authkey:
             raise SimplerEvaluationError("--auth-key-hex must be non-empty")
         tasks = resolve_task_selection(arguments.tasks)
@@ -120,6 +126,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             save_videos_path=arguments.save_videos_path,
             video_fps=arguments.video_fps,
             overwrite=arguments.overwrite,
+            shard_index=arguments.shard_index,
+            shard_count=arguments.shard_count,
+            rng_scope=arguments.rng_scope,
         )
         sim_packages = {"numpy": np.__version__}
         if arguments.preflight_only:

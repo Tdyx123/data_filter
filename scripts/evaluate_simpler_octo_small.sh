@@ -8,6 +8,8 @@ checkpoint=""
 base_model=""
 statistics=""
 device="cuda:0"
+device_explicit=0
+model_devices=""
 precision="bf16"
 sim_device="cuda:0"
 output_dir="${project_root}/outputs/octo_small_bridge_simpler_eval"
@@ -27,6 +29,8 @@ Launcher options:
   --base-model PATH      converted Octo-small PyTorch base model (required)
   --statistics PATH      optional normalization.json override
   --device DEVICE        model service CUDA device (default: cuda:0)
+  --model-devices LIST   parallel model replicas, e.g. cuda:0,cuda:1
+                         cannot be combined with --device
   --precision VALUE      model precision: bf16 or fp32 (default: bf16)
   --sim-device DEVICE    simulator renderer CUDA device (default: cuda:0)
   --output-dir PATH      evaluation output and persistent model-server.log
@@ -67,7 +71,7 @@ while (($#)); do
     --python|--python=*)
       fail "--python has been removed; use --sim-python"
       ;;
-    --pyenv-bin|--sim-python|--checkpoint|--base-model|--statistics|--device|--precision|--sim-device|--output-dir|--server-timeout)
+    --pyenv-bin|--sim-python|--checkpoint|--base-model|--statistics|--device|--model-devices|--precision|--sim-device|--output-dir|--server-timeout)
       option="$1"
       set_once "${option}"
       (($# >= 2)) || fail "${option} requires a non-empty value"
@@ -78,7 +82,8 @@ while (($#)); do
         --checkpoint) checkpoint="$2" ;;
         --base-model) base_model="$2" ;;
         --statistics) statistics="$2" ;;
-        --device) device="$2" ;;
+        --device) device="$2"; device_explicit=1 ;;
+        --model-devices) model_devices="$2" ;;
         --precision) precision="$2" ;;
         --sim-device) sim_device="$2" ;;
         --output-dir) output_dir="$2" ;;
@@ -86,7 +91,7 @@ while (($#)); do
       esac
       shift 2
       ;;
-    --pyenv-bin=*|--sim-python=*|--checkpoint=*|--base-model=*|--statistics=*|--device=*|--precision=*|--sim-device=*|--output-dir=*|--server-timeout=*)
+    --pyenv-bin=*|--sim-python=*|--checkpoint=*|--base-model=*|--statistics=*|--device=*|--model-devices=*|--precision=*|--sim-device=*|--output-dir=*|--server-timeout=*)
       option="${1%%=*}"
       value="${1#*=}"
       set_once "${option}"
@@ -97,7 +102,8 @@ while (($#)); do
         --checkpoint) checkpoint="${value}" ;;
         --base-model) base_model="${value}" ;;
         --statistics) statistics="${value}" ;;
-        --device) device="${value}" ;;
+        --device) device="${value}"; device_explicit=1 ;;
+        --model-devices) model_devices="${value}" ;;
         --precision) precision="${value}" ;;
         --sim-device) sim_device="${value}" ;;
         --output-dir) output_dir="${value}" ;;
@@ -119,7 +125,7 @@ while (($#)); do
       forwarded+=("$1")
       shift
       ;;
-    --socket|--socket=*|--auth-key-hex|--auth-key-hex=*)
+    --socket|--socket=*|--auth-key-hex|--auth-key-hex=*|--shard-index|--shard-index=*|--shard-count|--shard-count=*|--rng-scope|--rng-scope=*)
       fail "$1 is managed by this launcher"
       ;;
     *)
@@ -137,8 +143,43 @@ done
   fail "--server-timeout must be a positive integer"
 [[ "${sim_device}" =~ ^cuda:[0-9]+$ ]] ||
   fail "--sim-device must match cuda:<non-negative decimal integer>"
+if [[ -n "${model_devices}" ]]; then
+  ((device_explicit == 0)) || fail "--model-devices cannot be combined with --device"
+  [[ "${model_devices}" =~ ^cuda:[0-9]+(,cuda:[0-9]+)*$ ]] ||
+    fail "--model-devices must be a comma-separated list of unique cuda:<index> values"
+  declare -A seen_model_devices=()
+  IFS=',' read -r -a parsed_model_devices <<<"${model_devices}"
+  for model_device in "${parsed_model_devices[@]}"; do
+    [[ -z "${seen_model_devices[${model_device}]:-}" ]] ||
+      fail "--model-devices must be a comma-separated list of unique cuda:<index> values"
+    seen_model_devices["${model_device}"]=1
+  done
+fi
 [[ -x "${pyenv_bin}" ]] || fail "pyenv executable is not executable: ${pyenv_bin}"
 [[ -x "${sim_python}" ]] || fail "simulator Python is not executable: ${sim_python}"
+
+if [[ -n "${model_devices}" ]]; then
+  parallel_command=(
+    "${pyenv_bin}" exec python -m octo_small_bridge.parallel_evaluation
+    --sim-python "${sim_python}"
+    --checkpoint "${checkpoint}"
+    --base-model "${base_model}"
+    --model-devices "${model_devices}"
+    --sim-device "${sim_device}"
+    --precision "${precision}"
+    --output-dir "${output_dir}"
+    --server-timeout "${server_timeout}"
+  )
+  if [[ -n "${statistics}" ]]; then
+    parallel_command+=(--statistics "${statistics}")
+  fi
+  parallel_command+=(-- "${forwarded[@]}")
+  simpler_root="${project_root}/third_party/SimplerEnv"
+  maniskill_root="${simpler_root}/ManiSkill2_real2sim"
+  export PYTHONPATH="${project_root}/src:${simpler_root}:${maniskill_root}"
+  export MS2_REAL2SIM_ASSET_DIR="${maniskill_root}/data"
+  exec "${parallel_command[@]}"
+fi
 
 mkdir -p "${output_dir}"
 model_log="${output_dir}/model-server.log"
