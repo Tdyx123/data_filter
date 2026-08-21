@@ -379,7 +379,9 @@ def test_model_server_cli_and_metadata_expose_fixed_checkpoint_contract():
             parameter_bytes=9_976_489_486,
             dtypes=("torch.bfloat16",),
         ),
+        device="cuda:3",
     )
     assert metadata["native_action_chunk_size"] == 16
     assert metadata["checkpoint_tensor_count"] == 962
     assert metadata["available_unnorm_keys"] == ["oxe_bridge"]
+    assert metadata["device"] == "cuda:3"

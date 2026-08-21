@@ -32,6 +32,8 @@ def build_server_metadata(
     spec: Any,
     report: Any,
     runtime: dict[str, str] | None = None,
+    *,
+    device: str,
 ) -> dict[str, Any]:
     return {
         "model": "Qwen3VL-GR00T-Bridge-RT-1",
@@ -41,6 +43,7 @@ def build_server_metadata(
         "base_model": str(spec.base_model),
         "native_action_chunk_size": int(spec.action_horizon),
         "action_dim": int(spec.action_dim),
+        "device": str(device),
         "available_unnorm_keys": ["oxe_bridge"],
         "checkpoint_tensor_count": int(report.tensor_count),
         "checkpoint_parameter_bytes": int(report.parameter_bytes),
@@ -77,7 +80,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime = validate_model_runtime(device=arguments.device)
     spec = load_model_spec(arguments.model_dir, base_model=arguments.base_model)
     loaded = load_starvla_policy(spec, device=arguments.device)
-    metadata = build_server_metadata(spec, loaded.checkpoint_report, runtime)
+    metadata = build_server_metadata(
+        spec,
+        loaded.checkpoint_report,
+        runtime,
+        device=arguments.device,
+    )
     metadata["startup_preflight"] = run_startup_preflight(loaded)
     serve_policy(
         socket_path=arguments.socket,

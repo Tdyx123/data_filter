@@ -145,12 +145,16 @@ def test_server_validates_runtime_before_loading_checkpoint(monkeypatch, tmp_pat
             str(tmp_path / "model"),
             "--base-model",
             str(tmp_path / "base"),
+            "--device",
+            "cuda:3",
         ]
     )
 
     assert status == 0
     assert [event[0] for event in events] == ["runtime", "load", "serve"]
-    assert events[0][1] == {"device": "cuda:0"}
+    assert events[0][1] == {"device": "cuda:3"}
+    assert events[1][1] == {"device": "cuda:3"}
+    assert events[-1][1]["metadata"]["device"] == "cuda:3"
     assert events[-1][1]["metadata"]["runtime"]["diffusers"] == "0.38.0"
     assert predicted_images[0][0].shape == (224, 224, 3)
     assert predicted_images[0][0].dtype.name == "uint8"

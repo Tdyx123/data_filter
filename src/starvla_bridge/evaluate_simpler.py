@@ -53,6 +53,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--shard-index", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--shard-count", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--rng-scope",
+        choices=("per_policy_seed_stream", "per_episode"),
+        default="per_policy_seed_stream",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -102,7 +110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         settings = SimplerRunSettings(
             output_dir=arguments.output_dir,
             tasks=tasks,
-            device="remote-pyenv-cuda:0",
+            device=f"remote-pyenv:{policy.model_device}",
             sim_device=arguments.sim_device,
             action_horizon=arguments.action_horizon,
             policy_seeds=(0,) if arguments.smoke_test else POLICY_SEEDS,
@@ -111,6 +119,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             save_videos_path=arguments.save_videos_path,
             video_fps=arguments.video_fps,
             overwrite=arguments.overwrite,
+            shard_index=arguments.shard_index,
+            shard_count=arguments.shard_count,
+            rng_scope=arguments.rng_scope,
         )
         checkpoint = {
             key: metadata.get(key)

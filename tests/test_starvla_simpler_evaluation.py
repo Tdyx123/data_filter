@@ -12,6 +12,7 @@ class _FakeClient:
         return {
             "protocol_version": 2,
             "model": "Qwen3VL-GR00T-Bridge-RT-1",
+            "device": "cuda:3",
             "native_action_chunk_size": 16,
             "available_unnorm_keys": ["oxe_bridge"],
             "runtime": {"python": "3.12.12", "torch": "2.10.0+cu128"},
@@ -55,6 +56,7 @@ def test_remote_policy_resizes_rgb_resets_seed_and_reports_native_chunk():
     assert protocol["startup_preflight"]["finite"] is True
     assert protocol["terminate_episode"] == 0
     assert policy.metadata["model"] == "Qwen3VL-GR00T-Bridge-RT-1"
+    assert policy.model_device == "cuda:3"
     assert policy.gripper_threshold == 0.5
 
 
@@ -123,6 +125,9 @@ def test_starvla_cli_defaults_to_full_stepwise_protocol():
     assert arguments.sim_device == "cuda:0"
     assert arguments.output_dir.name == "starvla_simpler_eval"
     assert arguments.smoke_test is False
+    assert arguments.shard_index == 0
+    assert arguments.shard_count == 1
+    assert arguments.rng_scope == "per_policy_seed_stream"
     assert parser.parse_args(
         [
             "--socket",
@@ -181,7 +186,11 @@ def test_starvla_cli_keeps_remote_model_device_and_forwards_sim_device(
         def shutdown(self):
             captured["shutdown"] = True
 
-    policy = SimpleNamespace(metadata={}, protocol_metadata=lambda: {})
+    policy = SimpleNamespace(
+        metadata={"device": "cuda:5"},
+        model_device="cuda:5",
+        protocol_metadata=lambda: {},
+    )
     monkeypatch.setattr(evaluate_simpler, "StarVLAIPCClient", Client)
     monkeypatch.setattr(evaluate_simpler, "StarVLARemotePolicy", lambda client: policy)
     monkeypatch.setattr(evaluate_simpler, "validate_simpler_source", lambda path: {})
@@ -211,6 +220,12 @@ def test_starvla_cli_keeps_remote_model_device_and_forwards_sim_device(
         str(tmp_path / "output"),
         "--sim-device",
         "cuda:7",
+        "--shard-index",
+        "1",
+        "--shard-count",
+        "3",
+        "--rng-scope",
+        "per_episode",
     ]
     if preflight_only:
         arguments.append("--preflight-only")
@@ -218,7 +233,10 @@ def test_starvla_cli_keeps_remote_model_device_and_forwards_sim_device(
     status = evaluate_simpler.main(arguments)
 
     assert status == 0
-    assert captured["settings"].device == "remote-pyenv-cuda:0"
+    assert captured["settings"].device == "remote-pyenv:cuda:5"
     assert captured["settings"].sim_device == "cuda:7"
+    assert captured["settings"].shard_index == 1
+    assert captured["settings"].shard_count == 3
+    assert captured["settings"].rng_scope == "per_episode"
     assert captured["builder"] == ("spoon", "cuda:7")
     assert captured["shutdown"] is True

@@ -33,6 +33,10 @@ class StarVLARemotePolicy:
     def metadata(self) -> dict[str, Any]:
         return dict(self._metadata)
 
+    @property
+    def model_device(self) -> str:
+        return str(self._metadata.get("device", "unknown"))
+
     def make_generator(self, seed: int) -> int:
         return int(self.client.reset_rng(int(seed)))
 
