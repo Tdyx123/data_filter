@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import re
@@ -15,7 +16,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from simpler_bridge.evaluation import (
     SimplerTaskSpec,
@@ -36,6 +37,25 @@ class ParallelEvaluationError(RuntimeError):
     def __init__(self, message: str, *, exit_code: int = 1):
         super().__init__(message)
         self.exit_code = int(exit_code)
+
+
+@dataclass(frozen=True)
+class ParallelEvaluationBackend:
+    display_name: str
+    server_module: str
+    evaluator_module: str
+    failure_route: str
+    supports_denoising_steps: bool
+    checkpoint_validator: Callable[[Path, Path | None], Any] | None = None
+
+
+GROOT_BACKEND = ParallelEvaluationBackend(
+    display_name="Qwen",
+    server_module="qwen3_vl_groot.server",
+    evaluator_module="qwen3_vl_groot.evaluate_simpler",
+    failure_route="qwen3-vl-groot-simpler-widowx-parallel-eval",
+    supports_denoising_steps=True,
+)
 
 
 @dataclass
@@ -70,9 +90,11 @@ def _positive_integer(value: str) -> int:
     return parsed
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(
+    backend: ParallelEvaluationBackend = GROOT_BACKEND,
+) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run sharded Qwen SimplerEnv evaluation across model replicas."
+        description=f"Run sharded {backend.display_name} SimplerEnv evaluation across replicas."
     )
     parser.add_argument("--model-python", type=Path, default=Path(sys.executable))
     parser.add_argument("--sim-python", type=Path, required=True)
@@ -80,16 +102,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", type=Path, default=None)
     parser.add_argument("--model-devices", type=parse_model_devices, required=True)
     parser.add_argument("--sim-device", type=parse_sim_device, required=True)
-    parser.add_argument("--denoising-steps", type=_positive_integer, default=4)
+    if backend.supports_denoising_steps:
+        parser.add_argument("--denoising-steps", type=_positive_integer, default=4)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--server-timeout", type=_positive_integer, default=600)
     parser.add_argument("evaluation_args", nargs=argparse.REMAINDER)
     return parser
 
 
-def _evaluation_arguments(arguments: argparse.Namespace) -> argparse.Namespace:
-    from .evaluate_simpler import build_parser as build_evaluation_parser
-
+def _evaluation_arguments(
+    arguments: argparse.Namespace,
+    backend: ParallelEvaluationBackend,
+) -> argparse.Namespace:
+    evaluator = importlib.import_module(backend.evaluator_module)
+    build_evaluation_parser = evaluator.build_parser
     forwarded = list(arguments.evaluation_args)
     if forwarded[:1] == ["--"]:
         forwarded = forwarded[1:]
@@ -223,6 +249,7 @@ def _write_failure(
     error: BaseException,
     exit_code: int,
     replicas: Sequence[_Replica] = (),
+    route: str = GROOT_BACKEND.failure_route,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "failure.json"
@@ -231,7 +258,7 @@ def _write_failure(
     report = {
         "schema_version": 1,
         "status": "failed",
-        "route": "qwen3-vl-groot-simpler-widowx-parallel-eval",
+        "route": route,
         "exit_code": int(exit_code),
         "error": f"{type(error).__name__}: {error}",
         "workers": [
@@ -286,8 +313,14 @@ def _augment_preflight(
     return report
 
 
-def run_parallel(arguments: argparse.Namespace) -> dict[str, Any]:
-    evaluation = _evaluation_arguments(arguments)
+def run_parallel(
+    arguments: argparse.Namespace,
+    *,
+    backend: ParallelEvaluationBackend = GROOT_BACKEND,
+) -> dict[str, Any]:
+    evaluation = _evaluation_arguments(arguments, backend)
+    if backend.checkpoint_validator is not None:
+        backend.checkpoint_validator(arguments.checkpoint, arguments.model_path)
     tasks = resolve_task_selection(evaluation.tasks)
     policy_seeds = (0,) if evaluation.smoke_test else (0, 2, 4)
     object_episode_ids = (0,) if evaluation.smoke_test else tuple(range(24))
@@ -317,7 +350,7 @@ def run_parallel(arguments: argparse.Namespace) -> dict[str, Any]:
             command = [
                 str(arguments.model_python),
                 "-m",
-                "qwen3_vl_groot.server",
+                backend.server_module,
                 "--socket",
                 str(socket_path),
                 "--auth-key-hex",
@@ -326,9 +359,9 @@ def run_parallel(arguments: argparse.Namespace) -> dict[str, Any]:
                 str(arguments.checkpoint),
                 "--device",
                 device,
-                "--denoising-steps",
-                str(arguments.denoising_steps),
             ]
+            if backend.supports_denoising_steps:
+                command.extend(("--denoising-steps", str(arguments.denoising_steps)))
             if arguments.model_path is not None:
                 command.extend(("--model-path", str(arguments.model_path)))
             process = subprocess.Popen(
@@ -359,7 +392,7 @@ def run_parallel(arguments: argparse.Namespace) -> dict[str, Any]:
             command = [
                 str(arguments.sim_python),
                 "-m",
-                "qwen3_vl_groot.evaluate_simpler",
+                backend.evaluator_module,
                 "--socket",
                 str(replica.socket_path),
                 "--auth-key-hex",
@@ -425,6 +458,7 @@ def run_parallel(arguments: argparse.Namespace) -> dict[str, Any]:
             error=error,
             exit_code=exit_code,
             replicas=replicas,
+            route=backend.failure_route,
         )
         raise
     finally:
@@ -436,8 +470,12 @@ def run_parallel(arguments: argparse.Namespace) -> dict[str, Any]:
         shutil.rmtree(ipc_root, ignore_errors=True)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    arguments = build_parser().parse_args(argv)
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    backend: ParallelEvaluationBackend = GROOT_BACKEND,
+) -> int:
+    arguments = build_parser(backend).parse_args(argv)
     previous_handler = signal.getsignal(signal.SIGTERM)
 
     def interrupt(_signum: int, _frame: Any) -> None:
@@ -445,16 +483,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     signal.signal(signal.SIGTERM, interrupt)
     try:
-        report = run_parallel(arguments)
+        report = run_parallel(arguments, backend=backend)
     except KeyboardInterrupt as error:
-        _write_failure(arguments.output_dir, error=error, exit_code=130)
+        _write_failure(
+            arguments.output_dir,
+            error=error,
+            exit_code=130,
+            route=backend.failure_route,
+        )
         return 130
     except ParallelEvaluationError as error:
-        print(f"Qwen parallel evaluation error: {error}", file=sys.stderr)
+        print(f"{backend.display_name} parallel evaluation error: {error}", file=sys.stderr)
         return error.exit_code
     except Exception as error:
         print(
-            f"Qwen parallel evaluation failed: {type(error).__name__}: {error}",
+            f"{backend.display_name} parallel evaluation failed: "
+            f"{type(error).__name__}: {error}",
             file=sys.stderr,
         )
         return 1

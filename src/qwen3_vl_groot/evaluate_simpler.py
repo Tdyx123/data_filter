@@ -34,7 +34,13 @@ EVALUATION_ROUTE = "qwen3-vl-groot-simpler-widowx-eval"
 PREFLIGHT_ROUTE = "qwen3-vl-groot-simpler-widowx-preflight"
 
 
-def _write_failure(output_dir: Path, *, error: Exception, exit_code: int) -> None:
+def _write_failure(
+    output_dir: Path,
+    *,
+    error: Exception,
+    exit_code: int,
+    route: str = EVALUATION_ROUTE,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "failure.json"
     if path.exists():
@@ -45,7 +51,7 @@ def _write_failure(output_dir: Path, *, error: Exception, exit_code: int) -> Non
             {
                 "schema_version": 1,
                 "status": "failed",
-                "route": EVALUATION_ROUTE,
+                "route": route,
                 "exit_code": exit_code,
                 "error": f"{type(error).__name__}: {error}",
             },
@@ -96,7 +102,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    evaluation_route: str = EVALUATION_ROUTE,
+    preflight_route: str = PREFLIGHT_ROUTE,
+    display_name: str = "Qwen",
+) -> int:
     arguments = build_parser().parse_args(argv)
     client: QwenIPCClient | None = None
     if arguments.overwrite:
@@ -143,7 +155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 source_versions=source_versions,
                 package_versions=sim_packages,
-                route=PREFLIGHT_ROUTE,
+                route=preflight_route,
             )
         else:
             report = evaluate_simpler_policy(
@@ -154,21 +166,36 @@ def main(argv: Sequence[str] | None = None) -> int:
                     task, sim_device=settings.sim_device
                 ),
                 source_versions={**source_versions, "package_versions": sim_packages},
-                route=EVALUATION_ROUTE,
+                route=evaluation_route,
                 protocol_metadata=policy.protocol_metadata(),
             )
     except SimplerInfrastructureError as error:
-        _write_failure(arguments.output_dir, error=error, exit_code=3)
+        _write_failure(
+            arguments.output_dir,
+            error=error,
+            exit_code=3,
+            route=evaluation_route,
+        )
         print(f"SimplerEnv infrastructure error: {error}", file=sys.stderr)
         return 3
     except (SimplerEvaluationError, QwenIPCError) as error:
-        _write_failure(arguments.output_dir, error=error, exit_code=2)
-        print(f"Qwen SimplerEnv evaluation error: {error}", file=sys.stderr)
+        _write_failure(
+            arguments.output_dir,
+            error=error,
+            exit_code=2,
+            route=evaluation_route,
+        )
+        print(f"{display_name} SimplerEnv evaluation error: {error}", file=sys.stderr)
         return 2
     except Exception as error:
-        _write_failure(arguments.output_dir, error=error, exit_code=1)
+        _write_failure(
+            arguments.output_dir,
+            error=error,
+            exit_code=1,
+            route=evaluation_route,
+        )
         print(
-            f"Qwen SimplerEnv execution failed: {type(error).__name__}: {error}",
+            f"{display_name} SimplerEnv execution failed: {type(error).__name__}: {error}",
             file=sys.stderr,
         )
         return 1

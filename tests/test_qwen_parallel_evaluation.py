@@ -33,6 +33,7 @@ from multiprocessing.connection import Listener
 from pathlib import Path
 
 arguments = sys.argv[1:]
+module = arguments[1] if arguments[:1] == ["-m"] else None
 def option(name, default=None):
     if name not in arguments:
         return default
@@ -43,9 +44,11 @@ authkey = bytes.fromhex(option("--auth-key-hex"))
 device = option("--device")
 checkpoint = option("--checkpoint")
 model_path = option("--model-path")
-denoising_steps = int(option("--denoising-steps"))
+raw_denoising_steps = option("--denoising-steps")
+denoising_steps = int(raw_denoising_steps) if raw_denoising_steps is not None else None
 with Path(os.environ["QWEN_PARALLEL_TEST_MODEL_CALLS"]).open("a", encoding="utf-8") as handle:
     handle.write(json.dumps({
+        "module": module,
         "device": device,
         "pid": os.getpid(),
         "model_path": model_path,
@@ -60,12 +63,14 @@ metadata = {
     "checkpoint": {"requested_path": checkpoint},
     "model_image_shape": [224, 224, 3],
     "train_crop_size": 256,
-    "protocol": {"native_action_chunk_size": 8, "denoising_steps": denoising_steps},
+    "protocol": {"native_action_chunk_size": 8},
     "startup_preflight": {"action_shape": [1, 8, 7], "finite": True},
     "protocol_version": 1,
 }
+if denoising_steps is not None:
+    metadata["protocol"]["denoising_steps"] = denoising_steps
 if os.environ.get("QWEN_PARALLEL_TEST_METADATA_MISMATCH_DEVICE") == device:
-    metadata["protocol"]["denoising_steps"] += 1
+    metadata["protocol"]["metadata_mismatch"] = True
 listener = Listener(socket_path, family="AF_UNIX", authkey=authkey)
 stopping = False
 while not stopping:
@@ -106,7 +111,8 @@ from multiprocessing.connection import Client
 from pathlib import Path
 
 arguments = sys.argv[1:]
-if arguments[:2] == ["-m", "qwen3_vl_groot.evaluate_simpler"]:
+module = arguments[1] if arguments[:1] == ["-m"] else None
+if arguments[:1] == ["-m"]:
     arguments = arguments[2:]
 parser = argparse.ArgumentParser()
 parser.add_argument("--socket", required=True)
@@ -124,6 +130,7 @@ parsed, _unknown = parser.parse_known_args(arguments)
 
 with Path(os.environ["QWEN_PARALLEL_TEST_SIM_CALLS"]).open("a", encoding="utf-8") as handle:
     handle.write(json.dumps({
+        "module": module,
         "sim_device": parsed.sim_device,
         "shard_index": parsed.shard_index,
         "shard_count": parsed.shard_count,
@@ -141,11 +148,16 @@ connection.send({"type": "metadata"})
 metadata_response = connection.recv()
 metadata = metadata_response["data"]
 parsed.output_dir.mkdir(parents=True, exist_ok=True)
+route_prefix = (
+    "qwen-vl-oft-simpler-widowx"
+    if module == "qwen_vl_oft.evaluate_simpler"
+    else "qwen3-vl-groot-simpler-widowx"
+)
 if parsed.preflight_only:
     report = {
         "schema_version": 1,
         "status": "passed",
-        "route": "qwen3-vl-groot-simpler-widowx-preflight",
+        "route": route_prefix + "-preflight",
         "checkpoint": metadata["checkpoint"],
         "protocol": metadata["protocol"],
         "environments": [],
@@ -201,7 +213,7 @@ else:
     report = {
         "schema_version": 1,
         "status": "complete",
-        "route": "qwen3-vl-groot-simpler-widowx-eval",
+        "route": route_prefix + "-eval",
         "checkpoint": metadata["checkpoint"],
         "protocol": protocol,
         "summary": {"completed_episodes": len(episodes)},
@@ -315,6 +327,106 @@ def test_parse_model_devices_accepts_unique_logical_cuda_devices():
         "cuda:2",
         "cuda:7",
     )
+
+
+def test_oft_parallel_parser_omits_diffusion_denoising_option():
+    from qwen_vl_oft import parallel_evaluation
+
+    parser = parallel_evaluation.build_parser()
+    arguments = parser.parse_args(
+        [
+            "--sim-python",
+            "/venv/bin/python",
+            "--checkpoint",
+            "/models/checkpoint",
+            "--model-devices",
+            "cuda:0,cuda:1",
+            "--sim-device",
+            "cuda:4",
+            "--output-dir",
+            "/tmp/output",
+        ]
+    )
+
+    assert not hasattr(arguments, "denoising_steps")
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--sim-python",
+                "/venv/bin/python",
+                "--checkpoint",
+                "/models/checkpoint",
+                "--model-devices",
+                "cuda:0",
+                "--sim-device",
+                "cuda:4",
+                "--output-dir",
+                "/tmp/output",
+                "--denoising-steps",
+                "4",
+            ]
+        )
+
+
+def test_oft_parallel_backend_validates_once_and_launches_oft_modules(
+    tmp_path,
+    monkeypatch,
+):
+    from dataclasses import replace
+
+    from qwen_vl_oft import parallel_evaluation
+
+    model_python, sim_python, model_calls_path, sim_calls_path, environment = (
+        _make_fake_parallel_runtimes(tmp_path)
+    )
+    validations = []
+    monkeypatch.setattr(
+        parallel_evaluation,
+        "OFT_BACKEND",
+        replace(
+            parallel_evaluation.OFT_BACKEND,
+            checkpoint_validator=lambda checkpoint, model_path: validations.append(
+                (checkpoint, model_path)
+            ),
+        ),
+    )
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    output_dir = tmp_path / "output"
+    arguments = parallel_evaluation.build_parser().parse_args(
+        [
+            "--model-python",
+            str(model_python),
+            "--sim-python",
+            str(sim_python),
+            "--checkpoint",
+            "/models/checkpoint",
+            "--model-path",
+            "/models/qwen",
+            "--model-devices",
+            "cuda:0,cuda:1",
+            "--sim-device",
+            "cuda:4",
+            "--output-dir",
+            str(output_dir),
+            "--",
+            "--tasks",
+            "spoon",
+            "--smoke-test",
+        ]
+    )
+
+    report = parallel_evaluation.run_parallel(arguments)
+
+    model_calls = [json.loads(line) for line in model_calls_path.read_text().splitlines()]
+    sim_calls = [json.loads(line) for line in sim_calls_path.read_text().splitlines()]
+    assert validations == [(Path("/models/checkpoint"), Path("/models/qwen"))]
+    assert {call["module"] for call in model_calls} == {"qwen_vl_oft.server"}
+    assert {call["denoising_steps"] for call in model_calls} == {None}
+    assert {call["module"] for call in sim_calls} == {
+        "qwen_vl_oft.evaluate_simpler"
+    }
+    assert report["route"] == "qwen-vl-oft-simpler-widowx-eval"
 
 
 @pytest.mark.parametrize(

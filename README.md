@@ -707,6 +707,34 @@ actions = policy.predict_actions(image, state, instruction)
 assert actions.shape == (1, 8, 7)
 ```
 
+OFT checkpoint 的 SimplerEnv 评测使用独立入口，不能传给 GROOT 的
+`evaluate_simpler_qwen.sh`。模型服务与 SimplerEnv 继续使用隔离的 Python
+环境；OFT 推理是确定性的，因此该入口不接受 `--denoising-steps`：
+
+```bash
+# 单卡模型加载、环境和一次推理预检
+bash scripts/evaluate_simpler_qwenvl_oft.sh \
+  --checkpoint /data/dwb/qwen3_vl_4b_oft_bridge_full/checkpoints/step-00019000 \
+  --device cuda:0 \
+  --sim-device cuda:4 \
+  --tasks spoon \
+  --preflight-only \
+  --output-dir /data/dwb/qwen_oft_simpler_preflight
+
+# 四个模型副本并行分片完整协议
+bash scripts/evaluate_simpler_qwenvl_oft.sh \
+  --checkpoint /data/dwb/qwen3_vl_4b_oft_bridge_full/checkpoints/step-00019000 \
+  --model-devices cuda:0,cuda:1,cuda:2,cuda:3 \
+  --sim-device cuda:4 \
+  --tasks all \
+  --output-dir /data/dwb/qwen_simpler_eval \
+  --overwrite
+```
+
+单卡使用 `--device`，多卡使用 `--model-devices`，两者不能同时指定。复用已有
+输出目录时必须显式传 `--overwrite`；模型日志分别写入 `model-server.log` 或
+`model-server-XX.log`。
+
 ### Qwen LIBERO 全任务训练
 
 Qwen LIBERO 使用独立的 Shell/YAML 入口，不读取 Bridge 配置。默认训练

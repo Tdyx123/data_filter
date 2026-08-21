@@ -58,7 +58,8 @@ set -euo pipefail
   for argument in "$@"; do printf '%s\037' "${argument}"; done
   printf '\n'
 } >> "${QWEN_TEST_MODEL_CALLS:?}"
-if [[ " $* " == *" qwen3_vl_groot.parallel_evaluation "* ]]; then
+if [[ " $* " == *" qwen3_vl_groot.parallel_evaluation "* || \
+      " $* " == *" qwen_vl_oft.parallel_evaluation "* ]]; then
   if [[ -n "${QWEN_TEST_EXPECT_PARALLEL_PYTHONPATH:-}" ]]; then
     [[ "${PYTHONPATH:-}" == "${QWEN_TEST_EXPECT_PARALLEL_PYTHONPATH}" ]] || exit 31
     [[ "${MS2_REAL2SIM_ASSET_DIR:-}" == "${QWEN_TEST_EXPECT_PARALLEL_ASSET_DIR}" ]] || exit 32
