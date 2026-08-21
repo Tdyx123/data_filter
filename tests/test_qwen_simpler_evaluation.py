@@ -74,6 +74,9 @@ def test_qwen_simpler_client_requires_socket_and_defaults_to_full_protocol():
 
     assert arguments.action_horizon == 1
     assert arguments.sim_device == "cuda:0"
+    assert arguments.shard_index == 0
+    assert arguments.shard_count == 1
+    assert arguments.rng_scope == "per_policy_seed_stream"
     assert parser.parse_args(
         [
             "--socket",
@@ -156,6 +159,12 @@ def test_qwen_simpler_cli_applies_smoke_protocol_and_model_metadata(
             "--output-dir",
             str(tmp_path / "results"),
             "--smoke-test",
+            "--shard-index",
+            "1",
+            "--shard-count",
+            "2",
+            "--rng-scope",
+            "per_episode",
         ]
     )
 
@@ -165,6 +174,9 @@ def test_qwen_simpler_cli_applies_smoke_protocol_and_model_metadata(
     assert captured["settings"].object_episode_ids == (0,)
     assert captured["settings"].max_steps == 8
     assert captured["settings"].device == "remote-pyenv:cuda:3"
+    assert captured["settings"].shard_index == 1
+    assert captured["settings"].shard_count == 2
+    assert captured["settings"].rng_scope == "per_episode"
     assert captured["kwargs"]["checkpoint"] == policy.checkpoint_report
     assert captured["kwargs"]["route"] == "qwen3-vl-groot-simpler-widowx-eval"
     assert captured["kwargs"]["protocol_metadata"] == {

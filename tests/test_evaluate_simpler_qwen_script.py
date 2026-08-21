@@ -58,6 +58,13 @@ set -euo pipefail
   for argument in "$@"; do printf '%s\037' "${argument}"; done
   printf '\n'
 } >> "${QWEN_TEST_MODEL_CALLS:?}"
+if [[ " $* " == *" qwen3_vl_groot.parallel_evaluation "* ]]; then
+  if [[ -n "${QWEN_TEST_EXPECT_PARALLEL_PYTHONPATH:-}" ]]; then
+    [[ "${PYTHONPATH:-}" == "${QWEN_TEST_EXPECT_PARALLEL_PYTHONPATH}" ]] || exit 31
+    [[ "${MS2_REAL2SIM_ASSET_DIR:-}" == "${QWEN_TEST_EXPECT_PARALLEL_ASSET_DIR}" ]] || exit 32
+  fi
+  exit "${QWEN_TEST_PARALLEL_STATUS:-0}"
+fi
 if [[ "${QWEN_TEST_MODEL_CRASH:-0}" == "1" ]]; then
   exit 23
 fi
@@ -217,6 +224,74 @@ def test_launcher_separates_model_and_simulator_options(tmp_path):
     assert "--denoising-steps" not in sim_call
 
 
+def test_launcher_delegates_explicit_model_devices_to_parallel_coordinator(tmp_path):
+    simpler_root = PROJECT_ROOT / "third_party/SimplerEnv"
+    maniskill_root = simpler_root / "ManiSkill2_real2sim"
+    completed, model_calls, sim_calls, _stopped, output_dir = _run(
+        tmp_path,
+        "--model-path",
+        MODEL_PATH,
+        "--model-devices",
+        "cuda:0,cuda:2",
+        "--denoising-steps",
+        "6",
+        "--sim-device",
+        "cuda:7",
+        "--tasks",
+        "spoon",
+        environment_updates={
+            "QWEN_TEST_EXPECT_PARALLEL_PYTHONPATH": (
+                f"{PROJECT_ROOT / 'src'}:{simpler_root}:{maniskill_root}"
+            ),
+            "QWEN_TEST_EXPECT_PARALLEL_ASSET_DIR": str(maniskill_root / "data"),
+        },
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert len(model_calls) == 1
+    call = model_calls[0]
+    assert call[2:6] == [
+        "exec",
+        "python",
+        "-m",
+        "qwen3_vl_groot.parallel_evaluation",
+    ]
+    assert call[call.index("--model-devices") + 1] == "cuda:0,cuda:2"
+    assert call[call.index("--sim-device") + 1] == "cuda:7"
+    assert call[call.index("--output-dir") + 1] == str(output_dir)
+    assert call[call.index("--checkpoint") + 1] == CHECKPOINT
+    assert call[call.index("--model-path") + 1] == MODEL_PATH
+    assert call[call.index("--denoising-steps") + 1] == "6"
+    assert call[call.index("--") + 1 :] == ["--tasks", "spoon"]
+    assert sim_calls == []
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (("--model-devices", ""), "non-empty"),
+        (("--model-devices", "cuda:0,"), "unique cuda:<index>"),
+        (("--model-devices", "cuda:0,cuda:0"), "unique cuda:<index>"),
+        (("--model-devices", "cuda:0", "--device", "cuda:1"), "cannot be combined"),
+        (("--model-devices", "cpu,cuda:1"), "unique cuda:<index>"),
+    ],
+)
+def test_launcher_rejects_invalid_or_conflicting_model_devices_before_startup(
+    tmp_path,
+    arguments,
+    message,
+):
+    completed, model_calls, sim_calls, _stopped, _output_dir = _run(
+        tmp_path,
+        *arguments,
+    )
+
+    assert completed.returncode == 2
+    assert model_calls == []
+    assert sim_calls == []
+    assert message in completed.stderr
+
+
 @pytest.mark.parametrize(
     ("arguments", "message"),
     [
@@ -263,7 +338,10 @@ def test_launcher_rejects_removed_python_option(tmp_path):
     assert "--python has been removed; use --sim-python" in completed.stderr
 
 
-@pytest.mark.parametrize("option", ["--socket", "--auth-key-hex"])
+@pytest.mark.parametrize(
+    "option",
+    ["--socket", "--auth-key-hex", "--shard-index", "--shard-count", "--rng-scope"],
+)
 def test_launcher_rejects_internal_ipc_options(tmp_path, option):
     completed, model_calls, sim_calls, _stopped, _output_dir = _run(
         tmp_path, option, "user-controlled"
