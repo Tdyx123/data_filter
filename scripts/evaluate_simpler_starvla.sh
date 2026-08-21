@@ -8,6 +8,8 @@ sim_python="${project_root}/.venv-octo-simpler/bin/python"
 model_dir="/data/dwb/models/Qwen3VL-GR00T-Bridge-RT-1"
 base_model="/data/dwb/models/Qwen3-VL-4B-Instruct"
 device="cuda:0"
+device_explicit=0
+model_devices=""
 sim_device="cuda:0"
 output_dir="${project_root}/outputs/starvla_simpler_eval"
 server_timeout=600
@@ -26,6 +28,8 @@ Launcher options:
   --model-dir PATH       StarVLA checkpoint directory
   --base-model PATH      local Qwen3-VL config/processor directory
   --device DEVICE        model service CUDA device (default: cuda:0)
+  --model-devices LIST   parallel model replicas, e.g. cuda:0,cuda:1
+                         cannot be combined with --device
   --sim-device DEVICE    simulator renderer CUDA device (default: cuda:0)
   --output-dir PATH      evaluation output and persistent model-server.log
   --server-timeout SEC   maximum model load wait (default: 600)
@@ -34,6 +38,9 @@ Launcher options:
 Evaluation options are forwarded to starvla_bridge.evaluate_simpler, including:
   --tasks TASKS --action-horizon 1 --preflight-only --smoke-test
   --save-videos-path PATH --overwrite
+
+With --model-devices, each listed GPU loads a complete model replica and all
+simulator workers reuse --sim-device.
 EOF
 }
 
@@ -60,7 +67,7 @@ while (($#)); do
       usage
       exit 0
       ;;
-    --pyenv-bin|--pyenv-version|--sim-python|--model-dir|--base-model|--device|--sim-device|--output-dir|--server-timeout)
+    --pyenv-bin|--pyenv-version|--sim-python|--model-dir|--base-model|--device|--model-devices|--sim-device|--output-dir|--server-timeout)
       option="$1"
       set_once "${option}"
       (($# >= 2)) || fail "${option} requires a non-empty value"
@@ -71,14 +78,15 @@ while (($#)); do
         --sim-python) sim_python="$2" ;;
         --model-dir) model_dir="$2" ;;
         --base-model) base_model="$2" ;;
-        --device) device="$2" ;;
+        --device) device="$2"; device_explicit=1 ;;
+        --model-devices) model_devices="$2" ;;
         --sim-device) sim_device="$2" ;;
         --output-dir) output_dir="$2" ;;
         --server-timeout) server_timeout="$2" ;;
       esac
       shift 2
       ;;
-    --pyenv-bin=*|--pyenv-version=*|--sim-python=*|--model-dir=*|--base-model=*|--device=*|--sim-device=*|--output-dir=*|--server-timeout=*)
+    --pyenv-bin=*|--pyenv-version=*|--sim-python=*|--model-dir=*|--base-model=*|--device=*|--model-devices=*|--sim-device=*|--output-dir=*|--server-timeout=*)
       option="${1%%=*}"
       value="${1#*=}"
       set_once "${option}"
@@ -89,7 +97,8 @@ while (($#)); do
         --sim-python) sim_python="${value}" ;;
         --model-dir) model_dir="${value}" ;;
         --base-model) base_model="${value}" ;;
-        --device) device="${value}" ;;
+        --device) device="${value}"; device_explicit=1 ;;
+        --model-devices) model_devices="${value}" ;;
         --sim-device) sim_device="${value}" ;;
         --output-dir) output_dir="${value}" ;;
         --server-timeout) server_timeout="${value}" ;;
@@ -110,7 +119,7 @@ while (($#)); do
       forwarded+=("$1")
       shift
       ;;
-    --socket|--socket=*|--auth-key-hex|--auth-key-hex=*)
+    --socket|--socket=*|--auth-key-hex|--auth-key-hex=*|--shard-index|--shard-index=*|--shard-count|--shard-count=*|--rng-scope|--rng-scope=*)
       fail "$1 is managed by this launcher"
       ;;
     *)
@@ -123,8 +132,37 @@ done
 [[ "${server_timeout}" =~ ^[1-9][0-9]*$ ]] || fail "--server-timeout must be a positive integer"
 [[ "${sim_device}" =~ ^cuda:[0-9]+$ ]] ||
   fail "--sim-device must match cuda:<non-negative decimal integer>"
+if [[ -n "${model_devices}" ]]; then
+  ((device_explicit == 0)) || fail "--model-devices cannot be combined with --device"
+  [[ "${model_devices}" =~ ^cuda:(0|[1-9][0-9]*)(,cuda:(0|[1-9][0-9]*))*$ ]] ||
+    fail "--model-devices must be a comma-separated list of unique cuda:<index> values"
+  declare -A seen_model_devices=()
+  IFS=',' read -r -a parsed_model_devices <<<"${model_devices}"
+  for model_device in "${parsed_model_devices[@]}"; do
+    [[ -z "${seen_model_devices[${model_device}]:-}" ]] ||
+      fail "--model-devices must be a comma-separated list of unique cuda:<index> values"
+    seen_model_devices["${model_device}"]=1
+  done
+fi
 [[ -x "${pyenv_bin}" ]] || fail "pyenv executable is not executable: ${pyenv_bin}"
 [[ -x "${sim_python}" ]] || fail "simulator Python is not executable: ${sim_python}"
+
+if [[ -n "${model_devices}" ]]; then
+  simpler_root="${project_root}/third_party/SimplerEnv"
+  maniskill_root="${simpler_root}/ManiSkill2_real2sim"
+  export PYENV_VERSION="${pyenv_version}"
+  export PYTHONPATH="${project_root}/src:${simpler_root}:${maniskill_root}"
+  export MS2_REAL2SIM_ASSET_DIR="${maniskill_root}/data"
+  exec "${pyenv_bin}" exec python -m starvla_bridge.parallel_evaluation \
+    --sim-python "${sim_python}" \
+    --model-dir "${model_dir}" \
+    --base-model "${base_model}" \
+    --model-devices "${model_devices}" \
+    --sim-device "${sim_device}" \
+    --output-dir "${output_dir}" \
+    --server-timeout "${server_timeout}" \
+    -- "${forwarded[@]}"
+fi
 
 mkdir -p "${output_dir}"
 model_log="${output_dir}/model-server.log"

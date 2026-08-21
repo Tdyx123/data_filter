@@ -1152,6 +1152,49 @@ bash scripts/evaluate_simpler_qwen3vl_groot_rt1.sh \
   --output-dir outputs/starvla_simpler_eval
 ```
 
+省略 `--model-devices` 时仍使用上述单卡路径，模型服务和 SimplerEnv 客户端通过一个
+私有 Unix socket 通信。多卡模式是按 canonical episode identity 分片的数据并行，
+不是 tensor/model parallel：`--model-devices` 中的每张卡都会加载一份完整的 StarVLA
+模型，因此每张模型卡都必须能独立容纳全部模型权重和推理峰值显存。`--device` 与
+`--model-devices` 不能同时显式指定；列表必须由非空、互不重复的 `cuda:<非负整数>`
+组成（零写作 `cuda:0`，正整数索引不带前导零）。协调器最终仍聚合出标准
+`preflight.json`、`episodes.jsonl` 和 `results.json`。
+
+以下示例适用于 4 卡机器：模型副本使用 `cuda:0,cuda:1,cuda:2`，所有 simulator
+worker（不是只有第一个）都复用同一个 `--sim-device cuda:3`。先对全部模型副本执行
+多卡预检：
+
+```bash
+bash scripts/evaluate_simpler_qwen3vl_groot_rt1.sh \
+  --model-devices cuda:0,cuda:1,cuda:2 \
+  --sim-device cuda:3 \
+  --server-timeout 600 \
+  --output-dir outputs/starvla_simpler_multigpu_preflight \
+  --preflight-only
+```
+
+再运行每任务 seed 0、object episode 0、最多 8 个环境步的多卡 smoke test：
+
+```bash
+bash scripts/evaluate_simpler_qwen3vl_groot_rt1.sh \
+  --model-devices cuda:0,cuda:1,cuda:2 \
+  --sim-device cuda:3 \
+  --server-timeout 600 \
+  --output-dir outputs/starvla_simpler_multigpu_smoke \
+  --smoke-test
+```
+
+预检和 smoke test 均通过后，正式多卡评测命令为：
+
+```bash
+bash scripts/evaluate_simpler_qwen3vl_groot_rt1.sh \
+  --model-devices cuda:0,cuda:1,cuda:2 \
+  --sim-device cuda:3 \
+  --server-timeout 600 \
+  --tasks all \
+  --output-dir outputs/starvla_simpler_multigpu_eval
+```
+
 每个 `task × policy_seed` 只重置一次 Python、NumPy、Torch 和 CUDA 随机流，然后连续
 完成该 seed 的 24 个对象。StarVLA 每步返回原生 `(1,16,7)` 动作块，只执行首个
 动作；前六维按 `oxe_bridge.action` 的 q01/q99 和 mask 反归一化，抓手保持 `[0,1]`

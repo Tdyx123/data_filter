@@ -114,6 +114,8 @@ def test_fixed_launcher_explicitly_supplies_derived_model_dir_and_forwards_raw_a
     tmp_path,
 ):
     forwarded = [
+        "--model-devices",
+        "cuda:0,cuda:2",
         "--tasks=spoon,eggplant",
         "--action-horizon",
         "1",
@@ -162,6 +164,9 @@ def test_fixed_launcher_help_names_checkpoint_without_starting_processes(tmp_pat
     assert model_calls == []
     assert sim_calls == []
     assert str(FIXED_CHECKPOINT) in completed.stdout
+    assert "--model-devices" in completed.stdout
+    assert "complete model replica" in completed.stdout
+    assert "cannot override the fixed checkpoint" in completed.stdout
 
 
 @pytest.mark.parametrize(

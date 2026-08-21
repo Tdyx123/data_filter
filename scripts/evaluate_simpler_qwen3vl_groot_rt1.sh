@@ -15,6 +15,11 @@ Fixed checkpoint:
 
 Other options are forwarded unchanged to evaluate_simpler_starvla.sh;
 --checkpoint and --model-dir cannot override the fixed checkpoint.
+
+Multi-GPU:
+  --model-devices cuda:0,cuda:1 forwards parallel evaluation while the model
+  root and checkpoint remain fixed. Each GPU loads a complete model replica;
+  all simulator workers reuse the single --sim-device.
 EOF
 }
 

@@ -3,6 +3,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PROJECT_ROOT / "scripts" / "evaluate_simpler_starvla.sh"
@@ -54,6 +56,13 @@ set -euo pipefail
   for argument in "$@"; do printf '%s\037' "${argument}"; done
   printf '\n'
 } >> "${STARVLA_TEST_MODEL_CALLS:?}"
+if [[ " $* " == *" starvla_bridge.parallel_evaluation "* ]]; then
+  if [[ -n "${STARVLA_TEST_EXPECT_PARALLEL_PYTHONPATH:-}" ]]; then
+    [[ "${PYTHONPATH:-}" == "${STARVLA_TEST_EXPECT_PARALLEL_PYTHONPATH}" ]] || exit 31
+    [[ "${MS2_REAL2SIM_ASSET_DIR:-}" == "${STARVLA_TEST_EXPECT_PARALLEL_ASSET_DIR}" ]] || exit 32
+  fi
+  exit "${STARVLA_TEST_PARALLEL_STATUS:-0}"
+fi
 if [[ "${STARVLA_TEST_MODEL_CRASH:-0}" == "1" ]]; then
   exit 23
 fi
@@ -206,6 +215,112 @@ def test_launcher_keeps_model_device_separate_from_explicit_sim_device(tmp_path)
     assert "--device" not in sim_call
 
 
+def test_launcher_delegates_explicit_model_devices_to_parallel_coordinator(tmp_path):
+    simpler_root = PROJECT_ROOT / "third_party/SimplerEnv"
+    maniskill_root = simpler_root / "ManiSkill2_real2sim"
+    completed, model_calls, sim_calls, _stopped, output_dir = _run(
+        tmp_path,
+        "--model-devices",
+        "cuda:0,cuda:2",
+        "--sim-device",
+        "cuda:7",
+        "--server-timeout",
+        "9",
+        "--tasks",
+        "spoon,eggplant",
+        "--save-videos-path",
+        str(tmp_path / "videos with spaces"),
+        "--overwrite",
+        environment_updates={
+            "STARVLA_TEST_EXPECT_PARALLEL_PYTHONPATH": (
+                f"{PROJECT_ROOT / 'src'}:{simpler_root}:{maniskill_root}"
+            ),
+            "STARVLA_TEST_EXPECT_PARALLEL_ASSET_DIR": str(maniskill_root / "data"),
+        },
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert len(model_calls) == 1
+    call = model_calls[0]
+    assert call[0] == "PYENV_VERSION=miniconda3-3.12-25.11.1-1"
+    assert call[1] == (
+        f"PYTHONPATH={PROJECT_ROOT / 'src'}:{simpler_root}:{maniskill_root}"
+    )
+    assert call[2:6] == [
+        "exec",
+        "python",
+        "-m",
+        "starvla_bridge.parallel_evaluation",
+    ]
+    assert call[call.index("--sim-python") + 1].endswith("/bin/sim-python")
+    assert call[call.index("--model-dir") + 1] == (
+        "/data/dwb/models/Qwen3VL-GR00T-Bridge-RT-1"
+    )
+    assert call[call.index("--base-model") + 1] == (
+        "/data/dwb/models/Qwen3-VL-4B-Instruct"
+    )
+    assert call[call.index("--model-devices") + 1] == "cuda:0,cuda:2"
+    assert call[call.index("--sim-device") + 1] == "cuda:7"
+    assert call[call.index("--output-dir") + 1] == str(output_dir)
+    assert call[call.index("--server-timeout") + 1] == "9"
+    assert call[call.index("--") + 1 :] == [
+        "--tasks",
+        "spoon,eggplant",
+        "--save-videos-path",
+        str(tmp_path / "videos with spaces"),
+        "--overwrite",
+    ]
+    assert sim_calls == []
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (("--model-devices", ""), "non-empty"),
+        (("--model-devices", "cuda:0,"), "unique cuda:<index>"),
+        (("--model-devices", "cuda:0,cuda:0"), "unique cuda:<index>"),
+        (("--model-devices", "cuda:00"), "unique cuda:<index>"),
+        (("--model-devices", "cuda:0,cuda:01"), "unique cuda:<index>"),
+        (("--model-devices", "cpu,cuda:1"), "unique cuda:<index>"),
+        (
+            ("--device", "cuda:0", "--model-devices", "cuda:1"),
+            "cannot be combined",
+        ),
+    ],
+)
+def test_launcher_rejects_invalid_or_conflicting_model_devices_before_startup(
+    tmp_path,
+    arguments,
+    message,
+):
+    completed, model_calls, sim_calls, _stopped, _output_dir = _run(
+        tmp_path,
+        *arguments,
+    )
+
+    assert completed.returncode == 2
+    assert model_calls == []
+    assert sim_calls == []
+    assert message in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["--socket", "--auth-key-hex", "--shard-index", "--shard-count", "--rng-scope"],
+)
+def test_launcher_rejects_internal_parallel_options_before_startup(tmp_path, option):
+    completed, model_calls, sim_calls, _stopped, _output_dir = _run(
+        tmp_path,
+        option,
+        "user-controlled",
+    )
+
+    assert completed.returncode == 2
+    assert model_calls == []
+    assert sim_calls == []
+    assert "is managed by this launcher" in completed.stderr
+
+
 def test_launcher_rejects_invalid_sim_device_before_starting_processes(tmp_path):
     completed, model_calls, sim_calls, _stopped, _output_dir = _run(
         tmp_path,
@@ -294,6 +409,8 @@ def test_launcher_help_does_not_start_either_process(tmp_path):
     assert "--pyenv-version" in completed.stdout
     assert "--preflight-only" in completed.stdout
     assert "--device DEVICE        model service CUDA device" in completed.stdout
+    assert "--model-devices LIST" in completed.stdout
+    assert "cannot be combined with --device" in completed.stdout
     assert "--sim-device DEVICE    simulator renderer CUDA device" in completed.stdout
 
 
