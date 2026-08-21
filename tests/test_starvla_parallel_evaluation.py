@@ -429,6 +429,36 @@ def test_parse_model_devices_rejects_empty_duplicate_or_non_cuda_values(value):
 
 
 @pytest.mark.parametrize(
+    ("option", "abbreviation"),
+    (
+        ("--model-python", "--model-p"),
+        ("--sim-python", "--sim-p"),
+        ("--model-dir", "--model-di"),
+        ("--base-model", "--base-m"),
+        ("--model-devices", "--model-de"),
+        ("--sim-device", "--sim-d"),
+        ("--output-dir", "--output"),
+        ("--server-timeout", "--server-t"),
+    ),
+)
+def test_parallel_parser_rejects_abbreviated_coordinator_options(
+    tmp_path, option, abbreviation
+):
+    from starvla_bridge import parallel_evaluation
+
+    argv = _coordinator_arguments(
+        sys.executable,
+        sys.executable,
+        tmp_path / "output",
+        devices="cuda:0",
+    )
+    argv[argv.index(option)] = abbreviation
+
+    with pytest.raises(SystemExit):
+        parallel_evaluation.build_parser().parse_args(argv)
+
+
+@pytest.mark.parametrize(
     "forwarded",
     (
         ("--socket", "/tmp/override.sock"),
@@ -480,6 +510,55 @@ def test_parallel_rejects_coordinator_managed_forwarded_arguments_before_launch(
     monkeypatch.setattr(parallel_evaluation.subprocess, "Popen", reject_process_launch)
 
     with pytest.raises(parallel_evaluation.ParallelEvaluationError, match="managed"):
+        parallel_evaluation.run_parallel(arguments)
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "forwarded",
+    (
+        ("--sock", "/tmp/override.sock"),
+        ("--auth", "beef"),
+        ("--output", "/tmp/override-output"),
+        ("--sim-d", "cuda:6"),
+        ("--shard-i", "0"),
+        ("--shard-c", "1"),
+        ("--rng", "per_episode"),
+    ),
+)
+def test_parallel_rejects_abbreviated_managed_forwarded_arguments_before_launch(
+    tmp_path, monkeypatch, forwarded
+):
+    from starvla_bridge import parallel_evaluation
+
+    output_dir = tmp_path / "output"
+    arguments = parallel_evaluation.build_parser().parse_args(
+        [
+            "--sim-python",
+            sys.executable,
+            "--model-dir",
+            "/models/starvla",
+            "--base-model",
+            "/models/qwen",
+            "--model-devices",
+            "cuda:0",
+            "--sim-device",
+            "cuda:7",
+            "--output-dir",
+            str(output_dir),
+            "--",
+            *forwarded,
+            "--tasks",
+            "spoon",
+        ]
+    )
+
+    def reject_process_launch(*_args, **_kwargs):
+        pytest.fail("abbreviated managed argument reached process launch")
+
+    monkeypatch.setattr(parallel_evaluation.subprocess, "Popen", reject_process_launch)
+
+    with pytest.raises(SystemExit):
         parallel_evaluation.run_parallel(arguments)
     assert not output_dir.exists()
 

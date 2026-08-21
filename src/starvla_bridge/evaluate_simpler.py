@@ -36,7 +36,8 @@ PREFLIGHT_ROUTE = "qwen3vl-groot-starvla-simpler-widowx-preflight"
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate the released Qwen3VL-GR00T StarVLA checkpoint in SimplerEnv."
+        description="Evaluate the released Qwen3VL-GR00T StarVLA checkpoint in SimplerEnv.",
+        allow_abbrev=False,
     )
     parser.add_argument("--socket", type=Path, required=True)
     parser.add_argument("--auth-key-hex", required=True)

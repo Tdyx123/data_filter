@@ -75,7 +75,8 @@ def _positive_integer(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run sharded StarVLA SimplerEnv evaluation across model replicas."
+        description="Run sharded StarVLA SimplerEnv evaluation across model replicas.",
+        allow_abbrev=False,
     )
     parser.add_argument("--model-python", type=Path, default=Path(sys.executable))
     parser.add_argument("--sim-python", type=Path, required=True)
