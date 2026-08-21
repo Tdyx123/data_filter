@@ -1,3 +1,5 @@
+"""SimplerEnv client CLI for the managed Qwen model service."""
+
 from __future__ import annotations
 
 import argparse
@@ -7,29 +9,32 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .simpler_evaluation import (
+import numpy as np
+
+from simpler_bridge.evaluation import (
     OBJECT_EPISODE_IDS,
     POLICY_SEEDS,
     SimplerEvaluationError,
-    SimplerEvaluationSettings,
     SimplerInfrastructureError,
-    QwenSimplerPolicy,
+    SimplerRunSettings,
     create_simpler_environment,
     default_simpler_root,
-    evaluate_simpler_checkpoint,
+    evaluate_simpler_policy,
     parse_sim_device,
     resolve_task_selection,
-    validate_runtime_contract,
+    run_simpler_preflight,
     validate_simpler_source,
 )
 
+from .ipc import QwenIPCClient, QwenIPCError
+from .remote_policy import QwenRemotePolicy
 
-def _write_failure(
-    output_dir: Path,
-    *,
-    error: Exception,
-    exit_code: int,
-) -> None:
+
+EVALUATION_ROUTE = "qwen3-vl-groot-simpler-widowx-eval"
+PREFLIGHT_ROUTE = "qwen3-vl-groot-simpler-widowx-preflight"
+
+
+def _write_failure(output_dir: Path, *, error: Exception, exit_code: int) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "failure.json"
     if path.exists():
@@ -40,7 +45,7 @@ def _write_failure(
             {
                 "schema_version": 1,
                 "status": "failed",
-                "route": "qwen3-vl-groot-simpler-widowx-eval",
+                "route": EVALUATION_ROUTE,
                 "exit_code": exit_code,
                 "error": f"{type(error).__name__}: {error}",
             },
@@ -55,15 +60,10 @@ def _write_failure(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate a Qwen Bridge checkpoint on the four fixed SimplerEnv tasks."
+        description="Evaluate a remote Qwen Bridge policy on SimplerEnv."
     )
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        required=True,
-        help="Concrete Qwen step-XXXXXXXX checkpoint directory.",
-    )
-    parser.add_argument("--model-path", type=Path, default=None)
+    parser.add_argument("--socket", type=Path, required=True)
+    parser.add_argument("--auth-key-hex", required=True)
     parser.add_argument(
         "--tasks",
         default="all",
@@ -74,9 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("outputs/qwen_simpler_eval"),
     )
-    parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--sim-device", type=parse_sim_device, default="cuda:0")
-    parser.add_argument("--denoising-steps", type=int, default=4)
     parser.add_argument("--action-horizon", type=int, choices=(1,), default=1)
     parser.add_argument("--save-videos-path", type=Path, default=None)
     parser.add_argument("--video-fps", type=int, default=5)
@@ -90,47 +88,31 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _load_checkpoint_and_policy(arguments: argparse.Namespace):
-    try:
-        from .libero_evaluation import resolve_qwen_checkpoint
-        from octo_small_libero.evaluation import EvaluationError
-
-        checkpoint = resolve_qwen_checkpoint(
-            arguments.checkpoint,
-            model_path=arguments.model_path,
-        )
-        policy = QwenSimplerPolicy.from_checkpoint(
-            checkpoint,
-            device=arguments.device,
-        )
-    except EvaluationError as error:
-        raise SimplerEvaluationError(str(error)) from error
-    return checkpoint, policy
-
-
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    arguments = parser.parse_args(argv)
+    arguments = build_parser().parse_args(argv)
+    client: QwenIPCClient | None = None
     if arguments.overwrite:
         (arguments.output_dir / "failure.json").unlink(missing_ok=True)
     try:
+        try:
+            authkey = bytes.fromhex(arguments.auth_key_hex)
+        except ValueError as error:
+            raise SimplerEvaluationError(
+                "--auth-key-hex must contain valid hex bytes"
+            ) from error
+        if not authkey:
+            raise SimplerEvaluationError("--auth-key-hex must be non-empty")
         tasks = resolve_task_selection(arguments.tasks)
-        if arguments.denoising_steps <= 0:
-            raise SimplerEvaluationError("--denoising-steps must be positive")
         if arguments.video_fps <= 0:
             raise SimplerEvaluationError("--video-fps must be positive")
-
         source_versions = validate_simpler_source(default_simpler_root())
-        package_versions = validate_runtime_contract(device=arguments.device)
-        checkpoint, policy = _load_checkpoint_and_policy(arguments)
-        settings = SimplerEvaluationSettings(
-            checkpoint=arguments.checkpoint,
+        client = QwenIPCClient(arguments.socket, authkey=authkey)
+        policy = QwenRemotePolicy(client)
+        settings = SimplerRunSettings(
             output_dir=arguments.output_dir,
             tasks=tasks,
-            model_path=arguments.model_path,
-            device=arguments.device,
+            device=f"remote-pyenv:{policy.model_device}",
             sim_device=arguments.sim_device,
-            denoising_steps=arguments.denoising_steps,
             action_horizon=arguments.action_horizon,
             policy_seeds=(0,) if arguments.smoke_test else POLICY_SEEDS,
             object_episode_ids=(0,) if arguments.smoke_test else OBJECT_EPISODE_IDS,
@@ -139,53 +121,52 @@ def main(argv: Sequence[str] | None = None) -> int:
             video_fps=arguments.video_fps,
             overwrite=arguments.overwrite,
         )
+        sim_packages = {"numpy": np.__version__}
         if arguments.preflight_only:
-            from .simpler_evaluation import run_simpler_preflight
-
             report = run_simpler_preflight(
                 settings,
-                checkpoint=checkpoint,
+                checkpoint=policy.checkpoint_report,
                 policy=policy,
                 environment_factory=lambda task: create_simpler_environment(
                     task, sim_device=settings.sim_device
                 ),
                 source_versions=source_versions,
-                package_versions=package_versions,
+                package_versions=sim_packages,
+                route=PREFLIGHT_ROUTE,
             )
         else:
-            report = evaluate_simpler_checkpoint(
+            report = evaluate_simpler_policy(
                 settings,
-                checkpoint=checkpoint,
+                checkpoint=policy.checkpoint_report,
                 policy=policy,
                 environment_factory=lambda task: create_simpler_environment(
                     task, sim_device=settings.sim_device
                 ),
-                source_versions={**source_versions, "package_versions": package_versions},
+                source_versions={**source_versions, "package_versions": sim_packages},
+                route=EVALUATION_ROUTE,
+                protocol_metadata=policy.protocol_metadata(),
             )
     except SimplerInfrastructureError as error:
-        _write_failure(
-            arguments.output_dir,
-            error=error,
-            exit_code=3,
-        )
+        _write_failure(arguments.output_dir, error=error, exit_code=3)
         print(f"SimplerEnv infrastructure error: {error}", file=sys.stderr)
         return 3
-    except SimplerEvaluationError as error:
-        _write_failure(
-            arguments.output_dir,
-            error=error,
-            exit_code=2,
-        )
-        print(f"SimplerEnv evaluation error: {error}", file=sys.stderr)
+    except (SimplerEvaluationError, QwenIPCError) as error:
+        _write_failure(arguments.output_dir, error=error, exit_code=2)
+        print(f"Qwen SimplerEnv evaluation error: {error}", file=sys.stderr)
         return 2
     except Exception as error:
-        _write_failure(
-            arguments.output_dir,
-            error=error,
-            exit_code=1,
+        _write_failure(arguments.output_dir, error=error, exit_code=1)
+        print(
+            f"Qwen SimplerEnv execution failed: {type(error).__name__}: {error}",
+            file=sys.stderr,
         )
-        print(f"SimplerEnv task execution failed: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
+    finally:
+        if client is not None:
+            try:
+                client.shutdown()
+            except Exception:
+                client.close()
     print(json.dumps(report, indent=2, sort_keys=True))
     return 1 if report.get("status") == "completed_with_errors" else 0
 
