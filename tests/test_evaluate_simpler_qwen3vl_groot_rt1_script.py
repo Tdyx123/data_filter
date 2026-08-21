@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 
@@ -15,7 +16,66 @@ FIXED_CHECKPOINT = Path(
     "/data/dwb/models/Qwen3VL-GR00T-Bridge-RT-1/"
     "checkpoints/steps_20000_pytorch_model.pt"
 )
-FIXED_MODEL_DIR = Path("/data/dwb/models/Qwen3VL-GR00T-Bridge-RT-1")
+
+
+def _make_hermetic_launcher(tmp_path: Path):
+    fixture_root = tmp_path / "fixture-project"
+    scripts_dir = fixture_root / "scripts"
+    scripts_dir.mkdir(parents=True)
+
+    checkpoint = tmp_path / "models" / "fixed-model" / "checkpoints" / "model.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.touch()
+
+    checkpoint_assignment = f'fixed_checkpoint="{FIXED_CHECKPOINT}"'
+    production_source = SCRIPT.read_text(encoding="utf-8")
+    fixture_source = production_source.replace(
+        checkpoint_assignment,
+        f'fixed_checkpoint="{checkpoint}"',
+        1,
+    )
+    if fixture_source == production_source:
+        raise AssertionError("production wrapper fixed-checkpoint assignment was not found")
+
+    fixture_wrapper = scripts_dir / SCRIPT.name
+    fixture_wrapper.write_text(fixture_source, encoding="utf-8")
+    fixture_wrapper.chmod(0o755)
+
+    downstream_calls = tmp_path / "downstream-calls"
+    downstream = scripts_dir / "evaluate_simpler_starvla.sh"
+    downstream.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+for argument in "$@"; do
+  printf '%s\\037' "${argument}"
+done > "${QWEN3VL_GROOT_RT1_TEST_CALLS:?}"
+""",
+        encoding="utf-8",
+    )
+    downstream.chmod(0o755)
+    return fixture_wrapper, checkpoint, downstream_calls
+
+
+def _run_hermetic_launcher(tmp_path: Path, *arguments: str):
+    wrapper, checkpoint, downstream_calls = _make_hermetic_launcher(tmp_path)
+    environment = os.environ.copy()
+    environment["QWEN3VL_GROOT_RT1_TEST_CALLS"] = str(downstream_calls)
+    completed = subprocess.run(
+        ["bash", str(wrapper), *arguments],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=15,
+    )
+    calls = []
+    if downstream_calls.exists():
+        calls = [
+            argument.decode("utf-8")
+            for argument in downstream_calls.read_bytes().split(b"\x1f")[:-1]
+        ]
+    return completed, checkpoint, calls
 
 
 def _run_fixed_launcher(tmp_path: Path, *arguments: str):
@@ -50,7 +110,7 @@ def _run_fixed_launcher(tmp_path: Path, *arguments: str):
     )
 
 
-def test_fixed_launcher_uses_checkpoint_model_root_and_forwards_evaluation_arguments(
+def test_fixed_launcher_explicitly_supplies_derived_model_dir_and_forwards_raw_arguments(
     tmp_path,
 ):
     forwarded = [
@@ -63,16 +123,33 @@ def test_fixed_launcher_uses_checkpoint_model_root_and_forwards_evaluation_argum
         "--overwrite",
     ]
 
+    completed, checkpoint, downstream_call = _run_hermetic_launcher(tmp_path, *forwarded)
+
+    assert completed.returncode == 0, completed.stderr
+    assert downstream_call.count("--model-dir") == 1
+    assert downstream_call == [
+        "--model-dir",
+        str(checkpoint.parent.parent),
+        *forwarded,
+    ]
+
+
+@pytest.mark.real_data
+def test_production_fixed_checkpoint_path_reaches_existing_launcher(tmp_path):
+    if not FIXED_CHECKPOINT.is_file():
+        pytest.skip(f"fixed checkpoint is not mounted: {FIXED_CHECKPOINT}")
+
     completed, model_calls, sim_calls, stopped = _run_fixed_launcher(
-        tmp_path, *forwarded
+        tmp_path, "--preflight-only"
     )
 
     assert completed.returncode == 0, completed.stderr
     assert len(model_calls) == 1
     model_call = model_calls[0]
-    assert model_call[model_call.index("--model-dir") + 1] == str(FIXED_MODEL_DIR)
+    assert model_call[model_call.index("--model-dir") + 1] == str(
+        FIXED_CHECKPOINT.parent.parent
+    )
     assert len(sim_calls) == 1
-    assert sim_calls[0][-len(forwarded) :] == forwarded
     assert stopped.read_text(encoding="utf-8") == "stopped"
 
 
