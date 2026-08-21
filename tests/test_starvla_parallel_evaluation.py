@@ -319,6 +319,69 @@ def _assert_processes_reaped(calls_path: Path):
             pytest.fail(f"process {pid} survived coordinator cleanup with state {state}")
 
 
+class _FakeLifecycleProcess:
+    def __init__(self, name: str, *, poll_status=None, wait_status=0):
+        self.name = name
+        self.poll_status = poll_status
+        self.wait_status = wait_status
+        self.returncode = poll_status
+
+    def poll(self):
+        return self.poll_status
+
+    def wait(self, timeout=None):
+        del timeout
+        self.returncode = self.wait_status
+        self.poll_status = self.wait_status
+        return self.wait_status
+
+
+def _prepare_fake_lifecycle_run(
+    tmp_path,
+    monkeypatch,
+    parallel_evaluation,
+    *,
+    device_count=2,
+):
+    models = [_FakeLifecycleProcess(f"model-{index}") for index in range(device_count)]
+    simulators = [
+        _FakeLifecycleProcess(f"simulator-{index}") for index in range(device_count)
+    ]
+    pending_processes = iter([*models, *simulators])
+    log_handles = []
+
+    def launch_process(*_args, **kwargs):
+        if kwargs.get("stdout") is not None:
+            log_handles.append(kwargs["stdout"])
+        return next(pending_processes)
+
+    ipc_root = tmp_path / "ipc"
+
+    def make_ipc_root(*_args, **_kwargs):
+        ipc_root.mkdir()
+        return str(ipc_root)
+
+    monkeypatch.setattr(parallel_evaluation.subprocess, "Popen", launch_process)
+    monkeypatch.setattr(parallel_evaluation.tempfile, "mkdtemp", make_ipc_root)
+    monkeypatch.setattr(parallel_evaluation, "_wait_for_model_servers", lambda *_: None)
+    monkeypatch.setattr(parallel_evaluation, "_validate_replica_metadata", lambda *_: None)
+    monkeypatch.setattr(
+        parallel_evaluation,
+        "merge_worker_outputs",
+        lambda *_args, **_kwargs: {"status": "complete"},
+    )
+    output_dir = tmp_path / "output"
+    arguments = parallel_evaluation.build_parser().parse_args(
+        _coordinator_arguments(
+            sys.executable,
+            sys.executable,
+            output_dir,
+            devices=",".join(f"cuda:{index}" for index in range(device_count)),
+        )
+    )
+    return arguments, models, simulators, log_handles, ipc_root, output_dir
+
+
 def _episode(task: str, object_episode_id: int, inference_seed: int, *, success: bool):
     return {
         "task": task,
@@ -808,6 +871,201 @@ def test_parallel_coordinator_term_signal_reaps_children_and_reports_130(tmp_pat
     failure = json.loads((output_dir / "failure.json").read_text())
     assert failure["exit_code"] == 130
     _assert_processes_reaped(model_calls_path)
+
+
+@pytest.mark.parametrize("primary_kind", ("parallel", "keyboard"))
+def test_parallel_cleanup_attempts_every_resource_and_preserves_primary_error(
+    tmp_path, monkeypatch, primary_kind
+):
+    from starvla_bridge import parallel_evaluation
+
+    arguments, _models, _simulators, log_handles, ipc_root, output_dir = (
+        _prepare_fake_lifecycle_run(tmp_path, monkeypatch, parallel_evaluation)
+    )
+    primary_error = (
+        parallel_evaluation.ParallelEvaluationError("worker failed", exit_code=17)
+        if primary_kind == "parallel"
+        else KeyboardInterrupt()
+    )
+
+    def fail_during_simulator_wait(_replicas):
+        raise primary_error
+
+    cleanup_calls = []
+
+    def fail_first_cleanup(process):
+        cleanup_calls.append(process.name)
+        if len(cleanup_calls) == 1:
+            raise subprocess.TimeoutExpired(process.name, timeout=6)
+
+    monkeypatch.setattr(
+        parallel_evaluation, "_wait_for_simulators", fail_during_simulator_wait
+    )
+    monkeypatch.setattr(parallel_evaluation, "_terminate_process", fail_first_cleanup)
+
+    try:
+        parallel_evaluation.run_parallel(arguments)
+    except BaseException as error:
+        caught = error
+    else:
+        pytest.fail("primary worker error was not raised")
+
+    assert cleanup_calls == [
+        "simulator-0",
+        "simulator-1",
+        "model-0",
+        "model-1",
+    ]
+    assert all(handle.closed for handle in log_handles)
+    assert not ipc_root.exists()
+    assert caught is primary_error
+    failure = json.loads((output_dir / "failure.json").read_text())
+    assert failure["exit_code"] == (17 if primary_kind == "parallel" else 130)
+
+
+def test_parallel_cleanup_failure_after_success_writes_failure_and_fails(
+    tmp_path, monkeypatch
+):
+    from starvla_bridge import parallel_evaluation
+
+    arguments, _models, _simulators, log_handles, ipc_root, output_dir = (
+        _prepare_fake_lifecycle_run(tmp_path, monkeypatch, parallel_evaluation)
+    )
+    monkeypatch.setattr(parallel_evaluation, "_wait_for_simulators", lambda *_: None)
+    cleanup_calls = []
+
+    def fail_final_simulator_cleanup(process):
+        cleanup_calls.append(process.name)
+        if process.name == "simulator-0":
+            raise subprocess.TimeoutExpired(process.name, timeout=6)
+
+    monkeypatch.setattr(
+        parallel_evaluation,
+        "_terminate_process",
+        fail_final_simulator_cleanup,
+    )
+
+    try:
+        parallel_evaluation.run_parallel(arguments)
+    except BaseException as error:
+        caught = error
+    else:
+        pytest.fail("cleanup failure was not raised")
+
+    assert cleanup_calls == [
+        "model-0",
+        "model-1",
+        "simulator-0",
+        "simulator-1",
+    ]
+    assert all(handle.closed for handle in log_handles)
+    assert not ipc_root.exists()
+    assert isinstance(caught, parallel_evaluation.ParallelEvaluationError)
+    assert "cleanup failed" in str(caught)
+    failure = json.loads((output_dir / "failure.json").read_text())
+    assert failure["exit_code"] == 1
+    assert "TimeoutExpired" in failure["error"]
+
+
+def test_completed_process_groups_are_drained_before_merge_and_not_cleaned_again(
+    tmp_path, monkeypatch
+):
+    from starvla_bridge import parallel_evaluation
+
+    arguments, models, simulators, _log_handles, _ipc_root, _output_dir = (
+        _prepare_fake_lifecycle_run(
+            tmp_path,
+            monkeypatch,
+            parallel_evaluation,
+            device_count=1,
+        )
+    )
+    simulators[0].poll_status = 0
+    simulators[0].returncode = 0
+    phase = {"value": "running"}
+    cleanup_calls = []
+
+    def record_cleanup(process):
+        cleanup_calls.append((process.name, phase["value"]))
+
+    def merge_outputs(*_args, **_kwargs):
+        phase["value"] = "merged"
+        return {"status": "complete"}
+
+    monkeypatch.setattr(parallel_evaluation, "_terminate_process", record_cleanup)
+    monkeypatch.setattr(parallel_evaluation, "merge_worker_outputs", merge_outputs)
+
+    report = parallel_evaluation.run_parallel(arguments)
+
+    assert report == {"status": "complete"}
+    assert cleanup_calls == [
+        ("simulator-0", "running"),
+        ("model-0", "running"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("worker_kind", "exit_code"),
+    (("simulator", 17), ("model", 23)),
+)
+def test_worker_exit_code_survives_immediate_group_drain_failure(
+    tmp_path, monkeypatch, worker_kind, exit_code
+):
+    from starvla_bridge import parallel_evaluation
+
+    arguments, models, simulators, log_handles, ipc_root, output_dir = (
+        _prepare_fake_lifecycle_run(
+            tmp_path,
+            monkeypatch,
+            parallel_evaluation,
+            device_count=1,
+        )
+    )
+    phase = {"value": "waiting"}
+    failed_process = simulators[0] if worker_kind == "simulator" else models[0]
+
+    if worker_kind == "simulator":
+
+        def observe_failure():
+            phase["value"] = "observed"
+            return exit_code
+
+        simulators[0].poll = observe_failure
+    else:
+
+        def observe_failure():
+            phase["value"] = "observed"
+            return exit_code
+
+        models[0].poll = observe_failure
+
+    cleanup_calls = []
+
+    def fail_failed_group_cleanup(process):
+        cleanup_calls.append((process.name, phase["value"]))
+        if process is failed_process:
+            raise subprocess.TimeoutExpired(process.name, timeout=6)
+
+    original_write_failure = parallel_evaluation._write_failure
+
+    def record_failure(*args, **kwargs):
+        phase["value"] = "failure"
+        return original_write_failure(*args, **kwargs)
+
+    monkeypatch.setattr(
+        parallel_evaluation, "_terminate_process", fail_failed_group_cleanup
+    )
+    monkeypatch.setattr(parallel_evaluation, "_write_failure", record_failure)
+
+    with pytest.raises(parallel_evaluation.ParallelEvaluationError) as caught:
+        parallel_evaluation.run_parallel(arguments)
+
+    assert cleanup_calls[0] == (failed_process.name, "observed")
+    assert caught.value.exit_code == exit_code
+    failure = json.loads((output_dir / "failure.json").read_text())
+    assert failure["exit_code"] == exit_code
+    assert all(handle.closed for handle in log_handles)
+    assert not ipc_root.exists()
 
 
 def test_process_group_cleanup_kills_term_ignoring_descendant_after_leader_exits(tmp_path):

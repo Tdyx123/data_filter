@@ -47,7 +47,9 @@ class _Replica:
     log_path: Path
     log_handle: Any
     model_process: subprocess.Popen[Any]
+    model_group_owned: bool = True
     sim_process: subprocess.Popen[Any] | None = None
+    sim_group_owned: bool = False
 
 
 def parse_model_devices(value: str) -> tuple[str, ...]:
@@ -166,6 +168,55 @@ def _terminate_process(process: subprocess.Popen[Any] | None) -> None:
         raise subprocess.TimeoutExpired(f"process group {process.pid}", timeout=6)
 
 
+def _drain_model_group(replica: _Replica) -> Exception | None:
+    if not replica.model_group_owned:
+        return None
+    try:
+        _terminate_process(replica.model_process)
+    except Exception as error:
+        return error
+    replica.model_group_owned = False
+    return None
+
+
+def _drain_simulator_group(replica: _Replica) -> Exception | None:
+    if not replica.sim_group_owned:
+        return None
+    assert replica.sim_process is not None
+    try:
+        _terminate_process(replica.sim_process)
+    except Exception as error:
+        return error
+    replica.sim_group_owned = False
+    return None
+
+
+def _cleanup_replicas(
+    replicas: Sequence[_Replica],
+    ipc_root: Path,
+) -> tuple[Exception, ...]:
+    errors: list[Exception] = []
+    try:
+        for replica in replicas:
+            error = _drain_simulator_group(replica)
+            if error is not None:
+                errors.append(error)
+        for replica in replicas:
+            error = _drain_model_group(replica)
+            if error is not None:
+                errors.append(error)
+            try:
+                replica.log_handle.close()
+            except Exception as error:
+                errors.append(error)
+    finally:
+        try:
+            shutil.rmtree(ipc_root, ignore_errors=True)
+        except Exception as error:
+            errors.append(error)
+    return tuple(errors)
+
+
 def _wait_for_model_servers(replicas: Sequence[_Replica], timeout: int) -> None:
     deadline = time.monotonic() + timeout
     pending = {replica.index for replica in replicas}
@@ -175,11 +226,15 @@ def _wait_for_model_servers(replicas: Sequence[_Replica], timeout: int) -> None:
                 continue
             status = replica.model_process.poll()
             if status is not None:
-                raise ParallelEvaluationError(
+                cleanup_error = _drain_model_group(replica)
+                worker_error = ParallelEvaluationError(
                     f"model worker {replica.index} on {replica.device} exited before ready "
                     f"with status {status}; log: {replica.log_path}",
                     exit_code=status or 1,
                 )
+                if cleanup_error is not None:
+                    raise worker_error from cleanup_error
+                raise worker_error
             if replica.socket_path.is_socket():
                 pending.remove(replica.index)
         if not pending:
@@ -212,7 +267,20 @@ def _validate_replica_metadata(replicas: Sequence[_Replica]) -> None:
 
 
 def _shutdown_idle_replica(replica: _Replica) -> None:
-    if replica.model_process.poll() is not None:
+    status = replica.model_process.poll()
+    if status is not None:
+        cleanup_error = _drain_model_group(replica)
+        if status != 0:
+            worker_error = ParallelEvaluationError(
+                f"model worker {replica.index} exited with status {status}; "
+                f"log: {replica.log_path}",
+                exit_code=status,
+            )
+            if cleanup_error is not None:
+                raise worker_error from cleanup_error
+            raise worker_error
+        if cleanup_error is not None:
+            raise cleanup_error
         return
     client = StarVLAIPCClient(replica.socket_path, authkey=replica.authkey)
     try:
@@ -233,19 +301,33 @@ def _wait_for_simulators(replicas: Sequence[_Replica]) -> None:
             if sim_status is not None:
                 pending.remove(replica.index)
                 made_progress = True
+                cleanup_error = _drain_simulator_group(replica)
                 if sim_status != 0:
-                    raise ParallelEvaluationError(
+                    worker_error = ParallelEvaluationError(
                         f"simulator worker {replica.index} exited with status {sim_status}",
                         exit_code=sim_status,
                     )
+                    if cleanup_error is not None:
+                        raise worker_error from cleanup_error
+                    raise worker_error
+                if cleanup_error is not None:
+                    raise cleanup_error
                 continue
             model_status = replica.model_process.poll()
-            if model_status not in {None, 0}:
-                raise ParallelEvaluationError(
+            if model_status is not None:
+                cleanup_error = _drain_model_group(replica)
+                if model_status == 0:
+                    if cleanup_error is not None:
+                        raise cleanup_error
+                    continue
+                worker_error = ParallelEvaluationError(
                     f"model worker {replica.index} exited during evaluation with status "
                     f"{model_status}; log: {replica.log_path}",
                     exit_code=model_status or 1,
                 )
+                if cleanup_error is not None:
+                    raise worker_error from cleanup_error
+                raise worker_error
         if pending and not made_progress:
             time.sleep(0.05)
 
@@ -340,6 +422,7 @@ def run_parallel(arguments: argparse.Namespace) -> dict[str, Any]:
     worker_root.mkdir(parents=True, exist_ok=True)
     ipc_root = Path(tempfile.mkdtemp(prefix="starvla-simpler-parallel."))
     replicas: list[_Replica] = []
+    primary_error: BaseException | None = None
     started = time.monotonic()
     try:
         for index, device in enumerate(active_devices):
@@ -408,6 +491,7 @@ def run_parallel(arguments: argparse.Namespace) -> dict[str, Any]:
                 *forwarded,
             ]
             replica.sim_process = subprocess.Popen(command, start_new_session=True)
+            replica.sim_group_owned = True
         _wait_for_simulators(simulator_replicas)
         for replica in replicas[len(simulator_replicas) :]:
             _shutdown_idle_replica(replica)
@@ -418,12 +502,18 @@ def run_parallel(arguments: argparse.Namespace) -> dict[str, Any]:
                 raise ParallelEvaluationError(
                     f"model worker {replica.index} did not stop after evaluation"
                 ) from error
+            cleanup_error = _drain_model_group(replica)
             if replica.model_process.returncode != 0:
-                raise ParallelEvaluationError(
+                worker_error = ParallelEvaluationError(
                     f"model worker {replica.index} exited with status "
                     f"{replica.model_process.returncode}; log: {replica.log_path}",
                     exit_code=replica.model_process.returncode or 1,
                 )
+                if cleanup_error is not None:
+                    raise worker_error from cleanup_error
+                raise worker_error
+            if cleanup_error is not None:
+                raise cleanup_error
         elapsed = time.monotonic() - started
         if evaluation.preflight_only:
             return _augment_preflight(
@@ -445,6 +535,7 @@ def run_parallel(arguments: argparse.Namespace) -> dict[str, Any]:
             elapsed_seconds=elapsed,
         )
     except BaseException as error:
+        primary_error = error
         if isinstance(error, ParallelEvaluationError):
             exit_code = error.exit_code
         elif isinstance(error, KeyboardInterrupt):
@@ -459,12 +550,19 @@ def run_parallel(arguments: argparse.Namespace) -> dict[str, Any]:
         )
         raise
     finally:
-        for replica in replicas:
-            _terminate_process(replica.sim_process)
-        for replica in replicas:
-            _terminate_process(replica.model_process)
-            replica.log_handle.close()
-        shutil.rmtree(ipc_root, ignore_errors=True)
+        cleanup_errors = _cleanup_replicas(replicas, ipc_root)
+        if cleanup_errors and primary_error is None:
+            details = "; ".join(
+                f"{type(error).__name__}: {error}" for error in cleanup_errors
+            )
+            cleanup_error = ParallelEvaluationError(f"parallel cleanup failed: {details}")
+            _write_failure(
+                arguments.output_dir,
+                error=cleanup_error,
+                exit_code=cleanup_error.exit_code,
+                replicas=replicas,
+            )
+            raise cleanup_error from cleanup_errors[0]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
