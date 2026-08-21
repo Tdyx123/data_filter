@@ -31,7 +31,7 @@ Launcher options:
   --model-devices LIST   parallel model replicas, e.g. cuda:0,cuda:1
                          cannot be combined with --device
   --sim-device DEVICE    simulator renderer CUDA device (default: cuda:0)
-  --output-dir PATH      evaluation output and persistent model-server.log
+  --output-dir PATH      evaluation output and persistent model server logs
   --server-timeout SEC   maximum model load wait (default: 600)
   -h, --help             show this help without starting either process
 
@@ -40,7 +40,8 @@ Evaluation options are forwarded to starvla_bridge.evaluate_simpler, including:
   --save-videos-path PATH --overwrite
 
 With --model-devices, each listed GPU loads a complete model replica and all
-simulator workers reuse --sim-device.
+simulator workers reuse --sim-device. Single-GPU runs write model-server.log;
+multi-GPU runs write model-server-NN.log for each replica.
 EOF
 }
 

@@ -1199,8 +1199,9 @@ bash scripts/evaluate_simpler_qwen3vl_groot_rt1.sh \
 完成该 seed 的 24 个对象。StarVLA 每步返回原生 `(1,16,7)` 动作块，只执行首个
 动作；前六维按 `oxe_bridge.action` 的 q01/q99 和 mask 反归一化，抓手保持 `[0,1]`
 并以 `0.5` 为阈值。启动失败、客户端失败或收到 INT/TERM 时，脚本只回收本次启动的
-服务进程；`model-server.log` 保留在输出目录。正式完成后 `episodes.jsonl` 应恰有
-288 条，`results.json` 按任务和三个策略种子汇总。
+服务进程；单卡的 `model-server.log` 或多卡每个副本的 `model-server-NN.log` 保留在
+输出目录。正式完成后 `episodes.jsonl` 应恰有 288 条，`results.json` 按任务和三个
+策略种子汇总。
 
 ## 测试
 
