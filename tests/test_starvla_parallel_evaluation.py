@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -408,13 +409,79 @@ def test_parse_model_devices_accepts_unique_logical_cuda_devices():
 
 @pytest.mark.parametrize(
     "value",
-    ("", "cuda:0,", "cuda:0,cuda:0", "cuda", "cpu", "CUDA:1", "cuda:-1"),
+    (
+        "",
+        "cuda:0,",
+        "cuda:0,cuda:0",
+        "cuda",
+        "cpu",
+        "CUDA:1",
+        "cuda:-1",
+        "cuda:00",
+        "cuda:01",
+    ),
 )
 def test_parse_model_devices_rejects_empty_duplicate_or_non_cuda_values(value):
     from starvla_bridge import parallel_evaluation
 
     with pytest.raises(ValueError, match="model devices"):
         parallel_evaluation.parse_model_devices(value)
+
+
+@pytest.mark.parametrize(
+    "forwarded",
+    (
+        ("--socket", "/tmp/override.sock"),
+        ("--socket=/tmp/override.sock",),
+        ("--auth-key-hex", "beef"),
+        ("--auth-key-hex=beef",),
+        ("--output-dir", "/tmp/override-output"),
+        ("--output-dir=/tmp/override-output",),
+        ("--sim-device", "cuda:6"),
+        ("--sim-device=cuda:6",),
+        ("--shard-index", "0"),
+        ("--shard-index=0",),
+        ("--shard-count", "1"),
+        ("--shard-count=1",),
+        ("--rng-scope", "per_episode"),
+        ("--rng-scope=per_episode",),
+    ),
+)
+def test_parallel_rejects_coordinator_managed_forwarded_arguments_before_launch(
+    tmp_path, monkeypatch, forwarded
+):
+    from starvla_bridge import parallel_evaluation
+
+    output_dir = tmp_path / "output"
+    arguments = parallel_evaluation.build_parser().parse_args(
+        [
+            "--sim-python",
+            sys.executable,
+            "--model-dir",
+            "/models/starvla",
+            "--base-model",
+            "/models/qwen",
+            "--model-devices",
+            "cuda:0",
+            "--sim-device",
+            "cuda:7",
+            "--output-dir",
+            str(output_dir),
+            "--",
+            *forwarded,
+            "--tasks",
+            "spoon",
+        ]
+    )
+
+    def reject_process_launch(*_args, **_kwargs):
+        pytest.fail("managed forwarded argument reached process launch")
+
+    monkeypatch.setattr(parallel_evaluation.subprocess, "Popen", reject_process_launch)
+
+    with pytest.raises(parallel_evaluation.ParallelEvaluationError, match="managed"):
+        parallel_evaluation.run_parallel(arguments)
+    assert not output_dir.exists()
 
 
 def test_parallel_coordinator_runs_starvla_replicas_and_shared_renderer_workers(
@@ -662,6 +729,61 @@ def test_parallel_coordinator_term_signal_reaps_children_and_reports_130(tmp_pat
     failure = json.loads((output_dir / "failure.json").read_text())
     assert failure["exit_code"] == 130
     _assert_processes_reaped(model_calls_path)
+
+
+def test_process_group_cleanup_kills_term_ignoring_descendant_after_leader_exits(tmp_path):
+    from starvla_bridge import parallel_evaluation
+
+    child_pid_path = tmp_path / "child.pid"
+    child_ready_path = tmp_path / "child.ready"
+    leader_python = tmp_path / "leader-python"
+    leader_python.write_text(
+        r'''#!/usr/bin/env python3
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+child_pid_path = Path(sys.argv[1])
+child_ready_path = Path(sys.argv[2])
+child = subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        "import signal,sys,time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "Path(sys.argv[1]).write_text('ready'); time.sleep(60)",
+        str(child_ready_path),
+    ]
+)
+deadline = time.monotonic() + 5
+while not child_ready_path.exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+if not child_ready_path.exists():
+    raise SystemExit("descendant did not become ready")
+child_pid_path.write_text(str(child.pid))
+''',
+        encoding="utf-8",
+    )
+    leader_python.chmod(0o755)
+    leader = subprocess.Popen(
+        [str(leader_python), str(child_pid_path), str(child_ready_path)],
+        start_new_session=True,
+    )
+    assert leader.wait(timeout=5) == 0
+    child_pid = int(child_pid_path.read_text())
+    os.kill(child_pid, 0)
+
+    try:
+        parallel_evaluation._terminate_process(leader)
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    finally:
+        try:
+            os.killpg(leader.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def test_merge_worker_outputs_restores_canonical_order_and_aggregates_metadata(tmp_path):

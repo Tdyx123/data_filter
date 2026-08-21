@@ -54,7 +54,10 @@ def parse_model_devices(value: str) -> tuple[str, ...]:
     devices = tuple(str(value).split(","))
     if (
         not devices
-        or any(re.fullmatch(r"cuda:[0-9]+", device) is None for device in devices)
+        or any(
+            re.fullmatch(r"cuda:(?:0|[1-9][0-9]*)", device) is None
+            for device in devices
+        )
         or len(devices) != len(set(devices))
     ):
         raise ValueError(
@@ -89,9 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _evaluation_arguments(arguments: argparse.Namespace) -> argparse.Namespace:
     from .evaluate_simpler import build_parser as build_evaluation_parser
 
-    forwarded = list(arguments.evaluation_args)
-    if forwarded[:1] == ["--"]:
-        forwarded = forwarded[1:]
+    forwarded = _forwarded_arguments(arguments)
     return build_evaluation_parser().parse_args(
         [
             "--socket",
@@ -109,7 +110,24 @@ def _evaluation_arguments(arguments: argparse.Namespace) -> argparse.Namespace:
 
 def _forwarded_arguments(arguments: argparse.Namespace) -> list[str]:
     forwarded = list(arguments.evaluation_args)
-    return forwarded[1:] if forwarded[:1] == ["--"] else forwarded
+    if forwarded[:1] == ["--"]:
+        forwarded = forwarded[1:]
+    managed = {
+        "--socket",
+        "--auth-key-hex",
+        "--output-dir",
+        "--sim-device",
+        "--shard-index",
+        "--shard-count",
+        "--rng-scope",
+    }
+    for value in forwarded:
+        option = value.partition("=")[0]
+        if option in managed:
+            raise ParallelEvaluationError(
+                f"evaluation argument {option} is managed by the parallel coordinator"
+            )
+    return forwarded
 
 
 def _process_group_signal(process: subprocess.Popen[Any], signum: int) -> None:
@@ -119,17 +137,32 @@ def _process_group_signal(process: subprocess.Popen[Any], signum: int) -> None:
         return
 
 
+def _wait_for_process_group_exit(
+    process: subprocess.Popen[Any],
+    *,
+    timeout: float,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        process.poll()
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
 def _terminate_process(process: subprocess.Popen[Any] | None) -> None:
     if process is None:
         return
     _process_group_signal(process, signal.SIGTERM)
-    if process.poll() is not None:
+    if _wait_for_process_group_exit(process, timeout=3):
         return
-    try:
-        process.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        _process_group_signal(process, signal.SIGKILL)
-        process.wait(timeout=3)
+    _process_group_signal(process, signal.SIGKILL)
+    if not _wait_for_process_group_exit(process, timeout=3):
+        raise subprocess.TimeoutExpired(f"process group {process.pid}", timeout=6)
 
 
 def _wait_for_model_servers(replicas: Sequence[_Replica], timeout: int) -> None:

@@ -631,12 +631,10 @@ def _check_output_targets(settings: SimplerRunSettings) -> None:
     if settings.save_videos_path is not None:
         targets.extend(
             settings.save_videos_path
-            / task.key
-            / f"seed-{seed}"
-            / f"episode-{episode_id:02d}_{outcome}.mp4"
-            for task in settings.tasks
-            for seed in settings.policy_seeds
-            for episode_id in settings.object_episode_ids
+            / episode.task.key
+            / f"seed-{episode.policy_seed}"
+            / f"episode-{episode.object_episode_id:02d}_{outcome}.mp4"
+            for episode in assigned_episode_plan(settings)
             for outcome in ("success", "failure")
         )
     if not settings.overwrite and any(path.exists() for path in targets):

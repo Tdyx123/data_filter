@@ -106,6 +106,7 @@ def test_server_validates_runtime_before_loading_checkpoint(monkeypatch, tmp_pat
     )
     predicted_images = []
     loaded = SimpleNamespace(
+        policy=SimpleNamespace(device="cuda:5"),
         checkpoint_report=SimpleNamespace(
             tensor_count=962,
             parameter_bytes=9_976_489_486,
@@ -154,7 +155,7 @@ def test_server_validates_runtime_before_loading_checkpoint(monkeypatch, tmp_pat
     assert [event[0] for event in events] == ["runtime", "load", "serve"]
     assert events[0][1] == {"device": "cuda:3"}
     assert events[1][1] == {"device": "cuda:3"}
-    assert events[-1][1]["metadata"]["device"] == "cuda:3"
+    assert events[-1][1]["metadata"]["device"] == "cuda:5"
     assert events[-1][1]["metadata"]["runtime"]["diffusers"] == "0.38.0"
     assert predicted_images[0][0].shape == (224, 224, 3)
     assert predicted_images[0][0].dtype.name == "uint8"

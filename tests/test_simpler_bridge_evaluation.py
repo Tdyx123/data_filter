@@ -458,6 +458,26 @@ def test_shared_episode_plan_round_robins_the_canonical_matrix_without_gaps(tmp_
     ]
 
 
+def test_delayed_shard_output_check_ignores_video_written_by_another_shard(tmp_path):
+    shared = importlib.import_module("simpler_bridge.evaluation")
+    videos = tmp_path / "videos"
+    other_shard_video = videos / "spoon/seed-0/episode-01_success.mp4"
+    other_shard_video.parent.mkdir(parents=True)
+    other_shard_video.write_bytes(b"other shard")
+    settings = shared.SimplerRunSettings(
+        output_dir=tmp_path / "worker-0",
+        tasks=(shared.SIMPLER_TASKS[0],),
+        policy_seeds=(0,),
+        object_episode_ids=(0, 1),
+        save_videos_path=videos,
+        shard_index=0,
+        shard_count=2,
+        rng_scope="per_episode",
+    )
+
+    shared._check_output_targets(settings)
+
+
 def test_shared_parallel_runner_reseeds_each_episode_and_records_the_seed(tmp_path):
     shared = importlib.import_module("simpler_bridge.evaluation")
     adapter = _Adapter()

@@ -84,7 +84,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         spec,
         loaded.checkpoint_report,
         runtime,
-        device=arguments.device,
+        device=str(loaded.policy.device),
     )
     metadata["startup_preflight"] = run_startup_preflight(loaded)
     serve_policy(
