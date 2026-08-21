@@ -1115,9 +1115,12 @@ PYENV_VERSION=miniconda3-3.12-25.11.1-1 \
   -r requirements-starvla-pyenv.txt
 ```
 
-启动器自动管理两个进程：上述 pyenv 中的模型服务，以及
-`.venv-octo-simpler/bin/python` 中的 SimplerEnv 客户端。两者只通过启动器创建的
-私有 Unix socket 通信。模型服务从
+固定 RT-1 入口 `scripts/evaluate_simpler_qwen3vl_groot_rt1.sh` 先校验
+`/data/dwb/models/Qwen3VL-GR00T-Bridge-RT-1/checkpoints/steps_20000_pytorch_model.pt`，
+再从该路径派生模型目录并复用 `scripts/evaluate_simpler_starvla.sh`；不接受
+`--checkpoint` 或 `--model-dir` 覆盖。启动器自动管理两个进程：上述 pyenv 中的模型
+服务，以及 `.venv-octo-simpler/bin/python` 中的 SimplerEnv 客户端。两者只通过启动器
+创建的私有 Unix socket 通信。模型服务从
 `/data/dwb/models/Qwen3-VL-4B-Instruct` 读取 config、processor 和 chat template，
 在 meta device 构造与 StarVLA 提交
 `3422b9f2387b6f682cf02802904a77b23ab13afd` 同构的网络，再以 mmap、
@@ -1128,7 +1131,7 @@ PYENV_VERSION=miniconda3-3.12-25.11.1-1 \
 socket；客户端随后校验四个环境并完成 SimplerEnv 预检：
 
 ```bash
-bash scripts/evaluate_simpler_starvla.sh \
+bash scripts/evaluate_simpler_qwen3vl_groot_rt1.sh \
   --output-dir outputs/starvla_simpler_preflight \
   --preflight-only
 ```
@@ -1136,16 +1139,15 @@ bash scripts/evaluate_simpler_starvla.sh \
 四任务 smoke test 对每个任务只运行 seed 0、object episode 0，最多执行 8 个环境步：
 
 ```bash
-bash scripts/evaluate_simpler_starvla.sh \
+bash scripts/evaluate_simpler_qwen3vl_groot_rt1.sh \
   --output-dir outputs/starvla_simpler_smoke \
   --smoke-test
 ```
 
-正式命令默认读取
-`/data/dwb/models/Qwen3VL-GR00T-Bridge-RT-1`，运行固定 288 回合：
+正式命令固定读取上述 `steps_20000_pytorch_model.pt`，运行 288 回合：
 
 ```bash
-bash scripts/evaluate_simpler_starvla.sh \
+bash scripts/evaluate_simpler_qwen3vl_groot_rt1.sh \
   --tasks all \
   --output-dir outputs/starvla_simpler_eval
 ```
