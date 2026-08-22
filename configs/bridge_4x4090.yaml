@@ -9,7 +9,7 @@ data:
   action_key: action
   state_dim: 8
   action_dim: 7
-  action_horizon: 8
+  action_horizon: 16
   normalization_contract: bridge_v2_q99_binary_v1
   split_seed: 42
   validation_percent: 1

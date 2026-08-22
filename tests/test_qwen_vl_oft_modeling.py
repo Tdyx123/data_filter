@@ -29,9 +29,12 @@ class _FakeProcessor:
         assert padding is True
         assert return_tensors == "pt"
         assert len(text) == len(images)
+        query_counts = [prompt.count("🔍") for prompt in text]
+        assert len(set(query_counts)) == 1
+        input_ids = torch.tensor([[1, 2] + [9] * query_counts[0]])
         return {
-            "input_ids": torch.tensor([[1, 2, 9, 9]]).expand(len(text), -1),
-            "attention_mask": torch.ones(len(text), 4, dtype=torch.long),
+            "input_ids": input_ids.expand(len(text), -1),
+            "attention_mask": torch.ones(len(text), input_ids.shape[1], dtype=torch.long),
         }
 
 
@@ -76,6 +79,27 @@ def _stats():
         state_q99=[10.0, 20.0],
         action_q01=[10.0, 20.0],
         action_q99=[20.0, 40.0],
+    )
+
+
+def _bridge_policy_config():
+    return {
+        "data": {"state_dim": 8, "action_dim": 7, "action_horizon": 16},
+        "model": {
+            "context_dim": 4,
+            "state_bins": 256,
+            "action_token": "🔍",
+            "action_head_hidden_dim": 8,
+        },
+    }
+
+
+def _bridge_stats():
+    return QuantileStats(
+        state_q01=[0.0] * 8,
+        state_q99=[1.0] * 8,
+        action_q01=[0.0] * 7,
+        action_q99=[1.0] * 7,
     )
 
 
@@ -182,6 +206,28 @@ def test_policy_builds_generation_prompt_and_returns_denormalized_action_chunk()
     )
     assert actions.shape == (1, 2, 2)
     assert torch.equal(actions, torch.tensor([[[10.0, 40.0], [15.0, 30.0]]]))
+
+
+def test_policy_builds_16_action_queries_and_returns_bridge_action_chunks():
+    from qwen_vl_oft.modeling import QwenVLOFTPolicy
+
+    processor = _FakeProcessor()
+    policy = QwenVLOFTPolicy(
+        backbone=_FakeBackbone(),
+        processor=processor,
+        stats=_bridge_stats(),
+        config=_bridge_policy_config(),
+    )
+
+    actions = policy.predict_actions(
+        image=[torch.zeros(3, 8, 8), torch.zeros(3, 8, 8)],
+        state=torch.zeros(2, 8),
+        instruction=["Move", "Lift"],
+    )
+
+    prompt = processor.messages[0]["content"][-1]["text"]
+    assert prompt.count("🔍") == 16
+    assert actions.shape == (2, 16, 7)
 
 
 def test_policy_only_toggles_lora_backbone_parameters():

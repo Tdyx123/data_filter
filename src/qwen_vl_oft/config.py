@@ -77,8 +77,13 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ConfigError("Qwen-VL OFT supports only the Bridge dataset")
     if data.get("state_dim") != 8 or data.get("action_dim") != 7:
         raise ConfigError("Bridge OFT requires state_dim=8 and action_dim=7")
-    if data.get("action_horizon") != 8:
-        raise ConfigError("Bridge Qwen-VL OFT requires data.action_horizon=8")
+    action_horizon = data.get("action_horizon")
+    if (
+        isinstance(action_horizon, bool)
+        or not isinstance(action_horizon, int)
+        or action_horizon <= 0
+    ):
+        raise ConfigError("data.action_horizon must be a positive integer")
 
     if model.get("backbone_family", "qwen3_vl") != "qwen3_vl":
         raise ConfigError("Qwen-VL OFT requires model.backbone_family=qwen3_vl")

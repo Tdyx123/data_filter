@@ -26,6 +26,8 @@ def _write_oft_checkpoint(tmp_path: Path, *, checkpoint_format: str | None = Non
             encoding="utf-8"
         )
     )
+    # Simpler evaluation remains an explicit legacy 8-step protocol fixture.
+    config["data"]["action_horizon"] = 8
     config["paths"]["model"] = str(base_model)
     config["paths"]["dataset"] = str(tmp_path / "dataset")
     config["paths"]["output"] = str(tmp_path / "run")

@@ -66,4 +66,4 @@ def test_oft_runtime_metadata_records_starvla_strategy():
 
     assert metadata["strategy"] == "starvla-compatible-causal-query-oft"
     assert metadata["effective_batch_size"] == 64
-    assert metadata["action_query"] == {"token": "🔍", "horizon": 8, "state_bins": 256}
+    assert metadata["action_query"] == {"token": "🔍", "horizon": 16, "state_bins": 256}

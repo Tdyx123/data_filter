@@ -29,10 +29,12 @@ def test_episode_split_is_stable_and_disjoint():
 
 def test_action_window_preserves_relative_actions_and_masks_tail():
     actions = np.arange(5 * 7, dtype=np.float32).reshape(5, 7)
-    window, mask = make_action_window(actions, frame_index=3, horizon=8)
+    window, mask = make_action_window(actions, frame_index=3, horizon=16)
+    assert window.shape == (16, 7)
+    assert mask.shape == (16,)
     np.testing.assert_array_equal(window[:2], actions[3:5])
-    np.testing.assert_array_equal(window[2:], np.zeros((6, 7), dtype=np.float32))
-    np.testing.assert_array_equal(mask, [1, 1, 0, 0, 0, 0, 0, 0])
+    np.testing.assert_array_equal(window[2:], np.zeros((14, 7), dtype=np.float32))
+    np.testing.assert_array_equal(mask, [1, 1] + [0] * 14)
     # The function copies source actions verbatim; it never subtracts state.
     assert window[0, 0] == actions[3, 0]
 
@@ -59,4 +61,3 @@ def test_bridge_split_expected_size():
     train, validation = metadata.split()
     assert len(train) + len(validation) == 53_192
     assert len(validation) == 559
-

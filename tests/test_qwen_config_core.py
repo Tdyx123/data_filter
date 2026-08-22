@@ -19,6 +19,17 @@ QWEN35_CONFIG = PROJECT_ROOT / "configs" / "qwen3_5_0_8b_groot_libero_4x4090.yam
 BRIDGE_V2_NORMALIZATION_CONTRACT = "bridge_v2_q99_binary_v1"
 
 
+def test_bridge_four_gpu_training_config_uses_16_steps_and_effective_batch_64():
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
+
+    assert config["data"]["action_horizon"] == 16
+    assert (
+        config["train"]["gpu_count"]
+        * config["train"]["micro_batch_size"]
+        * config["train"]["gradient_accumulation_steps"]
+    ) == 64
+
+
 @pytest.mark.parametrize("name", ["bridge_4x4090.yaml", "bridge_8x4090.yaml"])
 def test_bridge_configs_require_bridge_v2_normalization_contract(name):
     config = load_config(PROJECT_ROOT / "configs" / name)

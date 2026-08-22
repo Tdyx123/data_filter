@@ -15,7 +15,7 @@ def test_default_oft_config_matches_four_4090_bridge_contract():
     assert config["paths"]["model"] == "/data/dwb/models/Qwen3-VL-4B-Instruct"
     assert config["data"]["state_dim"] == 8
     assert config["data"]["action_dim"] == 7
-    assert config["data"]["action_horizon"] == 8
+    assert config["data"]["action_horizon"] == 16
     assert config["model"]["attn_implementation"] == "sdpa"
     assert config["model"]["state_bins"] == 256
     assert config["model"]["action_token"] == "🔍"
@@ -56,7 +56,6 @@ def test_oft_config_overrides_training_and_paths_without_groot_options():
     ("path", "value", "message"),
     [
         (("data", "state_dim"), 7, "state_dim=8"),
-        (("data", "action_horizon"), 4, "action_horizon=8"),
         (("model", "state_bins"), 1, "state_bins"),
         (("model", "action_token"), "", "action_token"),
         (("model", "action_token"), "?", "action_token"),
@@ -75,4 +74,27 @@ def test_oft_config_rejects_incompatible_contract(path, value, message):
     destination[path[-1]] = value
 
     with pytest.raises(ConfigError, match=message):
+        validate_config(config)
+
+
+@pytest.mark.parametrize("action_horizon", [1, 8, 16])
+def test_oft_config_accepts_positive_integer_action_horizons(action_horizon):
+    from qwen_vl_oft.config import load_config, validate_config
+
+    config = load_config(CONFIG)
+    config["data"]["action_horizon"] = action_horizon
+
+    validate_config(config)
+
+
+@pytest.mark.parametrize("action_horizon", [True, 0, -1, 1.5, 16.0, "16"])
+def test_oft_config_rejects_non_positive_or_non_integer_action_horizons(
+    action_horizon,
+):
+    from qwen_vl_oft.config import ConfigError, load_config, validate_config
+
+    config = load_config(CONFIG)
+    config["data"]["action_horizon"] = action_horizon
+
+    with pytest.raises(ConfigError, match="positive integer"):
         validate_config(config)
