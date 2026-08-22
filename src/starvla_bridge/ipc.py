@@ -23,7 +23,7 @@ def seed_everything(seed: int) -> None:
 
     value = int(seed)
     random.seed(value)
-    np.random.seed(value)
+    np.random.seed(value % (2**32))
     torch.manual_seed(value)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(value)

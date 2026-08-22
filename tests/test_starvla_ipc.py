@@ -320,6 +320,23 @@ def test_seed_everything_restarts_numpy_and_torch_random_streams():
     assert not np.array_equal(np.random.standard_normal(4), first_numpy)
 
 
+def test_seed_everything_accepts_full_parallel_episode_seed():
+    from starvla_bridge.ipc import seed_everything
+
+    episode_seed = 8_361_816_881_672_972_874
+    numpy_seed = episode_seed % (2**32)
+
+    seed_everything(episode_seed)
+    actual_numpy = np.random.standard_normal(4)
+    actual_torch = torch.randn(4)
+
+    expected_numpy = np.random.RandomState(numpy_seed).standard_normal(4)
+    expected_torch_generator = torch.Generator().manual_seed(episode_seed)
+    expected_torch = torch.randn(4, generator=expected_torch_generator)
+    np.testing.assert_array_equal(actual_numpy, expected_numpy)
+    torch.testing.assert_close(actual_torch, expected_torch, rtol=0, atol=0)
+
+
 def test_ipc_rejects_nonfinite_or_wrong_shape_policy_actions(tmp_path):
     from starvla_bridge.ipc import StarVLAIPCClient, StarVLAIPCError, serve_policy
 
