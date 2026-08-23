@@ -36,7 +36,10 @@ Launcher options:
   -h, --help             show this help without starting either process
 
 Evaluation options are forwarded to starvla_bridge.evaluate_simpler, including:
-  --tasks TASKS --action-horizon 1 --preflight-only --smoke-test
+  --tasks TASKS --action-horizon 1 --max-steps 120
+  --action-postprocessing adaptive_ensemble_v1|first_action
+  --episode-protocol starvla_reference_24|robustness_3seed_288
+  --preflight-only --smoke-test
   --save-videos-path PATH --overwrite
 
 With --model-devices, each listed GPU loads a complete model replica and all

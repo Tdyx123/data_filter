@@ -10,7 +10,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from qwen_vl_common.backbone import ModelContractError, inspect_qwen_config
-from simpler_bridge.evaluation import SimplerEvaluationError
+from simpler_bridge.evaluation import SimplerEvaluationError, select_first_action
 
 from .checkpointing import CHECKPOINT_FORMAT
 from .config import ConfigError, validate_config
@@ -214,6 +214,12 @@ class OFTPolicyAdapter:
 
     def make_generator(self, seed: int) -> int:
         return int(seed)
+
+    def begin_episode(self, instruction: str) -> None:
+        del instruction
+
+    def select_action(self, actions: np.ndarray) -> np.ndarray:
+        return select_first_action(actions)
 
     def prepare_observation(
         self,

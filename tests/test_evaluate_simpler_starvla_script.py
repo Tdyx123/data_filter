@@ -471,6 +471,8 @@ def test_starvla_dependency_file_and_readme_preserve_the_current_pyenv_stack():
     assert "miniconda3-3.12-25.11.1-1" in readme
     assert "scripts/evaluate_simpler_starvla.sh" in readme
     assert "/data/dwb/models/Qwen3VL-GR00T-Bridge-RT-1" in readme
-    assert "每次只执行动作块的第一个动作" in readme
+    assert "`adaptive_ensemble_v1`" in readme
+    assert "`--action-postprocessing first_action`" in readme
+    assert "`starvla_reference_24`" in readme
     assert "共 288 回合" in readme
     assert "`--action-horizon` 的唯一合法值为 `1`" in readme

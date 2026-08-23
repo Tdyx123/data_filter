@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from simpler_bridge.evaluation import SimplerEvaluationError
+from simpler_bridge.evaluation import SimplerEvaluationError, select_first_action
 
 from .ipc import IPC_PROTOCOL_VERSION
 
@@ -62,6 +62,12 @@ class OctoRemotePolicy:
 
     def make_generator(self, seed: int) -> int:
         return int(self.client.reset_rng(int(seed)))
+
+    def begin_episode(self, instruction: str) -> None:
+        del instruction
+
+    def select_action(self, actions: np.ndarray) -> np.ndarray:
+        return select_first_action(actions)
 
     def prepare_observation(
         self,

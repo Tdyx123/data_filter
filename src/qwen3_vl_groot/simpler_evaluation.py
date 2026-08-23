@@ -26,6 +26,7 @@ from simpler_bridge.evaluation import (  # noqa: F401
     image_from_simpler_observation,
     parse_sim_device,
     resolve_task_selection,
+    select_first_action,
     validate_simpler_source,
 )
 
@@ -176,6 +177,12 @@ class QwenPolicyAdapter:
 
     def make_generator(self, seed: int) -> Any:
         return self.policy.make_generator(seed)
+
+    def begin_episode(self, instruction: str) -> None:
+        del instruction
+
+    def select_action(self, actions: np.ndarray) -> np.ndarray:
+        return select_first_action(actions)
 
     def prepare_observation(
         self,

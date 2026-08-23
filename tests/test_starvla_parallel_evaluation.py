@@ -136,6 +136,9 @@ parser.add_argument("--tasks", default="all")
 parser.add_argument("--shard-index", type=int, default=0)
 parser.add_argument("--shard-count", type=int, default=1)
 parser.add_argument("--rng-scope", default="per_policy_seed_stream")
+parser.add_argument("--action-postprocessing", default="adaptive_ensemble_v1")
+parser.add_argument("--max-steps", type=int, default=120)
+parser.add_argument("--episode-protocol", default="starvla_reference_24")
 parser.add_argument("--smoke-test", action="store_true")
 parser.add_argument("--preflight-only", action="store_true")
 parser.add_argument("--overwrite", action="store_true")
@@ -147,6 +150,8 @@ with Path(os.environ["STARVLA_PARALLEL_TEST_SIM_CALLS"]).open("a", encoding="utf
         "shard_index": parsed.shard_index,
         "shard_count": parsed.shard_count,
         "rng_scope": parsed.rng_scope,
+        "action_postprocessing": parsed.action_postprocessing,
+        "max_steps": parsed.max_steps,
         "pid": os.getpid(),
     }) + "\n")
 if os.environ.get("STARVLA_PARALLEL_TEST_FAIL_SHARD") == str(parsed.shard_index):
@@ -185,7 +190,7 @@ if parsed.preflight_only:
     (parsed.output_dir / "preflight.json").write_text(json.dumps(report), encoding="utf-8")
 else:
     task_keys = ["spoon", "carrot", "stack", "eggplant"] if parsed.tasks == "all" else parsed.tasks.split(",")
-    policy_seeds = [0] if parsed.smoke_test else [0, 2, 4]
+    policy_seeds = [0] if parsed.smoke_test or parsed.episode_protocol == "starvla_reference_24" else [0, 2, 4]
     object_episode_ids = [0] if parsed.smoke_test else list(range(24))
     episodes = []
     canonical_index = 0
@@ -219,7 +224,10 @@ else:
         "object_episode_ids": object_episode_ids,
         "planned_episodes": len(task_keys) * len(policy_seeds) * len(object_episode_ids),
         "action_horizon": 1,
-        "execution_mode": "stepwise_first_action",
+        "execution_mode": parsed.action_postprocessing,
+        "instruction_source": "environment",
+        "max_steps_override": parsed.max_steps,
+        "episode_protocol": parsed.episode_protocol,
         "environment_lifecycle": "one_per_task",
         "sim_renderer_device": parsed.sim_device,
         "rng_scope": "per_episode",
@@ -227,6 +235,10 @@ else:
         "shard_index": parsed.shard_index,
         "shard_count": parsed.shard_count,
         "native_action_chunk_size": 16,
+        "action_postprocessing": parsed.action_postprocessing,
+        "adaptive_ensemble_horizon": 7 if parsed.action_postprocessing == "adaptive_ensemble_v1" else None,
+        "adaptive_ensemble_alpha": 0.1 if parsed.action_postprocessing == "adaptive_ensemble_v1" else None,
+        "gripper_binarization": "before_action_ensemble" if parsed.action_postprocessing == "adaptive_ensemble_v1" else "at_environment_conversion",
         "model": metadata["model"],
         "starvla_source_commit": metadata["starvla_source_commit"],
         "checkpoint_tensor_count": metadata["checkpoint_tensor_count"],
@@ -658,11 +670,18 @@ def test_parallel_coordinator_runs_starvla_replicas_and_shared_renderer_workers(
     assert {call["rng_scope"] for call in sim_calls} == {"per_episode"}
     assert {call["sim_device"] for call in sim_calls} == {"cuda:7"}
     report = json.loads((output_dir / "results.json").read_text())
-    assert report["summary"]["completed_episodes"] == 72
+    assert report["summary"]["completed_episodes"] == 24
     assert report["protocol"]["parallel_workers"] == 2
     assert report["protocol"]["environment_lifecycle"] == "one_per_task_per_worker"
+    assert report["protocol"]["execution_mode"] == "adaptive_ensemble_v1"
+    assert report["protocol"]["action_postprocessing"] == "adaptive_ensemble_v1"
+    assert report["protocol"]["adaptive_ensemble_horizon"] == 7
+    assert report["protocol"]["adaptive_ensemble_alpha"] == 0.1
+    assert report["protocol"]["instruction_source"] == "environment"
+    assert report["protocol"]["max_steps_override"] == 120
+    assert report["protocol"]["episode_protocol"] == "starvla_reference_24"
     assert report["runtime"]["model_devices"] == ["cuda:0", "cuda:2"]
-    assert len((output_dir / "episodes.jsonl").read_text().splitlines()) == 72
+    assert len((output_dir / "episodes.jsonl").read_text().splitlines()) == 24
 
 
 def test_parallel_preflight_loads_every_model_but_runs_one_simulator(tmp_path, monkeypatch):

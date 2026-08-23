@@ -6,15 +6,36 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from simpler_bridge.evaluation import SimplerEvaluationError
+from simpler_bridge.evaluation import SimplerEvaluationError, select_first_action
+
+from .action_ensemble import AdaptiveActionEnsembler
+
+
+ACTION_POSTPROCESSING_MODES = ("adaptive_ensemble_v1", "first_action")
+ADAPTIVE_ENSEMBLE_HORIZON = 7
+ADAPTIVE_ENSEMBLE_ALPHA = 0.1
 
 
 class StarVLARemotePolicy:
     policy_name = "Qwen3VL-GR00T-Bridge-RT-1"
     gripper_threshold = 0.5
 
-    def __init__(self, client: Any):
+    def __init__(
+        self,
+        client: Any,
+        *,
+        action_postprocessing: str = "adaptive_ensemble_v1",
+    ):
+        if action_postprocessing not in ACTION_POSTPROCESSING_MODES:
+            raise SimplerEvaluationError(
+                "StarVLA action_postprocessing must be adaptive_ensemble_v1 or first_action"
+            )
         self.client = client
+        self.action_postprocessing = action_postprocessing
+        self._action_ensembler = AdaptiveActionEnsembler(
+            horizon=ADAPTIVE_ENSEMBLE_HORIZON,
+            alpha=ADAPTIVE_ENSEMBLE_ALPHA,
+        )
         metadata = dict(client.metadata())
         if metadata.get("protocol_version") != 2:
             raise SimplerEvaluationError(
@@ -39,6 +60,10 @@ class StarVLARemotePolicy:
 
     def make_generator(self, seed: int) -> int:
         return int(self.client.reset_rng(int(seed)))
+
+    def begin_episode(self, instruction: str) -> None:
+        del instruction
+        self._action_ensembler.reset()
 
     def prepare_observation(
         self,
@@ -78,9 +103,30 @@ class StarVLARemotePolicy:
             )
         return actions
 
+    def select_action(self, actions: np.ndarray) -> np.ndarray:
+        if self.action_postprocessing == "first_action":
+            return select_first_action(actions)
+        return self._action_ensembler.select_action(actions)
+
     def protocol_metadata(self) -> dict[str, Any]:
         return {
             "native_action_chunk_size": 16,
+            "action_postprocessing": self.action_postprocessing,
+            "adaptive_ensemble_horizon": (
+                ADAPTIVE_ENSEMBLE_HORIZON
+                if self.action_postprocessing == "adaptive_ensemble_v1"
+                else None
+            ),
+            "adaptive_ensemble_alpha": (
+                ADAPTIVE_ENSEMBLE_ALPHA
+                if self.action_postprocessing == "adaptive_ensemble_v1"
+                else None
+            ),
+            "gripper_binarization": (
+                "before_action_ensemble"
+                if self.action_postprocessing == "adaptive_ensemble_v1"
+                else "at_environment_conversion"
+            ),
             "model": self._metadata.get("model", self.policy_name),
             "starvla_source_commit": self._metadata.get("starvla_source_commit"),
             "checkpoint_tensor_count": self._metadata.get("checkpoint_tensor_count"),

@@ -404,7 +404,12 @@ def _augment_preflight(
 def run_parallel(arguments: argparse.Namespace) -> dict[str, Any]:
     evaluation = _evaluation_arguments(arguments)
     tasks = resolve_task_selection(evaluation.tasks)
-    policy_seeds = (0,) if evaluation.smoke_test else (0, 2, 4)
+    policy_seeds = (
+        (0,)
+        if evaluation.smoke_test
+        or evaluation.episode_protocol == "starvla_reference_24"
+        else (0, 2, 4)
+    )
     object_episode_ids = (0,) if evaluation.smoke_test else tuple(range(24))
     planned_episodes = len(tasks) * len(policy_seeds) * len(object_episode_ids)
     requested_devices = tuple(arguments.model_devices)

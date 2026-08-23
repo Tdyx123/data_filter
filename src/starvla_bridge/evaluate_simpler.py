@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
@@ -27,11 +28,12 @@ from simpler_bridge.evaluation import (
 )
 
 from .ipc import StarVLAIPCClient, StarVLAIPCError
-from .simpler_evaluation import StarVLARemotePolicy
+from .simpler_evaluation import ACTION_POSTPROCESSING_MODES, StarVLARemotePolicy
 
 
 EVALUATION_ROUTE = "qwen3vl-groot-starvla-simpler-widowx-eval"
 PREFLIGHT_ROUTE = "qwen3vl-groot-starvla-simpler-widowx-preflight"
+EPISODE_PROTOCOLS = ("starvla_reference_24", "robustness_3seed_288")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,6 +50,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("outputs/starvla_simpler_eval"),
     )
     parser.add_argument("--action-horizon", type=int, choices=(1,), default=1)
+    parser.add_argument(
+        "--action-postprocessing",
+        choices=ACTION_POSTPROCESSING_MODES,
+        default="adaptive_ensemble_v1",
+    )
+    parser.add_argument("--max-steps", type=int, default=120)
+    parser.add_argument(
+        "--episode-protocol",
+        choices=EPISODE_PROTOCOLS,
+        default="starvla_reference_24",
+    )
     parser.add_argument("--sim-device", type=parse_sim_device, default="cuda:0")
     parser.add_argument("--save-videos-path", type=Path, default=None)
     parser.add_argument("--video-fps", type=int, default=5)
@@ -97,16 +110,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if arguments.video_fps <= 0:
             raise SimplerEvaluationError("--video-fps must be positive")
+        if arguments.max_steps <= 0:
+            raise SimplerEvaluationError("--max-steps must be positive")
         try:
             authkey = bytes.fromhex(arguments.auth_key_hex)
         except ValueError as error:
             raise SimplerEvaluationError("--auth-key-hex must contain valid hex bytes") from error
         if not authkey:
             raise SimplerEvaluationError("--auth-key-hex must be non-empty")
-        tasks = resolve_task_selection(arguments.tasks)
+        tasks = tuple(
+            dataclasses.replace(task, max_steps=arguments.max_steps)
+            for task in resolve_task_selection(arguments.tasks)
+        )
         source_versions = validate_simpler_source(default_simpler_root())
         client = StarVLAIPCClient(arguments.socket, authkey=authkey)
-        policy = StarVLARemotePolicy(client)
+        policy = StarVLARemotePolicy(
+            client,
+            action_postprocessing=arguments.action_postprocessing,
+        )
         metadata = policy.metadata
         settings = SimplerRunSettings(
             output_dir=arguments.output_dir,
@@ -114,15 +135,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             device=f"remote-pyenv:{policy.model_device}",
             sim_device=arguments.sim_device,
             action_horizon=arguments.action_horizon,
-            policy_seeds=(0,) if arguments.smoke_test else POLICY_SEEDS,
+            policy_seeds=(
+                (0,)
+                if arguments.smoke_test
+                or arguments.episode_protocol == "starvla_reference_24"
+                else POLICY_SEEDS
+            ),
             object_episode_ids=(0,) if arguments.smoke_test else OBJECT_EPISODE_IDS,
-            max_steps=8 if arguments.smoke_test else None,
+            max_steps=8 if arguments.smoke_test else arguments.max_steps,
             save_videos_path=arguments.save_videos_path,
             video_fps=arguments.video_fps,
             overwrite=arguments.overwrite,
             shard_index=arguments.shard_index,
             shard_count=arguments.shard_count,
             rng_scope=arguments.rng_scope,
+            execution_mode=arguments.action_postprocessing,
+            instruction_source="environment",
+            episode_protocol=arguments.episode_protocol,
         )
         checkpoint = {
             key: metadata.get(key)
