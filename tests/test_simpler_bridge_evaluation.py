@@ -107,9 +107,19 @@ class _Adapter:
     def __init__(self):
         self.prepared = []
         self.generators = []
+        self.episode_instructions = []
+        self.selected_chunks = []
 
     def make_generator(self, seed):
         return f"generator-{seed}"
+
+    def begin_episode(self, instruction):
+        self.episode_instructions.append(instruction)
+
+    def select_action(self, actions):
+        chunk = np.asarray(actions)
+        self.selected_chunks.append(chunk.copy())
+        return chunk[0, 0]
 
     def prepare_observation(self, image, proprio, instruction):
         value = {
@@ -262,6 +272,37 @@ def test_full_shared_protocol_plans_four_by_twenty_four_by_three_episodes(tmp_pa
     assert protocol["planned_episodes"] == 288
 
 
+def test_shared_protocol_records_policy_execution_and_instruction_source(tmp_path):
+    shared = importlib.import_module("simpler_bridge.evaluation")
+    settings = shared.SimplerRunSettings(
+        output_dir=tmp_path / "results",
+        tasks=(shared.SIMPLER_TASKS[0],),
+        policy_seeds=(0,),
+        object_episode_ids=(0,),
+        max_steps=120,
+        execution_mode="adaptive_ensemble_v1",
+        instruction_source="environment",
+        episode_protocol="starvla_reference_24",
+    )
+
+    protocol = shared._protocol(
+        settings,
+        {
+            "action_postprocessing": "adaptive_ensemble_v1",
+            "adaptive_ensemble_horizon": 7,
+            "adaptive_ensemble_alpha": 0.1,
+        },
+    )
+
+    assert protocol["execution_mode"] == "adaptive_ensemble_v1"
+    assert protocol["instruction_source"] == "environment"
+    assert protocol["episode_protocol"] == "starvla_reference_24"
+    assert protocol["max_steps_override"] == 120
+    assert protocol["environment_lifecycle"] == "one_per_task"
+    assert protocol["adaptive_ensemble_horizon"] == 7
+    assert protocol["adaptive_ensemble_alpha"] == 0.1
+
+
 def test_shared_episode_runner_uses_a_model_independent_policy_adapter():
     shared = importlib.import_module("simpler_bridge.evaluation")
     environment = _Environment()
@@ -286,6 +327,66 @@ def test_shared_episode_runner_uses_a_model_independent_policy_adapter():
     assert len(frames) == 2
     assert adapter.prepared[0]["instruction"] == "Put Spoon on Towel"
     assert adapter.generators == ["generator-2"]
+    assert adapter.episode_instructions == ["Put Spoon on Towel"]
+    assert len(adapter.selected_chunks) == 1
+
+
+def test_shared_episode_runner_executes_the_action_selected_by_the_adapter():
+    shared = importlib.import_module("simpler_bridge.evaluation")
+    environment = _Environment()
+
+    class TailSelectingAdapter(_Adapter):
+        def predict_actions(self, prepared, *, generator):
+            actions = np.zeros((1, 8, 7), dtype=np.float32)
+            actions[0, 0, 0] = 1.0
+            actions[0, -1, 0] = 7.0
+            actions[..., 6] = 1.0
+            return actions
+
+        def select_action(self, actions):
+            return np.asarray(actions)[0, -1]
+
+    shared.run_simpler_episode(
+        task=shared.SIMPLER_TASKS[0],
+        object_episode_id=0,
+        policy_seed=0,
+        policy=TailSelectingAdapter(),
+        environment=environment,
+        generator="generator-0",
+        action_horizon=1,
+        max_steps=1,
+        capture_video=False,
+    )
+
+    assert environment.actions[0][0] == 7.0
+
+
+def test_shared_episode_runner_uses_the_environment_instruction_when_requested():
+    shared = importlib.import_module("simpler_bridge.evaluation")
+
+    class EnvironmentInstruction(_Environment):
+        def get_language_instruction(self):
+            return "put the spoon on the towel"
+
+    environment = EnvironmentInstruction()
+    adapter = _Adapter()
+
+    episode, _ = shared.run_simpler_episode(
+        task=shared.SIMPLER_TASKS[0],
+        object_episode_id=0,
+        policy_seed=0,
+        policy=adapter,
+        environment=environment,
+        generator="generator-0",
+        action_horizon=1,
+        max_steps=1,
+        capture_video=False,
+        instruction_source="environment",
+    )
+
+    assert episode["instruction"] == "put the spoon on the towel"
+    assert adapter.episode_instructions == ["put the spoon on the towel"]
+    assert adapter.prepared[0]["instruction"] == "put the spoon on the towel"
 
 
 def test_shared_episode_runner_uses_adapter_gripper_threshold():

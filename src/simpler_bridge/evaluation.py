@@ -67,6 +67,9 @@ class SimplerRunSettings:
     shard_index: int = 0
     shard_count: int = 1
     rng_scope: str = "per_policy_seed_stream"
+    execution_mode: str = "stepwise_first_action"
+    instruction_source: str = "task_spec"
+    episode_protocol: str = "robustness_3seed_288"
 
 
 class SimplerPolicyAdapter(Protocol):
@@ -76,6 +79,8 @@ class SimplerPolicyAdapter(Protocol):
     gripper_threshold: float
 
     def make_generator(self, seed: int) -> Any: ...
+
+    def begin_episode(self, instruction: str) -> None: ...
 
     def prepare_observation(
         self,
@@ -88,7 +93,26 @@ class SimplerPolicyAdapter(Protocol):
 
     def predict_actions(self, prepared: Any, *, generator: Any) -> Any: ...
 
+    def select_action(self, actions: np.ndarray) -> np.ndarray: ...
+
     def protocol_metadata(self) -> Mapping[str, Any]: ...
+
+
+def select_first_action(actions: np.ndarray) -> np.ndarray:
+    """Return the first action while preserving the historical adapter behavior."""
+
+    chunk = np.asarray(actions, dtype=np.float32)
+    if (
+        chunk.ndim != 3
+        or chunk.shape[0] != 1
+        or chunk.shape[1] < 1
+        or chunk.shape[2] != 7
+        or not np.all(np.isfinite(chunk))
+    ):
+        raise SimplerEvaluationError(
+            f"first-action selection expects finite (1, T, 7) actions; found {chunk.shape}"
+        )
+    return chunk[0, 0].copy()
 
 
 SIMPLER_TASKS = (
@@ -439,6 +463,7 @@ def run_simpler_episode(
     max_steps: int,
     capture_video: bool,
     inference_seed: int | None = None,
+    instruction_source: str = "task_spec",
 ) -> tuple[dict[str, Any], list[np.ndarray]]:
     """Run one official WidowX episode through a model-specific adapter."""
 
@@ -461,6 +486,12 @@ def run_simpler_episode(
             f"SimplerEnv reset failed for task {task.key}: {type(error).__name__}: {error}"
         ) from error
 
+    instruction = _resolve_instruction(
+        task=task,
+        environment=environment,
+        instruction_source=instruction_source,
+    )
+    policy.begin_episode(instruction)
     frames = [image_from_simpler_observation(observation)] if capture_video else []
     steps = 0
     success = False
@@ -469,7 +500,7 @@ def run_simpler_episode(
     while steps < max_steps and not success and not truncated:
         source_image = image_from_simpler_observation(observation)
         proprio = environment_to_bridge_proprio(environment)
-        prepared = policy.prepare_observation(source_image, proprio, task.instruction)
+        prepared = policy.prepare_observation(source_image, proprio, instruction)
         predicted = policy.predict_actions(prepared, generator=generator)
         if hasattr(predicted, "detach"):
             predicted = predicted.detach().float().cpu().numpy()
@@ -485,8 +516,15 @@ def run_simpler_episode(
                 f"{policy_name} returned actions with shape {actions.shape}; "
                 "expected (1, T, 7) with T >= 1"
             )
+        selected_action = np.asarray(policy.select_action(actions), dtype=np.float32)
+        if selected_action.shape != (7,) or not np.all(np.isfinite(selected_action)):
+            policy_name = str(getattr(policy, "policy_name", "policy"))
+            raise SimplerEvaluationError(
+                f"{policy_name} selected an invalid action with shape {selected_action.shape}; "
+                "expected one finite 7D action"
+            )
         simpler_action = bridge_actions_to_simpler(
-            actions[0, 0],
+            selected_action,
             gripper_threshold=float(getattr(policy, "gripper_threshold", 0.5)),
         )
         observation, success, truncated, last_info = _step_environment(environment, simpler_action)
@@ -500,7 +538,7 @@ def run_simpler_episode(
     termination = "success" if success else "truncated" if truncated else "max_steps"
     episode = {
         "task": task.key,
-        "instruction": task.instruction,
+        "instruction": instruction,
         "seed": int(policy_seed),
         "policy_seed": int(policy_seed),
         "object_episode_id": int(object_episode_id),
@@ -512,6 +550,37 @@ def run_simpler_episode(
     if inference_seed is not None:
         episode["inference_seed"] = int(inference_seed)
     return episode, frames
+
+
+def _resolve_instruction(
+    *,
+    task: SimplerTaskSpec,
+    environment: Any,
+    instruction_source: str,
+) -> str:
+    if instruction_source == "task_spec":
+        instruction = task.instruction
+    elif instruction_source == "environment":
+        getter = getattr(environment, "get_language_instruction", None)
+        if not callable(getter):
+            raise SimplerEvaluationError(
+                f"SimplerEnv task {task.key} does not expose get_language_instruction()"
+            )
+        try:
+            instruction = getter()
+        except Exception as error:
+            raise SimplerInfrastructureError(
+                f"Could not read SimplerEnv instruction for task {task.key}: "
+                f"{type(error).__name__}: {error}"
+            ) from error
+    else:
+        raise SimplerEvaluationError(
+            "instruction_source must be task_spec or environment"
+        )
+    text = str(instruction).strip()
+    if not text:
+        raise SimplerEvaluationError(f"SimplerEnv task {task.key} returned an empty instruction")
+    return text
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -617,6 +686,12 @@ def _validate_settings(settings: SimplerRunSettings) -> None:
         raise SimplerEvaluationError("shard_index must be in [0, shard_count)")
     if settings.rng_scope not in {"per_policy_seed_stream", "per_episode"}:
         raise SimplerEvaluationError("rng_scope must be per_policy_seed_stream or per_episode")
+    if not str(settings.execution_mode).strip():
+        raise SimplerEvaluationError("execution_mode must be non-empty")
+    if settings.instruction_source not in {"task_spec", "environment"}:
+        raise SimplerEvaluationError("instruction_source must be task_spec or environment")
+    if not str(settings.episode_protocol).strip():
+        raise SimplerEvaluationError("episode_protocol must be non-empty")
     if settings.shard_count > 1 and settings.rng_scope != "per_episode":
         raise SimplerEvaluationError("episode sharding requires rng_scope=per_episode")
 
@@ -667,7 +742,9 @@ def _protocol(
         "simulation_frequency_hz": 500,
         "control_mode": CONTROL_MODE,
         "action_horizon": settings.action_horizon,
-        "execution_mode": "stepwise_first_action",
+        "execution_mode": settings.execution_mode,
+        "instruction_source": settings.instruction_source,
+        "episode_protocol": settings.episode_protocol,
         "sim_renderer_device": settings.sim_device,
         "sim_renderer_offscreen_only": True,
         "environment_lifecycle": "one_per_task",
@@ -757,6 +834,7 @@ def evaluate_simpler_policy(
                             max_steps=settings.max_steps or task.max_steps,
                             capture_video=settings.save_videos_path is not None,
                             inference_seed=inference_seed,
+                            instruction_source=settings.instruction_source,
                         )
                     except (SimplerEvaluationError, SimplerInfrastructureError):
                         raise
@@ -1009,10 +1087,16 @@ def run_simpler_preflight(
                 ) from error
             source_image = image_from_simpler_observation(observation)
             proprio = environment_to_bridge_proprio(environment)
+            instruction = _resolve_instruction(
+                task=task,
+                environment=environment,
+                instruction_source=settings.instruction_source,
+            )
+            policy.begin_episode(instruction)
             prepared = policy.prepare_observation(
                 source_image,
                 proprio,
-                task.instruction,
+                instruction,
             )
             input_metadata = dict(policy.describe_observation(prepared))
             if inference is None:
@@ -1031,8 +1115,18 @@ def run_simpler_preflight(
                         f"{policy_name} preflight returned actions with shape "
                         f"{predicted_actions.shape}; expected (1, T, 7) with T >= 1"
                     )
+                selected_action = np.asarray(
+                    policy.select_action(predicted_actions),
+                    dtype=np.float32,
+                )
+                if selected_action.shape != (7,) or not np.all(np.isfinite(selected_action)):
+                    policy_name = str(getattr(policy, "policy_name", "policy"))
+                    raise SimplerEvaluationError(
+                        f"{policy_name} preflight selected an invalid action with shape "
+                        f"{selected_action.shape}; expected one finite 7D action"
+                    )
                 bridge_actions_to_simpler(
-                    predicted_actions[0, 0],
+                    selected_action,
                     gripper_threshold=float(getattr(policy, "gripper_threshold", 0.5)),
                 )
                 inference = {

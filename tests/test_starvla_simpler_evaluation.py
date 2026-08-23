@@ -88,6 +88,43 @@ def test_remote_policy_rejects_protocol_version_one():
         StarVLARemotePolicy(client)
 
 
+def test_remote_policy_defaults_to_adaptive_ensemble_and_resets_each_episode():
+    from starvla_bridge.simpler_evaluation import StarVLARemotePolicy
+
+    policy = StarVLARemotePolicy(_FakeClient())
+    first = np.zeros((1, 16, 7), dtype=np.float32)
+    first[0, 1, 0] = 4.0
+    second = np.zeros((1, 16, 7), dtype=np.float32)
+    second[0, 0, 0] = 2.0
+
+    policy.begin_episode("put the spoon on the towel")
+    policy.select_action(first)
+    integrated = policy.select_action(second)
+    assert integrated[0] > 2.0
+
+    policy.begin_episode("put carrot on plate")
+    np.testing.assert_allclose(policy.select_action(second), second[0, 0])
+    protocol = policy.protocol_metadata()
+    assert protocol["action_postprocessing"] == "adaptive_ensemble_v1"
+    assert protocol["adaptive_ensemble_horizon"] == 7
+    assert protocol["adaptive_ensemble_alpha"] == 0.1
+    assert protocol["gripper_binarization"] == "before_action_ensemble"
+
+
+def test_remote_policy_first_action_mode_preserves_the_existing_ablation():
+    from starvla_bridge.simpler_evaluation import StarVLARemotePolicy
+
+    policy = StarVLARemotePolicy(_FakeClient(), action_postprocessing="first_action")
+    actions = np.zeros((1, 16, 7), dtype=np.float32)
+    actions[0, 0] = np.arange(7, dtype=np.float32)
+    actions[0, 1] = 99.0
+
+    policy.begin_episode("put the spoon on the towel")
+
+    np.testing.assert_array_equal(policy.select_action(actions), actions[0, 0])
+    assert policy.protocol_metadata()["action_postprocessing"] == "first_action"
+
+
 def test_starvla_first_action_uses_world_euler_axis_angle_and_binary_gripper():
     from simpler_bridge.evaluation import bridge_actions_to_simpler
 
@@ -107,7 +144,7 @@ def test_starvla_first_action_uses_world_euler_axis_angle_and_binary_gripper():
     assert bridge_actions_to_simpler(action, gripper_threshold=0.5)[6] == -1.0
 
 
-def test_starvla_cli_defaults_to_full_stepwise_protocol():
+def test_starvla_cli_defaults_to_reference_adaptive_ensemble_protocol():
     from starvla_bridge.evaluate_simpler import build_parser
 
     parser = build_parser()
@@ -122,12 +159,35 @@ def test_starvla_cli_defaults_to_full_stepwise_protocol():
 
     assert arguments.tasks == "all"
     assert arguments.action_horizon == 1
+    assert arguments.action_postprocessing == "adaptive_ensemble_v1"
+    assert arguments.max_steps == 120
+    assert arguments.episode_protocol == "starvla_reference_24"
     assert arguments.sim_device == "cuda:0"
     assert arguments.output_dir.name == "starvla_simpler_eval"
     assert arguments.smoke_test is False
     assert arguments.shard_index == 0
     assert arguments.shard_count == 1
     assert arguments.rng_scope == "per_policy_seed_stream"
+    assert parser.parse_args(
+        [
+            "--socket",
+            "/tmp/policy.sock",
+            "--auth-key-hex",
+            "001122",
+            "--action-postprocessing",
+            "first_action",
+        ]
+    ).action_postprocessing == "first_action"
+    assert parser.parse_args(
+        [
+            "--socket",
+            "/tmp/policy.sock",
+            "--auth-key-hex",
+            "001122",
+            "--episode-protocol",
+            "robustness_3seed_288",
+        ]
+    ).episode_protocol == "robustness_3seed_288"
     assert parser.parse_args(
         [
             "--socket",
@@ -192,7 +252,11 @@ def test_starvla_cli_keeps_remote_model_device_and_forwards_sim_device(
         protocol_metadata=lambda: {},
     )
     monkeypatch.setattr(evaluate_simpler, "StarVLAIPCClient", Client)
-    monkeypatch.setattr(evaluate_simpler, "StarVLARemotePolicy", lambda client: policy)
+    def make_policy(client, *, action_postprocessing):
+        captured["action_postprocessing"] = action_postprocessing
+        return policy
+
+    monkeypatch.setattr(evaluate_simpler, "StarVLARemotePolicy", make_policy)
     monkeypatch.setattr(evaluate_simpler, "validate_simpler_source", lambda path: {})
     monkeypatch.setattr(
         evaluate_simpler,
@@ -238,5 +302,12 @@ def test_starvla_cli_keeps_remote_model_device_and_forwards_sim_device(
     assert captured["settings"].shard_index == 1
     assert captured["settings"].shard_count == 3
     assert captured["settings"].rng_scope == "per_episode"
+    assert captured["settings"].policy_seeds == (0,)
+    assert captured["settings"].episode_protocol == "starvla_reference_24"
+    assert captured["settings"].instruction_source == "environment"
+    assert captured["settings"].execution_mode == "adaptive_ensemble_v1"
+    assert captured["settings"].max_steps == 120
+    assert captured["settings"].tasks[0].max_steps == 120
+    assert captured["action_postprocessing"] == "adaptive_ensemble_v1"
     assert captured["builder"] == ("spoon", "cuda:7")
     assert captured["shutdown"] is True

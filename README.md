@@ -984,14 +984,19 @@ episode，并分别写入 `outputs/qwen_libero_eval/task-0/` 到 `task-9/`。单
 `--num-envs` 仍控制 LIBERO 仿真并行度。已有结果不会自动覆盖，重复正式评测需传
 `--overwrite`。
 
-### SimplerEnv 统一逐步动作协议
+### SimplerEnv 共享闭环动作协议
 
-Qwen、Octo-small 和 StarVLA 三类入口使用相同执行语义：每个环境步都重新推理原生
-动作块，每次只执行动作块的第一个动作，不缓存或复用后续动作，也不启用 temporal
-ensemble。`--action-horizon` 的唯一合法值为 `1`；旧值 `8` 会在启动参数解析阶段直接
-失败。正式口径统一为 4 个任务 × 24 个 object episode × 策略种子 `0,2,4`，
-共 288 回合。结果协议记录 `execution_mode: stepwise_first_action`、
-`action_horizon: 1` 和模型自己的 `native_action_chunk_size`。
+Qwen、Octo-small 和 StarVLA 三类入口都会在每个环境步重新推理原生动作块，且每个
+环境步只向仿真器发送一个动作；`--action-horizon` 的唯一合法值为 `1`。Qwen 和
+Octo-small 保持 `stepwise_first_action`：直接执行动作块首项。StarVLA 默认使用
+`adaptive_ensemble_v1`：先把每个 `(1,16,7)` chunk 的 gripper 按严格 `>0.5`
+二值化，再对最近 7 个重叠 chunk 按时间索引对齐，并用
+`exp(0.1 * cosine_similarity)` 权重集成当前动作。每个 episode 开始都会清空历史。
+
+StarVLA 默认统计口径为 `starvla_reference_24`：4 个任务 × object episode `0..23`
+× 策略 seed `0`，共 96 回合。`robustness_3seed_288` 才会扩展到策略 seed
+`0,2,4`、共 288 回合。结果协议明确记录 `execution_mode`、`action_postprocessing`、
+集成窗口与 alpha、`instruction_source`、`episode_protocol`、步数上限和环境生命周期。
 
 ### Qwen Bridge 的 SimplerEnv 四任务闭环评测
 
@@ -1172,12 +1177,32 @@ bash scripts/evaluate_simpler_qwen3vl_groot_rt1.sh \
   --smoke-test
 ```
 
-正式命令固定读取上述 `steps_20000_pytorch_model.pt`，运行 288 回合：
+正式参考命令固定读取上述 `steps_20000_pytorch_model.pt`，使用环境原始 instruction、
+每任务最多 120 步，并运行 96 回合：
 
 ```bash
 bash scripts/evaluate_simpler_qwen3vl_groot_rt1.sh \
   --tasks all \
   --output-dir outputs/starvla_simpler_eval
+```
+
+复现旧版“每步仅取 chunk 首动作”的单变量消融：
+
+```bash
+bash scripts/evaluate_simpler_qwen3vl_groot_rt1.sh \
+  --tasks all \
+  --action-postprocessing first_action \
+  --output-dir outputs/starvla_simpler_first_action_ablation
+```
+
+完成参考评测后，再运行三个策略 seed、共 288 回合的 robustness 扩展；该结果不应与
+StarVLA 单次 24-episode 的任务成功率直接混合比较：
+
+```bash
+bash scripts/evaluate_simpler_qwen3vl_groot_rt1.sh \
+  --tasks all \
+  --episode-protocol robustness_3seed_288 \
+  --output-dir outputs/starvla_simpler_robustness_288
 ```
 
 省略 `--model-devices` 时仍使用上述单卡路径，模型服务和 SimplerEnv 客户端通过一个
@@ -1227,11 +1252,14 @@ bash scripts/evaluate_simpler_qwen3vl_groot_rt1.sh \
 随机流，然后连续完成该 seed 的 24 个对象。多卡协调器则固定使用 `per_episode`：按
 canonical episode identity `(task, policy_seed, object_episode_id)` 通过确定性的 SHA-256
 派生独立 inference seed，因此结果不依赖 episode 被分到哪个 shard 或 worker 的完成
-顺序。StarVLA 每步返回原生 `(1,16,7)` 动作块，只执行首个动作；前六维按
-`oxe_bridge.action` 的 q01/q99 和 mask 反归一化，抓手保持 `[0,1]` 并以 `0.5` 为阈值。
+顺序。StarVLA 每步返回原生 `(1,16,7)` 动作块；默认先二值化抓手，再用 7-chunk、
+alpha 0.1 的自适应时间集成选择当前动作。`--action-postprocessing first_action` 只用于
+消融。前六维按 `oxe_bridge.action` 的 q01/q99 和 mask 反归一化；模型输入使用环境
+返回的原始语言 instruction。
 启动失败、客户端失败或收到 INT/TERM 时，脚本只回收本次启动的服务进程；单卡的
 `model-server.log` 或多卡每个副本的 `model-server-NN.log` 保留在输出目录。正式完成后
-`episodes.jsonl` 应恰有 288 条，`results.json` 按任务和三个策略种子汇总。
+默认参考协议完成后 `episodes.jsonl` 应恰有 96 条；robustness 协议则应有 288 条。
+`results.json` 会按任务和实际运行的策略 seed 汇总，并保留完整协议元数据。
 
 ## 测试
 

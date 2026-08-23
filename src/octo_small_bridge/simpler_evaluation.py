@@ -13,7 +13,7 @@ from typing import Any, Callable, Mapping
 import numpy as np
 from packaging.version import InvalidVersion, Version
 
-from simpler_bridge.evaluation import SimplerEvaluationError
+from simpler_bridge.evaluation import SimplerEvaluationError, select_first_action
 
 from .checkpoint_contract import (
     BridgeCheckpointContractError,
@@ -208,6 +208,12 @@ class OctoBridgeSimplerPolicy:
         import torch
 
         return torch.Generator(device=self.device).manual_seed(int(seed))
+
+    def begin_episode(self, instruction: str) -> None:
+        del instruction
+
+    def select_action(self, actions: np.ndarray) -> np.ndarray:
+        return select_first_action(actions)
 
     def prepare_observation(
         self,
