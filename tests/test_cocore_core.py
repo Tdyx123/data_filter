@@ -991,21 +991,136 @@ def test_random_multibranch_selects_the_highest_scoring_initial_branch() -> None
     assert result.selected_indices == (8, 0)
 
 
-def test_random_multibranch_ranks_recombination_clips_by_branch_frequency() -> None:
+def test_random_multibranch_ranks_committed_clips_by_frequency_then_seed() -> None:
     context = CocoreObjectiveContext(
-        _heap_graph(5), "cooccurrence", 1.0, similarity_threshold=0.8
+        _heap_graph(4), "cooccurrence", 1.0, similarity_threshold=0.8
+    )
+    selector = RandomMultiBranchSelector(context, seed=13)
+    counts = Counter({0: 1, 1: 1, 2: 1, 3: 1})
+
+    first = selector._rank_committed_indices(
+        [0, 1, 2, 3],
+        counts,
+        np.random.default_rng(3),
+        limit=4,
+    )
+    second = selector._rank_committed_indices(
+        [0, 1, 2, 3],
+        counts,
+        np.random.default_rng(19),
+        limit=4,
+    )
+    replayed = selector._rank_committed_indices(
+        [0, 1, 2, 3],
+        counts,
+        np.random.default_rng(3),
+        limit=4,
+    )
+
+    assert first == replayed
+    assert first != second
+    assert set(first) == {0, 1, 2, 3}
+    assert set(second) == {0, 1, 2, 3}
+
+
+def test_random_multibranch_ranks_retained_clips_by_frequency_then_reliability() -> None:
+    graph = _heap_graph(4)
+    graph.reliability = np.asarray([0.1, 0.9, 0.8, 0.7], dtype=np.float32)
+    context = CocoreObjectiveContext(
+        graph, "cooccurrence", 1.0, similarity_threshold=0.8
     )
     selector = RandomMultiBranchSelector(context, seed=13)
 
-    ranked = selector._rank_indices(
+    ranked = selector._rank_retained_indices(
         [0, 1, 2, 3],
-        Counter({0: 8, 1: 4, 2: 4, 3: 1}),
-        np.random.default_rng(13),
+        Counter({0: 2, 1: 1, 2: 1, 3: 1}),
         limit=3,
     )
 
-    assert ranked[0] == 0
-    assert set(ranked[1:]) == {1, 2}
+    assert ranked == (0, 1, 2)
+
+
+def test_random_multibranch_breaks_equal_retained_reliability_by_sample_id() -> None:
+    graph = _heap_graph(3)
+    graph.sample_ids = ["clip-c", "clip-a", "clip-b"]
+    graph.reliability = np.full(3, 0.5, dtype=np.float32)
+    context = CocoreObjectiveContext(
+        graph, "cooccurrence", 1.0, similarity_threshold=0.8
+    )
+    counts = Counter({0: 1, 1: 1, 2: 1})
+
+    first = RandomMultiBranchSelector(context, seed=3)._rank_retained_indices(
+        [0, 1, 2], counts, limit=3
+    )
+    second = RandomMultiBranchSelector(context, seed=19)._rank_retained_indices(
+        [0, 1, 2], counts, limit=3
+    )
+
+    assert first == (1, 2, 0)
+    assert second == first
+
+
+def test_random_multibranch_recombination_retains_reliability_ranked_clips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _heap_graph(100)
+    context = CocoreObjectiveContext(
+        graph, "cooccurrence", 1.0, similarity_threshold=0.8
+    )
+    monkeypatch.setattr("cocore.random_multibranch.BATCH_SIZE", 1)
+    monkeypatch.setattr("cocore.random_multibranch.FIRST_RECOMBINATION_ROUND", 2)
+    monkeypatch.setattr("cocore.random_multibranch.RECOMBINATION_INTERVAL", 10)
+    monkeypatch.setattr("cocore.random_multibranch.COMMIT_SIZE", 1)
+    monkeypatch.setattr("cocore.random_multibranch.RETAINED_SIZE", 1)
+
+    class ScheduledSelector(RandomMultiBranchSelector):
+        def __init__(self) -> None:
+            super().__init__(context, seed=13)
+            samples = list(range(1, 9))
+            first_children = [9, 9, 9, 10, 11, 12, 13, 14]
+            for parent, first_child in enumerate(first_children):
+                samples.extend(
+                    [first_child, 20 + 3 * parent, 21 + 3 * parent, 22 + 3 * parent]
+                )
+            samples.extend([99] * 32)
+            self.samples = iter(samples)
+            self.branch_ranking_calls = 0
+            self.retained_rankings: list[
+                tuple[tuple[int, ...], tuple[int, ...]]
+            ] = []
+
+        def _sample(self, rng, *, fixed, active, size):
+            del rng
+            assert size == 1
+            sampled = next(self.samples)
+            assert sampled not in fixed
+            assert sampled not in active
+            return (sampled,)
+
+        def _rank_branches(self, branches, rng, *, limit):
+            del rng
+            if len(branches) == 32:
+                self.branch_ranking_calls += 1
+                if self.branch_ranking_calls == 1:
+                    return [branches[index] for index in range(0, 32, 4)][:limit]
+            return branches[:limit]
+
+        def _rank_retained_indices(self, indices, counts, *, limit):
+            retained = super()._rank_retained_indices(indices, counts, limit=limit)
+            self.retained_rankings.append((tuple(indices), retained))
+            return retained
+
+    selector = ScheduledSelector()
+    result = selector.select(4, initial_indices=(0,))
+
+    assert selector.retained_rankings[3] == ((4, 10), (10,))
+    assert result.recombinations == 1
+    assert len(result.selected_indices) == 4
+    assert len(set(result.selected_indices)) == 4
+    replayed = CocoreObjectiveContext(
+        graph, "cooccurrence", 1.0, similarity_threshold=0.8
+    ).state_from_indices(result.selected_indices)
+    assert result.objective_value == pytest.approx(replayed.score)
 
 
 def test_random_multibranch_recombines_first_at_20_then_every_10_rounds() -> None:

@@ -161,7 +161,7 @@ class RandomMultiBranchSelector:
             ),
         )[:limit]
 
-    def _rank_indices(
+    def _rank_committed_indices(
         self,
         indices: tuple[int, ...] | list[int],
         counts: Counter[int],
@@ -175,6 +175,23 @@ class RandomMultiBranchSelector:
             key=lambda index: (
                 -counts[index],
                 tie_breakers[index],
+                self.context.graph.sample_ids[index],
+            ),
+        )
+        return tuple(ranked[:limit])
+
+    def _rank_retained_indices(
+        self,
+        indices: tuple[int, ...] | list[int],
+        counts: Counter[int],
+        *,
+        limit: int,
+    ) -> tuple[int, ...]:
+        ranked = sorted(
+            indices,
+            key=lambda index: (
+                -counts[index],
+                -float(self.context.graph.reliability[index]),
                 self.context.graph.sample_ids[index],
             ),
         )
@@ -396,7 +413,7 @@ class RandomMultiBranchSelector:
                 index for branch in branches for index in branch.active_indices
             )
             winner = branches[0]
-            committed = self._rank_indices(
+            committed = self._rank_committed_indices(
                 winner.active_indices,
                 counts,
                 rng,
@@ -421,10 +438,9 @@ class RandomMultiBranchSelector:
                 remaining = [
                     index for index in branch.active_indices if index not in fixed_set
                 ]
-                retained = self._rank_indices(
+                retained = self._rank_retained_indices(
                     remaining,
                     counts,
-                    rng,
                     limit=RETAINED_SIZE,
                 )
                 if len(retained) != RETAINED_SIZE:

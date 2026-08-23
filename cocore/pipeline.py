@@ -129,6 +129,10 @@ def _selection_algorithm(
             "commit_size": COMMIT_SIZE,
             "retained_size": RETAINED_SIZE,
             "seed": seed,
+            "recombination_ranking": {
+                "committed": "branch_frequency_then_seeded_random",
+                "retained": "branch_frequency_then_reliability_then_sample_id",
+            },
             "similarity_penalty": {
                 "backend": "faiss",
                 "index": "IndexFlatIP",

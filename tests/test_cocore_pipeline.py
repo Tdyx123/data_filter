@@ -603,6 +603,10 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
         "commit_size": 100,
         "retained_size": 100,
         "seed": 7,
+        "recombination_ranking": {
+            "committed": "branch_frequency_then_seeded_random",
+            "retained": "branch_frequency_then_reliability_then_sample_id",
+        },
         "similarity_penalty": {
             "backend": "faiss",
             "index": "IndexFlatIP",
