@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .faiss_penalty import FaissFlatPenaltyIndex, FaissFlatPenaltySpace
 from .objective import CocoreObjectiveContext, CocoreObjectiveUpdateState
 
 
@@ -19,8 +20,6 @@ FIRST_RECOMBINATION_ROUND = 20
 RECOMBINATION_INTERVAL = 10
 COMMIT_SIZE = 100
 RETAINED_SIZE = 100
-SIMILARITY_MAIN_SAMPLE_SIZE = 100
-SIMILARITY_RNG_STREAM = 1
 
 
 @dataclass(frozen=True)
@@ -58,6 +57,13 @@ class RandomMultiBranchSelector:
     def __init__(self, context: CocoreObjectiveContext, *, seed: int = 42) -> None:
         self.context = context
         self.seed = int(seed)
+        self.penalty_space = FaissFlatPenaltySpace(
+            context.graph.embeddings,
+            context.graph.reliability,
+            similarity_threshold=context.similarity_threshold,
+            redundancy_normalizer=context.redundancy_normalizer,
+            epsilon=context.epsilon,
+        )
 
     @staticmethod
     def _finite_score(state: CocoreObjectiveUpdateState) -> float:
@@ -116,29 +122,27 @@ class RandomMultiBranchSelector:
         update_state: CocoreObjectiveUpdateState,
         indices: tuple[int, ...],
         *,
-        similarity_main_indices: tuple[int, ...],
+        main_penalty_index: FaissFlatPenaltyIndex,
     ) -> CocoreObjectiveUpdateState:
+        active_penalty_index = self.penalty_space.create_index(
+            update_state.selected_indices
+        )
+        redundancy_deltas: list[float] = []
+        for index in indices:
+            redundancy_deltas.append(
+                self.penalty_space.penalty(
+                    index,
+                    (main_penalty_index, active_penalty_index),
+                )
+            )
+            active_penalty_index.add((index,))
         extended = self.context.extend_update_state(
             update_state,
             indices,
-            similarity_main_indices=similarity_main_indices,
+            redundancy_deltas=redundancy_deltas,
         )
         self._finite_score(extended)
         return extended
-
-    @staticmethod
-    def _sample_similarity_main(
-        rng: np.random.Generator,
-        fixed: tuple[int, ...] | list[int],
-    ) -> tuple[int, ...]:
-        if len(fixed) <= SIMILARITY_MAIN_SAMPLE_SIZE:
-            return tuple(fixed)
-        sampled = rng.choice(
-            np.asarray(fixed, dtype=np.int64),
-            size=SIMILARITY_MAIN_SAMPLE_SIZE,
-            replace=False,
-        )
-        return tuple(int(index) for index in sampled.tolist())
 
     def _rank_branches(
         self,
@@ -286,9 +290,6 @@ class RandomMultiBranchSelector:
         phases = ["coverage_seed"] * len(initial)
         steps = [0] * len(initial)
         rng = np.random.default_rng(self.seed)
-        similarity_rng = np.random.default_rng(
-            np.random.SeedSequence([self.seed, SIMILARITY_RNG_STREAM])
-        )
         round_runtime_seconds: list[float] = []
         recombination_runtime_seconds: list[tuple[int, float]] = []
         if len(fixed) == budget:
@@ -314,6 +315,7 @@ class RandomMultiBranchSelector:
             else self.context.state_from_indices(fixed)
         )
         root_update = self.context.empty_update_state(main_state)
+        main_penalty_index = self.penalty_space.create_index(fixed)
         initial_batch_size = min(BATCH_SIZE, budget - len(fixed))
         branches: list[_Branch] = []
         next_serial = 0
@@ -325,11 +327,10 @@ class RandomMultiBranchSelector:
                 active=(),
                 size=initial_batch_size,
             )
-            similarity_main = self._sample_similarity_main(similarity_rng, fixed)
             update_state = self._extend_update_state(
                 root_update,
                 active,
-                similarity_main_indices=similarity_main,
+                main_penalty_index=main_penalty_index,
             )
             branches.append(_Branch(update_state, next_serial))
             next_serial += 1
@@ -372,14 +373,10 @@ class RandomMultiBranchSelector:
                         active=branch.active_indices,
                         size=batch_size,
                     )
-                    similarity_main = self._sample_similarity_main(
-                        similarity_rng,
-                        fixed,
-                    )
                     update_state = self._extend_update_state(
                         branch.update_state,
                         added,
-                        similarity_main_indices=similarity_main,
+                        main_penalty_index=main_penalty_index,
                     )
                     children.append(_Branch(update_state, next_serial))
                     next_serial += 1
@@ -407,6 +404,7 @@ class RandomMultiBranchSelector:
             )
             fixed.extend(committed)
             fixed_set.update(committed)
+            main_penalty_index.add(committed)
             phases.extend(["branch_commit"] * len(committed))
             steps.extend([rounds] * len(committed))
             committed_clips += len(committed)
@@ -431,14 +429,10 @@ class RandomMultiBranchSelector:
                 )
                 if len(retained) != RETAINED_SIZE:
                     raise ValueError("recombination could not retain 100 active clips")
-                similarity_main = self._sample_similarity_main(
-                    similarity_rng,
-                    fixed,
-                )
                 update_state = self._extend_update_state(
                     root_update,
                     retained,
-                    similarity_main_indices=similarity_main,
+                    main_penalty_index=main_penalty_index,
                 )
                 recombined.append(_Branch(update_state, next_serial))
                 next_serial += 1

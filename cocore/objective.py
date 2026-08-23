@@ -226,43 +226,30 @@ class CocoreObjectiveContext:
         update_state: CocoreObjectiveUpdateState,
         indices: Sequence[int],
         *,
-        similarity_main_indices: Sequence[int],
+        redundancy_deltas: Sequence[float],
     ) -> CocoreObjectiveUpdateState:
         main = update_state.main_state
-        sample = tuple(int(index) for index in similarity_main_indices)
-        if len(sample) != len(set(sample)):
-            raise ValueError("similarity main indices cannot contain duplicates")
-        if any(
-            index < 0
-            or index >= len(self.graph.sample_ids)
-            or not main.selected_mask[index]
-            for index in sample
-        ):
-            raise ValueError("similarity main indices must belong to the main state")
-
         added = tuple(int(index) for index in indices)
+        added_redundancy = tuple(float(delta) for delta in redundancy_deltas)
+        if len(added_redundancy) != len(added):
+            raise ValueError("redundancy deltas must match added candidates")
+        if any(not math.isfinite(delta) or delta < 0.0 for delta in added_redundancy):
+            raise ValueError("redundancy deltas must be finite and non-negative")
         state = self.materialize_update_state(update_state)
-        penalty_selected = set(sample)
-        penalty_selected.update(update_state.selected_indices)
         relation_deltas = list(update_state.relation_deltas)
-        redundancy_deltas = list(update_state.redundancy_deltas)
-        for index in added:
+        accumulated_redundancy = list(update_state.redundancy_deltas)
+        for index, redundancy_delta in zip(
+            added,
+            added_redundancy,
+            strict=True,
+        ):
             previous_relation = float(state.relation)
             previous_redundancy = float(state.redundancy)
             self.add_candidate(state, index)
-            redundancy_delta = (
-                sum(
-                    penalty
-                    for other, penalty in self.redundancy_adjacency[index]
-                    if other in penalty_selected
-                )
-                / self.redundancy_normalizer
-            )
             state.redundancy = previous_redundancy + redundancy_delta
             state.score = self.relation_weight * state.relation - state.redundancy
-            penalty_selected.add(index)
             relation_deltas.append(float(state.relation) - previous_relation)
-            redundancy_deltas.append(float(redundancy_delta))
+            accumulated_redundancy.append(float(redundancy_delta))
         selected_indices = update_state.selected_indices + added
 
         prototype_indices = np.flatnonzero(
@@ -282,7 +269,7 @@ class CocoreObjectiveContext:
             main_state=main,
             selected_indices=selected_indices,
             relation_deltas=tuple(relation_deltas),
-            redundancy_deltas=tuple(redundancy_deltas),
+            redundancy_deltas=tuple(accumulated_redundancy),
             prototype_override_indices=prototype_indices,
             prototype_override_values=state.prototype_coverage[prototype_indices].copy(),
             sequence_override_flat_indices=sequence_indices,

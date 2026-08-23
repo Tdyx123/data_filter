@@ -212,12 +212,12 @@ def test_objective_update_state_materializes_without_mutating_shared_main(
     first = context.extend_update_state(
         root,
         (1,),
-        similarity_main_indices=(0,),
+        redundancy_deltas=(0.0,),
     )
     second = context.extend_update_state(
         root,
         (2,),
-        similarity_main_indices=(0,),
+        redundancy_deltas=(1.0,),
     )
     materialized = context.materialize_update_state(first)
     expected = context.state_from_indices([0, 1])
@@ -313,12 +313,12 @@ def test_sequence_update_state_accumulates_only_current_to_previous_edges() -> N
     parent = context.extend_update_state(
         root,
         (2,),
-        similarity_main_indices=(0, 1),
+        redundancy_deltas=(0.0,),
     )
     child = context.extend_update_state(
         parent,
         (3, 4),
-        similarity_main_indices=(0, 1),
+        redundancy_deltas=(0.0, 0.0),
     )
     materialized = context.materialize_update_state(child)
     denominator = np.log1p(6.0) + context.epsilon
@@ -400,12 +400,12 @@ def test_objective_update_state_accumulates_only_new_candidate_redundancy() -> N
     parent = context.extend_update_state(
         root,
         (2,),
-        similarity_main_indices=(0,),
+        redundancy_deltas=(1.0 / 8.0,),
     )
     child = context.extend_update_state(
         parent,
         (3, 4),
-        similarity_main_indices=(1,),
+        redundancy_deltas=(2.0 / 8.0, 3.0 / 8.0),
     )
 
     assert parent.redundancy == pytest.approx(1.0 / 8.0)
@@ -415,6 +415,47 @@ def test_objective_update_state_accumulates_only_new_candidate_redundancy() -> N
         (1.0 / 8.0, 2.0 / 8.0, 3.0 / 8.0)
     )
     assert child.score == pytest.approx(child.relation - child.redundancy)
+
+
+def test_objective_update_state_accumulates_explicit_redundancy_deltas() -> None:
+    context = CocoreObjectiveContext(
+        _heap_graph(4), "cooccurrence", relation_weight=1.0, similarity_threshold=0.8
+    )
+    main = context.state_from_indices([0])
+    root = context.empty_update_state(main)
+
+    parent = context.extend_update_state(root, (1,), redundancy_deltas=(0.125,))
+    child = context.extend_update_state(parent, (2, 3), redundancy_deltas=(0.25, 0.5))
+
+    assert parent.redundancy_deltas == pytest.approx((0.125,))
+    assert child.redundancy_deltas == pytest.approx((0.125, 0.25, 0.5))
+    assert child.redundancy == pytest.approx(0.875)
+    assert child.score == pytest.approx(child.relation - 0.875)
+
+
+@pytest.mark.parametrize(
+    ("indices", "redundancy_deltas"),
+    [
+        ((1,), ()),
+        ((1,), (-0.1,)),
+        ((1,), (float("nan"),)),
+    ],
+)
+def test_objective_update_state_rejects_invalid_redundancy_deltas(
+    indices: tuple[int, ...],
+    redundancy_deltas: tuple[float, ...],
+) -> None:
+    context = CocoreObjectiveContext(
+        _heap_graph(2), "cooccurrence", relation_weight=1.0, similarity_threshold=0.8
+    )
+    root = context.empty_update_state(context.state_from_indices([0]))
+
+    with pytest.raises(ValueError, match="redundancy deltas"):
+        context.extend_update_state(
+            root,
+            indices,
+            redundancy_deltas=redundancy_deltas,
+        )
 
 
 def test_objective_recombination_resets_and_replays_retained_redundancy() -> None:
@@ -431,7 +472,7 @@ def test_objective_recombination_resets_and_replays_retained_redundancy() -> Non
     before_recombination = context.extend_update_state(
         context.empty_update_state(main),
         (1, 2),
-        similarity_main_indices=(0,),
+        redundancy_deltas=(1.0 / 3.0, 2.0 / 3.0),
     )
 
     recombined_main = context.extend_state(main, [1])
@@ -439,7 +480,7 @@ def test_objective_recombination_resets_and_replays_retained_redundancy() -> Non
     replayed_retained = context.extend_update_state(
         recombined_root,
         (2,),
-        similarity_main_indices=(0, 1),
+        redundancy_deltas=(2.0 / 3.0,),
     )
 
     assert before_recombination.redundancy == pytest.approx(1.0)
@@ -465,7 +506,7 @@ def test_sequence_recombination_resets_and_replays_retained_relation() -> None:
     before_recombination = context.extend_update_state(
         context.empty_update_state(main),
         (2, 3),
-        similarity_main_indices=(0, 1),
+        redundancy_deltas=(0.0, 0.0),
     )
 
     recombined_main = context.extend_state(main, [2])
@@ -473,7 +514,7 @@ def test_sequence_recombination_resets_and_replays_retained_relation() -> None:
     replayed_retained = context.extend_update_state(
         recombined_root,
         (3,),
-        similarity_main_indices=(0, 1, 2),
+        redundancy_deltas=(0.0,),
     )
     denominator = np.log1p(4.0) + context.epsilon
 
@@ -510,7 +551,7 @@ def test_objective_update_state_penalizes_only_new_active_pairs() -> None:
     update = context.extend_update_state(
         context.empty_update_state(main),
         (101, 102),
-        similarity_main_indices=tuple(range(100)),
+        redundancy_deltas=(0.25, 0.25),
     )
 
     assert update.relation == pytest.approx(1.0)
@@ -629,6 +670,16 @@ def test_random_multibranch_sequence_coverage_only_result_has_zero_objective() -
 
 def test_random_multibranch_sequence_result_uses_winner_incremental_deltas() -> None:
     graph = _heap_graph(4)
+    sine = np.sqrt(0.19)
+    graph.embeddings = np.asarray(
+        [
+            [1.0, 0.0],
+            [-1.0, 0.0],
+            [0.9, sine],
+            [0.62, 1.8 * sine],
+        ],
+        dtype=np.float32,
+    )
     graph.reliability = np.ones(4, dtype=np.float32)
     graph.sequence_edges = _edges(
         [(0, 1, 1.0), (0, 2, 1.0), (2, 3, 1.0), (3, 1, 1.0)],
@@ -654,16 +705,27 @@ def test_random_multibranch_sequence_result_uses_winner_incremental_deltas() -> 
 
     assert result.relation == pytest.approx(expected_relation)
     assert result.relation < canonical.relation
-    assert result.redundancy == pytest.approx(1.0)
+    assert result.redundancy == pytest.approx(0.5, abs=1.0e-6)
     assert result.score_deltas[:2] == pytest.approx((0.0, 0.0))
     assert sum(result.score_deltas[2:]) == pytest.approx(
-        2.0 * result.relation - result.redundancy
+        2.0 * result.relation - 0.5,
+        abs=1.0e-6,
     )
     assert sum(result.score_deltas) == pytest.approx(result.objective_value)
 
 
 def test_random_multibranch_result_preserves_incremental_branch_redundancy() -> None:
     graph = _heap_graph(4)
+    sine = np.sqrt(0.19)
+    graph.embeddings = np.asarray(
+        [
+            [1.0, 0.0],
+            [-1.0, 0.0],
+            [0.9, sine],
+            [0.62, 1.8 * sine],
+        ],
+        dtype=np.float32,
+    )
     graph.reliability = np.ones(4, dtype=np.float32)
     graph.similarity_edges = _edges(
         [(0, 1, 1.0), (0, 2, 1.0), (2, 3, 1.0)],
@@ -678,10 +740,10 @@ def test_random_multibranch_result_preserves_incremental_branch_redundancy() -> 
         initial_indices=(0, 1),
     )
 
-    assert result.redundancy == pytest.approx(2.0 / 3.0)
-    assert result.objective_value == pytest.approx(1.0 / 3.0)
+    assert result.redundancy == pytest.approx(1.0 / 3.0, abs=1.0e-6)
+    assert result.objective_value == pytest.approx(2.0 / 3.0, abs=1.0e-6)
     assert sum(result.score_deltas[:2]) == pytest.approx(1.0)
-    assert sum(result.score_deltas[2:]) == pytest.approx(-2.0 / 3.0)
+    assert sum(result.score_deltas[2:]) == pytest.approx(-1.0 / 3.0, abs=1.0e-6)
     assert sum(result.score_deltas) == pytest.approx(result.objective_value)
 
 
@@ -760,6 +822,36 @@ def test_random_multibranch_times_rounds_separately_from_recombination(
     assert result.recombination_runtime_seconds == ((2, 0.25),)
 
 
+def test_random_multibranch_recombination_adds_committed_clips_to_faiss_main(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _heap_graph(4)
+    graph.embeddings = np.ones((4, 1), dtype=np.float32)
+    graph.reliability = np.ones(4, dtype=np.float32)
+    graph.similarity_edges = _edges(
+        [(left, right, 1.0) for left in range(4) for right in range(left + 1, 4)],
+        "similarity",
+    )
+    context = CocoreObjectiveContext(
+        graph, "cooccurrence", relation_weight=1.0, similarity_threshold=0.8
+    )
+    monkeypatch.setattr("cocore.random_multibranch.BATCH_SIZE", 1)
+    monkeypatch.setattr("cocore.random_multibranch.FIRST_RECOMBINATION_ROUND", 2)
+    monkeypatch.setattr("cocore.random_multibranch.RECOMBINATION_INTERVAL", 10)
+    monkeypatch.setattr("cocore.random_multibranch.COMMIT_SIZE", 1)
+    monkeypatch.setattr("cocore.random_multibranch.RETAINED_SIZE", 1)
+
+    result = RandomMultiBranchSelector(context, seed=11).select(
+        4,
+        initial_indices=(0,),
+    )
+
+    assert result.recombinations == 1
+    assert result.committed_clips == 1
+    assert result.final_active_clips == 2
+    assert result.redundancy == pytest.approx(5.0 / 6.0)
+
+
 def test_random_multibranch_does_not_clone_complete_branch_states(monkeypatch) -> None:
     context = CocoreObjectiveContext(
         _heap_graph(30), "cooccurrence", 1.0, similarity_threshold=0.8
@@ -798,55 +890,35 @@ def test_random_multibranch_does_not_clone_complete_branch_states(monkeypatch) -
     )
 
 
-def test_random_multibranch_similarity_sampling_uses_strict_100_clip_threshold() -> None:
+def test_random_multibranch_faiss_penalizes_against_all_fixed_clips() -> None:
+    graph = _heap_graph(102)
+    graph.embeddings = np.tile(np.asarray([[0.0, 1.0]], dtype=np.float32), (102, 1))
+    graph.embeddings[0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    graph.embeddings[101] = np.asarray([0.9, np.sqrt(0.19)], dtype=np.float32)
+    graph.reliability = np.ones(102, dtype=np.float32)
+    graph.similarity_edges = _edges([(0, 101, 0.9)], "similarity")
     context = CocoreObjectiveContext(
-        _heap_graph(101), "cooccurrence", 1.0, similarity_threshold=0.8
-    )
-    selector = RandomMultiBranchSelector(context, seed=17)
-
-    class RejectingGenerator:
-        def choice(self, *args, **kwargs):
-            del args, kwargs
-            raise AssertionError("100 fixed clips must not consume the similarity RNG")
-
-    fixed_100 = tuple(range(100))
-    assert selector._sample_similarity_main(RejectingGenerator(), fixed_100) == fixed_100
-
-    sampled = selector._sample_similarity_main(
-        np.random.default_rng(17),
-        tuple(range(101)),
-    )
-    assert len(sampled) == 100
-    assert len(set(sampled)) == 100
-    assert set(sampled) < set(range(101))
-
-
-def test_random_multibranch_resamples_similarity_main_for_every_new_branch() -> None:
-    context = CocoreObjectiveContext(
-        _heap_graph(112), "cooccurrence", 1.0, similarity_threshold=0.8
+        graph, "cooccurrence", relation_weight=1.0, similarity_threshold=0.8
     )
 
-    class RecordingSelector(RandomMultiBranchSelector):
-        def __init__(self) -> None:
-            super().__init__(context, seed=29)
-            self.similarity_samples: list[tuple[int, ...]] = []
+    result = RandomMultiBranchSelector(context, seed=4).select(
+        102,
+        initial_indices=tuple(range(101)),
+    )
 
-        def _sample_similarity_main(self, rng, fixed):
-            sample = super()._sample_similarity_main(rng, fixed)
-            self.similarity_samples.append(sample)
-            return sample
-
-    selector = RecordingSelector()
-    result = selector.select(112, initial_indices=tuple(range(101)))
-
-    assert len(selector.similarity_samples) == 8 + 32
-    assert all(len(sample) == 100 for sample in selector.similarity_samples)
-    assert all(set(sample) < set(range(101)) for sample in selector.similarity_samples)
-    assert result.final_active_clips == 11
+    assert result.selected_indices[-1] == 101
+    assert result.redundancy == pytest.approx(1.0)
+    assert result.score_deltas[-1] == pytest.approx(-1.0)
 
 
-def test_random_multibranch_final_result_excludes_sampled_main_internal_pairs() -> None:
+def test_random_multibranch_final_result_excludes_main_internal_pairs() -> None:
     graph = _heap_graph(103)
+    sine = np.sqrt(0.19)
+    graph.embeddings = np.tile(np.asarray([[-1.0, 0.0]], dtype=np.float32), (103, 1))
+    graph.embeddings[0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    graph.embeddings[100] = np.asarray([1.0, 0.0], dtype=np.float32)
+    graph.embeddings[101] = np.asarray([0.9, sine], dtype=np.float32)
+    graph.embeddings[102] = np.asarray([0.62, 1.8 * sine], dtype=np.float32)
     graph.reliability = np.ones(103, dtype=np.float32)
     graph.similarity_edges = _edges(
         [
@@ -894,6 +966,8 @@ def test_random_multibranch_uses_seed_to_break_equal_branch_scores() -> None:
 
 def test_random_multibranch_selects_the_highest_scoring_initial_branch() -> None:
     graph = _heap_graph(9)
+    graph.embeddings = np.tile(np.asarray([[1.0, 0.0]], dtype=np.float32), (9, 1))
+    graph.embeddings[0] = np.asarray([0.0, 1.0], dtype=np.float32)
     graph.similarity_edges = _edges(
         [(8, index, 0.9) for index in range(1, 8)], "similarity"
     )
