@@ -51,15 +51,15 @@ def test_cli_uses_natural_order_and_stacks_first_two_over_last(tmp_path: Path) -
     assert completed.returncode == 0, completed.stderr
     with Image.open(output) as image:
         assert image.mode == "RGBA"
-        assert image.size == (293, 88)
+        assert image.size == (255, 88)
         assert image.getpixel((5, 5)) == (255, 0, 0, 255)
-        assert image.getpixel((80, 10)) == (0, 255, 0, 255)
-        assert image.getpixel((200, 10)) == (0, 0, 255, 255)
-        assert image.getpixel((185, 2)) == (0, 0, 0, 0)
-        assert (255, 255, 255, 255) not in set(image.getdata())
+        assert image.getpixel((45, 10)) == (0, 255, 0, 255)
+        assert image.getpixel((160, 10)) == (0, 0, 255, 255)
+        assert image.getpixel((150, 2)) == (0, 0, 0, 0)
+        assert (0, 0, 0, 255) not in set(image.getdata())
 
 
-def test_cli_draws_three_white_dots_when_middle_images_are_omitted(tmp_path: Path) -> None:
+def test_cli_draws_three_black_dots_when_middle_images_are_omitted(tmp_path: Path) -> None:
     input_dir = tmp_path / "frames"
     input_dir.mkdir()
     _write_solid(input_dir / "frame1.png", (255, 0, 0), (100, 80))
@@ -72,11 +72,11 @@ def test_cli_draws_three_white_dots_when_middle_images_are_omitted(tmp_path: Pat
 
     assert completed.returncode == 0, completed.stderr
     with Image.open(output) as image:
-        assert image.size == (332, 88)
-        assert image.getpixel((194, 47)) == (255, 255, 255, 255)
-        assert image.getpixel((204, 47)) == (255, 255, 255, 255)
-        assert image.getpixel((214, 47)) == (255, 255, 255, 255)
-        assert image.getpixel((240, 10)) == (0, 0, 255, 255)
+        assert image.size == (294, 88)
+        assert image.getpixel((156, 47)) == (0, 0, 0, 255)
+        assert image.getpixel((166, 47)) == (0, 0, 0, 255)
+        assert image.getpixel((176, 47)) == (0, 0, 0, 255)
+        assert image.getpixel((200, 10)) == (0, 0, 255, 255)
         assert (255, 255, 0, 255) not in set(image.getdata())
 
 
@@ -99,8 +99,8 @@ def test_cli_center_crops_images_to_the_first_image_size(tmp_path: Path) -> None
 
     assert completed.returncode == 0, completed.stderr
     with Image.open(output) as image:
-        assert image.size == (12, 4)
-        assert {image.getpixel((x, 1)) for x in range(3, 7)} == {(0, 255, 0, 255)}
+        assert image.size == (11, 4)
+        assert {image.getpixel((x, 1)) for x in range(2, 6)} == {(0, 255, 0, 255)}
 
 
 def test_cli_applies_exif_orientation_before_choosing_default_card_size(
@@ -120,7 +120,7 @@ def test_cli_applies_exif_orientation_before_choosing_default_card_size(
 
     assert completed.returncode == 0, completed.stderr
     with Image.open(output) as image:
-        assert image.size == (12, 2)
+        assert image.size == (11, 2)
 
 
 def test_cli_honors_card_size_and_layout_ratio_overrides(tmp_path: Path) -> None:
@@ -168,8 +168,8 @@ def test_cli_excludes_existing_output_from_input_selection_when_forced(
     assert "already exists" in refused.stderr
     assert completed.returncode == 0, completed.stderr
     with Image.open(output) as image:
-        assert image.size == (293, 88)
-        assert image.getpixel((200, 10)) == (0, 0, 255, 255)
+        assert image.size == (255, 88)
+        assert image.getpixel((160, 10)) == (0, 0, 255, 255)
 
 
 @pytest.mark.parametrize(

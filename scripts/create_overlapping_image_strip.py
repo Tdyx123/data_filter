@@ -19,7 +19,7 @@ SUPPORTED_EXTENSIONS = {
     ".tiff",
     ".webp",
 }
-DEFAULT_OVERLAP_RATIO = 0.22
+DEFAULT_OVERLAP_RATIO = 0.60
 DEFAULT_VERTICAL_OFFSET_RATIO = 0.10
 HORIZONTAL_GAP_RATIO = 0.15
 DOT_DIAMETER_RATIO = 0.045
@@ -144,7 +144,7 @@ def compose_strip(
                     dot_x + dot_diameter - 1,
                     dot_y + dot_diameter - 1,
                 ),
-                fill=(255, 255, 255, 255),
+                fill=(0, 0, 0, 255),
             )
 
     canvas.alpha_composite(last, dest=(last_x, second_y))
