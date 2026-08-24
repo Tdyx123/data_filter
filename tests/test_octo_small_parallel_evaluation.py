@@ -50,9 +50,13 @@ metadata = {
     "device": device,
     "precision": option("--precision"),
     "checkpoint": {"requested_path": checkpoint},
-    "protocol": {"native_action_chunk_size": 8, "precision": option("--precision")},
+    "protocol": {
+        "native_action_chunk_size": 8,
+        "model_action_gripper": "continuous_model_prediction",
+        "precision": option("--precision"),
+    },
     "startup_preflight": {"action_shape": [1, 8, 7], "finite": True},
-    "protocol_version": 1,
+    "protocol_version": 2,
 }
 listener = Listener(socket_path, family="AF_UNIX", authkey=authkey)
 stopping = False
@@ -105,6 +109,7 @@ parser.add_argument("--tasks", default="all")
 parser.add_argument("--shard-index", type=int, default=0)
 parser.add_argument("--shard-count", type=int, default=1)
 parser.add_argument("--rng-scope", default="per_policy_seed_stream")
+parser.add_argument("--action-postprocessing", default="octo_temporal_ensemble_v1")
 parser.add_argument("--smoke-test", action="store_true")
 parser.add_argument("--preflight-only", action="store_true")
 parser.add_argument("--overwrite", action="store_true")
@@ -177,7 +182,9 @@ else:
         "object_episode_ids": object_episode_ids,
         "planned_episodes": len(task_keys) * len(policy_seeds) * len(object_episode_ids),
         "action_horizon": 1,
-        "execution_mode": "stepwise_first_action",
+        "execution_mode": parsed.action_postprocessing,
+        "instruction_source": "environment",
+        "episode_protocol": "octo_reference_3seed_288",
         "environment_lifecycle": "one_per_task",
         "sim_renderer_device": parsed.sim_device,
         "rng_scope": "per_episode",
@@ -185,6 +192,11 @@ else:
         "shard_index": parsed.shard_index,
         "shard_count": parsed.shard_count,
         "native_action_chunk_size": 8,
+        "model_action_gripper": "continuous_model_prediction",
+        "action_postprocessing": parsed.action_postprocessing,
+        "temporal_ensemble_prediction_horizon": 8 if parsed.action_postprocessing == "octo_temporal_ensemble_v1" else None,
+        "temporal_ensemble_temperature": 0.0 if parsed.action_postprocessing == "octo_temporal_ensemble_v1" else None,
+        "gripper_binarization": "after_action_ensemble" if parsed.action_postprocessing == "octo_temporal_ensemble_v1" else "at_environment_conversion",
     }
     report = {
         "schema_version": 1,
@@ -251,13 +263,21 @@ def _write_worker(
         "object_episode_ids": [0, 1],
         "planned_episodes": 4,
         "action_horizon": 1,
-        "execution_mode": "stepwise_first_action",
+        "execution_mode": "octo_temporal_ensemble_v1",
+        "instruction_source": "environment",
+        "episode_protocol": "octo_reference_3seed_288",
         "environment_lifecycle": "one_per_task",
         "sim_renderer_device": "cuda:7",
         "rng_scope": "per_episode",
         "rng_seed_derivation": "sha256-octo-simpler-episode-v1",
         "shard_index": shard_index,
         "shard_count": 2,
+        "native_action_chunk_size": 8,
+        "model_action_gripper": "continuous_model_prediction",
+        "action_postprocessing": "octo_temporal_ensemble_v1",
+        "temporal_ensemble_prediction_horizon": 8,
+        "temporal_ensemble_temperature": 0.0,
+        "gripper_binarization": "after_action_ensemble",
     }
     report = {
         "schema_version": 1,
@@ -366,6 +386,13 @@ def test_parallel_coordinator_runs_model_replicas_and_shared_renderer_workers(
     assert report["summary"]["completed_episodes"] == 72
     assert report["protocol"]["parallel_workers"] == 2
     assert report["protocol"]["environment_lifecycle"] == "one_per_task_per_worker"
+    assert report["protocol"]["execution_mode"] == "octo_temporal_ensemble_v1"
+    assert report["protocol"]["instruction_source"] == "environment"
+    assert report["protocol"]["episode_protocol"] == "octo_reference_3seed_288"
+    assert report["protocol"]["action_postprocessing"] == "octo_temporal_ensemble_v1"
+    assert report["protocol"]["temporal_ensemble_prediction_horizon"] == 8
+    assert report["protocol"]["temporal_ensemble_temperature"] == 0.0
+    assert report["protocol"]["gripper_binarization"] == "after_action_ensemble"
     assert report["runtime"]["model_devices"] == ["cuda:0", "cuda:2"]
     assert len((output_dir / "episodes.jsonl").read_text().splitlines()) == 72
     assert (output_dir / "model-server-00.log").exists()

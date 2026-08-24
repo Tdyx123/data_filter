@@ -987,11 +987,15 @@ episode，并分别写入 `outputs/qwen_libero_eval/task-0/` 到 `task-9/`。单
 ### SimplerEnv 共享闭环动作协议
 
 Qwen、Octo-small 和 StarVLA 三类入口都会在每个环境步重新推理原生动作块，且每个
-环境步只向仿真器发送一个动作；`--action-horizon` 的唯一合法值为 `1`。Qwen 和
-Octo-small 保持 `stepwise_first_action`：直接执行动作块首项。StarVLA 默认使用
-`adaptive_ensemble_v1`：先把每个 `(1,16,7)` chunk 的 gripper 按严格 `>0.5`
-二值化，再对最近 7 个重叠 chunk 按时间索引对齐，并用
-`exp(0.1 * cosine_similarity)` 权重集成当前动作。每个 episode 开始都会清空历史。
+环境步只向仿真器发送一个动作；`--action-horizon` 的唯一合法值为 `1`。Qwen 保持
+`stepwise_first_action`。Octo-small 默认使用 `octo_temporal_ensemble_v1`：对最近
+8 个 `(1,8,7)` chunk 按时间索引对齐，并严格按官方公式
+`exp(-temperature * arange(n))` 加权；默认 `temperature=0.0`，因此对当前时刻的
+重叠预测做均匀平均。Octo 的连续 gripper 预测参与集成后，才由共享环境转换按严格
+`>0.5` 二值化。StarVLA 默认使用 `adaptive_ensemble_v1`：先把每个 `(1,16,7)`
+chunk 的 gripper 二值化，再对最近 7 个重叠 chunk 按时间索引对齐，并用
+`exp(0.1 * cosine_similarity)` 权重集成当前动作。两类集成器都会在每个 episode
+开始时清空历史。
 
 StarVLA 默认统计口径为 `starvla_reference_24`：4 个任务 × object episode `0..23`
 × 策略 seed `0`，共 96 回合。`robustness_3seed_288` 才会扩展到策略 seed
@@ -1129,10 +1133,28 @@ bash scripts/evaluate_simpler_octo_small.sh \
   --output-dir outputs/octo_small_bridge_simpler_eval
 ```
 
-评测只启用 primary 图像 tokenizer，使用 checkpoint 内 Bridge V2 q01/q99 统计标准化
-proprio、反归一化前六维动作；gripper 以严格 `>0.5` 输出 `0/1`。默认不录像；输出
-文件、覆盖保护和退出码与 Qwen SimplerEnv 入口一致。Octo-small 同样在每个环境步
-重新预测原生 8 步动作块，并且只执行第一个动作。
+评测固定使用环境返回的原始 instruction，只启用 primary 图像 tokenizer，并使用
+checkpoint 内 Bridge V2 q01/q99 统计标准化 proprio、反归一化前六维动作。Octo-small
+在每个环境步重新预测原生 8 步动作块；默认把最近 8 个重叠 chunk 按时间索引对齐，
+以 `temperature=0.0` 均匀集成当前动作。gripper 保留模型连续预测值参与集成，随后
+才由共享环境转换按严格 `>0.5` 输出 `-1/+1`。每个 episode 开始都会清空集成历史。
+
+如需运行只选择最新 chunk 首动作的纯后处理消融，显式传入：
+
+```bash
+bash scripts/evaluate_simpler_octo_small.sh \
+  --checkpoint /data/dwb/octo_small_bridge_v2/checkpoints/step-00020000 \
+  --base-model /data/dwb/models/octo-small-pytorch \
+  --output-dir outputs/octo_small_bridge_simpler_first_action \
+  --action-postprocessing first_action
+```
+
+默认正式协议标记为 `octo_reference_3seed_288`，任务步数保持 spoon/carrot/stack 为
+60、eggplant 为 120。`results.json` 会记录 execution mode、动作后处理模式、prediction
+horizon `8`、temperature `0.0`、gripper 二值化顺序、environment instruction 来源、
+episode 协议和实际环境生命周期。Octo IPC 协议版本为 2，客户端会在推理前拒绝仍把
+gripper 当作服务端二值值的旧服务。默认不录像；输出文件、覆盖保护和退出码与 Qwen
+SimplerEnv 入口一致。
 
 ### StarVLA Qwen3VL-GR00T Bridge 的 SimplerEnv 评测
 

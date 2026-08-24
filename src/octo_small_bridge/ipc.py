@@ -11,7 +11,7 @@ from typing import Any, Mapping
 import numpy as np
 
 
-IPC_PROTOCOL_VERSION = 1
+IPC_PROTOCOL_VERSION = 2
 ACTION_SHAPE = (1, 8, 7)
 PROPRIO_SHAPE = (8,)
 

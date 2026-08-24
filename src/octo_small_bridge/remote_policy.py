@@ -8,15 +8,36 @@ import numpy as np
 
 from simpler_bridge.evaluation import SimplerEvaluationError, select_first_action
 
+from .action_ensemble import OctoTemporalActionEnsembler
 from .ipc import IPC_PROTOCOL_VERSION
+
+
+ACTION_POSTPROCESSING_MODES = ("octo_temporal_ensemble_v1", "first_action")
+TEMPORAL_ENSEMBLE_PREDICTION_HORIZON = 8
+TEMPORAL_ENSEMBLE_TEMPERATURE = 0.0
 
 
 class OctoRemotePolicy:
     policy_name = "Octo-small Bridge checkpoint"
     gripper_threshold = 0.5
 
-    def __init__(self, client: Any) -> None:
+    def __init__(
+        self,
+        client: Any,
+        *,
+        action_postprocessing: str = "octo_temporal_ensemble_v1",
+    ) -> None:
+        if action_postprocessing not in ACTION_POSTPROCESSING_MODES:
+            raise SimplerEvaluationError(
+                "Octo action_postprocessing must be "
+                "octo_temporal_ensemble_v1 or first_action"
+            )
         self.client = client
+        self.action_postprocessing = action_postprocessing
+        self._action_ensembler = OctoTemporalActionEnsembler(
+            prediction_horizon=TEMPORAL_ENSEMBLE_PREDICTION_HORIZON,
+            temperature=TEMPORAL_ENSEMBLE_TEMPERATURE,
+        )
         metadata = dict(client.metadata())
         if metadata.get("protocol_version") != IPC_PROTOCOL_VERSION:
             raise SimplerEvaluationError(
@@ -39,6 +60,11 @@ class OctoRemotePolicy:
             raise SimplerEvaluationError("Octo server checkpoint metadata must be a mapping")
         if not isinstance(protocol, Mapping):
             raise SimplerEvaluationError("Octo server protocol metadata must be a mapping")
+        if protocol.get("model_action_gripper") != "continuous_model_prediction":
+            raise SimplerEvaluationError(
+                "Octo server model_action_gripper must be "
+                "continuous_model_prediction"
+            )
         if not isinstance(startup_preflight, Mapping):
             raise SimplerEvaluationError(
                 "Octo server startup_preflight metadata must be a mapping"
@@ -65,9 +91,12 @@ class OctoRemotePolicy:
 
     def begin_episode(self, instruction: str) -> None:
         del instruction
+        self._action_ensembler.reset()
 
     def select_action(self, actions: np.ndarray) -> np.ndarray:
-        return select_first_action(actions)
+        if self.action_postprocessing == "first_action":
+            return select_first_action(actions)
+        return self._action_ensembler.select_action(actions)
 
     def prepare_observation(
         self,
@@ -130,6 +159,22 @@ class OctoRemotePolicy:
     def protocol_metadata(self) -> dict[str, Any]:
         return {
             **self._protocol,
+            "action_postprocessing": self.action_postprocessing,
+            "temporal_ensemble_prediction_horizon": (
+                TEMPORAL_ENSEMBLE_PREDICTION_HORIZON
+                if self.action_postprocessing == "octo_temporal_ensemble_v1"
+                else None
+            ),
+            "temporal_ensemble_temperature": (
+                TEMPORAL_ENSEMBLE_TEMPERATURE
+                if self.action_postprocessing == "octo_temporal_ensemble_v1"
+                else None
+            ),
+            "gripper_binarization": (
+                "after_action_ensemble"
+                if self.action_postprocessing == "octo_temporal_ensemble_v1"
+                else "at_environment_conversion"
+            ),
             "ipc_protocol_version": IPC_PROTOCOL_VERSION,
             "startup_preflight": dict(self._startup_preflight),
         }

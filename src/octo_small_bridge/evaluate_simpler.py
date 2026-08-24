@@ -27,7 +27,7 @@ from simpler_bridge.evaluation import (
 )
 
 from .ipc import OctoIPCClient, OctoIPCError
-from .remote_policy import OctoRemotePolicy
+from .remote_policy import ACTION_POSTPROCESSING_MODES, OctoRemotePolicy
 
 
 EVALUATION_ROUTE = "octo-small-bridge-simpler-widowx-eval"
@@ -76,6 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sim-device", type=parse_sim_device, default="cuda:0")
     parser.add_argument("--action-horizon", type=int, choices=(1,), default=1)
+    parser.add_argument(
+        "--action-postprocessing",
+        choices=ACTION_POSTPROCESSING_MODES,
+        default="octo_temporal_ensemble_v1",
+        help="Action selection mode (default: octo_temporal_ensemble_v1).",
+    )
     parser.add_argument("--save-videos-path", type=Path, default=None)
     parser.add_argument("--video-fps", type=int, default=5)
     parser.add_argument("--preflight-only", action="store_true")
@@ -113,7 +119,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SimplerEvaluationError("--video-fps must be positive")
         source_versions = validate_simpler_source(default_simpler_root())
         client = OctoIPCClient(arguments.socket, authkey=authkey)
-        policy = OctoRemotePolicy(client)
+        policy = OctoRemotePolicy(
+            client,
+            action_postprocessing=arguments.action_postprocessing,
+        )
         settings = SimplerRunSettings(
             output_dir=arguments.output_dir,
             tasks=tasks,
@@ -129,6 +138,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             shard_index=arguments.shard_index,
             shard_count=arguments.shard_count,
             rng_scope=arguments.rng_scope,
+            execution_mode=arguments.action_postprocessing,
+            instruction_source="environment",
+            episode_protocol="octo_reference_3seed_288",
         )
         sim_packages = {"numpy": np.__version__}
         if arguments.preflight_only:
