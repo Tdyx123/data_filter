@@ -41,7 +41,7 @@ def _v2_statistics_file(tmp_path: Path) -> Path:
     return _statistics_file(tmp_path)
 
 
-def test_octo_bridge_policy_uses_v2_quantiles_and_binary_gripper(tmp_path):
+def test_octo_bridge_policy_uses_v2_quantiles_and_preserves_continuous_gripper(tmp_path):
     from octo_small_bridge.simpler_evaluation import (
         OctoBridgeSimplerPolicy,
         load_bridge_statistics,
@@ -73,7 +73,7 @@ def test_octo_bridge_policy_uses_v2_quantiles_and_binary_gripper(tmp_path):
         actions[0, 0, :6],
         np.asarray([2.2, -4.4, 0, 0, 0, 0], dtype=np.float32),
     )
-    assert actions[0, 0, 6] == 1.0
+    np.testing.assert_allclose(actions[0, 0, 6], 0.50001, rtol=0, atol=1.0e-6)
     assert policy.gripper_threshold == 0.5
 
 
@@ -154,8 +154,12 @@ def test_bridge_statistics_and_octo_adapter_preserve_gripper_semantics(tmp_path)
         actions[..., :6],
         np.zeros((1, 8, 6), dtype=np.float32),
     )
-    np.testing.assert_allclose(actions[..., 6], 1.0)
+    np.testing.assert_allclose(actions[..., 6], 0.75)
     assert policy.protocol_metadata()["precision"] == "fp32"
+    assert (
+        policy.protocol_metadata()["model_action_gripper"]
+        == "continuous_model_prediction"
+    )
 
 
 def test_bridge_statistics_reject_invalid_shapes_and_reversed_quantiles(tmp_path):
@@ -310,6 +314,7 @@ def test_remote_policy_preserves_raw_observations_rng_and_server_metadata():
                 },
                 "protocol": {
                     "native_action_chunk_size": 8,
+                    "model_action_gripper": "continuous_model_prediction",
                     "precision": "bf16",
                 },
                 "startup_preflight": {"action_shape": [1, 8, 7], "finite": True},
@@ -342,10 +347,126 @@ def test_remote_policy_preserves_raw_observations_rng_and_server_metadata():
     assert policy.model_device == "cuda:3"
     assert policy.protocol_metadata() == {
         "native_action_chunk_size": 8,
+        "model_action_gripper": "continuous_model_prediction",
         "precision": "bf16",
+        "action_postprocessing": "octo_temporal_ensemble_v1",
+        "temporal_ensemble_prediction_horizon": 8,
+        "temporal_ensemble_temperature": 0.0,
+        "gripper_binarization": "after_action_ensemble",
         "ipc_protocol_version": IPC_PROTOCOL_VERSION,
         "startup_preflight": {"action_shape": [1, 8, 7], "finite": True},
     }
+
+
+def test_remote_policy_defaults_to_official_temporal_ensemble_and_resets_each_episode():
+    from octo_small_bridge.ipc import IPC_PROTOCOL_VERSION
+    from octo_small_bridge.remote_policy import OctoRemotePolicy
+
+    class Client:
+        def metadata(self):
+            return {
+                "protocol_version": IPC_PROTOCOL_VERSION,
+                "native_action_chunk_size": 8,
+                "action_dim": 7,
+                "checkpoint": {},
+                "protocol": {
+                    "native_action_chunk_size": 8,
+                    "model_action_gripper": "continuous_model_prediction",
+                },
+                "startup_preflight": {},
+            }
+
+    policy = OctoRemotePolicy(Client())
+    first = np.zeros((1, 8, 7), dtype=np.float32)
+    first[0, 1, 0] = 2.0
+    first[0, 1, 6] = 0.49
+    second = np.zeros((1, 8, 7), dtype=np.float32)
+    second[0, 0, 1] = 4.0
+    second[0, 0, 6] = 0.9
+
+    policy.begin_episode("put the spoon on the towel")
+    np.testing.assert_array_equal(policy.select_action(first), first[0, 0])
+    selected = policy.select_action(second)
+    np.testing.assert_allclose(
+        selected,
+        np.asarray([1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.695], dtype=np.float32),
+        rtol=0,
+        atol=1.0e-7,
+    )
+
+    policy.begin_episode("put the spoon on the towel")
+    np.testing.assert_array_equal(policy.select_action(second), second[0, 0])
+
+
+def test_remote_policy_first_action_is_a_pure_action_selection_ablation():
+    from octo_small_bridge.ipc import IPC_PROTOCOL_VERSION
+    from octo_small_bridge.remote_policy import OctoRemotePolicy
+
+    client = SimpleNamespace(
+        metadata=lambda: {
+            "protocol_version": IPC_PROTOCOL_VERSION,
+            "native_action_chunk_size": 8,
+            "action_dim": 7,
+            "checkpoint": {},
+            "protocol": {
+                "native_action_chunk_size": 8,
+                "model_action_gripper": "continuous_model_prediction",
+            },
+            "startup_preflight": {},
+        }
+    )
+    policy = OctoRemotePolicy(client, action_postprocessing="first_action")
+    actions = np.arange(56, dtype=np.float32).reshape(1, 8, 7)
+
+    policy.begin_episode("environment instruction")
+
+    np.testing.assert_array_equal(policy.select_action(actions), actions[0, 0])
+    assert policy.protocol_metadata()["action_postprocessing"] == "first_action"
+    assert policy.protocol_metadata()["temporal_ensemble_prediction_horizon"] is None
+    assert policy.protocol_metadata()["temporal_ensemble_temperature"] is None
+    assert policy.protocol_metadata()["gripper_binarization"] == "at_environment_conversion"
+
+
+def test_remote_policy_rejects_ipc_v1_server_before_inference():
+    from octo_small_bridge.remote_policy import OctoRemotePolicy
+    from simpler_bridge.evaluation import SimplerEvaluationError
+
+    client = SimpleNamespace(
+        metadata=lambda: {
+            "protocol_version": 1,
+            "native_action_chunk_size": 8,
+            "action_dim": 7,
+            "checkpoint": {},
+            "protocol": {},
+            "startup_preflight": {},
+        }
+    )
+
+    with pytest.raises(SimplerEvaluationError, match=r"protocol_version must be 2.*found 1"):
+        OctoRemotePolicy(client)
+
+
+def test_remote_policy_rejects_binary_gripper_semantics_from_ipc_v2_server():
+    from octo_small_bridge.ipc import IPC_PROTOCOL_VERSION
+    from octo_small_bridge.remote_policy import OctoRemotePolicy
+    from simpler_bridge.evaluation import SimplerEvaluationError
+
+    client = SimpleNamespace(
+        metadata=lambda: {
+            "protocol_version": IPC_PROTOCOL_VERSION,
+            "native_action_chunk_size": 8,
+            "action_dim": 7,
+            "checkpoint": {},
+            "protocol": {"model_action_gripper": "binary"},
+            "startup_preflight": {},
+        }
+    )
+
+    with pytest.raises(
+        SimplerEvaluationError,
+        match="model_action_gripper must be continuous_model_prediction",
+    ):
+        OctoRemotePolicy(client)
 
 
 def test_octo_simpler_client_requires_socket_and_defaults_to_full_protocol():
@@ -366,6 +487,9 @@ def test_octo_simpler_client_requires_socket_and_defaults_to_full_protocol():
     assert arguments.output_dir == Path("outputs/octo_small_bridge_simpler_eval")
     assert arguments.sim_device == "cuda:0"
     assert arguments.action_horizon == 1
+    assert arguments.action_postprocessing == "octo_temporal_ensemble_v1"
+    normalized_help = " ".join(parser.format_help().split())
+    assert "default: octo_temporal_ensemble_v1" in normalized_help
     assert arguments.shard_index == 0
     assert arguments.shard_count == 1
     assert arguments.rng_scope == "per_policy_seed_stream"
@@ -393,6 +517,19 @@ def test_octo_simpler_client_requires_socket_and_defaults_to_full_protocol():
                 "8",
             ]
         )
+    assert (
+        parser.parse_args(
+            [
+                "--socket",
+                "/tmp/octo.sock",
+                "--auth-key-hex",
+                "abcd",
+                "--action-postprocessing",
+                "first_action",
+            ]
+        ).action_postprocessing
+        == "first_action"
+    )
     assert arguments.smoke_test is False
     with pytest.raises(SystemExit):
         parser.parse_args(["--socket", "/tmp/octo.sock"])
@@ -437,7 +574,11 @@ def test_octo_simpler_cli_applies_smoke_protocol_and_model_metadata(tmp_path, mo
         lambda path: {"simpler_env_commit": "06accaca9353"},
     )
     monkeypatch.setattr(evaluate_simpler, "OctoIPCClient", lambda *args, **kwargs: client)
-    monkeypatch.setattr(evaluate_simpler, "OctoRemotePolicy", lambda value: policy)
+    def remote_policy(value, *, action_postprocessing):
+        captured["action_postprocessing"] = action_postprocessing
+        return policy
+
+    monkeypatch.setattr(evaluate_simpler, "OctoRemotePolicy", remote_policy)
 
     def evaluate(settings, **kwargs):
         captured["settings"] = settings
@@ -475,10 +616,62 @@ def test_octo_simpler_cli_applies_smoke_protocol_and_model_metadata(tmp_path, mo
     assert captured["settings"].shard_index == 1
     assert captured["settings"].shard_count == 2
     assert captured["settings"].rng_scope == "per_episode"
+    assert captured["settings"].execution_mode == "octo_temporal_ensemble_v1"
+    assert captured["settings"].instruction_source == "environment"
+    assert captured["settings"].episode_protocol == "octo_reference_3seed_288"
+    assert captured["action_postprocessing"] == "octo_temporal_ensemble_v1"
     assert captured["kwargs"]["checkpoint"] == policy.checkpoint_report
     assert captured["kwargs"]["route"] == "octo-small-bridge-simpler-widowx-eval"
     assert captured["kwargs"]["protocol_metadata"] == {"native_action_chunk_size": 8}
     assert captured["shutdown"] is True
+
+
+def test_octo_simpler_cli_defaults_to_official_288_episode_plan(tmp_path, monkeypatch):
+    from octo_small_bridge import evaluate_simpler
+    from simpler_bridge.evaluation import canonical_episode_plan
+
+    captured = {}
+    client = SimpleNamespace(shutdown=lambda: None)
+    policy = SimpleNamespace(
+        checkpoint_report={},
+        model_device="cuda:0",
+        protocol_metadata=lambda: {},
+    )
+    monkeypatch.setattr(evaluate_simpler, "validate_simpler_source", lambda path: {})
+    monkeypatch.setattr(evaluate_simpler, "OctoIPCClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(
+        evaluate_simpler,
+        "OctoRemotePolicy",
+        lambda value, *, action_postprocessing: policy,
+    )
+
+    def evaluate(settings, **kwargs):
+        captured["settings"] = settings
+        return {"status": "complete"}
+
+    monkeypatch.setattr(evaluate_simpler, "evaluate_simpler_policy", evaluate)
+
+    status = evaluate_simpler.main(
+        [
+            "--socket",
+            "/tmp/octo.sock",
+            "--auth-key-hex",
+            "abcd",
+            "--output-dir",
+            str(tmp_path / "results"),
+        ]
+    )
+
+    settings = captured["settings"]
+    assert status == 0
+    assert settings.policy_seeds == (0, 2, 4)
+    assert settings.object_episode_ids == tuple(range(24))
+    assert [task.max_steps for task in settings.tasks] == [60, 60, 60, 120]
+    assert settings.max_steps is None
+    assert len(canonical_episode_plan(settings)) == 288
+    assert settings.execution_mode == "octo_temporal_ensemble_v1"
+    assert settings.instruction_source == "environment"
+    assert settings.episode_protocol == "octo_reference_3seed_288"
 
 
 @pytest.mark.parametrize("preflight_only", (False, True), ids=("evaluation", "preflight"))
@@ -494,7 +687,11 @@ def test_octo_cli_forwards_sim_device_to_environment_builder(tmp_path, monkeypat
     client = SimpleNamespace(shutdown=lambda: None)
     monkeypatch.setattr(evaluate_simpler, "validate_simpler_source", lambda path: {})
     monkeypatch.setattr(evaluate_simpler, "OctoIPCClient", lambda *args, **kwargs: client)
-    monkeypatch.setattr(evaluate_simpler, "OctoRemotePolicy", lambda value: policy)
+    monkeypatch.setattr(
+        evaluate_simpler,
+        "OctoRemotePolicy",
+        lambda value, *, action_postprocessing: policy,
+    )
     monkeypatch.setattr(
         evaluate_simpler,
         "create_simpler_environment",

@@ -74,6 +74,23 @@ def test_bridge_v2_action_denormalization_extrapolates_and_binarizes_gripper():
     np.testing.assert_array_equal(actual[:, 6], np.asarray([0, 1], dtype=np.float32))
 
 
+def test_bridge_v2_action_denormalization_can_preserve_continuous_gripper():
+    statistics = _statistics()
+    normalized = np.asarray(
+        [[2.2, -2.2, 0, 0, 0, 0, 0.50001]],
+        dtype=np.float32,
+    )
+
+    actual = statistics.denormalize_action(normalized, binarize_gripper=False)
+
+    np.testing.assert_allclose(
+        actual,
+        np.asarray([[2.2, -4.4, 0, 0, 0, 0, 0.50001]], dtype=np.float32),
+        rtol=0,
+        atol=1.0e-6,
+    )
+
+
 class _StatisticsAdapter:
     vector_observation_keys = ("observation.state",)
     action_key = "action"

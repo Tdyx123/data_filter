@@ -99,7 +99,12 @@ class BridgeV2NormalizationStatistics:
             np.float32, copy=False
         )
 
-    def denormalize_action(self, value: Any) -> np.ndarray:
+    def denormalize_action(
+        self,
+        value: Any,
+        *,
+        binarize_gripper: bool = True,
+    ) -> np.ndarray:
         array = self._array(value, dimension=ACTION_DIM, name="Normalized action")
         span = self.action_q99[:-1] - self.action_q01[:-1]
         constant = np.abs(span) < self.epsilon
@@ -110,7 +115,9 @@ class BridgeV2NormalizationStatistics:
             + self.action_q01[:-1]
         )
         continuous = np.where(constant, self.action_q01[:-1], continuous)
-        gripper = (array[..., -1:] > np.float32(0.5)).astype(np.float32)
+        gripper = array[..., -1:]
+        if binarize_gripper:
+            gripper = (gripper > np.float32(0.5)).astype(np.float32)
         return np.concatenate([continuous, gripper], axis=-1).astype(
             np.float32, copy=False
         )

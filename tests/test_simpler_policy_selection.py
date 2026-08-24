@@ -6,9 +6,6 @@ import pytest
     "adapter_class",
     (
         pytest.param(
-            "octo_small_bridge.remote_policy:OctoRemotePolicy", id="octo-remote"
-        ),
-        pytest.param(
             "octo_small_bridge.simpler_evaluation:OctoBridgeSimplerPolicy",
             id="octo-local",
         ),
@@ -23,7 +20,7 @@ import pytest
         ),
     ),
 )
-def test_non_starvla_adapters_keep_first_action_selection(adapter_class: str) -> None:
+def test_stepwise_adapters_keep_first_action_selection(adapter_class: str) -> None:
     module_name, class_name = adapter_class.split(":")
     module = __import__(module_name, fromlist=[class_name])
     adapter = object.__new__(getattr(module, class_name))

@@ -73,9 +73,17 @@ class BridgeNormalizationStatistics:
         except ValueError as error:
             raise SimplerEvaluationError(str(error)) from error
 
-    def actions_to_bridge(self, value: Any) -> np.ndarray:
+    def actions_to_bridge(
+        self,
+        value: Any,
+        *,
+        binarize_gripper: bool = True,
+    ) -> np.ndarray:
         try:
-            return self.values.denormalize_action(value)
+            return self.values.denormalize_action(
+                value,
+                binarize_gripper=binarize_gripper,
+            )
         except ValueError as error:
             raise SimplerEvaluationError(str(error)) from error
 
@@ -287,12 +295,16 @@ class OctoBridgeSimplerPolicy:
             raise SimplerEvaluationError(
                 f"Octo checkpoint returned actions with shape {normalized.shape}; expected {expected}"
             )
-        return self.statistics.actions_to_bridge(normalized)
+        return self.statistics.actions_to_bridge(
+            normalized,
+            binarize_gripper=False,
+        )
 
     def protocol_metadata(self) -> dict[str, Any]:
         return {
             "diffusion_steps": DIFFUSION_STEPS,
             "gripper_threshold": self.gripper_threshold,
+            "model_action_gripper": "continuous_model_prediction",
             "native_action_chunk_size": ACTION_HORIZON,
             "observation_tokenizers": ["primary"],
             "precision": self.precision,

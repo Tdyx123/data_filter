@@ -65,6 +65,7 @@ def _start_server(tmp_path, policy, *, authkey=b"octo-test-key"):
 def test_authenticated_client_round_trips_metadata_rng_observation_and_actions(tmp_path):
     from octo_small_bridge.ipc import IPC_PROTOCOL_VERSION, OctoIPCClient
 
+    assert IPC_PROTOCOL_VERSION == 2
     policy = _FakePolicy()
     socket_path, thread = _start_server(tmp_path, policy)
     client = OctoIPCClient(socket_path, authkey=b"octo-test-key")

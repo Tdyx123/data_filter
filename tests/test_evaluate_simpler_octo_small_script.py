@@ -163,6 +163,8 @@ def test_launcher_starts_current_pyenv_model_then_dedicated_simulator(tmp_path):
         "--statistics",
         STATISTICS,
         "--tasks=spoon,eggplant",
+        "--action-postprocessing",
+        "first_action",
         "--smoke-test",
     )
 
@@ -195,6 +197,7 @@ def test_launcher_starts_current_pyenv_model_then_dedicated_simulator(tmp_path):
     assert sim_call[sim_call.index("--sim-device") + 1] == "cuda:0"
     assert "--checkpoint" not in sim_call
     assert "--tasks=spoon,eggplant" in sim_call
+    assert sim_call[sim_call.index("--action-postprocessing") + 1] == "first_action"
     assert "--smoke-test" in sim_call
     assert not socket_path.exists()
     assert stopped.read_text(encoding="utf-8") == "stopped"
@@ -233,6 +236,8 @@ def test_launcher_delegates_explicit_model_devices_to_parallel_coordinator(tmp_p
         "cuda:7",
         "--tasks",
         "spoon",
+        "--action-postprocessing",
+        "first_action",
         environment_updates={
             "OCTO_TEST_EXPECT_PARALLEL_PYTHONPATH": (
                 f"{PROJECT_ROOT / 'src'}:{simpler_root}:{maniskill_root}"
@@ -255,7 +260,12 @@ def test_launcher_delegates_explicit_model_devices_to_parallel_coordinator(tmp_p
     assert call[call.index("--output-dir") + 1] == str(output_dir)
     assert call[call.index("--checkpoint") + 1] == CHECKPOINT
     assert call[call.index("--base-model") + 1] == BASE_MODEL
-    assert call[call.index("--") + 1 :] == ["--tasks", "spoon"]
+    assert call[call.index("--") + 1 :] == [
+        "--tasks",
+        "spoon",
+        "--action-postprocessing",
+        "first_action",
+    ]
     assert sim_calls == []
 
 
@@ -421,6 +431,11 @@ def test_launcher_help_does_not_start_processes_and_documents_defaults(tmp_path)
     assert ".venv-octo-simpler/bin/python" in completed.stdout
     assert "--server-timeout SEC" in completed.stdout
     assert "--preflight-only" in completed.stdout
+    assert (
+        "--action-postprocessing octo_temporal_ensemble_v1|first_action "
+        "(default: octo_temporal_ensemble_v1)"
+        in completed.stdout
+    )
 
 
 def test_launcher_term_signal_reaps_both_managed_processes(tmp_path):

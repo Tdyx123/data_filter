@@ -38,7 +38,9 @@ Launcher options:
   -h, --help             show this help without starting either process
 
 Evaluation options are forwarded to octo_small_bridge.evaluate_simpler, including:
-  --tasks TASKS --action-horizon 1 --preflight-only --smoke-test
+  --tasks TASKS --action-horizon 1
+  --action-postprocessing octo_temporal_ensemble_v1|first_action (default: octo_temporal_ensemble_v1)
+  --preflight-only --smoke-test
   --save-videos-path PATH --video-fps FPS --overwrite
 
 The removed --python option is not accepted; use --sim-python instead.
