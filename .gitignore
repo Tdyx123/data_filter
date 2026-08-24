@@ -10,3 +10,5 @@ dist/
 outputs/
 runs/
 .worktrees/
+/demo_images/
+/tmp_results/
