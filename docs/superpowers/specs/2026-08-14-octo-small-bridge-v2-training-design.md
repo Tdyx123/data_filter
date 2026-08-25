@@ -16,7 +16,7 @@
 
 预检由单个 Python 进程完成；正式训练通过四个 `torchrun` 进程执行。默认模型为
 `/data/dwb/models/octo-small-pytorch`，默认数据集为
-`/data/dwb/datasets/bridge_orig_1.0.0_lerobo`。
+`/data/dwb/datasets/bridge_orig_1.0.0_lerobot`。
 
 ## 数据契约
 

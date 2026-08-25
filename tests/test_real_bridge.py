@@ -12,7 +12,7 @@ from qwen3_vl_groot.data import BridgeMetadata, validate_episode  # noqa: E402
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DATASET_ROOT = Path("/data/dwb/datasets/bridge_orig_1.0.0_lerobo")
+DATASET_ROOT = Path("/data/dwb/datasets/bridge_orig_1.0.0_lerobot")
 
 
 @pytest.mark.real_data

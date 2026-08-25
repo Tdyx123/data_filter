@@ -87,7 +87,7 @@ def test_old_octo_bridge_checkpoint_is_rejected_before_model_loading(tmp_path):
     (checkpoint / "model.safetensors").write_bytes(b"old")
     calls = []
 
-    with pytest.raises(SimplerEvaluationError, match="checkpoint_manifest"):
+    with pytest.raises(SimplerEvaluationError, match="Legacy Octo Bridge checkpoints"):
         load_octo_bridge_policy(
             checkpoint,
             base_model=base_model,
@@ -222,73 +222,17 @@ def _self_contained_base_model(tmp_path: Path) -> Path:
 
 
 def test_policy_loader_uses_primary_only_and_strict_checkpoint_weights(tmp_path):
-    from octo_small_bridge.checkpoint_contract import BridgeCheckpointContract
     from octo_small_bridge.simpler_evaluation import load_octo_bridge_policy
+    from simpler_bridge.evaluation import SimplerEvaluationError
 
     base_model = _self_contained_base_model(tmp_path)
-    checkpoint = tmp_path / "checkpoints" / "step-00020000"
-    checkpoint.mkdir(parents=True)
-    (checkpoint / "model.safetensors").write_bytes(b"fine-tuned")
-    statistics_path = _statistics_file(tmp_path)
-    BridgeCheckpointContract(statistics_path, "d" * 64).write(checkpoint)
-    calls = {}
-
-    class Model:
-        config = SimpleNamespace(
-            action_dim=7,
-            action_horizon=8,
-            proprio_dim=8,
-            language_tokens=16,
-            diffusion_steps=20,
+    with pytest.raises(SimplerEvaluationError, match="official_pytorch"):
+        load_octo_bridge_policy(
+            tmp_path / "checkpoint",
+            base_model=base_model,
+            device="cpu",
+            precision="fp32",
         )
-
-        def to(self, device):
-            calls["device"] = str(device)
-            return self
-
-        def eval(self):
-            calls["eval"] = True
-            return self
-
-    model = Model()
-
-    def model_loader(path, **kwargs):
-        calls["model_loader"] = (Path(path), kwargs)
-        return model, _Tokenizer()
-
-    def weight_loader(loaded_model, path, **kwargs):
-        calls["weight_loader"] = (loaded_model, Path(path), kwargs)
-
-    torch_module = SimpleNamespace(
-        device=lambda value: SimpleNamespace(type="cuda", __str__=lambda self: value),
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            is_bf16_supported=lambda: True,
-        ),
-    )
-
-    spec, policy = load_octo_bridge_policy(
-        checkpoint,
-        base_model=base_model,
-        device="cuda:0",
-        precision="bf16",
-        model_loader=model_loader,
-        weight_loader=weight_loader,
-        torch_module=torch_module,
-    )
-
-    assert spec.requested_path == checkpoint.resolve()
-    assert calls["model_loader"] == (
-        base_model.resolve(),
-        {"device": "cpu", "observation_tokenizers": ("primary",)},
-    )
-    assert calls["weight_loader"] == (
-        model,
-        checkpoint.resolve() / "model.safetensors",
-        {"strict": True, "device": "cpu"},
-    )
-    assert calls["eval"] is True
-    assert policy.statistics.path == checkpoint.resolve() / "normalization.json"
 
 
 def test_remote_policy_preserves_raw_observations_rng_and_server_metadata():

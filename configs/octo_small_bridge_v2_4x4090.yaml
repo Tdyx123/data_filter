@@ -1,21 +1,19 @@
 paths:
-  model: /data/dwb/models/octo-small-pytorch
-  dataset: /data/dwb/datasets/bridge_orig_1.0.0_lerobo
+  model: /data/dwb/models/octo-small-pytorch-official
+  dataset: /data/dwb/datasets/bridge_orig_1.0.0_lerobot
 
 data:
   dataset_name: bridge_orig_1.0.0
+  prior_selection:
+    prefiltered_scores: null
   image_obs_keys:
     primary: observation.images.image_0
-  state_obs_keys: [observation.state]
   action_key: action
-  state_dim: 8
   action_dim: 7
-  window_size: 1
-  action_horizon: 8
-  normalization_contract: bridge_v2_q99_binary_v1
-  normalization_epsilon: 1.0e-6
-  absolute_action_mask: [false, false, false, false, false, false, true]
-  action_normalization_mask: [true, true, true, true, true, true, false]
+  window_size: 2
+  action_horizon: 4
+  action_normalization: bridge_dataset_mean_std
+  gripper_transform: trajectory_backward_binarize_minus_one_to_one
   resize:
     primary: [256, 256]
   empty_task_policy: exclude
@@ -27,7 +25,7 @@ data:
 
 model:
   required_observation_tokenizers: [primary]
-  use_proprio: true
+  use_proprio: false
   action_head: diffusion
   finetuning_mode: full
 
@@ -38,7 +36,7 @@ train:
   batch_size: 128
   micro_batch_size_per_gpu: 8
   gradient_accumulation_steps: 4
-  max_steps: 10000
+  max_steps: 20000
   num_workers_per_rank: 4
   prefetch_factor: 2
   episode_cache_size: 2

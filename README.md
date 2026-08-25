@@ -60,81 +60,20 @@ FlashAttention varlen backward 的已知越界问题；Qwen3-VL 的自动选择�
 
 ## 训练
 
-### Octo-small（独立并列配置）
+### Octo-small 官方语义 PyTorch 四卡微调
 
-Octo-small 使用独立的纯 PyTorch 路线，不替换 Qwen3-VL，也不复用其 LoRA、
-GR00T DiT 或 DeepSpeed 配置。训练数据、双相机视觉 stem、T5-base、12 层
-blockwise transformer 和 diffusion action head 均由 PyTorch 执行；正式环境
-不安装或导入 TensorFlow、dlimp、JAX、Flax、Optax、Orbax。
+该路线固定使用 pyenv 的 `miniconda3-3.12-25.11.1-1`，默认基础 artifact 为
+`/data/dwb/models/octo-small-pytorch-official`。`--model-path` 只能指向通过严格
+`octo-small-official-pytorch-v1` 校验的原始官方转换产物；旧
+`/data/dwb/models/octo-small-pytorch` 和旧 Bridge checkpoint 不兼容。
 
-#### 安装纯 PyTorch 环境
-
-Octo 路线固定使用独立 Python 3.10 环境：
-
-```bash
-python3.10 -m venv .venv-octo-pytorch
-source .venv-octo-pytorch/bin/activate
-python -m pip install --upgrade pip
-pip install --index-url https://download.pytorch.org/whl/cu121 \
-  torch==2.4.1 torchvision==0.19.1
-pip install -r requirements-octo-pytorch.txt
-```
-
-#### 一次性转换预训练 checkpoint
-
-本地 `/data/dwb/models/octo-small` 是 Orbax 格式。使用独立的一次性 CPU
-环境把 step 270000 转成 PyTorch：
-
-```bash
-python3.10 -m venv .venv-octo-convert
-source .venv-octo-convert/bin/activate
-python -m pip install --upgrade pip
-pip install --index-url https://download.pytorch.org/whl/cpu torch==2.4.1
-pip install -r requirements-octo-convert.txt
-
-bash scripts/convert_octo_small_to_pytorch.sh \
-  --source /data/dwb/models/octo-small \
-  --output /data/dwb/models/octo-small-pytorch \
-  --step 270000
-```
-
-转换器直接读取 Orbax 参数树，不依赖官方 Octo 包或 TensorFlow。它会转换
-双相机 stem、T5-base、12 层 transformer 和兼容的 diffusion 权重；新增
-proprio 参数以及 horizon 4→8 后形状不兼容的 diffusion 投影按 seed 42
-初始化。输出包含 `model.safetensors`、`model_config.json`、自包含
-`text_encoder/` 和记录源 hash、逐 tensor 映射的 `conversion_manifest.json`。
-
-首次转换默认从 `/data/dwb/models/t5-base` 读取预先下载的
-`config.json`、`spiece.model` 和 `tokenizer.json`；T5 模型权重仍来自本地
-Octo checkpoint。转换过程不会访问 Hugging Face，最终 artifact 会生成完整的
-`text_encoder/tokenizer_config.json`。如需使用其他本地目录：
-
-```bash
-bash scripts/convert_octo_small_to_pytorch.sh \
-  --t5-source /path/to/t5-base \
-  --local-files-only
-```
-
-转换完成后可删除一次性环境，训练只使用纯 PyTorch 环境。
-
-纯 CPU 两步模型/优化器 smoke test 不需要 CUDA：
-
-```bash
-PYTHONPATH=src pytest -q \
-  tests/test_octo_small_pytorch.py \
-  -k two_step_cpu_smoke
-```
-
-#### BridgeData V2 四卡微调
-
-Octo-small 可直接读取默认的
-`/data/dwb/datasets/bridge_orig_1.0.0_lerobo`，无需转换或复制数据。独立入口只使用
-`observation.images.image_0` 作为主相机、8 维 `observation.state` 和 7 维
-`action`；空语言 episode 会被排除。状态 `xyz/rpy/pad` 和动作 `Δxyz/Δrpy`
-按有效 episode 精确计算的 q01/q99 分维归一化并截断到 `[-2.2,2.2]`，常量
-`pad` 固定为 `0`。状态及动作 gripper 均以 `x > 0.5` 转为严格 `0/1`；动作原值
-仍接受 `[-1e-5, 1+1e-5]` 的浮点容差，非有限值或明显越界值会触发包含 episode
-ID 的数据校验错误。管线不伪造 wrist 图像。
+训练直接读取 `/data/dwb/datasets/bridge_orig_1.0.0_lerobot`，不修改或复制源数据。
+仅使用 `observation.images.image_0` 和 7 维 action，不读取 proprio/wrist；14,532 条
+空语言 episode 被排除。每个样本包含前一帧和当前帧，episode 首帧重复首图并使用
+`[False, True]` timestep mask；窗口内两帧共享增广参数。两个有效 readout 都监督
+4-step action chunk，尾部重复 episode 最后动作。前六维严格使用官方 artifact 中
+`bridge_dataset` mean/std，gripper 先按整条轨迹反向消除中间值，再从 `0..1` 映射到
+`-1..1`；不会重新计算 q01/q99。
 
 先运行只读预检，再执行两步 smoke test 或正式训练；`--output-dir` 始终必填：
 
@@ -152,25 +91,49 @@ bash scripts/train_bridge_octo_small_4x4090.sh \
 ```
 
 默认使用 GPU `0,1,2,3`、每卡 micro-batch 8、梯度累积 4、全局 batch 128、
-10,000 optimizer steps、400 步 warmup、峰值学习率 `3e-4` 和 BF16。预检会验证
-LeRobot v2/WidowX/5 Hz/AV1、特征和统计维度、源数据计数，并解码有效 episode 的
-首、中、尾样本。精确 q01/q99 缓存写入输出目录的 `normalization.json`。自定义路径
-和续训示例：
+20,000 optimizer steps、400 步 warmup、峰值学习率 `3e-4`、weight decay `0.01`、
+cosine 和 BF16。预检使用单进程，训练使用四进程；预检会严格校验基础权重、config、
+statistics、T5 资源及哈希，再验证 LeRobot v2/WidowX/5 Hz/AV1、固定计数和代表性
+双帧/四步样本。自定义数据路径、原始官方 artifact 和严格续训示例：
 
 ```bash
 bash scripts/train_bridge_octo_small_4x4090.sh \
   --dataset-path /path/to/bridge_lerobot_v2 \
-  --model-path /path/to/octo-small-pytorch \
+  --model-path /path/to/octo-small-pytorch-official \
   --gpu-ids 0,1,2,3 \
   --output-dir outputs/octo_small_bridge \
   --resume latest
 ```
 
-首版使用全部 38,660 条非空语言 episode（1,305,714 帧），不划分验证集，也不接收
-Cocore/RelCore 筛选清单或运行 SimplerEnv 评测。训练输出沿用 Octo 的配置、数据和
-模型 manifest、metrics、latest/best checkpoint 指针；每个 checkpoint 都自包含并
-校验 `normalization.json` 与 `bridge_v2_q99_binary_v1` 契约。缺少该契约的旧 Octo
-Bridge checkpoint 会在加载模型权重前被拒绝；续训会恢复采样顺序和随机数状态。
+默认使用全部 38,660 条非空语言 episode（1,305,714 帧），不划分验证集。若要训练
+Cocore/RelCore 已选片段，传入 `selected_manifest.jsonl`：
+
+```bash
+bash scripts/train_bridge_octo_small_4x4090.sh \
+  --prior-prefiltered-scores /path/to/cocore/selected_manifest.jsonl \
+  --output-dir outputs/octo_small_bridge_cocore
+```
+
+`--prior-prefiltered-scores` 接受 JSONL 或 CSV，每行必须包含
+`episode_id,start_step,end_step`；所有行都视为已筛选结果，额外评分字段会被忽略，
+重叠片段的训练起点会去重。动作窗口可越过片段边界，但只会在 episode 尾部重复最后
+一个动作。预检、数据 manifest 和 checkpoint 会记录清单哈希与选择统计；修改清单后
+不能从旧选择结果续训。训练保留 metrics、latest/best、原子保存，以及四个 rank 的
+采样/RNG/优化器/scheduler 恢复。每个 step checkpoint 使用
+`octo-small-official-pytorch-finetune-v1`，自包含模型、官方 config/statistics/T5、
+训练状态和 manifest；哈希、shape、语义、基础权重或选择不一致时先拒绝再加载权重。
+
+使用 best checkpoint 做官方 PyTorch SimplerEnv 预检：
+
+```bash
+best_checkpoint="$(PYENV_VERSION=miniconda3-3.12-25.11.1-1 \
+  /home/dwb/.pyenv/bin/pyenv exec python -c \
+  'import json; print(json.load(open("outputs/octo_small_bridge/checkpoints/best.json"))["checkpoint"])')"
+bash scripts/evaluate_simpler_octo_small_official_pytorch.sh \
+  --checkpoint "outputs/octo_small_bridge/checkpoints/${best_checkpoint}" \
+  --output-dir outputs/octo_small_bridge_best_simpler_preflight \
+  --preflight-only
+```
 
 #### 转换 LIBERO
 
@@ -624,7 +587,7 @@ bash scripts/train_bridge_4x4090.sh \
   --lora-learning-rate 1e-5 \
   --action-head-learning-rate 1e-4 \
   --model-path /data/dwb/models/Qwen3-VL-4B-Instruct \
-  --dataset-path /data/dwb/datasets/bridge_orig_1.0.0_lerobo \
+  --dataset-path /data/dwb/datasets/bridge_orig_1.0.0_lerobot \
   --output-dir outputs/qwen3_vl_4b_groot_bridge_4gpu
 ```
 
@@ -842,7 +805,7 @@ bash scripts/train_libero_qwen3_vl_4b_groot_all_tasks_4x4090.sh \
 ```bash
 bash scripts/train_bridge_8x4090.sh \
   --model-path /data/dwb/models/Qwen3-VL-4B-Instruct \
-  --dataset-path /data/dwb/datasets/bridge_orig_1.0.0_lerobo \
+  --dataset-path /data/dwb/datasets/bridge_orig_1.0.0_lerobot \
   --output-dir outputs/qwen3_vl_4b_groot_bridge
 ```
 
@@ -1077,84 +1040,11 @@ bash scripts/evaluate_simpler_qwen.sh \
 
 ### Octo-small Bridge 的 SimplerEnv 四任务闭环评测
 
-Octo-small 使用与 Qwen 相同的固定 WidowX 协议和 SimplerEnv/ManiSkill2_real2sim
-源码版本。启动器把模型与仿真拆成两个进程：模型默认通过
-`/home/dwb/.pyenv/bin/pyenv exec python` 运行并继承当前选中的 pyenv，仿真默认使用
-`.venv-octo-simpler/bin/python`。先准备 Python 3.10/3.11 的仿真环境：
-
-```bash
-uv venv --python /usr/bin/python3.10 .venv-octo-simpler
-uv pip install --python .venv-octo-simpler/bin/python \
-  torch==2.4.1 torchvision==0.19.1 \
-  --index-url https://download.pytorch.org/whl/cu121
-uv pip install --python .venv-octo-simpler/bin/python \
-  -r requirements-octo-simpler-eval.txt \
-  --build-constraints requirements-octo-simpler-build.txt
-```
-
-构建约束只固定 `ruckig==0.14.0` 所需的旧版构建后端，不会安装进评测运行时。
-模型 pyenv 必须已经具备加载 Octo checkpoint 所需的 Torch、Transformers 和
-safetensors 等依赖；启动器不会安装依赖、固定 `PYENV_VERSION` 或校验包版本。
-如需覆盖默认入口，分别传 `--pyenv-bin PATH` 和 `--sim-python PATH`。
-
-checkpoint 包含微调权重及训练时使用的 Bridge V2 归一化统计，因此只需 checkpoint
-和基础模型。可选 `--statistics` 仅用于显式指定相同文件，内容哈希不一致会被拒绝。
-启动器为两个进程创建带随机认证密钥的私有 Unix socket；模型完成一次黑图推理后才
-启动仿真客户端。模型输出持久写入评测目录的 `model-server.log`，退出或收到信号时
-启动器会回收两个子进程并清理 socket。
-先用独立输出目录运行四任务预检：
-
-```bash
-bash scripts/evaluate_simpler_octo_small.sh \
-  --checkpoint /data/dwb/octo_small_bridge_v2/checkpoints/step-00020000 \
-  --base-model /data/dwb/models/octo-small-pytorch \
-  --output-dir outputs/octo_small_bridge_simpler_preflight \
-  --preflight-only
-```
-
-预检通过后，每任务运行 seed 0、object episode 0、最多 8 步的 smoke test：
-
-```bash
-bash scripts/evaluate_simpler_octo_small.sh \
-  --checkpoint /data/dwb/octo_small_bridge_v2/checkpoints/step-00020000 \
-  --base-model /data/dwb/models/octo-small-pytorch \
-  --output-dir outputs/octo_small_bridge_simpler_smoke \
-  --smoke-test
-```
-
-不传 `--smoke-test` 时，默认串行运行 `spoon`、`carrot`、`stack`、`eggplant`，
-每个任务执行 object episode `0..23` 与策略种子 `0,2,4` 的组合，共 288 回合：
-
-```bash
-bash scripts/evaluate_simpler_octo_small.sh \
-  --checkpoint /data/dwb/octo_small_bridge_v2/checkpoints/step-00020000 \
-  --base-model /data/dwb/models/octo-small-pytorch \
-  --tasks all \
-  --output-dir outputs/octo_small_bridge_simpler_eval
-```
-
-评测固定使用环境返回的原始 instruction，只启用 primary 图像 tokenizer，并使用
-checkpoint 内 Bridge V2 q01/q99 统计标准化 proprio、反归一化前六维动作。Octo-small
-在每个环境步重新预测原生 8 步动作块；默认把最近 8 个重叠 chunk 按时间索引对齐，
-以 `temperature=0.0` 均匀集成当前动作。gripper 保留模型连续预测值参与集成，随后
-才由共享环境转换按严格 `>0.5` 输出 `-1/+1`。每个 episode 开始都会清空集成历史。
-
-如需运行只选择最新 chunk 首动作的纯后处理消融，显式传入：
-
-```bash
-bash scripts/evaluate_simpler_octo_small.sh \
-  --checkpoint /data/dwb/octo_small_bridge_v2/checkpoints/step-00020000 \
-  --base-model /data/dwb/models/octo-small-pytorch \
-  --output-dir outputs/octo_small_bridge_simpler_first_action \
-  --action-postprocessing first_action
-```
-
-默认正式协议标记为 `octo_reference_3seed_288`，任务步数保持 spoon/carrot/stack 为
-60、eggplant 为 120。`results.json` 会记录 execution mode、动作后处理模式、prediction
-horizon `8`、temperature `0.0`、gripper 二值化顺序、environment instruction 来源、
-episode 协议和实际环境生命周期。Octo IPC 协议版本为 2，客户端会在推理前拒绝仍把
-gripper 当作服务端二值值的旧服务。默认不录像；输出文件、覆盖保护和退出码与 Qwen
-SimplerEnv 入口一致。
+新训练 checkpoint 只使用下文的官方 PyTorch 评测入口
+`scripts/evaluate_simpler_octo_small_official_pytorch.sh`。旧
+`scripts/evaluate_simpler_octo_small.sh`、`--base-model`、proprio/q01-q99 和 8-step
+协议不兼容，也不会自动迁移。官方入口固定 primary-only、最多双帧历史、原生 4-step
+action chunk，并根据 manifest 报告 `official_parity` 或 `official_finetuned`。
 
 ### StarVLA Qwen3VL-GR00T Bridge 的 SimplerEnv 评测
 
@@ -1283,11 +1173,93 @@ alpha 0.1 的自适应时间集成选择当前动作。`--action-postprocessing 
 默认参考协议完成后 `episodes.jsonl` 应恰有 96 条；robustness 协议则应有 288 条。
 `results.json` 会按任务和实际运行的策略 seed 汇总，并保留完整协议元数据。
 
+### Octo-small 官方语义 PyTorch SimplerEnv 评测
+
+官方语义评测与旧 8-step Bridge/LIBERO 模型完全隔离。它使用独立 package、
+checkpoint 格式、IPC 和启动器，对齐发布版 Octo-small 的最多 2 帧图像历史、原生
+4-step action chunk、块因果注意力和 `bridge_dataset` mean/std；模型输入不创建、传输
+或读取 proprio。现有 `/data/dwb/models/octo-small-pytorch` 不会被读取或覆盖。
+
+从官方 `/data/dwb/models/octo-small` step 270000 做一次完整转换。默认输出为新的
+`/data/dwb/models/octo-small-pytorch-official`；若目录已存在，必须显式传
+`--overwrite`：
+
+```bash
+bash scripts/convert_octo_small_official_to_pytorch.sh
+
+# 仅在确认要替换该独立官方产物时使用
+bash scripts/convert_octo_small_official_to_pytorch.sh --overwrite
+```
+
+转换使用 `requirements-octo-convert.txt` 所在的 pyenv 环境，复制官方
+`bridge_dataset` statistics，并写出格式为 `octo-small-official-pytorch-v1` 的
+manifest。转换会拒绝任何未映射的官方推理 tensor；manifest 中
+`intentionally_initialized`、`skipped_source_tensors` 和
+`unexpected_source_tensors` 都必须为空。启动器不会隐式转换，checkpoint 缺失或
+manifest 不匹配时会在启动仿真前失败。评测加载器同时接受严格的原始
+`octo-small-official-pytorch-v1` artifact 和训练产出的
+`octo-small-official-pytorch-finetune-v1` step checkpoint；两者都在加载权重前校验
+哈希、tensor shape、config、statistics 和 T5 资源。
+
+先运行四任务预检；模型进程默认继承 `/home/dwb/.pyenv/bin/pyenv exec python`，
+仿真进程仍使用 `.venv-octo-simpler/bin/python`：
+
+```bash
+bash scripts/evaluate_simpler_octo_small_official_pytorch.sh \
+  --device cuda:4 \
+  --sim-device cuda:5 \
+  --tasks all \
+  --output-dir /data/dwb/octo_small_bridge_simpler_eval/official-pytorch-preflight \
+  --preflight-only
+```
+
+预检会报告动作 shape `(1,4,7)`、首步 1 帧/后续 2 帧历史以及
+`use_proprio=false`。随后可运行每任务一个 8-step episode 的 smoke test：
+
+```bash
+bash scripts/evaluate_simpler_octo_small_official_pytorch.sh \
+  --device cuda:4 \
+  --sim-device cuda:5 \
+  --tasks all \
+  --output-dir /data/dwb/octo_small_bridge_simpler_eval/official-pytorch-smoke \
+  --smoke-test
+```
+
+正式 288 回合命令为：
+
+```bash
+bash scripts/evaluate_simpler_octo_small_official_pytorch.sh \
+  --device cuda:4 \
+  --sim-device cuda:5 \
+  --tasks all \
+  --output-dir /data/dwb/octo_small_bridge_simpler_eval/official-pytorch
+```
+
+默认使用官方 horizon-4 temporal ensemble；gripper 连续预测先参与 ensemble，再按
+严格 `>0.5` 转成 `-1/+1`。纯首动作对照使用
+`--action-postprocessing first_action`。第一版只支持单个模型 GPU，不提供模型副本或
+模型分片。结果目录继续生成 `results.json`、`episodes.jsonl` 和
+`model-server.log`；原始 artifact 的结果协议标记 `official_parity`，微调 checkpoint
+标记 `official_finetuned`，并记录 history horizon
+2、native chunk 4、`use_proprio=false`、statistics SHA-256、Torch RNG 后端以及模型侧
+实际 Python/Torch/Transformers 版本。Torch 与 JAX 的相同整数 seed 不声明逐位等价。
+
+转换后可在安装了固定 Octo 源码及 Flax/Orbax 依赖的环境运行 opt-in layer parity；
+该测试比较视觉编码、T5、双帧 transformer 最后 readout 和 diffusion score：
+
+```bash
+OCTO_SOURCE_DIR=/path/to/octo-at-653c54ac \
+OCTO_OFFICIAL_PYTORCH_MODEL=/data/dwb/models/octo-small-pytorch-official \
+pytest -q tests/test_octo_small_official_pytorch_parity.py
+```
+
 ## 测试
 
 ```bash
-pytest
-pytest -m real_data
+PYENV_VERSION=miniconda3-3.12-25.11.1-1 \
+  PYTHONPATH=src:. /home/dwb/.pyenv/bin/pyenv exec pytest
+PYENV_VERSION=miniconda3-3.12-25.11.1-1 \
+  PYTHONPATH=src:. /home/dwb/.pyenv/bin/pyenv exec pytest -m real_data
 pytest -q tests/test_qwen_ipc.py tests/test_qwen_simpler_server.py \
   tests/test_qwen_simpler_evaluation.py tests/test_evaluate_simpler_qwen_script.py
 bash -n scripts/evaluate_simpler_qwen.sh
@@ -1295,6 +1267,22 @@ pytest -q tests/test_simpler_bridge_evaluation.py \
   tests/test_octo_small_simpler_evaluation.py \
   tests/test_evaluate_simpler_octo_small_script.py
 bash -n scripts/evaluate_simpler_octo_small.sh
+PYENV_VERSION=miniconda3-3.12-25.11.1-1 PYTHONPATH=src:. \
+  /home/dwb/.pyenv/bin/pyenv exec pytest -q \
+  tests/test_octo_small_bridge_official_training.py \
+  tests/test_octo_small_bridge_checkpoint_contract.py \
+  tests/test_train_bridge_octo_script.py \
+  tests/test_octo_small_official_pytorch_model.py \
+  tests/test_octo_small_official_pytorch_conversion.py \
+  tests/test_octo_small_official_pytorch_policy.py \
+  tests/test_octo_small_official_pytorch_ipc.py \
+  tests/test_octo_small_official_pytorch_server_eval.py \
+  tests/test_octo_small_official_pytorch_scripts.py \
+  tests/test_octo_small_official_pytorch_launcher.py \
+  tests/test_octo_small_official_pytorch_parity.py
+bash -n scripts/convert_octo_small_official_to_pytorch.sh \
+  scripts/evaluate_simpler_octo_small_official_pytorch.sh \
+  scripts/train_bridge_octo_small_4x4090.sh
 pytest -q tests/test_starvla_modeling.py tests/test_starvla_runtime.py \
   tests/test_starvla_ipc.py tests/test_starvla_simpler_evaluation.py \
   tests/test_evaluate_simpler_starvla_script.py

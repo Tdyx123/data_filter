@@ -482,7 +482,8 @@ def test_octo_readme_documents_split_default_runtimes():
     octo_section = readme.split("### Octo-small Bridge 的 SimplerEnv 四任务闭环评测", 1)[1].split(
         "### StarVLA", 1
     )[0]
-    assert "model-server.log" in octo_section
-    assert "/home/dwb/.pyenv/bin/pyenv" in octo_section
-    assert ".venv-octo-simpler/bin/python" in octo_section
+    assert "evaluate_simpler_octo_small_official_pytorch.sh" in octo_section
+    assert "primary-only" in octo_section
+    assert "4-step" in octo_section
+    assert "official_finetuned" in octo_section
     assert "bash scripts/evaluate_simpler_octo_small.sh \\\n  --python" not in octo_section

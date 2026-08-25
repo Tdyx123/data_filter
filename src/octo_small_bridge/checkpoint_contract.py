@@ -1,145 +1,218 @@
-"""Self-contained checkpoint contract for Octo-small Bridge V2 runs."""
+"""Self-contained official-semantics fine-tune checkpoint contract."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import BRIDGE_V2_NORMALIZATION_CONTRACT
-from .normalization import BridgeV2NormalizationStatistics
-
-
-CHECKPOINT_FORMAT = "octo-small-bridge-checkpoint-v2"
+from octo_small_official_pytorch.checkpoint import (
+    OFFICIAL_FINETUNE_FORMAT,
+    OFFICIAL_FORMAT,
+    TEXT_ARTIFACT_PATHS,
+    OfficialCheckpointError,
+    OfficialCheckpointReport,
+    sha256_file,
+    validate_official_checkpoint,
+    validate_official_or_finetuned_checkpoint,
+)
 
 
 class BridgeCheckpointContractError(RuntimeError):
-    """Raised when a Bridge checkpoint predates or violates the V2 contract."""
+    """Raised when an official Bridge fine-tune checkpoint is incompatible."""
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _write_json(path: Path, value: Any) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True, ensure_ascii=False)
+        handle.write("\n")
+
+
+def _clean_config(config: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in config.items() if not key.startswith("_")}
+
+
+def _training_step(directory: Path) -> int:
+    name = directory.name
+    if name.startswith(".step-") and name.endswith(".tmp"):
+        digits = name.removeprefix(".step-").removesuffix(".tmp")
+    elif name.startswith("step-"):
+        digits = name.removeprefix("step-")
+    else:
+        digits = ""
+    if not digits.isdigit() or int(digits) <= 0:
+        raise BridgeCheckpointContractError(
+            f"Cannot derive a positive training step from checkpoint directory {directory}"
+        )
+    return int(digits)
+
+
+def _tensor_shapes(path: Path) -> dict[str, list[int]]:
+    try:
+        from safetensors import safe_open
+
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            return {
+                key: list(handle.get_slice(key).get_shape()) for key in sorted(handle.keys())
+            }
+    except (ImportError, OSError, RuntimeError, ValueError) as error:
+        raise BridgeCheckpointContractError(
+            f"Could not inspect fine-tuned model.safetensors: {error}"
+        ) from error
 
 
 @dataclass(frozen=True)
-class BridgeCheckpointContract:
-    normalization_path: Path
+class OfficialFinetuneCheckpointContract:
+    base_report: OfficialCheckpointReport
+    training_config: dict[str, Any]
+    dataset_manifest: dict[str, Any]
     selection_sha256: str
 
     def write(self, directory: str | Path) -> None:
         target = Path(directory)
-        source = Path(self.normalization_path)
-        if not source.is_file():
+        weights = target / "model.safetensors"
+        if not weights.is_file():
             raise BridgeCheckpointContractError(
-                f"Bridge normalization file does not exist: {source}"
+                f"Fine-tuned weights do not exist before manifest creation: {weights}"
             )
-        BridgeV2NormalizationStatistics.load(source)
-        normalization = target / "normalization.json"
-        shutil.copyfile(source, normalization)
+        if self.base_report.manifest.get("format") != OFFICIAL_FORMAT:
+            raise BridgeCheckpointContractError(
+                "Base checkpoint must be the strict official conversion artifact"
+            )
+        if self.dataset_manifest.get("selection_sha256") != self.selection_sha256:
+            raise BridgeCheckpointContractError(
+                "Dataset manifest selection differs from the training data selection"
+            )
+
+        shutil.copyfile(
+            self.base_report.path / "model_config.json",
+            target / "model_config.json",
+        )
+        shutil.copyfile(
+            self.base_report.statistics_path,
+            target / "dataset_statistics.json",
+        )
+        for relative_path in TEXT_ARTIFACT_PATHS:
+            destination = target / relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self.base_report.path / relative_path, destination)
+        _write_json(target / "finetune_config.json", _clean_config(self.training_config))
+        _write_json(target / "dataset_manifest.json", self.dataset_manifest)
+
+        base_manifest_path = self.base_report.path / "conversion_manifest.json"
         manifest = {
-            "format": CHECKPOINT_FORMAT,
-            "normalization_contract": BRIDGE_V2_NORMALIZATION_CONTRACT,
-            "normalization_sha256": _sha256(normalization),
-            "selection_sha256": str(self.selection_sha256),
+            "format": OFFICIAL_FINETUNE_FORMAT,
+            "training_step": _training_step(target),
+            "weights_sha256": sha256_file(weights),
+            "model_config_sha256": sha256_file(target / "model_config.json"),
+            "dataset_statistics_sha256": sha256_file(
+                target / "dataset_statistics.json"
+            ),
+            "finetune_config_sha256": sha256_file(target / "finetune_config.json"),
+            "dataset_manifest_sha256": sha256_file(target / "dataset_manifest.json"),
+            "text_artifact_sha256": {
+                relative_path: sha256_file(target / relative_path)
+                for relative_path in TEXT_ARTIFACT_PATHS
+            },
+            "tensor_shapes": _tensor_shapes(weights),
+            "data_selection_sha256": self.selection_sha256,
+            "base_checkpoint": {
+                "format": OFFICIAL_FORMAT,
+                "source_step": int(self.base_report.manifest["source_step"]),
+                "source_octo_commit": self.base_report.manifest["source_octo_commit"],
+                "weights_sha256": self.base_report.weights_sha256,
+                "conversion_manifest_sha256": sha256_file(base_manifest_path),
+            },
+            "training_contract": {
+                "observation_tokenizers": ["primary"],
+                "history_horizon": 2,
+                "action_horizon": 4,
+                "action_dim": 7,
+                "use_proprio": False,
+                "action_normalization": "bridge_dataset_mean_std",
+                "gripper_transform": "trajectory_backward_binarize_minus_one_to_one",
+                "diffusion_loss_readouts": "all_valid",
+                "padded_readouts": "masked",
+            },
         }
-        with (target / "checkpoint_manifest.json").open(
-            "w", encoding="utf-8"
-        ) as handle:
-            json.dump(manifest, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+        _write_json(target / "checkpoint_manifest.json", manifest)
 
     def validate(self, directory: str | Path) -> Path:
-        return validate_bridge_checkpoint(
-            directory,
-            expected_selection_sha256=self.selection_sha256,
-            expected_normalization_path=self.normalization_path,
-        )
-
-
-def validate_bridge_checkpoint(
-    checkpoint: str | Path,
-    *,
-    expected_selection_sha256: str | None = None,
-    expected_normalization_path: str | Path | None = None,
-) -> Path:
-    root = Path(checkpoint).expanduser().resolve()
-    manifest_path = root / "checkpoint_manifest.json"
-    normalization_path = root / "normalization.json"
-    if not manifest_path.is_file():
-        raise BridgeCheckpointContractError(
-            f"Bridge checkpoint is missing checkpoint_manifest.json: {root}"
-        )
-    if not normalization_path.is_file():
-        raise BridgeCheckpointContractError(
-            f"Bridge checkpoint is missing normalization.json: {root}"
-        )
-    try:
-        manifest: Any = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise BridgeCheckpointContractError(
-            f"Could not read Bridge checkpoint manifest: {manifest_path}"
-        ) from error
-    if not isinstance(manifest, dict):
-        raise BridgeCheckpointContractError("Bridge checkpoint manifest must be a mapping")
-    if manifest.get("format") != CHECKPOINT_FORMAT:
-        raise BridgeCheckpointContractError(
-            f"Bridge checkpoint format must be {CHECKPOINT_FORMAT!r}"
-        )
-    if manifest.get("normalization_contract") != BRIDGE_V2_NORMALIZATION_CONTRACT:
-        raise BridgeCheckpointContractError(
-            "Bridge checkpoint normalization contract must be "
-            f"{BRIDGE_V2_NORMALIZATION_CONTRACT!r}"
-        )
-    expected_hash = str(manifest.get("normalization_sha256", ""))
-    if not expected_hash or _sha256(normalization_path) != expected_hash:
-        raise BridgeCheckpointContractError(
-            "Bridge checkpoint normalization SHA-256 does not match its manifest"
-        )
-    try:
-        BridgeV2NormalizationStatistics.load(normalization_path)
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        raise BridgeCheckpointContractError(
-            f"Invalid Bridge checkpoint normalization: {error}"
-        ) from error
-    if (
-        expected_selection_sha256 is not None
-        and manifest.get("selection_sha256") != expected_selection_sha256
-    ):
-        raise BridgeCheckpointContractError(
-            "Bridge checkpoint data selection differs from the current run"
-        )
-    if expected_normalization_path is not None:
-        expected_path = Path(expected_normalization_path)
-        if not expected_path.is_file() or _sha256(expected_path) != expected_hash:
+        try:
+            report = validate_official_or_finetuned_checkpoint(directory)
+        except OfficialCheckpointError as error:
+            raise BridgeCheckpointContractError(str(error)) from error
+        if report.checkpoint_kind != "official_finetuned":
             raise BridgeCheckpointContractError(
-                "Bridge checkpoint normalization differs from the current run"
+                "Resume requires an official fine-tuned checkpoint, not base weights"
             )
-    return normalization_path
+        manifest = report.manifest
+        if manifest.get("data_selection_sha256") != self.selection_sha256:
+            raise BridgeCheckpointContractError(
+                "Bridge checkpoint data selection differs from the current run"
+            )
+        if manifest.get("base_checkpoint", {}).get(
+            "weights_sha256"
+        ) != self.base_report.weights_sha256:
+            raise BridgeCheckpointContractError(
+                "Bridge checkpoint base weights differ from the current official artifact"
+            )
+        saved_config = json.loads(
+            (report.path / "finetune_config.json").read_text(encoding="utf-8")
+        )
+        if saved_config != _clean_config(self.training_config):
+            raise BridgeCheckpointContractError(
+                "Bridge checkpoint training configuration differs from the current run"
+            )
+        return report.path
 
 
 def build_checkpoint_contract(
     config: dict[str, Any],
     paths: dict[str, Path],
     training_data: Any,
-) -> BridgeCheckpointContract:
-    contract = config["data"].get("normalization_contract")
-    if contract != BRIDGE_V2_NORMALIZATION_CONTRACT:
+) -> OfficialFinetuneCheckpointContract:
+    from .training import build_dataset_manifest
+
+    base_report = validate_official_checkpoint(paths["model"])
+    statistics_path = Path(training_data.statistics_path).resolve()
+    if statistics_path != base_report.statistics_path.resolve():
         raise BridgeCheckpointContractError(
-            "Cannot build a Bridge checkpoint without the V2 normalization contract"
+            "Bridge training statistics do not come from the official base artifact"
         )
-    normalization_path = Path(training_data.normalization_path).resolve()
-    if normalization_path != Path(paths["normalization"]).resolve():
-        raise BridgeCheckpointContractError(
-            "Bridge training data normalization path differs from the configured output"
-        )
-    return BridgeCheckpointContract(
-        normalization_path=normalization_path,
+    dataset_manifest = build_dataset_manifest(
+        config,
+        paths,
+        training_data=training_data,
+    )
+    return OfficialFinetuneCheckpointContract(
+        base_report=base_report,
+        training_config=config,
+        dataset_manifest=dataset_manifest,
         selection_sha256=str(training_data.selection_sha256),
     )
+
+
+def validate_bridge_checkpoint(
+    checkpoint: str | Path,
+    *,
+    expected_selection_sha256: str | None = None,
+) -> Path:
+    """Compatibility entry point backed by the official fine-tune validator."""
+
+    try:
+        report = validate_official_or_finetuned_checkpoint(checkpoint)
+    except OfficialCheckpointError as error:
+        raise BridgeCheckpointContractError(str(error)) from error
+    if report.checkpoint_kind != "official_finetuned":
+        raise BridgeCheckpointContractError("Bridge resume checkpoint must be fine-tuned")
+    if (
+        expected_selection_sha256 is not None
+        and report.manifest.get("data_selection_sha256") != expected_selection_sha256
+    ):
+        raise BridgeCheckpointContractError(
+            "Bridge checkpoint data selection differs from the current run"
+        )
+    return report.path

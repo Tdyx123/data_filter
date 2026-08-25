@@ -713,30 +713,6 @@ def test_bridge_dataset_manifest_records_filtered_source(tmp_path: Path) -> None
     assert manifest["selection_sha256"] == "a" * 64
 
 
-def test_bridge_training_wrapper_selects_primary_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    import octo_small_libero.training as shared_training
-    from octo_small_bridge.training import train
-
-    recorded: dict[str, object] = {}
-
-    def fake_train(config, paths, **kwargs):
-        recorded.update(config=config, paths=paths, **kwargs)
-
-    monkeypatch.setattr(shared_training, "train", fake_train)
-    config = {"train": {"max_steps": 2}}
-    paths = {"dataset": Path("/bridge")}
-
-    train(config, paths, resume="latest")
-
-    assert recorded["config"] is config
-    assert recorded["paths"] is paths
-    assert recorded["resume"] == "latest"
-    assert recorded["observation_tokenizers"] == ("primary",)
-    assert callable(recorded["training_data_builder"])
-    assert callable(recorded["dataset_manifest_builder"])
-    assert callable(recorded["checkpoint_contract_builder"])
-
-
 def test_bridge_default_config_and_cli_contract(tmp_path: Path) -> None:
     from octo_small_bridge.cli import build_parser, parse_arguments
     from octo_small_bridge.config import apply_overrides, load_config, resolved_paths
@@ -746,21 +722,24 @@ def test_bridge_default_config_and_cli_contract(tmp_path: Path) -> None:
         project_root / "configs" / "octo_small_bridge_v2_4x4090.yaml"
     )
     assert config["paths"]["dataset"] == (
-        "/data/dwb/datasets/bridge_orig_1.0.0_lerobo"
+        "/data/dwb/datasets/bridge_orig_1.0.0_lerobot"
     )
     assert config["model"]["required_observation_tokenizers"] == ["primary"]
-    assert config["data"]["normalization_contract"] == (
-        "bridge_v2_q99_binary_v1"
+    assert config["paths"]["model"] == (
+        "/data/dwb/models/octo-small-pytorch-official"
     )
-    assert config["data"]["normalization_epsilon"] == pytest.approx(1.0e-6)
+    assert config["data"]["action_normalization"] == "bridge_dataset_mean_std"
+    assert config["model"]["use_proprio"] is False
+    assert config["data"]["prior_selection"] == {"prefiltered_scores": None}
     assert config["train"]["gpu_ids"] == [0, 1, 2, 3]
     assert config["train"]["batch_size"] == 128
     assert config["train"]["micro_batch_size_per_gpu"] == 8
     assert config["train"]["gradient_accumulation_steps"] == 4
-    assert config["train"]["max_steps"] == 10_000
+    assert config["train"]["max_steps"] == 20_000
     assert config["train"]["learning_rate"]["warmup_steps"] == 400
     assert config["train"]["learning_rate"]["peak_value"] == pytest.approx(3.0e-4)
-    assert config["data"]["action_horizon"] == 8
+    assert config["data"]["window_size"] == 2
+    assert config["data"]["action_horizon"] == 4
 
     parser = build_parser()
     with pytest.raises(SystemExit):
@@ -773,11 +752,16 @@ def test_bridge_default_config_and_cli_contract(tmp_path: Path) -> None:
             str(tmp_path / "bridge"),
             "--gpu-ids",
             "0,1,2,3",
+            "--prior-prefiltered-scores",
+            str(tmp_path / "selected_manifest.jsonl"),
             "--smoke-test",
         ]
     )
     assert arguments.output_dir == str(tmp_path / "run")
     assert arguments.gpu_ids == [0, 1, 2, 3]
+    assert arguments.prior_prefiltered_scores == str(
+        tmp_path / "selected_manifest.jsonl"
+    )
     override_arguments = parse_arguments(
         [
             "--output-dir",
@@ -794,12 +778,16 @@ def test_bridge_default_config_and_cli_contract(tmp_path: Path) -> None:
         dataset_path=arguments.dataset_path,
         gpu_ids=arguments.gpu_ids,
         max_steps=2,
+        prior_prefiltered_scores=arguments.prior_prefiltered_scores,
     )
     paths = resolved_paths(updated)
     assert paths["dataset"] == (tmp_path / "bridge").resolve()
     assert paths["output"] == (tmp_path / "run").resolve()
-    assert paths["normalization"] == (
-        tmp_path / "run" / "normalization.json"
+    assert paths["statistics"] == Path(
+        "/data/dwb/models/octo-small-pytorch-official/dataset_statistics.json"
+    )
+    assert paths["prior_prefiltered_scores"] == (
+        tmp_path / "selected_manifest.jsonl"
     ).resolve()
     overridden = apply_overrides(
         config,
@@ -906,16 +894,16 @@ def test_bridge_cli_main_applies_learning_rate_overrides(
     assert resolved["train"]["learning_rate"]["warmup_steps"] == 0
 
 
-def test_bridge_config_rejects_missing_normalization_contract() -> None:
+def test_bridge_config_rejects_legacy_normalization_contract() -> None:
     from octo_small_bridge.config import load_config, validate_config
 
     project_root = Path(__file__).resolve().parents[1]
     config = load_config(
         project_root / "configs" / "octo_small_bridge_v2_4x4090.yaml"
     )
-    config["data"].pop("normalization_contract")
+    config["data"]["normalization_contract"] = "bridge_v2_q99_binary_v1"
 
-    with pytest.raises(ValueError, match="normalization_contract"):
+    with pytest.raises(ValueError, match="legacy data fields"):
         validate_config(config)
 
 

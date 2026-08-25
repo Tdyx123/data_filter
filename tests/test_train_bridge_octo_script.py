@@ -13,7 +13,7 @@ def _fake_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
     calls = tmp_path / "calls.txt"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    for executable in ("python3", "torchrun"):
+    for executable in ("pyenv",):
         fake = fake_bin / executable
         fake.write_text(
             "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$OCTO_TEST_CALLS\"\n",
@@ -23,6 +23,8 @@ def _fake_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
     environment = os.environ.copy()
     environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
     environment["OCTO_TEST_CALLS"] = str(calls)
+    environment["PYENV_BIN"] = str(fake_bin / "pyenv")
+    environment["PYENV_VERSION"] = "octo-test"
     return environment, calls
 
 
@@ -41,6 +43,8 @@ def test_bridge_octo_script_uses_single_process_for_preflight(tmp_path: Path) ->
             "2e-4",
             "--warmup-steps",
             "400",
+            "--prior-prefiltered-scores",
+            "/data/cocore/selected_manifest.jsonl",
             "--preflight-only",
         ],
         cwd=tmp_path,
@@ -49,13 +53,16 @@ def test_bridge_octo_script_uses_single_process_for_preflight(tmp_path: Path) ->
     )
 
     arguments = calls.read_text(encoding="utf-8").splitlines()
-    assert arguments[:2] == ["-m", "octo_small_bridge.cli"]
+    assert arguments[:4] == ["exec", "python", "-m", "octo_small_bridge.cli"]
     assert arguments[arguments.index("--config") + 1] == str(
         PROJECT_ROOT / "configs" / "octo_small_bridge_v2_4x4090.yaml"
     )
     assert arguments[arguments.index("--output-dir") + 1] == "outputs/preflight"
     assert arguments[arguments.index("--learning-rate") + 1] == "2e-4"
     assert arguments[arguments.index("--warmup-steps") + 1] == "400"
+    assert arguments[arguments.index("--prior-prefiltered-scores") + 1] == (
+        "/data/cocore/selected_manifest.jsonl"
+    )
     assert "--preflight-only" in arguments
 
 
@@ -74,6 +81,8 @@ def test_bridge_octo_script_uses_four_torchrun_processes(tmp_path: Path) -> None
             "1e-4",
             "--warmup-steps",
             "0",
+            "--prior-prefiltered-scores",
+            "/data/cocore/selected_manifest.jsonl",
         ],
         cwd=PROJECT_ROOT,
         env=environment,
@@ -81,9 +90,18 @@ def test_bridge_octo_script_uses_four_torchrun_processes(tmp_path: Path) -> None
     )
 
     arguments = calls.read_text(encoding="utf-8").splitlines()
-    assert arguments[:3] == ["--standalone", "--nproc_per_node=4", "-m"]
-    assert arguments[3] == "octo_small_bridge.cli"
+    assert arguments[:5] == [
+        "exec",
+        "torchrun",
+        "--standalone",
+        "--nproc_per_node=4",
+        "-m",
+    ]
+    assert arguments[5] == "octo_small_bridge.cli"
     assert arguments[arguments.index("--output-dir") + 1] == "outputs/train"
     assert arguments[arguments.index("--max-steps") + 1] == "7"
     assert arguments[arguments.index("--learning-rate") + 1] == "1e-4"
     assert arguments[arguments.index("--warmup-steps") + 1] == "0"
+    assert arguments[arguments.index("--prior-prefiltered-scores") + 1] == (
+        "/data/cocore/selected_manifest.jsonl"
+    )

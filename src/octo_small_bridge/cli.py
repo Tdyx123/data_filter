@@ -30,6 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dataset-path")
     parser.add_argument("--model-path")
+    parser.add_argument("--prior-prefiltered-scores")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--gpu-ids", type=_gpu_ids)
     parser.add_argument("--max-steps", type=int)
@@ -67,6 +68,7 @@ def main() -> None:
         max_steps=max_steps,
         learning_rate=arguments.learning_rate,
         warmup_steps=arguments.warmup_steps,
+        prior_prefiltered_scores=arguments.prior_prefiltered_scores,
     )
     if arguments.smoke_test:
         config["train"]["log_every_steps"] = 1

@@ -7,7 +7,7 @@ Cocore 的编码、运动原语、关系目标或选择算法，而是固定 Bri
 
 ## 固定数据契约
 
-- 默认数据路径：`/data/dwb/datasets/bridge_orig_1.0.0_lerobo`；
+- 默认数据路径：`/data/dwb/datasets/bridge_orig_1.0.0_lerobot`；
 - LeRobot `v2.0`、WidowX、5 Hz；
 - 只读取 `observation.images.image_0`、8 维 `observation.state` 和 7 维 `action`；
 - 排除任务名为空的 episode，再应用 `--max-episodes`；
@@ -117,7 +117,7 @@ selection；建议使用新的输出目录，或在确认目标后使用 `--forc
 python -m cocore_bridge_v2 validate \
   --output-dir \
     outputs/cocore_bridge_v2/bridge_orig_1.0.0/select-sequence-w1-top10pct \
-  --dataset-path /data/dwb/datasets/bridge_orig_1.0.0_lerobo \
+  --dataset-path /data/dwb/datasets/bridge_orig_1.0.0_lerobot \
   --relation sequence --relation-weight 1.0 \
   --selection-method lazy_heap \
   --selection-ratio 0.10 \

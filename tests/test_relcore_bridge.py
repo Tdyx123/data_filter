@@ -166,7 +166,7 @@ def test_relcore_config_accepts_global_selection_only_with_zero_minimum() -> Non
 def test_bridge_production_config_selects_named_data_globally_on_one_gpu() -> None:
     config = load_config(Path("relcore/config_bridge.yaml"))
 
-    assert config["dataset"]["path"] == "/data/dwb/datasets/bridge_orig_1.0.0_lerobo"
+    assert config["dataset"]["path"] == "/data/dwb/datasets/bridge_orig_1.0.0_lerobot"
     assert config["dataset"]["empty_task_policy"] == "exclude"
     assert config["dataset"]["feature_keys"]["image_observations"] == [
         "observation.images.image_0"
@@ -179,7 +179,7 @@ def test_bridge_production_config_selects_named_data_globally_on_one_gpu() -> No
 
 @pytest.mark.real_data
 def test_mounted_bridge_metadata_matches_relcore_acceptance_counts() -> None:
-    root = Path("/data/dwb/datasets/bridge_orig_1.0.0_lerobo")
+    root = Path("/data/dwb/datasets/bridge_orig_1.0.0_lerobot")
     if not root.is_dir():
         pytest.skip("Bridge LeRobot dataset is not mounted")
     config = load_config(Path("relcore/config_bridge.yaml"))

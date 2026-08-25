@@ -5,17 +5,25 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
-from octo_small_libero.checkpoint import inspect_octo_checkpoint
+from octo_small_official_pytorch.checkpoint import validate_official_checkpoint
+from octo_small_official_pytorch.policy import (
+    OfficialActionStatistics,
+    load_official_action_statistics,
+)
 from trajectory_data import DatasetValidationError, LeRobotDatasetAdapter
 
-from .data import BridgeFrameDataset, BridgeFrameRef
-from .normalization import (
-    BridgeV2NormalizationStatistics,
-    compute_bridge_v2_statistics,
+from .data import (
+    BridgeDistributedBatchSampler,
+    BridgeFrameDataset,
+    BridgeFrameRef,
+)
+from .selection import (
+    BridgePrefilteredSelection,
+    resolve_bridge_prefiltered_selection,
 )
 
 
@@ -34,7 +42,7 @@ def _adapter(root: Path) -> LeRobotDatasetAdapter:
                 "timestamp": "timestamp",
                 "frame_index": "frame_index",
                 "episode_index": "episode_index",
-                "vector_observations": ["observation.state"],
+                "vector_observations": [],
                 "image_observations": ["observation.images.image_0"],
             },
         }
@@ -45,9 +53,10 @@ def inspect_bridge_dataset(
     root: str | Path,
     *,
     adapter: LeRobotDatasetAdapter,
-    statistics: BridgeV2NormalizationStatistics,
+    statistics: OfficialActionStatistics,
+    frame_positions_by_episode: Mapping[int, tuple[int, ...]] | None = None,
 ) -> dict[str, Any]:
-    """Validate metadata/stats and decode the first/middle/last retained episodes."""
+    """Validate metadata/stats and decode representative retained training starts."""
 
     if str(adapter.info.get("robot_type", "")).lower() != "widowx":
         raise DatasetValidationError("Bridge dataset robot_type must be widowx")
@@ -59,8 +68,6 @@ def inspect_bridge_dataset(
     video_info = image_feature.get("info", {})
     if str(video_info.get("video.codec", "")).lower() != "av1":
         raise DatasetValidationError("Bridge image_0 video codec must be AV1")
-    if adapter.features["observation.state"].get("shape") != [8]:
-        raise DatasetValidationError("Bridge observation.state must have shape [8]")
     if adapter.features["action"].get("shape") != [7]:
         raise DatasetValidationError("Bridge action must have shape [7]")
 
@@ -68,29 +75,80 @@ def inspect_bridge_dataset(
         adapter,
         statistics=statistics,
         dataset_name="bridge_orig_1.0.0",
-        action_horizon=8,
+        action_horizon=4,
+        history_horizon=2,
         primary_size=(256, 256),
         train=False,
     )
     records = tuple(adapter.episodes())
     if not records:
         raise DatasetValidationError("Bridge dataset has no non-empty language episodes")
-    sampled_indices = sorted({0, len(records) // 2, len(records) - 1})
-    sampled_episodes: list[int] = []
-    for index in sampled_indices:
-        record = records[index]
-        sample = dataset[
-            BridgeFrameRef(epoch=0, episode_id=record.episode_id, frame_position=0)
+    if frame_positions_by_episode is None:
+        available_refs = [
+            BridgeFrameRef(epoch=0, episode_id=records[0].episode_id, frame_position=0),
+            BridgeFrameRef(
+                epoch=0,
+                episode_id=records[len(records) // 2].episode_id,
+                frame_position=records[len(records) // 2].length // 2,
+            ),
+            BridgeFrameRef(
+                epoch=0,
+                episode_id=records[-1].episode_id,
+                frame_position=records[-1].length - 1,
+            ),
         ]
-        if sample["image_primary"].shape != (1, 3, 256, 256):
-            raise DatasetValidationError(
-                f"Episode {record.episode_id} produced an invalid primary image"
+    else:
+        available_refs = [
+            BridgeFrameRef(
+                epoch=0,
+                episode_id=record.episode_id,
+                frame_position=frame_position,
             )
-        if not np.all(np.isfinite(sample["proprio"])):
+            for record in records
+            for frame_position in frame_positions_by_episode.get(record.episode_id, ())
+        ]
+        if not available_refs:
+            raise DatasetValidationError("Bridge prefiltered selection has no training starts")
+    sampled_indices = sorted({0, len(available_refs) // 2, len(available_refs) - 1})
+    records_by_id = {record.episode_id: record for record in records}
+    sampled_episodes: list[int] = []
+    sampled_frames: list[dict[str, int]] = []
+    for index in sampled_indices:
+        reference = available_refs[index]
+        sample = dataset[reference]
+        if sample["image_primary"].shape != (2, 3, 256, 256):
             raise DatasetValidationError(
-                f"Episode {record.episode_id} produced non-finite proprio"
+                f"Episode {reference.episode_id} produced an invalid primary image"
             )
-        sampled_episodes.append(record.episode_id)
+        if sample["action"].shape != (2, 4, 7):
+            raise DatasetValidationError(
+                f"Episode {reference.episode_id} produced an invalid action chunk"
+            )
+        if "proprio" in sample:
+            raise DatasetValidationError("Official Bridge samples must not contain proprio")
+        if not np.all(np.isfinite(sample["action"])):
+            raise DatasetValidationError(
+                f"Episode {reference.episode_id} produced non-finite actions"
+            )
+        expected_timestep_mask = np.asarray(
+            [reference.frame_position > 0, True], dtype=np.bool_
+        )
+        if not np.array_equal(sample["timestep_pad_mask"], expected_timestep_mask):
+            raise DatasetValidationError(
+                f"Episode {reference.episode_id} produced an invalid timestep mask"
+            )
+        if reference.frame_position == records_by_id[reference.episode_id].length - 1:
+            if not np.allclose(sample["action"][1], sample["action"][1, :1]):
+                raise DatasetValidationError(
+                    f"Episode {reference.episode_id} did not repeat its final action"
+                )
+        sampled_episodes.append(reference.episode_id)
+        sampled_frames.append(
+            {
+                "episode_id": reference.episode_id,
+                "frame_position": reference.frame_position,
+            }
+        )
     summary = adapter.dataset_summary()
     return {
         "path": str(adapter.root),
@@ -100,27 +158,70 @@ def inspect_bridge_dataset(
         **summary,
         "retained_frames": sum(record.length for record in records),
         "image_key": adapter.image_observation_keys[0],
-        "state_key": adapter.vector_observation_keys[0],
         "action_key": adapter.action_key,
         "sampled_episodes": sampled_episodes,
+        "sampled_frames": sampled_frames,
         "metadata_sha256": adapter.fingerprint(),
     }
 
 
+def _validate_prefiltered_sampling(
+    config: Mapping[str, Any],
+    records: tuple[Any, ...],
+    selection: BridgePrefilteredSelection,
+) -> None:
+    selected_ids = set(selection.frame_positions_by_episode)
+    sampled_records = tuple(
+        record for record in records if record.episode_id in selected_ids
+    )
+    train = config["train"]
+    world_size = int(train["gpu_count"])
+    for rank in range(world_size):
+        sampler = BridgeDistributedBatchSampler(
+            sampled_records,
+            local_batch_size=int(train["micro_batch_size_per_gpu"]),
+            rank=rank,
+            world_size=world_size,
+            seed=int(train["seed"]),
+            num_batches=1,
+            frame_positions_by_episode=selection.frame_positions_by_episode,
+        )
+        next(iter(sampler))
+
+
 def run_preflight(config: dict[str, Any], paths: dict[str, Path]) -> dict[str, Any]:
     try:
-        checkpoint = inspect_octo_checkpoint(paths["model"])
+        checkpoint = validate_official_checkpoint(paths["model"])
+        statistics = load_official_action_statistics(checkpoint.statistics_path)
         adapter = _adapter(paths["dataset"])
-        statistics = compute_bridge_v2_statistics(
-            adapter,
-            paths["normalization"],
-            epsilon=float(config["data"]["normalization_epsilon"]),
-        )
-        dataset = inspect_bridge_dataset(
-            paths["dataset"],
-            adapter=adapter,
-            statistics=statistics,
-        )
+        prior_selection = None
+        if (
+            config["data"]
+            .get("prior_selection", {})
+            .get("prefiltered_scores")
+            is not None
+        ):
+            records = tuple(adapter.episodes())
+            prior_selection = resolve_bridge_prefiltered_selection(
+                config,
+                paths,
+                records=records,
+            )
+            assert prior_selection is not None
+            _validate_prefiltered_sampling(config, records, prior_selection)
+        if prior_selection is not None:
+            dataset = inspect_bridge_dataset(
+                paths["dataset"],
+                adapter=adapter,
+                statistics=statistics,
+                frame_positions_by_episode=prior_selection.frame_positions_by_episode,
+            )
+        else:
+            dataset = inspect_bridge_dataset(
+                paths["dataset"],
+                adapter=adapter,
+                statistics=statistics,
+            )
     except (OSError, RuntimeError, ValueError) as error:
         raise PreflightError(str(error)) from error
     expected = config["data"]["expected_counts"]
@@ -149,16 +250,19 @@ def run_preflight(config: dict[str, Any], paths: dict[str, Path]) -> dict[str, A
     if world_size not in (1, requested):
         raise PreflightError(f"WORLD_SIZE must be 1 or {requested}, got {world_size}")
     report = {
-        "route": "octo-small-bridge-v2-pytorch",
-        "checkpoint": checkpoint,
+        "route": "octo-small-official-bridge-pytorch",
+        "checkpoint": checkpoint.as_dict(),
         "dataset": dataset,
-        "normalization": {
-            "contract": statistics.contract,
-            "path": str(paths["normalization"]),
-            "metadata_sha256": statistics.metadata_sha256,
-            "retained_episodes": statistics.retained_episodes,
-            "retained_frames": statistics.retained_frames,
-        },
+        "normalization": statistics.as_dict(),
+        "selection": (
+            prior_selection.as_manifest()
+            if prior_selection is not None
+            else {
+                "enabled": False,
+                "mode": "all_non_empty_episodes",
+                "training_starts": dataset["retained_frames"],
+            }
+        ),
         "runtime": {
             "torch_version": torch.__version__,
             "transformers_version": transformers.__version__,

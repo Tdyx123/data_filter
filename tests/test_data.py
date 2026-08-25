@@ -40,7 +40,7 @@ def test_action_window_preserves_relative_actions_and_masks_tail():
 
 
 def test_bridge_task_fallback():
-    dataset_path = Path("/data/dwb/datasets/bridge_orig_1.0.0_lerobo")
+    dataset_path = Path("/data/dwb/datasets/bridge_orig_1.0.0_lerobot")
     if not dataset_path.is_dir():
         pytest.skip("Bridge dataset is not available")
     config = load_config(PROJECT_ROOT / "configs" / "bridge_8x4090.yaml")
@@ -53,7 +53,7 @@ def test_bridge_task_fallback():
 
 
 def test_bridge_split_expected_size():
-    dataset_path = Path("/data/dwb/datasets/bridge_orig_1.0.0_lerobo")
+    dataset_path = Path("/data/dwb/datasets/bridge_orig_1.0.0_lerobot")
     if not dataset_path.is_dir():
         pytest.skip("Bridge dataset is not available")
     config = load_config(PROJECT_ROOT / "configs" / "bridge_8x4090.yaml")

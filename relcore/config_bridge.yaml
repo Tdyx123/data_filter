@@ -3,7 +3,7 @@ seed: 42
 dataset:
   type: lerobot
   name: bridge_orig_1.0.0
-  path: /data/dwb/datasets/bridge_orig_1.0.0_lerobo
+  path: /data/dwb/datasets/bridge_orig_1.0.0_lerobot
   use_images: true
   empty_task_policy: exclude
   feature_keys:

@@ -31,7 +31,7 @@ pip install -r tdus/requirements.txt
 dataset:
   type: lerobot
   name: bridge_orig
-  path: /data/dwb/datasets/bridge_orig_1.0.0_lerobo
+  path: /data/dwb/datasets/bridge_orig_1.0.0_lerobot
 ```
 
 数据路径需包含 `meta/info.json`、`meta/episodes.jsonl` 和 Parquet episode。

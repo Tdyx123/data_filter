@@ -14,7 +14,8 @@ class ConfigError(ValueError):
     """Raised when a Bridge training configuration is invalid."""
 
 
-BRIDGE_V2_NORMALIZATION_CONTRACT = "bridge_v2_q99_binary_v1"
+OFFICIAL_ACTION_NORMALIZATION = "bridge_dataset_mean_std"
+OFFICIAL_GRIPPER_TRANSFORM = "trajectory_backward_binarize_minus_one_to_one"
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -48,36 +49,50 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ConfigError("paths.output must be a non-empty path when present")
 
     data = config["data"]
+    selection = data.get("prior_selection")
+    if not isinstance(selection, dict):
+        raise ConfigError("data.prior_selection must be a mapping")
+    unexpected_selection_keys = set(selection) - {"prefiltered_scores"}
+    if unexpected_selection_keys:
+        raise ConfigError(
+            "data.prior_selection contains unsupported keys: "
+            f"{sorted(unexpected_selection_keys)}"
+        )
+    prefiltered_scores = selection.get("prefiltered_scores")
+    if prefiltered_scores is not None and (
+        not isinstance(prefiltered_scores, str) or not prefiltered_scores.strip()
+    ):
+        raise ConfigError(
+            "data.prior_selection.prefiltered_scores must be null or a non-empty path"
+        )
     expected_data = {
         "dataset_name": "bridge_orig_1.0.0",
         "image_obs_keys": {"primary": "observation.images.image_0"},
-        "state_obs_keys": ["observation.state"],
         "action_key": "action",
-        "state_dim": 8,
         "action_dim": 7,
-        "window_size": 1,
-        "action_horizon": 8,
-        "absolute_action_mask": [False] * 6 + [True],
-        "action_normalization_mask": [True] * 6 + [False],
+        "window_size": 2,
+        "action_horizon": 4,
+        "action_normalization": OFFICIAL_ACTION_NORMALIZATION,
+        "gripper_transform": OFFICIAL_GRIPPER_TRANSFORM,
         "resize": {"primary": [256, 256]},
         "empty_task_policy": "exclude",
     }
     for key, expected in expected_data.items():
         if data.get(key) != expected:
             raise ConfigError(f"data.{key} must equal {expected!r}")
-    if data.get("normalization_contract") != BRIDGE_V2_NORMALIZATION_CONTRACT:
+    forbidden_legacy_keys = {
+        "state_obs_keys",
+        "state_dim",
+        "normalization_contract",
+        "normalization_epsilon",
+        "absolute_action_mask",
+        "action_normalization_mask",
+    }.intersection(data)
+    if forbidden_legacy_keys:
         raise ConfigError(
-            "data.normalization_contract must equal "
-            f"{BRIDGE_V2_NORMALIZATION_CONTRACT!r}"
+            "Official Bridge training rejects legacy data fields: "
+            f"{sorted(forbidden_legacy_keys)}"
         )
-    normalization_epsilon = data.get("normalization_epsilon")
-    if (
-        isinstance(normalization_epsilon, bool)
-        or not isinstance(normalization_epsilon, (int, float))
-        or not math.isfinite(float(normalization_epsilon))
-        or float(normalization_epsilon) <= 0
-    ):
-        raise ConfigError("data.normalization_epsilon must be a finite positive number")
     expected_counts = data.get("expected_counts")
     if not isinstance(expected_counts, dict):
         raise ConfigError("data.expected_counts must be a mapping")
@@ -92,8 +107,10 @@ def validate_config(config: dict[str, Any]) -> None:
     model = config["model"]
     if model.get("required_observation_tokenizers") != ["primary"]:
         raise ConfigError("Bridge Octo-small requires only the primary tokenizer")
-    if model.get("action_head") != "diffusion" or not model.get("use_proprio"):
-        raise ConfigError("Bridge Octo-small requires proprio and the diffusion action head")
+    if model.get("action_head") != "diffusion":
+        raise ConfigError("Bridge Octo-small requires the diffusion action head")
+    if model.get("use_proprio") is not False:
+        raise ConfigError("Official Bridge Octo-small requires model.use_proprio=false")
     if model.get("finetuning_mode") != "full":
         raise ConfigError("Bridge Octo-small currently supports full fine-tuning")
 
@@ -177,6 +194,10 @@ def apply_overrides(config: dict[str, Any], **overrides: Any) -> dict[str, Any]:
             continue
         section, key = mapping[name]
         result[section][key] = value
+    if overrides.get("prior_prefiltered_scores") is not None:
+        result["data"]["prior_selection"]["prefiltered_scores"] = overrides[
+            "prior_prefiltered_scores"
+        ]
     if overrides.get("learning_rate") is not None:
         result["train"]["learning_rate"]["peak_value"] = overrides["learning_rate"]
     if overrides.get("warmup_steps") is not None:
@@ -199,10 +220,16 @@ def resolved_paths(config: dict[str, Any]) -> dict[str, Path]:
     if not isinstance(output, str) or not output.strip():
         raise ConfigError("An explicit --output-dir is required")
     dataset = resolve(config["paths"]["dataset"])
-    return {
+    paths = {
         "project_root": project_root,
         "model": resolve(config["paths"]["model"]),
         "dataset": dataset,
         "output": resolve(output),
-        "normalization": resolve(output) / "normalization.json",
+        "statistics": resolve(config["paths"]["model"]) / "dataset_statistics.json",
     }
+    prefiltered_scores = config["data"]["prior_selection"].get(
+        "prefiltered_scores"
+    )
+    if prefiltered_scores is not None:
+        paths["prior_prefiltered_scores"] = resolve(prefiltered_scores)
+    return paths

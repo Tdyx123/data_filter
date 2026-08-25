@@ -1,6 +1,6 @@
 paths:
   model: /data/dwb/models/Qwen3-VL-4B-Instruct
-  dataset: /data/dwb/datasets/bridge_orig_1.0.0_lerobo
+  dataset: /data/dwb/datasets/bridge_orig_1.0.0_lerobot
   output: outputs/qwen3_vl_4b_groot_bridge_4gpu
 
 data:

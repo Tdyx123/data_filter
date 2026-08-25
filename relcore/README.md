@@ -231,7 +231,7 @@ python -m relcore run --config relcore/config_debug.yaml --force
 ## BridgeData V2
 
 `config_bridge.yaml` 直接读取
-`/data/dwb/datasets/bridge_orig_1.0.0_lerobo/`，只使用
+`/data/dwb/datasets/bridge_orig_1.0.0_lerobot/`，只使用
 `observation.images.image_0`、`observation.state` 和 `action`。数据集中任务名为空的
 14,532 条 episode 会在 `max_episodes` 生效前排除；其视频、state 和 action 不参与
 归一化、CLIP 或候选片段构建。其余任务保留原始 `task_index` 和 `task_name`，但 Top

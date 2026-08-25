@@ -15,10 +15,6 @@ from packaging.version import InvalidVersion, Version
 
 from simpler_bridge.evaluation import SimplerEvaluationError, select_first_action
 
-from .checkpoint_contract import (
-    BridgeCheckpointContractError,
-    validate_bridge_checkpoint,
-)
 from .normalization import BridgeV2NormalizationStatistics
 
 
@@ -345,82 +341,10 @@ def load_octo_bridge_policy(
     weight_loader: Callable[..., Any] | None = None,
     torch_module: Any | None = None,
 ) -> tuple[Any, OctoBridgeSimplerPolicy]:
-    """Load a weight-only Bridge checkpoint over a self-contained Octo base."""
+    """Reject the removed proprio/q99/8-step evaluation route."""
 
-    try:
-        from octo_small_libero.evaluation import EvaluationError, resolve_checkpoint
-    except ImportError as error:
-        raise SimplerEvaluationError(str(error)) from error
-    try:
-        checkpoint_spec = resolve_checkpoint(checkpoint, base_model=base_model)
-    except EvaluationError as error:
-        raise SimplerEvaluationError(str(error)) from error
-
-    try:
-        checkpoint_statistics = validate_bridge_checkpoint(
-            checkpoint_spec.weights_path.parent,
-            expected_normalization_path=statistics,
-        )
-    except BridgeCheckpointContractError as error:
-        raise SimplerEvaluationError(str(error)) from error
-    bridge_statistics = load_bridge_statistics(
-        checkpoint_statistics if statistics is None else statistics
-    )
-    if torch_module is None:
-        try:
-            import torch as torch_module
-        except ImportError as error:
-            raise SimplerEvaluationError("PyTorch is required for Octo evaluation") from error
-    if model_loader is None:
-        from octo_small_libero.torch_model import OctoSmallPolicy
-
-        model_loader = OctoSmallPolicy.from_pretrained
-    if weight_loader is None:
-        try:
-            from safetensors.torch import load_model as weight_loader
-        except ImportError as error:
-            raise SimplerEvaluationError(
-                "safetensors is required for Octo checkpoint evaluation"
-            ) from error
-
-    if precision not in {"bf16", "fp32"}:
-        raise SimplerEvaluationError("precision must be bf16 or fp32")
-    resolved_device = torch_module.device(device)
-    device_type = str(resolved_device.type)
-    if device_type == "cuda":
-        if not torch_module.cuda.is_available():
-            raise SimplerEvaluationError(f"CUDA device requested but CUDA is unavailable: {device}")
-        if precision == "bf16" and not torch_module.cuda.is_bf16_supported():
-            raise SimplerEvaluationError(f"CUDA device does not support BF16: {device}")
-    elif precision == "bf16":
-        raise SimplerEvaluationError("BF16 evaluation requires a CUDA device; use --precision fp32")
-
-    try:
-        model, tokenizer = model_loader(
-            checkpoint_spec.base_model_path,
-            device="cpu",
-            observation_tokenizers=("primary",),
-        )
-        base_weights = (checkpoint_spec.base_model_path / "model.safetensors").resolve()
-        if checkpoint_spec.weights_path.resolve() != base_weights:
-            weight_loader(
-                model,
-                str(checkpoint_spec.weights_path),
-                strict=True,
-                device="cpu",
-            )
-        _validate_model_contract(model)
-        model.to(resolved_device)
-        model.eval()
-    except SimplerEvaluationError:
-        raise
-    except Exception as error:
-        raise SimplerEvaluationError(f"Could not load Octo Bridge checkpoint: {error}") from error
-
-    return checkpoint_spec, OctoBridgeSimplerPolicy(
-        model=model,
-        tokenizer=tokenizer,
-        statistics=bridge_statistics,
-        device=str(device),
-        precision=precision,
+    raise SimplerEvaluationError(
+        "Legacy Octo Bridge checkpoints are unsupported; use "
+        "scripts/evaluate_simpler_octo_small_official_pytorch.sh with an official "
+        "base or official fine-tune checkpoint"
     )

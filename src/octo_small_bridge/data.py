@@ -17,7 +17,14 @@ from PIL import Image, ImageEnhance
 from trajectory_data import DatasetValidationError, EpisodeData, EpisodeRecord
 from trajectory_data.lerobot import LeRobotDatasetAdapter
 
-from .normalization import BridgeV2NormalizationStatistics
+from octo_small_official_pytorch.policy import (
+    OfficialActionStatistics,
+    load_official_action_statistics,
+)
+from .selection import (
+    BridgePrefilteredSelection,
+    resolve_bridge_prefiltered_selection,
+)
 
 
 @dataclass(frozen=True)
@@ -29,7 +36,7 @@ class BridgeFrameRef:
     frame_position: int
 
 
-def _normalize_gripper_actions(
+def _standardize_gripper_trajectory(
     gripper: np.ndarray,
     *,
     episode_id: int,
@@ -47,7 +54,25 @@ def _normalize_gripper_actions(
             "[-1e-5, 1+1e-5]"
         )
     clipped = np.clip(gripper, np.float32(0.0), np.float32(1.0))
-    return (clipped > np.float32(0.5)).astype(np.float32)
+    is_open = bool(clipped[-1] > np.float32(0.5))
+    standardized = np.empty_like(clipped, dtype=np.float32)
+    for index in range(len(clipped) - 1, -1, -1):
+        if clipped[index] > np.float32(0.95):
+            is_open = True
+        elif clipped[index] < np.float32(0.05):
+            is_open = False
+        standardized[index] = np.float32(1.0 if is_open else -1.0)
+    return standardized
+
+
+def _normalize_gripper_actions(
+    gripper: np.ndarray,
+    *,
+    episode_id: int,
+) -> np.ndarray:
+    """Compatibility alias for the official trajectory-level gripper transform."""
+
+    return _standardize_gripper_trajectory(gripper, episode_id=episode_id)
 
 
 class BridgeDistributedBatchSampler:
@@ -62,6 +87,7 @@ class BridgeDistributedBatchSampler:
         world_size: int = 1,
         seed: int = 42,
         num_batches: int,
+        frame_positions_by_episode: Mapping[int, Sequence[int]] | None = None,
     ) -> None:
         if local_batch_size <= 0:
             raise ValueError("local_batch_size must be positive")
@@ -74,6 +100,30 @@ class BridgeDistributedBatchSampler:
         self._records = tuple(records)
         if len(self._records) < world_size:
             raise ValueError("world_size cannot exceed the number of episodes")
+        record_ids = {int(record.episode_id) for record in self._records}
+        if frame_positions_by_episode is None:
+            self._frame_positions_by_episode = None
+        else:
+            provided_ids = {int(episode_id) for episode_id in frame_positions_by_episode}
+            if provided_ids != record_ids:
+                raise ValueError(
+                    "frame_positions_by_episode must contain exactly the sampled episodes"
+                )
+            normalized: dict[int, tuple[int, ...]] = {}
+            records_by_id = {int(record.episode_id): record for record in self._records}
+            for episode_id, values in frame_positions_by_episode.items():
+                positions = tuple(int(value) for value in values)
+                record = records_by_id[int(episode_id)]
+                if (
+                    not positions
+                    or len(set(positions)) != len(positions)
+                    or any(value < 0 or value >= int(record.length) for value in positions)
+                ):
+                    raise ValueError(
+                        "selected frame positions must be non-empty, unique, and in bounds"
+                    )
+                normalized[int(episode_id)] = positions
+            self._frame_positions_by_episode = normalized
         self.local_batch_size = int(local_batch_size)
         self.rank = int(rank)
         self.world_size = int(world_size)
@@ -91,7 +141,10 @@ class BridgeDistributedBatchSampler:
         records = list(self._records)
         random.Random(self.seed + epoch).shuffle(records)
         frames_per_rank = [
-            sum(record.length for record in records[rank :: self.world_size])
+            sum(
+                len(self._frame_positions(record))
+                for record in records[rank :: self.world_size]
+            )
             for rank in range(self.world_size)
         ]
         common_batches = min(frames_per_rank) // self.local_batch_size
@@ -105,7 +158,7 @@ class BridgeDistributedBatchSampler:
         emitted = 0
         limit = self._epoch_size(epoch)
         for record in self._epoch_records(epoch):
-            positions = list(range(record.length))
+            positions = list(self._frame_positions(record))
             frame_seed = self.seed + epoch * 1_000_003 + record.episode_id * 97
             random.Random(frame_seed).shuffle(positions)
             for frame_position in positions:
@@ -117,6 +170,11 @@ class BridgeDistributedBatchSampler:
                     frame_position=frame_position,
                 )
                 emitted += 1
+
+    def _frame_positions(self, record: EpisodeRecord) -> Sequence[int]:
+        if self._frame_positions_by_episode is None:
+            return range(record.length)
+        return self._frame_positions_by_episode[int(record.episode_id)]
 
     def _refs_from_offset(self, offset: int) -> Iterator[BridgeFrameRef]:
         epoch = 0
@@ -182,9 +240,10 @@ class BridgeFrameDataset:
         self,
         adapter: LeRobotDatasetAdapter,
         *,
-        statistics: BridgeV2NormalizationStatistics,
+        statistics: OfficialActionStatistics | Any,
         dataset_name: str,
         action_horizon: int,
+        history_horizon: int = 2,
         primary_size: tuple[int, int] = (256, 256),
         episode_cache_size: int = 2,
         seed: int = 42,
@@ -192,15 +251,17 @@ class BridgeFrameDataset:
         tokenizer: Any | None = None,
         language_max_length: int = 16,
     ) -> None:
-        if action_horizon <= 0:
-            raise ValueError("action_horizon must be positive")
+        if action_horizon != 4:
+            raise ValueError("Official Octo-small action_horizon must equal 4")
+        if history_horizon != 2:
+            raise ValueError("Official Octo-small history_horizon must equal 2")
         if len(primary_size) != 2 or any(int(value) <= 0 for value in primary_size):
             raise ValueError("primary_size must contain two positive integers")
         if episode_cache_size <= 0:
             raise ValueError("episode_cache_size must be positive")
-        if len(adapter.vector_observation_keys) != 1:
+        if len(adapter.vector_observation_keys) != 0:
             raise DatasetValidationError(
-                "Bridge Octo-small requires exactly one vector observation feature"
+                "Official Bridge Octo-small must not read vector/proprio observations"
             )
         if len(adapter.image_observation_keys) != 1:
             raise DatasetValidationError(
@@ -210,6 +271,7 @@ class BridgeFrameDataset:
         self.statistics = statistics
         self.dataset_name = str(dataset_name)
         self.action_horizon = int(action_horizon)
+        self.history_horizon = int(history_horizon)
         self.primary_size = tuple(int(value) for value in primary_size)
         self.episode_cache_size = int(episode_cache_size)
         self.seed = int(seed)
@@ -219,8 +281,8 @@ class BridgeFrameDataset:
         self._records = {record.episode_id: record for record in adapter.episodes()}
         self._cache: OrderedDict[int, EpisodeData] = OrderedDict()
         self._token_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        self._state_key = adapter.vector_observation_keys[0]
         self._image_key = adapter.image_observation_keys[0]
+        self._standardized_gripper: OrderedDict[int, np.ndarray] = OrderedDict()
 
     def __len__(self) -> int:
         return sum(record.length for record in self._records.values())
@@ -237,8 +299,49 @@ class BridgeFrameDataset:
         episode = self.adapter.load_episode(record, load_images=True)
         self._cache[episode_id] = episode
         while len(self._cache) > self.episode_cache_size:
-            self._cache.popitem(last=False)
+            evicted_episode_id, _ = self._cache.popitem(last=False)
+            self._standardized_gripper.pop(evicted_episode_id, None)
         return episode
+
+    def _episode_gripper(self, episode: EpisodeData) -> np.ndarray:
+        cached = self._standardized_gripper.get(episode.episode_id)
+        if cached is not None:
+            self._standardized_gripper.move_to_end(episode.episode_id)
+            return cached
+        standardized = _standardize_gripper_trajectory(
+            np.asarray(episode.actions[:, 6], dtype=np.float32),
+            episode_id=episode.episode_id,
+        )
+        self._standardized_gripper[episode.episode_id] = standardized
+        return standardized
+
+    def _action_chunk(
+        self,
+        actions: np.ndarray,
+        standardized_gripper: np.ndarray,
+        *,
+        start: int,
+    ) -> np.ndarray:
+        stop = min(start + self.action_horizon, len(actions))
+        chunk = np.asarray(actions[start:stop], dtype=np.float32).copy()
+        chunk[:, 6] = standardized_gripper[start:stop]
+        normalized = np.where(
+            np.asarray(self.statistics.mask, dtype=np.bool_),
+            (chunk - np.asarray(self.statistics.mean, dtype=np.float32))
+            / np.asarray(self.statistics.std, dtype=np.float32),
+            chunk,
+        ).astype(np.float32, copy=False)
+        if len(normalized) < self.action_horizon:
+            normalized = np.concatenate(
+                [
+                    normalized,
+                    np.repeat(
+                        normalized[-1:], self.action_horizon - len(normalized), axis=0
+                    ),
+                ],
+                axis=0,
+            )
+        return normalized
 
     def _primary_image(
         self,
@@ -248,7 +351,7 @@ class BridgeFrameDataset:
         array = np.asarray(frame, dtype=np.uint8)
         if array.ndim != 3 or array.shape[-1] != 3:
             raise DatasetValidationError(f"Primary image must be RGB, got {array.shape}")
-        image = Image.fromarray(array, mode="RGB")
+        image = Image.fromarray(array)
         if self.train:
             image = self._augment_image(image, reference)
         image = image.resize(self.primary_size[::-1], resample=Image.Resampling.LANCZOS)
@@ -286,7 +389,7 @@ class BridgeFrameDataset:
         hue_shift = int(round(randomizer.uniform(-0.05, 0.05) * 255))
         hsv = np.asarray(image.convert("HSV"), dtype=np.uint8).copy()
         hsv[..., 0] = (hsv[..., 0].astype(np.int16) + hue_shift) % 256
-        return Image.fromarray(hsv, mode="HSV").convert("RGB")
+        return Image.fromarray(hsv).convert("RGB")
 
     def _tokens(self, instruction: str) -> tuple[np.ndarray, np.ndarray] | None:
         if self.tokenizer is None:
@@ -323,34 +426,29 @@ class BridgeFrameDataset:
                 f"Episode {episode.episode_id} actions must have shape "
                 f"({episode.length}, 7), got {actions.shape}"
             )
-        valid_steps = min(self.action_horizon, episode.length - position)
-        action_window = actions[position : position + valid_steps]
-        if valid_steps < self.action_horizon:
-            action_window = np.concatenate(
-                [
-                    action_window,
-                    np.repeat(
-                        action_window[-1:], self.action_horizon - valid_steps, axis=0
-                    ),
-                ],
-                axis=0,
-            )
-        normalized_action = self.statistics.normalize_action(action_window)
-        normalized_action[:, 6] = _normalize_gripper_actions(
-            action_window[:, 6],
-            episode_id=episode.episode_id,
+        history_positions = (max(0, position - 1), position)
+        timestep_pad_mask = np.asarray([position > 0, True], dtype=np.bool_)
+        images = np.stack(
+            [
+                self._primary_image(
+                    episode.observations[self._image_key][history_position],
+                    reference,
+                )
+                for history_position in history_positions
+            ],
+            axis=0,
         )
-        action_pad_mask = np.zeros((self.action_horizon, 7), dtype=np.bool_)
-        action_pad_mask[:valid_steps] = True
-
-        state = np.asarray(episode.observations[self._state_key][position], dtype=np.float32)
-        if state.shape != (8,):
-            raise DatasetValidationError(
-                f"Episode {episode.episode_id} state must have shape (8,), got {state.shape}"
-            )
-        proprio = self.statistics.normalize_state(state)
-        image = self._primary_image(
-            episode.observations[self._image_key][position], reference
+        standardized_gripper = self._episode_gripper(episode)
+        normalized_action = np.stack(
+            [
+                self._action_chunk(
+                    actions,
+                    standardized_gripper,
+                    start=history_position,
+                )
+                for history_position in history_positions
+            ],
+            axis=0,
         )
         instruction = str(episode.task_name or "").strip()
         if not instruction:
@@ -358,11 +456,9 @@ class BridgeFrameDataset:
                 f"Episode {episode.episode_id} has an empty language instruction"
             )
         sample: dict[str, Any] = {
-            "image_primary": image[None, ...].astype(np.float32, copy=False),
-            "proprio": proprio[None, ...].astype(np.float32, copy=False),
-            "timestep_pad_mask": np.ones((1,), dtype=np.bool_),
+            "image_primary": images.astype(np.float32, copy=False),
+            "timestep_pad_mask": timestep_pad_mask,
             "action": normalized_action.astype(np.float32, copy=False),
-            "action_pad_mask": action_pad_mask,
             "language_instruction": instruction,
             "dataset_name": self.dataset_name,
             "episode_index": episode.episode_id,
@@ -380,7 +476,8 @@ class BridgeTrainingData:
     batch_sampler: BridgeDistributedBatchSampler
     dataloader: Any
     selection_sha256: str
-    normalization_path: Path
+    statistics_path: Path
+    prior_selection: BridgePrefilteredSelection | None
 
 
 def _selection_sha256(
@@ -389,7 +486,8 @@ def _selection_sha256(
     dataset_name: str,
     action_horizon: int,
     sampling_contract: Mapping[str, Any],
-    normalization_path: Path,
+    statistics_path: Path,
+    prior_selection_sha256: str | None = None,
 ) -> str:
     digest = hashlib.sha256()
     digest.update(adapter.fingerprint().encode("ascii"))
@@ -400,7 +498,14 @@ def _selection_sha256(
             "utf-8"
         )
     )
-    with normalization_path.open("rb") as handle:
+    digest.update(
+        json.dumps(
+            {"prior_selection_sha256": prior_selection_sha256},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    with statistics_path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     for record in adapter.episodes():
@@ -439,35 +544,41 @@ def make_training_dataset(
                 "timestamp": "timestamp",
                 "frame_index": "frame_index",
                 "episode_index": "episode_index",
-                "vector_observations": data["state_obs_keys"],
+                "vector_observations": [],
                 "image_observations": [data["image_obs_keys"]["primary"]],
             },
         }
     )
-    normalization_path = Path(paths["normalization"])
-    statistics = BridgeV2NormalizationStatistics.load(normalization_path)
-    retained_frames = sum(record.length for record in adapter.episodes())
-    if (
-        statistics.metadata_sha256 != adapter.fingerprint()
-        or statistics.retained_episodes != len(adapter.episodes())
-        or statistics.retained_frames != retained_frames
-    ):
-        raise DatasetValidationError(
-            "Bridge normalization statistics do not match the filtered dataset"
-        )
+    records = tuple(adapter.episodes())
+    prior_selection = resolve_bridge_prefiltered_selection(
+        config,
+        paths,
+        records=records,
+    )
+    statistics_path = Path(paths["statistics"])
+    statistics = load_official_action_statistics(statistics_path)
     dataset = BridgeFrameDataset(
         adapter,
         statistics=statistics,
         dataset_name=data["dataset_name"],
         action_horizon=int(data["action_horizon"]),
+        history_horizon=int(data["window_size"]),
         primary_size=tuple(data["resize"]["primary"]),
         episode_cache_size=int(train["episode_cache_size"]),
         seed=int(train["seed"]),
         train=True,
         tokenizer=tokenizer,
     )
+    sampled_records = records
+    selected_positions = None
+    if prior_selection is not None:
+        selected_positions = prior_selection.frame_positions_by_episode
+        selected_episode_ids = set(selected_positions)
+        sampled_records = tuple(
+            record for record in records if record.episode_id in selected_episode_ids
+        )
     batch_sampler = BridgeDistributedBatchSampler(
-        adapter.episodes(),
+        sampled_records,
         local_batch_size=int(train["micro_batch_size_per_gpu"]),
         rank=rank,
         world_size=world_size,
@@ -475,6 +586,7 @@ def make_training_dataset(
         num_batches=(
             int(train["max_steps"]) * int(train["gradient_accumulation_steps"])
         ),
+        frame_positions_by_episode=selected_positions,
     )
     worker_count = int(train["num_workers_per_rank"])
     loader_options: dict[str, Any] = {
@@ -494,7 +606,7 @@ def make_training_dataset(
             adapter,
             dataset_name=data["dataset_name"],
             action_horizon=int(data["action_horizon"]),
-            normalization_path=normalization_path,
+            statistics_path=statistics_path,
             sampling_contract={
                 "seed": int(train["seed"]),
                 "world_size": int(world_size),
@@ -504,9 +616,14 @@ def make_training_dataset(
                 ),
                 "primary_size": list(data["resize"]["primary"]),
                 "image_key": data["image_obs_keys"]["primary"],
-                "state_keys": list(data["state_obs_keys"]),
                 "action_key": data["action_key"],
             },
+            prior_selection_sha256=(
+                prior_selection.selection_sha256
+                if prior_selection is not None
+                else None
+            ),
         ),
-        normalization_path=normalization_path,
+        statistics_path=statistics_path,
+        prior_selection=prior_selection,
     )

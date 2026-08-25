@@ -11,7 +11,7 @@ import yaml
 from cocore.config import resolve_config
 
 
-DEFAULT_DATASET_PATH = Path("/data/dwb/datasets/bridge_orig_1.0.0_lerobo")
+DEFAULT_DATASET_PATH = Path("/data/dwb/datasets/bridge_orig_1.0.0_lerobot")
 DEFAULT_SELECTION_RATIO = 0.10
 DEFAULT_SELECTION_METHOD = "lazy_heap"
 _CONFIG_PATH = Path(__file__).with_name("config_bridge_v2.yaml")

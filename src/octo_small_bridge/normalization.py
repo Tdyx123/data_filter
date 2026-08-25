@@ -11,7 +11,9 @@ import numpy as np
 
 from trajectory_data import DatasetValidationError
 
-from .config import BRIDGE_V2_NORMALIZATION_CONTRACT
+# Legacy utility retained for reading historical artifacts only.  The official
+# Bridge training route never imports or writes this q01/q99 contract.
+BRIDGE_V2_NORMALIZATION_CONTRACT = "bridge_v2_q99_binary_v1"
 
 
 STATE_DIM = 8
