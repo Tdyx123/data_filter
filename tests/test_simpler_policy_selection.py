@@ -6,10 +6,6 @@ import pytest
     "adapter_class",
     (
         pytest.param(
-            "octo_small_bridge.simpler_evaluation:OctoBridgeSimplerPolicy",
-            id="octo-local",
-        ),
-        pytest.param(
             "qwen3_vl_groot.remote_policy:QwenRemotePolicy", id="qwen-remote"
         ),
         pytest.param(

@@ -1,4 +1,4 @@
-"""Octo-small training and evaluation support for BridgeData V2."""
+"""Octo-small official-semantics training support for BridgeData V2."""
 
 from typing import Any
 

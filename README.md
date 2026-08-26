@@ -1041,10 +1041,10 @@ bash scripts/evaluate_simpler_qwen.sh \
 ### Octo-small Bridge 的 SimplerEnv 四任务闭环评测
 
 新训练 checkpoint 只使用下文的官方 PyTorch 评测入口
-`scripts/evaluate_simpler_octo_small_official_pytorch.sh`。旧
-`scripts/evaluate_simpler_octo_small.sh`、`--base-model`、proprio/q01-q99 和 8-step
-协议不兼容，也不会自动迁移。官方入口固定 primary-only、最多双帧历史、原生 4-step
-action chunk，并根据 manifest 报告 `official_parity` 或 `official_finetuned`。
+`scripts/evaluate_simpler_octo_small_official_pytorch.sh`。旧 Octo Bridge SimplerEnv
+评估栈已删除；`--base-model`、proprio/q01-q99 和 8-step 协议不受支持，也不会自动
+迁移。官方入口固定 primary-only、最多双帧历史、原生 4-step action chunk，并根据
+manifest 报告 `official_parity` 或 `official_finetuned`。
 
 ### StarVLA Qwen3VL-GR00T Bridge 的 SimplerEnv 评测
 
@@ -1263,10 +1263,7 @@ PYENV_VERSION=miniconda3-3.12-25.11.1-1 \
 pytest -q tests/test_qwen_ipc.py tests/test_qwen_simpler_server.py \
   tests/test_qwen_simpler_evaluation.py tests/test_evaluate_simpler_qwen_script.py
 bash -n scripts/evaluate_simpler_qwen.sh
-pytest -q tests/test_simpler_bridge_evaluation.py \
-  tests/test_octo_small_simpler_evaluation.py \
-  tests/test_evaluate_simpler_octo_small_script.py
-bash -n scripts/evaluate_simpler_octo_small.sh
+pytest -q tests/test_simpler_bridge_evaluation.py
 PYENV_VERSION=miniconda3-3.12-25.11.1-1 PYTHONPATH=src:. \
   /home/dwb/.pyenv/bin/pyenv exec pytest -q \
   tests/test_octo_small_bridge_official_training.py \

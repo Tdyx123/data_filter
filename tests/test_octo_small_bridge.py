@@ -23,9 +23,6 @@ from octo_small_bridge.data import (  # noqa: E402
     BridgeFrameRef,
     _normalize_gripper_actions,
 )
-from octo_small_bridge.normalization import (  # noqa: E402
-    compute_bridge_v2_statistics,
-)
 
 
 AV1_FIXTURE_SKIP = pytest.mark.skip(
@@ -295,18 +292,36 @@ def _video_adapter(root: Path) -> LeRobotDatasetAdapter:
                 "timestamp": "timestamp",
                 "frame_index": "frame_index",
                 "episode_index": "episode_index",
-                "vector_observations": ["observation.state"],
+                "vector_observations": [],
                 "image_observations": ["observation.images.image_0"],
             },
         }
     )
 
 
-def _video_statistics(root: Path, adapter: LeRobotDatasetAdapter):
-    return compute_bridge_v2_statistics(
-        adapter,
-        root / "normalization.json",
-        epsilon=1.0e-6,
+def _video_statistics(root: Path) -> SimpleNamespace:
+    path = root / "dataset_statistics.json"
+    path.write_text(
+        json.dumps(
+            {
+                "bridge_dataset": {
+                    "action": {
+                        "mean": [3.0] * 6 + [0.0],
+                        "std": [1.96] * 6 + [1.0],
+                        "mask": [True] * 6 + [False],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return SimpleNamespace(
+        path=path,
+        mean=np.asarray([3.0] * 6 + [0.0], dtype=np.float32),
+        std=np.asarray([1.96] * 6 + [1.0], dtype=np.float32),
+        mask=np.asarray([True] * 6 + [False], dtype=np.bool_),
+        sha256="a" * 64,
+        dataset_name="bridge_dataset",
     )
 
 
@@ -339,7 +354,7 @@ def test_lerobot_adapter_rejects_record_excluded_from_its_index(tmp_path: Path) 
 
 
 @AV1_FIXTURE_SKIP
-def test_bridge_frame_dataset_filters_empty_tasks_and_builds_octo_sample(
+def test_bridge_frame_dataset_filters_empty_tasks_and_builds_official_sample(
     tmp_path: Path,
 ) -> None:
     class FakeTokenizer:
@@ -361,9 +376,9 @@ def test_bridge_frame_dataset_filters_empty_tasks_and_builds_octo_sample(
     adapter = _video_adapter(root)
     dataset = BridgeFrameDataset(
         adapter,
-        statistics=_video_statistics(root, adapter),
+        statistics=_video_statistics(root),
         dataset_name="bridge_orig_1.0.0",
-        action_horizon=5,
+        action_horizon=4,
         primary_size=(8, 8),
         episode_cache_size=1,
         seed=17,
@@ -380,36 +395,22 @@ def test_bridge_frame_dataset_filters_empty_tasks_and_builds_octo_sample(
     }
     sample = dataset[BridgeFrameRef(epoch=0, episode_id=0, frame_position=0)]
 
-    assert sample["image_primary"].shape == (1, 3, 8, 8)
+    assert sample["image_primary"].shape == (2, 3, 8, 8)
     assert sample["image_primary"].dtype == np.float32
     assert "image_wrist" not in sample
+    assert "proprio" not in sample
+    np.testing.assert_array_equal(sample["timestep_pad_mask"], [False, True])
     np.testing.assert_allclose(
-        sample["proprio"],
-        np.asarray([[-1.0204082] * 7 + [1.0]], dtype=np.float32),
+        sample["action"][1, :, 0],
+        [-1.0204082, 0.0, 1.0204082, 1.0204082],
         atol=1.0e-6,
     )
     np.testing.assert_allclose(
-        sample["action"][:, 0],
-        [-1.0204082, 0.0, 1.0204082, 1.0204082, 1.0204082],
+        sample["action"][1, :, 6],
+        [-1.0, 1.0, 1.0, 1.0],
         atol=1.0e-6,
     )
-    np.testing.assert_allclose(
-        sample["action"][:, 6],
-        [0.0, 1.0, 1.0, 1.0, 1.0],
-        atol=1.0e-6,
-    )
-    np.testing.assert_array_equal(
-        sample["action_pad_mask"],
-        np.asarray(
-            [
-                [True] * 7,
-                [True] * 7,
-                [True] * 7,
-                [False] * 7,
-                [False] * 7,
-            ]
-        ),
-    )
+    assert "action_pad_mask" not in sample
     assert sample["language_instruction"] == "move the block"
     np.testing.assert_array_equal(sample["language_input_ids"], np.arange(16))
     np.testing.assert_array_equal(sample["language_attention_mask"], np.ones(16))
@@ -429,16 +430,16 @@ def test_bridge_frame_dataset_clips_gripper_roundoff_at_unit_interval(
     adapter = _video_adapter(root)
     dataset = BridgeFrameDataset(
         adapter,
-        statistics=_video_statistics(root, adapter),
+        statistics=_video_statistics(root),
         dataset_name="bridge_orig_1.0.0",
-        action_horizon=3,
+        action_horizon=4,
         primary_size=(8, 8),
         train=False,
     )
 
     sample = dataset[BridgeFrameRef(epoch=0, episode_id=0, frame_position=0)]
 
-    np.testing.assert_allclose(sample["action"][:, 6], [0.0, 1.0, 0.0])
+    np.testing.assert_allclose(sample["action"][1, :, 6], [-1.0, 1.0, -1.0, -1.0])
 
 
 @pytest.mark.parametrize("invalid_gripper", [-2.0e-5, 1.0 + 2.0e-5, np.nan, np.inf])
@@ -455,9 +456,9 @@ def test_bridge_frame_dataset_rejects_invalid_continuous_gripper_with_episode_id
     adapter = _video_adapter(root)
     dataset = BridgeFrameDataset(
         adapter,
-        statistics=_video_statistics(root, adapter),
+        statistics=_video_statistics(root),
         dataset_name="bridge_orig_1.0.0",
-        action_horizon=1,
+        action_horizon=4,
         primary_size=(8, 8),
         train=False,
     )
@@ -642,30 +643,30 @@ def test_bridge_selection_signature_covers_gradient_accumulation(tmp_path: Path)
     root = tmp_path / "bridge"
     _write_video_bridge_fixture(root)
     adapter = _video_adapter(root)
-    normalization_path = root / "normalization.json"
-    compute_bridge_v2_statistics(adapter, normalization_path)
+    statistics_path = _video_statistics(root).path
     common = {
         "seed": 42,
         "world_size": 4,
         "local_batch_size": 8,
         "primary_size": [256, 256],
         "image_key": "observation.images.image_0",
-        "state_keys": ["observation.state"],
+        "history_horizon": 2,
+        "use_proprio": False,
         "action_key": "action",
     }
 
     baseline = _selection_sha256(
         adapter,
         dataset_name="bridge_orig_1.0.0",
-        action_horizon=8,
-        normalization_path=normalization_path,
+        action_horizon=4,
+        statistics_path=statistics_path,
         sampling_contract={**common, "gradient_accumulation_steps": 4},
     )
     changed = _selection_sha256(
         adapter,
         dataset_name="bridge_orig_1.0.0",
-        action_horizon=8,
-        normalization_path=normalization_path,
+        action_horizon=4,
+        statistics_path=statistics_path,
         sampling_contract={**common, "gradient_accumulation_steps": 2},
     )
 
@@ -679,26 +680,23 @@ def test_bridge_dataset_manifest_records_filtered_source(tmp_path: Path) -> None
     root = tmp_path / "bridge"
     _write_video_bridge_fixture(root)
     adapter = _video_adapter(root)
+    statistics = _video_statistics(root)
     dataset = BridgeFrameDataset(
         adapter,
-        statistics=_video_statistics(root, adapter),
+        statistics=statistics,
         dataset_name="bridge_orig_1.0.0",
-        action_horizon=8,
+        action_horizon=4,
         train=False,
     )
 
     manifest = build_dataset_manifest(
-        {
-            "data": {
-                "dataset_name": "bridge_orig_1.0.0",
-                "normalization_contract": "bridge_v2_q99_binary_v1",
-            }
-        },
-        {"dataset": root, "normalization": root / "normalization.json"},
+        {"data": {"dataset_name": "bridge_orig_1.0.0"}},
+        {"dataset": root},
         training_data=SimpleNamespace(
             dataset=dataset,
             selection_sha256="a" * 64,
-            normalization_path=root / "normalization.json",
+            statistics_path=statistics.path,
+            prior_selection=None,
         ),
     )
 
@@ -708,8 +706,17 @@ def test_bridge_dataset_manifest_records_filtered_source(tmp_path: Path) -> None
     assert manifest["excluded_empty_task_episodes"] == 1
     assert manifest["retained_frames"] == 3
     assert len(manifest["metadata_sha256"]) == 64
-    assert manifest["normalization"]["contract"] == "bridge_v2_q99_binary_v1"
-    assert len(manifest["normalization"]["sha256"]) == 64
+    assert manifest["statistics"]["source_dataset"] == "bridge_dataset"
+    assert len(manifest["statistics"]["sha256"]) == 64
+    assert manifest["statistics"]["recomputed"] is False
+    assert manifest["training_contract"] == {
+        "history_horizon": 2,
+        "action_horizon": 4,
+        "action_dim": 7,
+        "use_proprio": False,
+        "action_normalization": "bridge_dataset_mean_std",
+        "gripper_transform": "trajectory_backward_binarize_minus_one_to_one",
+    }
     assert manifest["selection_sha256"] == "a" * 64
 
 
@@ -918,7 +925,7 @@ def test_bridge_preflight_inspects_filtered_av1_dataset(tmp_path: Path) -> None:
     report = inspect_bridge_dataset(
         root,
         adapter=adapter,
-        statistics=_video_statistics(root, adapter),
+        statistics=_video_statistics(root),
     )
 
     assert report["robot_type"] == "widowx"
