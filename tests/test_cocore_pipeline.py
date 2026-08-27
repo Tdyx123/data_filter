@@ -14,7 +14,8 @@ import pytest
 import yaml
 
 from cocore import pipeline as cocore_pipeline
-from cocore.pipeline import encode_stage, graph_stage, run_pipeline, validate_output
+from cocore.config import to_relcore_config
+from cocore.pipeline import encode_stage, graph_stage, run_pipeline, scan_stage, validate_output
 from relcore.schemas import ClipRecord
 from trajectory_data import (
     DatasetAdapter,
@@ -174,6 +175,40 @@ def _config(tmp_path: Path, relation: str = "cooccurrence") -> dict[str, object]
         "runtime": {"num_workers": 0, "max_episodes": None, "resume": True},
         "output": {"directory": str(tmp_path / "cocore-output")},
     }
+
+
+def test_libero_config_translation_retains_fifteen_frame_clip_geometry(
+    tmp_path: Path,
+) -> None:
+    translated = to_relcore_config(_config(tmp_path))
+
+    assert translated["clip"] == {"length": 15, "stride": 15}
+
+
+def test_bridge_profile_rejects_legacy_fifteen_frame_scan_cache(
+    tmp_path: Path,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    root = tmp_path / "profile-specific-scan"
+
+    _, _, libero_clips, libero_fingerprint = scan_stage(config, output_dir=root)
+    assert {clip.length for clip in libero_clips} == {15}
+
+    config["prototypes"]["profile"] = "bridge_v2"  # type: ignore[index]
+    with pytest.raises(FileExistsError, match="--force"):
+        scan_stage(config, output_dir=root)
+
+    _, _, bridge_clips, bridge_fingerprint = scan_stage(
+        config,
+        output_dir=root,
+        force=True,
+    )
+    assert len(bridge_clips) == 174
+    assert {clip.length for clip in bridge_clips} == {7}
+    assert bridge_fingerprint != libero_fingerprint
+    manifest = json.loads((root / "scan" / "manifest.json").read_text())
+    assert manifest["clip_length"] == 7
 
 
 def test_encode_stage_publishes_normalized_visual_half_artifact(tmp_path: Path) -> None:
@@ -489,6 +524,8 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert graph_manifest["prototype_visual_normalization"] == (
         "l2_normalized_eight_frame_mean_after_projection"
     )
+    assert graph_manifest["trajectory_window_length"] == 8
+    assert graph_manifest["trajectory_horizon"] == 7
     assert "prototype_action_weights" not in nodes.files
     assert "prototype_distance_weights" not in nodes.files
     assert np.all(nodes["prototype_weights"].sum(axis=1) > 0.0)
@@ -570,6 +607,12 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert run_manifest["stage_directories"]["graph"] == "graph-18-motion-hard-nearest-pca"
     assert run_manifest["algorithm"] == report["algorithm"]
     assert run_manifest["window_policy"] == "near_uniform_full_coverage"
+    assert run_manifest["clip_length"] == 15
+    assert run_manifest["clip_anchors"] == [0, 7, 14]
+    assert run_manifest["visual_half_windows"] == [[0, 8], [7, 15]]
+    assert run_manifest["visual_half_encoding"] == "l2_normalized_eight_frame_mean"
+    assert run_manifest["trajectory_window_length"] == 8
+    assert run_manifest["trajectory_horizon"] == 7
     assert run_manifest["sequence_adjacency"] == "ordered_candidates"
     select_manifest = json.loads((result / "manifest.json").read_text())
     assert select_manifest["cocore_version"] == "0.16.0"

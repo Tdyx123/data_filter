@@ -45,7 +45,7 @@ from cocore.encoding import (
     encode_cocore_dataset,
 )
 from cocore.graph import SEQUENCE_ADJACENCY, build_graph
-from cocore.index import CLIP_LENGTH, WINDOW_POLICY, build_clip_records
+from cocore.index import WINDOW_POLICY, build_clip_records
 from cocore.objective import CocoreObjectiveContext
 from cocore.prototypes import (
     build_hierarchical_motion_prototypes,
@@ -70,6 +70,7 @@ from cocore.selection import (
     LazyHeapSelector,
     build_max_coverage_seed,
 )
+from cocore.temporal import TemporalGeometry, resolve_temporal_geometry
 from cocore.timing import emit_completed_timing, timed_step
 
 
@@ -81,9 +82,33 @@ PROTOTYPE_STRATEGY = (
     "hybrid_kmeans_nearest"
 )
 PROTOTYPE_VISUAL_PROJECTION = "frame @ visual_pca.components[:, :frame_embedding_dim].T"
-PROTOTYPE_VISUAL_NORMALIZATION = "l2_normalized_eight_frame_mean_after_projection"
 RANDOM_MULTIBRANCH_TIMING_SCHEMA_VERSION = 1
 
+
+def _frame_count_name(frame_count: int) -> str:
+    return {4: "four", 8: "eight"}[frame_count]
+
+
+def _visual_half_encoding(geometry: TemporalGeometry) -> str:
+    return (
+        f"l2_normalized_{_frame_count_name(geometry.trajectory_window_length)}_"
+        "frame_mean"
+    )
+
+
+def _prototype_visual_normalization(geometry: TemporalGeometry) -> str:
+    return f"{_visual_half_encoding(geometry)}_after_projection"
+
+
+def _temporal_manifest_fields(geometry: TemporalGeometry) -> dict[str, object]:
+    return {
+        "clip_length": geometry.clip_length,
+        "clip_anchors": list(geometry.clip_anchors),
+        "visual_half_windows": [list(window) for window in geometry.visual_half_windows],
+        "visual_half_encoding": _visual_half_encoding(geometry),
+        "trajectory_window_length": geometry.trajectory_window_length,
+        "trajectory_horizon": geometry.state_delta_horizon,
+    }
 
 def _number_tag(value: float) -> str:
     return format(float(value), ".12g").replace("-", "m").replace(".", "p")
@@ -286,9 +311,11 @@ def _save_cocore_encoded(
     temporary: Path,
     encoded: CocoreEncodedClips,
     *,
+    profile: str,
     fingerprint: str,
     runtime_seconds: float,
 ) -> None:
+    geometry = resolve_temporal_geometry(profile)
     np.save(temporary / "embeddings.npy", encoded.embeddings)
     np.save(temporary / "visual_half_embeddings.npy", encoded.visual_half_embeddings)
     np.save(temporary / "state_sequences.npy", encoded.state_sequences)
@@ -357,11 +384,13 @@ def _save_cocore_encoded(
             "visual_embedding_dim": projector.output_dim,
             "embedding_dim": int(encoded.embeddings.shape[1]),
             "visual_half_embedding_dim": int(encoded.visual_half_embeddings.shape[2]),
-            "clip_length": CLIP_LENGTH,
+            "clip_length": geometry.clip_length,
             "window_policy": WINDOW_POLICY,
-            "clip_anchors": [0, 7, 14],
-            "visual_half_windows": [[0, 8], [7, 15]],
-            "visual_half_encoding": "l2_normalized_eight_frame_mean",
+            "clip_anchors": list(geometry.clip_anchors),
+            "visual_half_windows": [
+                list(window) for window in geometry.visual_half_windows
+            ],
+            "visual_half_encoding": _visual_half_encoding(geometry),
             "counts": {
                 "candidate_fragments": candidate_count,
                 "pca_fit_fragments": encoded.pca_fit_fragment_count,
@@ -472,7 +501,10 @@ def _validate_frame_embedding_cache(
 def _validate_visual_half_embedding_cache(
     encode_root: Path,
     clips: list[ClipRecord],
+    *,
+    profile: str = "libero",
 ) -> None:
+    geometry = resolve_temporal_geometry(profile)
     path = encode_root / "visual_half_embeddings.npy"
     try:
         visual_halves = np.load(path, allow_pickle=False, mmap_mode="r")
@@ -497,7 +529,11 @@ def _validate_visual_half_embedding_cache(
 
     clips_by_episode: dict[int, list[tuple[int, ClipRecord]]] = {}
     for clip_index, clip in enumerate(clips):
-        if clip.length != 15 or clip.end_step - clip.start_step + 1 != 15 or clip.start_step < 0:
+        if (
+            clip.length != geometry.clip_length
+            or clip.end_step - clip.start_step + 1 != geometry.clip_length
+            or clip.start_step < 0
+        ):
             raise ValueError("cocore visual half boundary is invalid")
         clips_by_episode.setdefault(clip.episode_id, []).append((clip_index, clip))
 
@@ -517,9 +553,17 @@ def _validate_visual_half_embedding_cache(
             if clip.end_step >= len(frame_values):
                 raise ValueError("cocore visual half boundary exceeds frame cache")
             window = frame_values[clip.start_step : clip.end_step + 1]
-            if window.shape != (15, visual_halves.shape[2]) or not np.all(np.isfinite(window)):
+            if window.shape != (
+                geometry.clip_length,
+                visual_halves.shape[2],
+            ) or not np.all(np.isfinite(window)):
                 raise ValueError("cocore visual half frame window is invalid")
-            means = np.stack([window[:8].mean(axis=0), window[7:].mean(axis=0)])
+            means = np.stack(
+                [
+                    window[start:end].mean(axis=0)
+                    for start, end in geometry.visual_half_windows
+                ]
+            )
             norms = np.linalg.norm(means, axis=1, keepdims=True)
             if not np.all(np.isfinite(norms)) or np.any(norms <= 1.0e-8):
                 raise ValueError("cocore visual half frame mean has a non-positive norm")
@@ -540,6 +584,8 @@ def scan_stage(
     force: bool = False,
 ) -> tuple[Path, object, list[ClipRecord], str]:
     resolved = resolve_config(config)
+    profile = str(resolved["prototypes"]["profile"])
+    geometry = resolve_temporal_geometry(profile)
     root = _output_root(resolved, output_dir)
     adapter = create_dataset(resolved["dataset"])
     if len(adapter.image_observation_keys) != 1:
@@ -551,7 +597,7 @@ def scan_stage(
     episodes = list(adapter.episodes())
     if max_episodes is not None:
         episodes = episodes[:max_episodes]
-    clips = build_clip_records(episodes)
+    clips = build_clip_records(episodes, clip_length=geometry.clip_length)
     fingerprint = stable_hash(
         {
             "producer": "cocore",
@@ -561,11 +607,13 @@ def scan_stage(
             "dataset": resolved["dataset"],
             "runtime": {"max_episodes": max_episodes},
             "window_policy": WINDOW_POLICY,
-            "clip_length": CLIP_LENGTH,
+            "clip_length": geometry.clip_length,
         }
     )
     destination = root / "scan"
-    skipped_short = [record.episode_id for record in episodes if record.length < CLIP_LENGTH]
+    skipped_short = [
+        record.episode_id for record in episodes if record.length < geometry.clip_length
+    ]
 
     def build(temporary: Path) -> None:
         started = time.perf_counter()
@@ -586,7 +634,7 @@ def scan_stage(
                 "skipped_short_episodes": skipped_short,
                 "skipped_short_episode_count": len(skipped_short),
                 "window_policy": WINDOW_POLICY,
-                "clip_length": CLIP_LENGTH,
+                "clip_length": geometry.clip_length,
                 "runtime_seconds": time.perf_counter() - started,
             },
         )
@@ -613,6 +661,8 @@ def encode_stage(
     visual_encoder: VisualEncoder | None = None,
 ) -> tuple[Path, object, CocoreEncodedArtifact]:
     resolved = resolve_config(config)
+    profile = str(resolved["prototypes"]["profile"])
+    geometry = resolve_temporal_geometry(profile)
     seed_everything(int(resolved["seed"]))
     root, adapter, clips, scan_fingerprint = scan_stage(
         resolved, output_dir=output_dir, force=force
@@ -636,10 +686,10 @@ def encode_stage(
             "runtime": {"max_episodes": resolved["runtime"].get("max_episodes")},
             "seed": resolved["seed"],
             "window_policy": WINDOW_POLICY,
-            "clip_length": CLIP_LENGTH,
+            "clip_length": geometry.clip_length,
             "visual_halves": {
-                "windows": [[0, 8], [7, 15]],
-                "encoding": "l2_normalized_eight_frame_mean",
+                "windows": [list(window) for window in geometry.visual_half_windows],
+                "encoding": _visual_half_encoding(geometry),
             },
             "visual_model_sha256": model_sha256,
         }
@@ -653,6 +703,7 @@ def encode_stage(
         encoded = encode_cocore_dataset(
             adapter,
             encoder,
+            profile=profile,
             visual_dim=int(encoding_config["visual_dim"]),
             pca_fit_max_samples=encoding_config.get("pca_fit_max_samples"),
             quantile_low=float(encoding_config["quantile_low"]),
@@ -670,6 +721,7 @@ def encode_stage(
         _save_cocore_encoded(
             temporary,
             encoded,
+            profile=profile,
             fingerprint=fingerprint,
             runtime_seconds=time.perf_counter() - started,
         )
@@ -701,7 +753,11 @@ def encode_stage(
                 f"cocore frame embedding cache is incompatible: {destination}; pass --force"
             ) from error
         try:
-            _validate_visual_half_embedding_cache(destination, clips)
+            _validate_visual_half_embedding_cache(
+                destination,
+                clips,
+                profile=profile,
+            )
         except ValueError as error:
             raise FileExistsError(
                 f"cocore visual half embedding cache is incompatible: {destination}; pass --force"
@@ -722,7 +778,7 @@ def encode_stage(
         destination,
         expected_episodes=expected_frame_episodes,
     )
-    _validate_visual_half_embedding_cache(destination, clips)
+    _validate_visual_half_embedding_cache(destination, clips, profile=profile)
     return (
         root,
         adapter,
@@ -757,30 +813,32 @@ def graph_stage(
     pca_components = _load_visual_pca_components(root / "encode", visual_dim=visual_dim)
     prototype_config = resolved["prototypes"]
     prototype_profile = str(prototype_config["profile"])
+    geometry = resolve_temporal_geometry(prototype_profile)
     primitive_contract = motion_primitive_contract(prototype_profile)
     prototype_fingerprint_config = {
         key: prototype_config[key]
         for key in ("method", "profile", "batch_size", "max_iter", "tol", "use_stop_bucket")
     }
-    fingerprint = stable_hash(
-        {
-            "producer": "cocore",
-            "version": __version__,
-            "stage": "graph",
-            "adapter": adapter.fingerprint(),
-            "upstream": encoded.fingerprint,
-            "quality": resolved["quality"],
-            "prototypes": prototype_fingerprint_config,
-            "motion_primitive": primitive_contract,
-            "graph": resolved["graph"],
-            "seed": resolved["seed"],
-            "max_episodes": resolved["runtime"].get("max_episodes"),
-            "reliability_metrics": list(RELIABILITY_METRICS),
-            "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
-            "prototype_strategy": PROTOTYPE_STRATEGY,
-            "sequence_adjacency": SEQUENCE_ADJACENCY,
-        }
-    )
+    fingerprint_payload = {
+        "producer": "cocore",
+        "version": __version__,
+        "stage": "graph",
+        "adapter": adapter.fingerprint(),
+        "upstream": encoded.fingerprint,
+        "quality": resolved["quality"],
+        "prototypes": prototype_fingerprint_config,
+        "motion_primitive": primitive_contract,
+        "graph": resolved["graph"],
+        "seed": resolved["seed"],
+        "max_episodes": resolved["runtime"].get("max_episodes"),
+        "reliability_metrics": list(RELIABILITY_METRICS),
+        "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
+        "prototype_strategy": PROTOTYPE_STRATEGY,
+        "sequence_adjacency": SEQUENCE_ADJACENCY,
+    }
+    if prototype_profile != "libero":
+        fingerprint_payload["temporal_geometry"] = _temporal_manifest_fields(geometry)
+    fingerprint = stable_hash(fingerprint_payload)
     destination = root / GRAPH_DIRECTORY
 
     def build(temporary: Path) -> None:
@@ -877,7 +935,11 @@ def graph_stage(
                 "use_stop_bucket": bool(prototype_config["use_stop_bucket"]),
                 "prototype_visual_dim": visual_dim,
                 "prototype_visual_projection": PROTOTYPE_VISUAL_PROJECTION,
-                "prototype_visual_normalization": PROTOTYPE_VISUAL_NORMALIZATION,
+                "prototype_visual_normalization": _prototype_visual_normalization(
+                    geometry
+                ),
+                "trajectory_window_length": geometry.trajectory_window_length,
+                "trajectory_horizon": geometry.state_delta_horizon,
                 "sequence_adjacency": SEQUENCE_ADJACENCY,
                 "nodes": len(graph.sample_ids),
                 "scanned_candidate_nodes": len(encoded.clips),
@@ -1413,6 +1475,7 @@ def select_stage(
     visual_encoder: VisualEncoder | None = None,
 ) -> Path:
     resolved = resolve_config(config)
+    geometry = resolve_temporal_geometry(str(resolved["prototypes"]["profile"]))
     root = _output_root(resolved, output_dir)
     resolved["output"]["directory"] = str(root)
     root, adapter, clips, graph, graph_fingerprint = graph_stage(
@@ -1686,6 +1749,7 @@ def select_stage(
             ),
             "use_stop_bucket": bool(resolved["prototypes"]["use_stop_bucket"]),
             "window_policy": WINDOW_POLICY,
+            **_temporal_manifest_fields(geometry),
             "sequence_adjacency": SEQUENCE_ADJACENCY,
             "selection_ratio": ratio,
             "relation_type": relation_type,
@@ -1759,10 +1823,20 @@ def validate_output(
     run_profile = run_manifest.get("prototype_profile")
     try:
         run_motion_primitive = motion_primitive_contract(str(run_profile))
+        run_geometry = resolve_temporal_geometry(str(run_profile))
     except ValueError as error:
         raise ValueError("cocore motion primitive profile is incompatible") from error
     if run_manifest.get("motion_primitive") != run_motion_primitive:
         raise ValueError("cocore motion primitive contract is incompatible")
+    expected_run_temporal = _temporal_manifest_fields(run_geometry)
+    if (
+        run_profile != "libero"
+        or any(field in run_manifest for field in expected_run_temporal)
+    ) and any(
+        run_manifest.get(field) != value
+        for field, value in expected_run_temporal.items()
+    ):
+        raise ValueError("cocore run manifest temporal geometry is incompatible")
     if run_manifest.get("window_policy") != WINDOW_POLICY:
         raise ValueError("cocore run manifest window policy is incompatible")
     if run_manifest.get("sequence_adjacency") != SEQUENCE_ADJACENCY:
@@ -1859,26 +1933,52 @@ def validate_output(
             raise ValueError(f"invalid stage artifacts: {stage}")
         if run_manifest["stage_fingerprints"].get(stage) != manifest["fingerprint"]:
             raise ValueError(f"run/stage fingerprint mismatch: {stage}")
+    graph_manifest = stage_manifests["graph"]
+    graph_temporal_fields = {
+        "trajectory_window_length": run_geometry.trajectory_window_length,
+        "trajectory_horizon": run_geometry.state_delta_horizon,
+    }
+    graph_temporal_is_incompatible = (
+        run_profile != "libero"
+        or any(field in graph_manifest for field in graph_temporal_fields)
+    ) and any(
+        graph_manifest.get(field) != value
+        for field, value in graph_temporal_fields.items()
+    )
     if (
-        stage_manifests["graph"].get("prototype_schema_version") != PROTOTYPE_SCHEMA_VERSION
-        or stage_manifests["graph"].get("prototype_strategy") != PROTOTYPE_STRATEGY
-        or stage_manifests["graph"].get("prototype_profile") != run_profile
-        or stage_manifests["graph"].get("motion_primitive") != run_motion_primitive
-        or stage_manifests["graph"].get("use_stop_bucket")
+        graph_manifest.get("prototype_schema_version") != PROTOTYPE_SCHEMA_VERSION
+        or graph_manifest.get("prototype_strategy") != PROTOTYPE_STRATEGY
+        or graph_manifest.get("prototype_profile") != run_profile
+        or graph_manifest.get("motion_primitive") != run_motion_primitive
+        or graph_manifest.get("use_stop_bucket")
         is not bool(run_manifest.get("use_stop_bucket"))
-        or stage_manifests["graph"].get("prototype_visual_dim") != 128
-        or stage_manifests["graph"].get("prototype_visual_projection")
+        or graph_manifest.get("prototype_visual_dim") != 128
+        or graph_manifest.get("prototype_visual_projection")
         != PROTOTYPE_VISUAL_PROJECTION
-        or stage_manifests["graph"].get("prototype_visual_normalization")
-        != PROTOTYPE_VISUAL_NORMALIZATION
-        or stage_manifests["graph"].get("stage_directory") != GRAPH_DIRECTORY
-        or stage_manifests["graph"].get("sequence_adjacency") != SEQUENCE_ADJACENCY
+        or graph_manifest.get("prototype_visual_normalization")
+        != _prototype_visual_normalization(run_geometry)
+        or graph_temporal_is_incompatible
+        or graph_manifest.get("stage_directory") != GRAPH_DIRECTORY
+        or graph_manifest.get("sequence_adjacency") != SEQUENCE_ADJACENCY
     ):
         raise ValueError("graph manifest prototype schema is incompatible")
-    if any(
-        stage_manifests[stage].get("window_policy") != WINDOW_POLICY
-        or stage_manifests[stage].get("clip_length") != CLIP_LENGTH
-        for stage in ("scan", "encode")
+    encode_temporal_fields = {
+        key: expected_run_temporal[key]
+        for key in (
+            "clip_length",
+            "clip_anchors",
+            "visual_half_windows",
+            "visual_half_encoding",
+        )
+    }
+    if (
+        stage_manifests["scan"].get("window_policy") != WINDOW_POLICY
+        or stage_manifests["scan"].get("clip_length") != run_geometry.clip_length
+        or stage_manifests["encode"].get("window_policy") != WINDOW_POLICY
+        or any(
+            stage_manifests["encode"].get(field) != value
+            for field, value in encode_temporal_fields.items()
+        )
     ):
         raise ValueError("cocore stage window policy is incompatible")
     scan_clips = _load_clips(root / "scan" / "clips.parquet")
@@ -1903,7 +2003,8 @@ def validate_output(
                 task_name=str(row["task_name"]),
             )
             for row in episode_rows
-        ]
+        ],
+        clip_length=run_geometry.clip_length,
     )
     if scan_clips != expected_clips:
         raise ValueError("scan clips do not match Cocore near-uniform candidate windows")
@@ -1911,7 +2012,11 @@ def validate_output(
         root / "encode",
         expected_episodes=[(int(row["episode_id"]), int(row["length"])) for row in episode_rows],
     )
-    _validate_visual_half_embedding_cache(root / "encode", scan_clips)
+    _validate_visual_half_embedding_cache(
+        root / "encode",
+        scan_clips,
+        profile=str(run_profile),
+    )
     if config is None:
         resolved_path = result / "resolved_config.yaml"
         if not resolved_path.is_file():
@@ -1948,7 +2053,13 @@ def validate_output(
         resolved=replay_resolved,
         clips=scan_clips,
         expected_total_raw_actions=sum(
-            len(trajectory_window_starts(int(row["length"]))) for row in episode_rows
+            len(
+                trajectory_window_starts(
+                    int(row["length"]),
+                    window_length=run_geometry.trajectory_window_length,
+                )
+            )
+            for row in episode_rows
         ),
     )
     select_manifest = json.loads(required["select_manifest"].read_text(encoding="utf-8"))

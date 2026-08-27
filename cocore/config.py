@@ -14,6 +14,8 @@ import yaml
 from relcore.config import DEFAULT_CONFIG as RELCORE_DEFAULT_CONFIG
 from relcore.config import resolve_config as resolve_relcore_config
 
+from cocore.temporal import resolve_temporal_geometry
+
 
 _SHARED_SECTIONS = (
     "dataset",
@@ -224,6 +226,9 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def to_relcore_config(resolved: Mapping[str, Any]) -> dict[str, Any]:
     translated = copy.deepcopy(RELCORE_DEFAULT_CONFIG)
+    geometry = resolve_temporal_geometry(
+        str(resolved["prototypes"].get("profile", "libero"))
+    )
     translated["seed"] = int(resolved.get("seed", 42))
     for section in _SHARED_SECTIONS:
         if section == "prototypes":
@@ -243,7 +248,12 @@ def to_relcore_config(resolved: Mapping[str, Any]) -> dict[str, Any]:
     translated["selection"]["quota_mode"] = "none"
     translated["selection"]["minimum_per_task"] = 0
     translated["output"] = copy.deepcopy(resolved["output"])
-    return resolve_relcore_config(translated)
+    validated = resolve_relcore_config(translated)
+    validated["clip"] = {
+        "length": geometry.clip_length,
+        "stride": geometry.clip_length,
+    }
+    return validated
 
 
 def load_config(path: str | Path) -> dict[str, Any]:

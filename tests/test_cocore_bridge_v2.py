@@ -155,8 +155,8 @@ def _write_synthetic_bridge_dataset(
         steps = np.arange(605, dtype=np.float32)
         states = np.zeros((605, 8), dtype=np.float32)
         if not (stop_first_valid_episode and episode_id == 1):
-            states[:, 0] = steps * 0.01
-            states[:, 3] = steps * 0.02
+            states[:, 0] = steps * 0.02
+            states[:, 3] = steps * 0.05
         actions = np.zeros((605, 7), dtype=np.float32)
         actions[:, 0] = 0.01
         table = pa.table(
@@ -278,6 +278,7 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
     assert "num_threads" not in translated["prototypes"]
     assert "profile" not in translated["prototypes"]
     assert "tol" not in translated["prototypes"]
+    assert translated["clip"] == {"length": 7, "stride": 7}
     assert translated["selection"]["quota_mode"] == "none"
     assert translated["selection"]["minimum_per_task"] == 0
 
@@ -828,11 +829,21 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
         "excluded_episodes": 1,
         "excluded_empty_task_episodes": 1,
     }
-    assert scan_manifest["clips"] == 82
+    assert scan_manifest["clips"] == 174
+    assert scan_manifest["clip_length"] == 7
     scanned_episode_ids = pq.read_table(output / "scan" / "episodes.parquet")[
         "episode_id"
     ].to_pylist()
     assert scanned_episode_ids == [1, 2]
+    scanned_clips = pq.read_table(output / "scan" / "clips.parquet").to_pylist()
+    assert {row["length"] for row in scanned_clips} == {7}
+    encode_manifest = json.loads((output / "encode" / "manifest.json").read_text())
+    assert encode_manifest["clips"] == 174
+    assert encode_manifest["clip_length"] == 7
+    assert encode_manifest["clip_anchors"] == [0, 3, 6]
+    assert encode_manifest["visual_half_windows"] == [[0, 4], [3, 7]]
+    assert encode_manifest["visual_half_encoding"] == "l2_normalized_four_frame_mean"
+    assert np.load(output / "encode" / "state_sequences.npy").shape == (174, 7, 8)
     selected = [
         json.loads(line) for line in (result / "selected_manifest.jsonl").read_text().splitlines()
     ]
@@ -856,7 +867,18 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     assert run_manifest["stage_directories"]["graph"] == "graph-18-motion-hard-nearest-pca"
     assert run_manifest["prototype_schema_version"] == 10
     assert run_manifest["prototype_profile"] == "bridge_v2"
+    assert run_manifest["clip_length"] == 7
+    assert run_manifest["clip_anchors"] == [0, 3, 6]
+    assert run_manifest["visual_half_windows"] == [[0, 4], [3, 7]]
+    assert run_manifest["visual_half_encoding"] == "l2_normalized_four_frame_mean"
+    assert run_manifest["trajectory_window_length"] == 4
+    assert run_manifest["trajectory_horizon"] == 3
     assert graph_manifest["prototype_profile"] == "bridge_v2"
+    assert graph_manifest["prototype_visual_normalization"] == (
+        "l2_normalized_four_frame_mean_after_projection"
+    )
+    assert graph_manifest["trajectory_window_length"] == 4
+    assert graph_manifest["trajectory_horizon"] == 3
     assert graph_manifest["motion_primitive"]["roll_labels"] == {
         "positive": "roll positive",
         "negative": "roll negative",
@@ -875,6 +897,12 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
         "negative": "roll negative",
     }
     assert catalog["constants"]["cyclic_axes"] == [3, 5]
+    assert catalog["total_raw_actions"] == 404
+    assert catalog["constants"]["trajectory_window_length"] == 4
+    assert catalog["constants"]["visual_half_windows"] == [[0, 4], [3, 7]]
+    assert catalog["constants"]["visual_half_encoding"] == (
+        "l2_normalized_mean_of_four_projected_frames"
+    )
     assert any(
         leaf["action_label"] == "move forward, roll positive"
         for leaf in catalog["leaf_prototypes"]
@@ -883,6 +911,16 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
         "status": "valid",
         "selected_clips": 10,
     }
+
+    run_manifest["clip_length"] = 15
+    run_manifest["clip_anchors"] = [0, 7, 14]
+    run_manifest["visual_half_windows"] = [[0, 8], [7, 15]]
+    run_manifest["visual_half_encoding"] = "l2_normalized_eight_frame_mean"
+    run_manifest["trajectory_window_length"] = 8
+    run_manifest["trajectory_horizon"] = 7
+    (result / "run_manifest.json").write_text(json.dumps(run_manifest))
+    with pytest.raises(ValueError, match="temporal geometry"):
+        validate_output(result, config=config)
 
 
 def test_bridge_validate_replays_the_same_max_episode_subset(
@@ -947,6 +985,6 @@ def test_bridge_validate_replays_the_same_max_episode_subset(
     )
 
     assert json.loads(capsys.readouterr().out) == {
-        "selected_clips": 21,
+        "selected_clips": 44,
         "status": "valid",
     }
