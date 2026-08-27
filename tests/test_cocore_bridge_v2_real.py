@@ -5,10 +5,11 @@ from pathlib import Path
 
 import pytest
 
+from cocore.index import build_clip_records
+from cocore.temporal import resolve_temporal_geometry
 from cocore_bridge_v2 import cli
 from cocore_bridge_v2.config import DEFAULT_DATASET_PATH, build_config
 from cocore_bridge_v2.preflight import validate_bridge_dataset
-from relcore.data.index import build_clip_records
 from trajectory_data import LeRobotDatasetAdapter
 
 
@@ -20,6 +21,7 @@ def test_mounted_bridge_metadata_parquet_and_av1_match_contract() -> None:
     config = build_config(relation="sequence", relation_weight=1.0)
     adapter = LeRobotDatasetAdapter(config["dataset"])
     records = list(adapter.episodes())
+    geometry = resolve_temporal_geometry("bridge_v2")
 
     assert adapter.dataset_summary() == {
         "source_episodes": 53_192,
@@ -29,10 +31,10 @@ def test_mounted_bridge_metadata_parquet_and_av1_match_contract() -> None:
         "excluded_empty_task_episodes": 14_532,
     }
     assert sum(record.length for record in records) == 1_305_714
-    assert sum(record.length < 15 for record in records) == 537
-    clips = build_clip_records(records, length=15, stride=15)
-    assert len(clips) == 106_625
-    assert int(len(clips) * 0.10 + 0.5) == 10_663
+    assert sum(record.length < geometry.clip_length for record in records) == 2
+    clips = build_clip_records(records, clip_length=geometry.clip_length)
+    assert len(clips) == 202_739
+    assert int(len(clips) * 0.10 + 0.5) == 20_274
 
     episode = next(
         iter(

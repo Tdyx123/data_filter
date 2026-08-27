@@ -46,9 +46,10 @@ class _DiagnosticAdapter(DatasetAdapter):
         for record in records:
             steps = np.arange(record.length, dtype=np.float32)
             states = np.zeros((record.length, 8), dtype=np.float32)
-            states[:, 0] = steps * np.float32(0.01)
+            states[:, 0] = steps * np.float32(0.02)
+            states[:, 1] = steps * np.float32(0.008)
             if record.episode_id == 1:
-                states[:, 3] = steps * np.float32(0.02)
+                states[:, 3] = steps * np.float32(0.05)
             yield EpisodeData(
                 episode_id=record.episode_id,
                 timestamps=steps.astype(np.float64) / 5.0,
@@ -70,7 +71,9 @@ def test_diagnostic_scans_states_without_loading_images_and_reports_axes() -> No
 
     assert report["profile"] == "bridge_v2"
     assert report["episode_count"] == 2
-    assert report["window_count"] == 800
+    assert report["trajectory_window_length"] == 4
+    assert report["trajectory_horizon"] == 3
+    assert report["window_count"] == 804
     assert report["unique_compound_labels"] == 2
     assert report["retained_non_stop_action_buckets"] == 2
     assert report["estimated_leaf_prototypes"] == 20
@@ -80,6 +83,7 @@ def test_diagnostic_scans_states_without_loading_images_and_reports_axes() -> No
     assert report["atomic_action_retention_quality"] == 1.0
     assert report["atomic_occurrence_retention_quality"] == 1.0
     assert report["axis_statistics"]["x"]["activation_rate"] == 1.0
+    assert report["axis_statistics"]["y"]["activation_rate"] == 0.0
     assert report["axis_statistics"]["roll"]["activation_rate"] == 0.5
     assert report["axis_statistics"]["yaw"]["activation_rate"] == 0.0
     assert adapter.load_images_calls == [False]
@@ -118,13 +122,28 @@ def test_reference_acceptance_reports_every_failed_contract() -> None:
             "estimated_leaf_prototypes": 1,
             "exact_non_stop_coverage": 0.0,
             "raw_stop_rate": 1.0,
-            "stop_or_no_parent_fallback_rate": 1.0,
             "atomic_action_retention_quality": 0.0,
         }
     )
 
-    assert len(failures) == 8
+    assert len(failures) == 7
     assert all(isinstance(failure, str) and failure for failure in failures)
+
+
+def test_reference_acceptance_accepts_new_four_frame_production_baseline() -> None:
+    failures = validate_reference_acceptance(
+        {
+            "window_count": 434_370,
+            "unique_compound_labels": 1_399,
+            "retained_non_stop_action_buckets": 83,
+            "estimated_leaf_prototypes": 1_139,
+            "exact_non_stop_coverage": 0.6539,
+            "raw_stop_rate": 0.2236,
+            "atomic_action_retention_quality": 0.730,
+        }
+    )
+
+    assert failures == ()
 
 
 @pytest.mark.parametrize("count", [True, -1, 1.5])

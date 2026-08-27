@@ -1,31 +1,36 @@
 # Cocore：运动原语关系筛选
 
-Cocore 从 LeRobot v2 机器人 episode 中选择固定预算的 15 帧片段。它独立管理候选
+Cocore 从 LeRobot v2 机器人 episode 中选择固定预算的 profile 固定长度片段：LIBERO
+使用 15 帧，BridgeData V2 使用 7 帧。它独立管理候选
 索引、稀疏图、Quality 风格编码流水线、两级动作原型、配置、缓存与输出产物；
 运行时代码不依赖 `quality_filter` 或 `segment_filter_core` 的切片逻辑。
 
-长度为 `L >= 15` 的 episode 固定生成 `N = ceil(L / 15)` 个完整候选。首个候选从
+LIBERO 中长度为 `L >= 15` 的 episode 固定生成 `N = ceil(L / 15)` 个完整候选。首个候选从
 第 0 帧开始，末个候选结束于最后一帧；中间 `N-1` 个起点间隔近似均匀，间隔最多
 相差 1，较短间隔集中在前部。例如 16 帧的起点为 `[0,1]`，31 帧为
 `[0,8,16]`，207 帧为 `[0,14,28,42,57,...,192]`。同一 episode 中按起点相邻的
-候选始终构成 sequence 边，即使两个 15 帧窗口发生重叠。
+候选始终构成 sequence 边，即使两个 15 帧窗口发生重叠。Bridge 使用同一近似均匀、
+首尾覆盖策略，但将候选长度固定为 7，候选数为 `ceil(L / 7)`。
 
 编码先按全数据 1%/99% 分位将 action 和向量 observation 缩放到 `[0,1]`。每个
 episode 只执行一次视觉模型前向；候选片段的视觉特征
-`[sum(v0..v14), v14-v0]` 直接用于拟合 128 维 PCA，再与 state/action 的
+`[sum(v0..v(C-1)), v(C-1)-v0]` 直接用于拟合 128 维 PCA，其中 `C` 为 profile 的候选
+长度；再与 state/action 的
 `mean/std/max` 及 `start/episode_length` 拼接并做行 L2 归一化。该 embedding 用于
-可靠性 support 和相似图。Encode 还保留原始逐帧 CLIP 缓存，并将候选拆成共享第 7 帧的
-`[0..7]`、`[7..14]` 两个半段，分别缓存原始 CLIP 空间中的 8 帧归一化均值。
+可靠性 support 和相似图。Encode 还保留原始逐帧 CLIP 缓存。LIBERO 将候选拆成共享
+第 7 帧的 `[0..7]`、`[7..14]` 两个 8 帧半段；Bridge 将 7 帧候选拆成共享第 3 帧的
+`[0..3]`、`[3..6]` 两个 4 帧半段，分别缓存原始 CLIP 空间中的归一化均值。
 
 动作—视觉原型保留两级解耦：一级表达动作桶，二级表达桶内视觉中心。学习原型时，
-对每条完整轨迹生成首尾覆盖、起点间隔最大为 3 的 8 帧窗口 `[t,t+7]`，用
-`state[t]→state[t+7]` 分类动作。间隔默认取 3；轨迹长度为 `3x+1` 时最后一个间隔
+对每条完整轨迹生成首尾覆盖、起点间隔最大为 3 的 profile 固定窗口：LIBERO 使用
+8 帧 `[t,t+7]` 和 `state[t]→state[t+7]`，Bridge 使用 4 帧 `[t,t+3]` 和
+`state[t]→state[t+3]`。间隔默认取 3；对于 LIBERO 8 帧窗口，轨迹长度为 `3x+1` 时最后一个间隔
 取 2，长度为 `3x` 时最后两个间隔取 2，长度 9 特取起点 `[0,1]`。例如长度
 12、13、14 的起点分别为 `[0,2,4]`、`[0,3,5]`、`[0,3,6]`。设原始逐帧 CLIP
 维度为 `D`；聚类复用上述
 `visual_pca.npz`，裁剪 `components` 的前 `D` 列，对每帧执行纯矩阵乘法
 `v @ components[:, :D].T`，不应用 PCA 的 `mean` 或 `scale`，分量不足时右补零到
-128 维。窗口在投影后取 8 帧均值并 L2 归一化，再学习视觉中心；候选两个半段也投影到
+128 维。窗口在投影后按 profile 取 8 帧或 4 帧均值并 L2 归一化，再学习视觉中心；候选两个半段也投影到
 同一空间后分配最近中心。`prototypes.profile` 固定分类与动作保留契约：
 
 - `libero`（通用 Cocore 默认）：沿用单一严格阈值 `0.03`，不分类 roll，动作保留条件为
@@ -61,8 +66,9 @@ MiniBatchKMeans，这些大桶按动作 ID 串行拟合且每个模型固定 4 �
 上限。中心按硬归属数降序、坐标字典序稳定编号；每桶还记录训练窗口到最近中心的欧氏
 距离 q10/q90。
 
-构造 15 帧候选标签时，分别分类 `state[0]→state[7]` 与
-`state[7]→state[14]`，两个半段各自独立打一个叶标签。若原始动作未保留，先找原子数
+构造候选标签时，LIBERO 分别分类 `state[0]→state[7]` 与
+`state[7]→state[14]`，Bridge 分别分类 `state[0]→state[3]` 与
+`state[3]→state[6]`；两个半段各自独立打一个叶标签。若原始动作未保留，先找原子数
 最多的保留子集；多个父动作并列时，在它们的所有中心中选欧氏距离最近的叶原型，距离
 相同取较小叶 ID。启用 stop 桶时，没有非空父集会回退 `stop`；关闭时该半段不产生
 标签。两个半段都没有标签的候选从 graph 起排除，不参与 KNN、关系图、预算计算或筛选；
@@ -208,7 +214,8 @@ selection:
   max_refreshes: 100  # 仅 lazy_heap 使用
 ```
 
-片段长度固定为 15，候选数量、首尾锚定与近似均匀间隔是 Cocore 固定算法的一部分；
+片段长度由 profile 固定为 LIBERO 15 帧或 Bridge 7 帧，候选数量、首尾锚定与近似均匀
+间隔是 Cocore 固定算法的一部分；
 配置中不接受 `clip` section。
 Quality 风格编码取代了旧关系编码，因此不再接受顶层 `relation` 或 `normalization`；
 `encoding.visual_dim` 固定为 128，`pca_fit_max_samples` 可限制 PCA 拟合样本数。
@@ -224,7 +231,7 @@ debug 配置固定为 1。它与 `runtime.num_workers` 相互独立，后者仍�
 视觉中心训练会一次物化所有保留窗口的 128 维 `float32` 投影。小桶用完整 KMeans
 并行拟合，大桶用 MiniBatchKMeans 串行拟合，避免多个大桶同时占用 CPU 和临时内存。
 基础额外内存约为“保留窗口数 × 128 × 4 字节”：LIBERO90 约 106 MiB，Bridge V2
-约 273 MiB；完整 KMeans 拟合小桶时还会产生有界于 65,536 个窗口的工作副本。改变
+按 4 帧参考基线估算约 186 MiB；完整 KMeans 拟合小桶时还会产生有界于 65,536 个窗口的工作副本。改变
 `num_threads` 不改变 graph 指纹或产物，因此可复用同一 graph 缓存；改变
 `profile`、`batch_size`、`max_iter`、`tol` 或 `use_stop_bucket` 会使 graph 缓存失效。
 profile、分轴阈值、roll 标签、环绕轴和保留公式同时写入 catalog、各级 manifest 与
@@ -264,13 +271,15 @@ RelCore 的 `--reliability-metrics`、`--prototype-method` 或
 python -m cocore run --config cocore/config_debug.yaml --force
 ```
 
-Cocore 0.16.0 使用 prototype schema 10、10～30 个桶内视觉中心、可选 stop 桶、无标签
+Cocore 0.16.0 使用 prototype schema 10、profile 固定的 15/8（LIBERO）或 7/4（Bridge）
+时间几何、10～30 个桶内视觉中心、可选 stop 桶、无标签
 候选诱导子图、65,536 窗口的混合 KMeans 阈值、最大间隔 3 的动作训练窗口、裁剪 PCA
 的 128 维聚类空间、近似均匀候选和原始相邻 sequence 图，并按 episode 持久化完整原始
 逐帧 CLIP 特征，并提供 lazy heap 与随机多分支两种选择方法。0.15.x 的 schema 9
 artifact 不迁移，也不会被 validator 接受；既有 scan、encode、graph 和 selection 缓存
-全部视为不兼容；
-升级后必须通过 `--force` 重建全部阶段，或使用新的输出目录。
+全部视为不兼容。Bridge 适配器 0.8.0 保持 Cocore 0.16.0/schema 10，但 7/4 几何与旧
+Bridge 15/8 artifact 不兼容；升级这两类旧产物后都必须通过 `--force` 重建全部阶段，
+或使用新的输出目录。LIBERO 的 15/8 缓存契约不变。
 
 ## 输出与校验
 
@@ -315,7 +324,7 @@ python -m cocore validate \
 只有生成结果时关闭了 stop 桶，验证时才应传入该开关。若省略 `--config`，CLI 会从
 选择目录的 `resolved_config.yaml` 读取重放配置；验证随机多分支结果时必须使用生成时
 相同的方法和 seed，校验器会重放每个分支的 FAISS 阈值检索并核对增量惩罚。复用
-0.15.x/schema 9、profile、阈值、环绕策略或 stop 设置不同的
+0.15.x/schema 9、旧 Bridge 15/8 几何、profile、阈值、环绕策略或 stop 设置不同的
 输出目录时，应使用 `--force` 重建全部不兼容阶段。
 
 校验还会从 episode 元数据重放近似均匀候选，逐字段核对 `clips.parquet`，逐个检查

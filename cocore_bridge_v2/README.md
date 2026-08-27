@@ -11,10 +11,10 @@ Cocore 的编码、运动原语、关系目标或选择算法，而是固定 Bri
 - LeRobot `v2.0`、WidowX、5 Hz；
 - 只读取 `observation.images.image_0`、8 维 `observation.state` 和 7 维 `action`；
 - 排除任务名为空的 episode，再应用 `--max-episodes`；
-- 固定使用 15 帧近似均匀候选和 Cocore schema 10 两级动作原型；原型学习在完整轨迹
-  上使用首尾覆盖、起点间隔最大为 3 的八帧窗口，只用精确保留动作训练硬视觉桶；
-- 固定 `prototypes.profile: bridge_v2`，CLI 不提供 profile 覆盖；八帧窗口始终使用
-  `state[t] → state[t+7]`；
+- 固定使用 7 帧近似均匀候选和 Cocore schema 10 两级动作原型；原型学习在完整轨迹
+  上使用首尾覆盖、起点间隔最大为 3 的四帧窗口，只用精确保留动作训练硬视觉桶；
+- 固定 `prototypes.profile: bridge_v2`，CLI 不提供 profile 覆盖；四帧窗口始终使用
+  `state[t] → state[t+3]`；
 - xyz 严格阈值为 `0.03 m`，roll/pitch 为 `0.12 rad`，yaw 为 `0.18 rad`，gripper
   为 `0.20`；等于阈值不激活动作；
 - roll 与 yaw 使用 `[-π, π)` 最短角差。原子顺序固定为平移、
@@ -31,12 +31,13 @@ Cocore 的编码、运动原语、关系目标或选择算法，而是固定 Bri
   MiniBatchKMeans，按动作 ID 串行且每个模型使用 4 个 OpenMP 线程；
 - `prototypes.num_threads` 与只控制 episode 读取进程的 `runtime.num_workers: 4` 相互
   独立，改变线程数不改变 graph 指纹；
-- 候选按 `[0..7]`、`[7..14]` 独立选择最近叶原型，权重为保留比例置信度与桶内距离
+- 候选按 `[0..3]`、`[3..6]` 独立选择最近叶原型，权重为保留比例置信度与桶内距离
   置信度的乘积；同叶合并，最终绝对权重不归一；
 - 全局选择，不施加逐任务配额。
 
-Bridge 为 5 Hz，因此 15 帧片段覆盖约 3 秒，运动原语的 7 帧状态差跨度为
-1.4 秒。本适配包不重采样轨迹帧，也不改变 Cocore 的帧级语义；最大间隔 3 只控制
+Bridge 为 5 Hz，因此 7 帧片段按帧数计约 1.4 秒，运动原语的
+`state[t] → state[t+3]` 状态差跨度为 0.6 秒。本适配包不重采样轨迹帧，也不改变 Cocore
+的帧级语义；最大间隔 3 只控制
 动作原型训练窗口的起点。
 
 安装依赖：
@@ -107,14 +108,15 @@ PCA components 前半列进行逐帧纯矩阵投影，不使用 mean/scale。选
 原型标签、动作标签、绝对置信度和 `half_action_labels`，不包含旧的 action/distance
 分解权重。catalog 与 manifest 记录 `bridge_v2` profile、分轴阈值、roll 标签、环绕轴
 和 `0.1%/400` 保留策略。manifest 的生产者仍为 `cocore`；Cocore 版本为 0.16.0，
-Bridge 包版本为 0.7.0。
+Bridge 包版本为 0.8.0。
 
 视觉中心训练只物化一次保留窗口投影；小桶并行执行完整 KMeans，大桶串行执行
-MiniBatchKMeans。Bridge V2 完整生产数据的基础额外内存约为 273 MiB（保留窗口数 ×
-128 × 4 字节），不使用 memmap 或磁盘 fallback。
+MiniBatchKMeans。Bridge V2 完整生产数据的基础额外内存约为 186 MiB（按参考精确保留
+非 stop 与原始 stop 窗口估算，每窗口 `128 × 4` 字节），不使用 memmap 或磁盘 fallback。
 
-Cocore schema 9 artifact 不迁移且 validator 会拒绝。升级到 Cocore 0.16.0 / Bridge
-0.7.0 后必须使用 `--force` 重新构建 scan、encode、graph 和 selection，不能复用旧缓存。
+Cocore schema 9 artifact 不迁移且 validator 会拒绝。Cocore 仍为 0.16.0/schema 10；
+Bridge 0.8.0 的 7/4 几何与 0.7.x 的 15/8 artifact 不兼容。升级后必须使用 `--force`
+重新构建 scan、encode、graph 和 selection，不能复用旧缓存。
 
 验证时必须重复传入生成该选择结果时使用的目标、比例、数据集路径以及
 `--max-episodes`（若生成时设置）。省略 `--max-episodes` 表示按完整有效数据集重放；
@@ -134,14 +136,14 @@ python -m cocore_bridge_v2 validate \
   --no-use-stop-bucket
 ```
 
-只有生成结果时传入了 `--no-use-stop-bucket`，验证时才重复传入。升级自 schema 9 / 0.6.x
+只有生成结果时传入了 `--no-use-stop-bucket`，验证时才重复传入。升级自 schema 9 / 0.7.x
 或切换 stop 设置并复用同一输出根目录时，应使用 `--force` 重建全部不兼容阶段。
 
 ## 运行基线
 
 正式数据预期包含 53,192 条源 episode。排除 14,532 条空任务 episode 后保留
-38,660 条、1,305,714 帧；其中 537 条短于 15 帧。最终产生 106,625 个候选片段，
-Top 10% 预算为 10,663。
+38,660 条、1,305,714 帧；其中 2 条短于 7 帧。最终产生 202,739 个候选片段，
+Top 10% 预算为 20,274。
 
 只读动作诊断不加载图像、不创建缓存：
 
@@ -152,9 +154,9 @@ Top 10% 预算为 10,663。
 ```
 
 它输出七轴绝对差分位与激活率、复合类别数、stop/回退率、精确覆盖、原子保留质量、
-动作桶数和预计视觉叶原型数。完整训练集参考契约为 384,946 个窗口、2,089 个实际复合
-标签、179 个保留的非 stop 桶和约 2,058 个叶原型；非 stop 精确覆盖约 65.60%，原始
-stop 约 3.04%，stop 与无父动作回退合计不超过 3.5%，原子动作保留质量至少 86.8%。
+动作桶数和预计视觉叶原型数。完整训练集参考契约为 434,370 个四帧窗口、1,399 个实际
+复合标签、83 个保留的非 stop 桶和约 1,139 个叶原型；非 stop 精确覆盖约 65.39%，
+原始 stop 约 22.36%，原子动作保留质量至少 73.0%。
 
 无需 GPU 的 100 episode scan 冒烟：
 
@@ -166,6 +168,6 @@ python -m cocore_bridge_v2 scan \
 ```
 
 `encode` 和完整 `run` 会解码 `image_0` AV1 视频并使用单路 CLIP 特征。每个有效
-episode（包括不足 15 帧的短 episode）的完整逐帧特征会写入 encode 缓存，并经 128 维视觉 PCA 与 state/action
+episode（包括不足 7 帧的短 episode）的完整逐帧特征会写入 encode 缓存，并经 128 维视觉 PCA 与 state/action
 时序池化特征融合。生产配置固定从 `/data/dwb/models/clip-vit-base-patch32` 本地加载
 模型，要求 CUDA；不会访问网络，也不会读取 `image_1`、`image_2` 或 `image_3`。

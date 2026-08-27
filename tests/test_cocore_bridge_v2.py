@@ -214,7 +214,7 @@ def test_package_exposes_only_version() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["0.7.0", "['__version__']"]
+    assert result.stdout.splitlines() == ["0.8.0", "['__version__']"]
 
 
 def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None:

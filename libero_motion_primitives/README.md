@@ -22,7 +22,9 @@
 ## BridgeData V2 状态约定
 
 `make_bridge_v2_config()` 固定使用 8 维
-`[x, y, z, roll, pitch, yaw, pad, gripper]` 状态和 7 帧 horizon。xyz 阈值为
+`[x, y, z, roll, pitch, yaw, pad, gripper]` 状态和 `horizon=3`。Cocore Bridge
+由此构成四帧 `[t..t+3]` 动作窗口，并使用 `state[t] → state[t+3]`；在 5 Hz 下状态差
+跨度为 0.6 秒。xyz 阈值为
 `0.03 m`，roll/pitch 为 `0.12 rad`，yaw 为 `0.18 rad`，gripper 为 `0.20`。
 roll 与 yaw 使用 `[-π, π)` 最短角差；动作顺序固定为平移、
 `roll positive/negative`、pitch tilt、yaw rotate、gripper。所有边界仍为严格

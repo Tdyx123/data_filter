@@ -12,7 +12,6 @@ import numpy as np
 
 from cocore.prototypes import (
     STATE_KEY,
-    TRAJECTORY_WINDOW_LENGTH,
     atomic_action_count,
     cluster_count_for_training_count,
     create_action_catalog,
@@ -21,6 +20,7 @@ from cocore.prototypes import (
     resolve_motion_primitive_profile,
     trajectory_window_starts,
 )
+from cocore.temporal import resolve_temporal_geometry
 from libero_motion_primitives import classify_motion_primitive
 from trajectory_data import DatasetAdapter
 
@@ -146,6 +146,7 @@ def analyze_bridge_action_windows(
     """Scan Bridge states only and report classification behavior without writes."""
 
     profile = resolve_motion_primitive_profile(_PROFILE)
+    geometry = resolve_temporal_geometry(_PROFILE)
     records = list(adapter.episodes())
     if max_episodes is not None:
         records = records[:max_episodes]
@@ -182,10 +183,16 @@ def analyze_bridge_action_windows(
             raise ValueError(
                 f"episode {episode.episode_id}: observation.state must be finite [time, dim>=8]"
             )
-        starts = np.asarray(trajectory_window_starts(len(states)), dtype=np.int64)
+        starts = np.asarray(
+            trajectory_window_starts(
+                len(states),
+                window_length=geometry.trajectory_window_length,
+            ),
+            dtype=np.int64,
+        )
         if len(starts) == 0:
             continue
-        future = starts + TRAJECTORY_WINDOW_LENGTH - 1
+        future = starts + geometry.state_delta_horizon
         deltas = states[future] - states[starts]
         for axis in profile.primitive_config.cyclic_axes:
             outside = (deltas[:, axis] < -math.pi) | (deltas[:, axis] >= math.pi)
@@ -205,6 +212,8 @@ def analyze_bridge_action_windows(
     return {
         **summary,
         "episode_count": len(records),
+        "trajectory_window_length": geometry.trajectory_window_length,
+        "trajectory_horizon": geometry.state_delta_horizon,
         "motion_primitive": motion_primitive_contract(_PROFILE),
         "axis_statistics": _axis_statistics(axis_deltas),
     }
@@ -214,34 +223,30 @@ def validate_reference_acceptance(report: Mapping[str, object]) -> tuple[str, ..
     """Return deviations from the fixed full BridgeData V2 acceptance contract."""
 
     checks = (
-        (report.get("window_count") == 384_946, "window_count must equal 384946"),
+        (report.get("window_count") == 434_370, "window_count must equal 434370"),
         (
-            report.get("unique_compound_labels") == 2_089,
-            "unique_compound_labels must equal 2089",
+            report.get("unique_compound_labels") == 1_399,
+            "unique_compound_labels must equal 1399",
         ),
         (
-            report.get("retained_non_stop_action_buckets") == 179,
-            "retained_non_stop_action_buckets must equal 179",
+            report.get("retained_non_stop_action_buckets") == 83,
+            "retained_non_stop_action_buckets must equal 83",
         ),
         (
-            report.get("estimated_leaf_prototypes") == 2_058,
-            "estimated_leaf_prototypes must equal 2058",
+            report.get("estimated_leaf_prototypes") == 1_139,
+            "estimated_leaf_prototypes must equal 1139",
         ),
         (
-            abs(float(report.get("exact_non_stop_coverage", math.nan)) - 0.6560) <= 0.0005,
-            "exact_non_stop_coverage must be within 0.05 percentage points of 65.60%",
+            abs(float(report.get("exact_non_stop_coverage", math.nan)) - 0.6539) <= 0.0005,
+            "exact_non_stop_coverage must be within 0.05 percentage points of 65.39%",
         ),
         (
-            abs(float(report.get("raw_stop_rate", math.nan)) - 0.0304) <= 0.0005,
-            "raw_stop_rate must be within 0.05 percentage points of 3.04%",
+            abs(float(report.get("raw_stop_rate", math.nan)) - 0.2236) <= 0.0005,
+            "raw_stop_rate must be within 0.05 percentage points of 22.36%",
         ),
         (
-            float(report.get("stop_or_no_parent_fallback_rate", math.inf)) <= 0.035,
-            "stop_or_no_parent_fallback_rate must not exceed 3.5%",
-        ),
-        (
-            float(report.get("atomic_action_retention_quality", -math.inf)) >= 0.868,
-            "atomic_action_retention_quality must be at least 86.8%",
+            float(report.get("atomic_action_retention_quality", -math.inf)) >= 0.730,
+            "atomic_action_retention_quality must be at least 73.0%",
         ),
     )
     return tuple(message for passed, message in checks if not passed)
