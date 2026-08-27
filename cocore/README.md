@@ -22,11 +22,13 @@ episode 只执行一次视觉模型前向；候选片段的视觉特征
 `[0..3]`、`[3..6]` 两个 4 帧半段，分别缓存原始 CLIP 空间中的归一化均值。
 
 动作—视觉原型保留两级解耦：一级表达动作桶，二级表达桶内视觉中心。学习原型时，
-对每条完整轨迹生成首尾覆盖、起点间隔最大为 3 的 profile 固定窗口：LIBERO 使用
-8 帧 `[t,t+7]` 和 `state[t]→state[t+7]`，Bridge 使用 4 帧 `[t,t+3]` 和
-`state[t]→state[t+3]`。间隔默认取 3；对于 LIBERO 8 帧窗口，轨迹长度为 `3x+1` 时最后一个间隔
-取 2，长度为 `3x` 时最后两个间隔取 2，长度 9 特取起点 `[0,1]`。例如长度
-12、13、14 的起点分别为 `[0,2,4]`、`[0,3,5]`、`[0,3,6]`。设原始逐帧 CLIP
+对每条完整轨迹生成首尾覆盖的 profile 固定窗口：LIBERO 使用起点最大间隔 3 的
+8 帧 `[t,t+7]` 和 `state[t]→state[t+7]`；Bridge 使用起点最大间隔 2 的 4 帧
+`[t,t+3]` 和 `state[t]→state[t+3]`。LIBERO 的尾部重排规则保持不变：轨迹长度为
+`3x+1` 时最后一个间隔取 2，长度为 `3x` 时最后两个间隔取 2，长度 9 特取起点
+`[0,1]`；例如长度 12、13、14 的起点分别为 `[0,2,4]`、`[0,3,5]`、
+`[0,3,6]`。Bridge 正常起点每隔 2 帧，尾差为奇数时最后一个间隔取 1；例如长度
+7、8、9 的起点分别为 `[0,2,3]`、`[0,2,4]`、`[0,2,4,5]`。设原始逐帧 CLIP
 维度为 `D`；聚类复用上述
 `visual_pca.npz`，裁剪 `components` 的前 `D` 列，对每帧执行纯矩阵乘法
 `v @ components[:, :D].T`，不应用 PCA 的 `mean` 或 `scale`，分量不足时右补零到
@@ -231,17 +233,18 @@ debug 配置固定为 1。它与 `runtime.num_workers` 相互独立，后者仍�
 视觉中心训练会一次物化所有保留窗口的 128 维 `float32` 投影。小桶用完整 KMeans
 并行拟合，大桶用 MiniBatchKMeans 串行拟合，避免多个大桶同时占用 CPU 和临时内存。
 基础额外内存约为“保留窗口数 × 128 × 4 字节”：LIBERO90 约 106 MiB，Bridge V2
-按 4 帧参考基线估算约 179 MiB；完整 KMeans 拟合小桶时还会产生有界于 65,536 个窗口的工作副本。改变
+按间隔 2 的 4 帧参考基线估算约 257 MiB；完整 KMeans 拟合小桶时还会产生有界于
+65,536 个窗口的工作副本。改变
 `num_threads` 不改变 graph 指纹或产物，因此可复用同一 graph 缓存；改变
 `profile`、`batch_size`、`max_iter`、`tol` 或 `use_stop_bucket` 会使 graph 缓存失效。
 profile、分轴阈值、roll 标签、环绕轴和保留公式同时写入 catalog、各级 manifest 与
 graph/select 指纹。
 
-Bridge Orig V2 参考数据（排除空任务 episode）包含 38,660 条有效 episode 和 434,370
-个四帧窗口；完整集门槛为 2,172。参考结果为 1,104 个复合标签、24 个保留的非 stop
-动作桶和约 530 个叶原型，非 stop 精确覆盖约 60.18%，父类回退约 14.56%，无父类
-回退不超过 1.30%，原始 stop 约 24.00%；原子动作与 occurrence 保留质量分别至少为
-68.40% 和 84.10%。
+Bridge Orig V2 参考数据（排除空任务 episode）包含 38,660 条有效 episode 和 622,782
+个四帧窗口；完整集门槛为 3,114。参考结果为 1,181 个复合标签、25 个保留的非 stop
+动作桶和约 594 个叶原型，非 stop 精确覆盖约 60.62%，父类回退约 14.22%，无父类
+回退不超过 1.23%，原始 stop 约 23.94%；原子动作与 occurrence 保留质量分别至少为
+68.79% 和 84.67%。
 
 可在运行时覆盖选择方法、选择比例、关系类型与关系权重：
 
@@ -279,12 +282,13 @@ python -m cocore run --config cocore/config_debug.yaml --force
 
 Cocore 0.16.0 使用 prototype schema 10、profile 固定的 15/8（LIBERO）或 7/4（Bridge）
 时间几何、10～30 个桶内视觉中心、可选 stop 桶、无标签
-候选诱导子图、65,536 窗口的混合 KMeans 阈值、最大间隔 3 的动作训练窗口、裁剪 PCA
+候选诱导子图、65,536 窗口的混合 KMeans 阈值、LIBERO 最大间隔 3、Bridge 最大间隔 2
+的动作训练窗口、裁剪 PCA
 的 128 维聚类空间、近似均匀候选和原始相邻 sequence 图，并按 episode 持久化完整原始
 逐帧 CLIP 特征，并提供 lazy heap 与随机多分支两种选择方法。0.15.x 的 schema 9
 artifact 不迁移，也不会被 validator 接受；既有 scan、encode、graph 和 selection 缓存
-全部视为不兼容。Bridge 适配器 0.9.0 保持 Cocore 0.16.0/schema 10；相对 0.8.0，新的
-角阈值与 `0.5%/400` 保留公式进入 graph/select 指纹和 catalog，旧 graph/selection
+全部视为不兼容。Bridge 适配器 0.10.0 保持 Cocore 0.16.0/schema 10；相对 0.9.0，
+新的动作窗口最大间隔 2 进入 graph/select 指纹、manifest 和 catalog，旧 graph/selection
 artifact 会被拒绝，必须通过 `--force` 重建，兼容的 scan/encode 缓存继续复用。旧
 Bridge 15/8 artifact 与 7/4 几何不兼容，升级时仍需重建全部阶段。LIBERO 的 15/8
 缓存契约不变。

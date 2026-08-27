@@ -100,6 +100,15 @@ def _prototype_visual_normalization(geometry: TemporalGeometry) -> str:
     return f"{_visual_half_encoding(geometry)}_after_projection"
 
 
+def _action_sampling_manifest_fields(geometry: TemporalGeometry) -> dict[str, object]:
+    if geometry.profile == "libero":
+        return {}
+    return {
+        "trajectory_window_max_gap": geometry.trajectory_window_max_gap,
+        "trajectory_window_policy": geometry.trajectory_window_policy,
+    }
+
+
 def _temporal_manifest_fields(geometry: TemporalGeometry) -> dict[str, object]:
     return {
         "clip_length": geometry.clip_length,
@@ -108,7 +117,7 @@ def _temporal_manifest_fields(geometry: TemporalGeometry) -> dict[str, object]:
         "visual_half_encoding": _visual_half_encoding(geometry),
         "trajectory_window_length": geometry.trajectory_window_length,
         "trajectory_horizon": geometry.state_delta_horizon,
-    }
+    } | _action_sampling_manifest_fields(geometry)
 
 def _number_tag(value: float) -> str:
     return format(float(value), ".12g").replace("-", "m").replace(".", "p")
@@ -950,6 +959,7 @@ def graph_stage(
                 ),
                 "trajectory_window_length": geometry.trajectory_window_length,
                 "trajectory_horizon": geometry.state_delta_horizon,
+                **_action_sampling_manifest_fields(geometry),
                 "sequence_adjacency": SEQUENCE_ADJACENCY,
                 "nodes": len(graph.sample_ids),
                 "scanned_candidate_nodes": len(encoded.clips),
@@ -1947,7 +1957,7 @@ def validate_output(
     graph_temporal_fields = {
         "trajectory_window_length": run_geometry.trajectory_window_length,
         "trajectory_horizon": run_geometry.state_delta_horizon,
-    }
+    } | _action_sampling_manifest_fields(run_geometry)
     graph_temporal_is_incompatible = (
         run_profile != "libero"
         or any(field in graph_manifest for field in graph_temporal_fields)
@@ -2067,6 +2077,7 @@ def validate_output(
                 trajectory_window_starts(
                     int(row["length"]),
                     window_length=run_geometry.trajectory_window_length,
+                    max_gap=run_geometry.trajectory_window_max_gap,
                 )
             )
             for row in episode_rows
