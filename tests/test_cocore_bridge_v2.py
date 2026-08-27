@@ -156,6 +156,7 @@ def _write_synthetic_bridge_dataset(
         states = np.zeros((605, 8), dtype=np.float32)
         if not (stop_first_valid_episode and episode_id == 1):
             states[:, 0] = steps * 0.01
+            states[:, 3] = steps * 0.02
         actions = np.zeros((605, 7), dtype=np.float32)
         actions[:, 0] = 0.01
         table = pa.table(
@@ -213,7 +214,7 @@ def test_package_exposes_only_version() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["0.6.0", "['__version__']"]
+    assert result.stdout.splitlines() == ["0.7.0", "['__version__']"]
 
 
 def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None:
@@ -255,9 +256,11 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
         "epsilon": 1.0e-8,
     }
     assert config["prototypes"]["method"] == "motion_primitives"
+    assert config["prototypes"]["profile"] == "bridge_v2"
     assert config["prototypes"]["use_stop_bucket"] is True
     assert set(config["prototypes"]) == {
         "method",
+        "profile",
         "batch_size",
         "max_iter",
         "tol",
@@ -273,6 +276,7 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
     assert config["output"]["directory"] == ("outputs/cocore_bridge_v2/bridge_orig_1.0.0")
     translated = to_relcore_config(config)
     assert "num_threads" not in translated["prototypes"]
+    assert "profile" not in translated["prototypes"]
     assert "tol" not in translated["prototypes"]
     assert translated["selection"]["quota_mode"] == "none"
     assert translated["selection"]["minimum_per_task"] == 0
@@ -626,7 +630,7 @@ def test_scan_cli_preflights_and_delegates_resolved_bridge_config(
             "build-graph",
             "graph_stage",
             lambda root: (root, None, None, SimpleNamespace(sample_ids=(1, 2)), "fingerprint"),
-            "cocore_output={root}/graph-17-motion-hard-nearest-pca nodes=2",
+            "cocore_output={root}/graph-18-motion-hard-nearest-pca nodes=2",
         ),
         (
             "select",
@@ -832,14 +836,49 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     selected = [
         json.loads(line) for line in (result / "selected_manifest.jsonl").read_text().splitlines()
     ]
+    all_rows = pq.read_table(result / "all_clips.parquet").to_pylist()
     assert len(selected) == 10
+    assert all("roll positive" in row["primary_action_label"] for row in all_rows)
+    assert all(
+        any("roll positive" in label for label in row["prototype_action_labels"])
+        for row in all_rows
+    )
     select_manifest = json.loads((result / "manifest.json").read_text())
     run_manifest = json.loads((result / "run_manifest.json").read_text())
+    graph_root = output / "graph-18-motion-hard-nearest-pca"
+    graph_manifest = json.loads((graph_root / "manifest.json").read_text())
+    catalog = json.loads((graph_root / "prototype_catalog.json").read_text())
     assert select_manifest["producer"] == "cocore"
-    assert select_manifest["cocore_version"] == "0.15.0"
+    assert select_manifest["cocore_version"] == "0.16.0"
+    assert select_manifest["prototype_profile"] == "bridge_v2"
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.15.0"
-    assert run_manifest["stage_directories"]["graph"] == "graph-17-motion-hard-nearest-pca"
+    assert run_manifest["cocore_version"] == "0.16.0"
+    assert run_manifest["stage_directories"]["graph"] == "graph-18-motion-hard-nearest-pca"
+    assert run_manifest["prototype_schema_version"] == 10
+    assert run_manifest["prototype_profile"] == "bridge_v2"
+    assert graph_manifest["prototype_profile"] == "bridge_v2"
+    assert graph_manifest["motion_primitive"]["roll_labels"] == {
+        "positive": "roll positive",
+        "negative": "roll negative",
+    }
+    assert catalog["schema_version"] == 10
+    assert catalog["profile"] == "bridge_v2"
+    assert catalog["constants"]["primitive_thresholds"] == {
+        "translation": 0.03,
+        "roll": 0.12,
+        "tilt": 0.12,
+        "rotation": 0.18,
+        "gripper": 0.2,
+    }
+    assert catalog["constants"]["roll_labels"] == {
+        "positive": "roll positive",
+        "negative": "roll negative",
+    }
+    assert catalog["constants"]["cyclic_axes"] == [3, 5]
+    assert any(
+        leaf["action_label"] == "move forward, roll positive"
+        for leaf in catalog["leaf_prototypes"]
+    )
     assert validate_output(result, config=config) == {
         "status": "valid",
         "selected_clips": 10,

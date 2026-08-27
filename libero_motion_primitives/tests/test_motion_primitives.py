@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
 from libero_motion_primitives import (
     PrimitiveConfig,
+    PrimitiveThresholds,
     classify_motion_primitive,
     compute_primitive_statistics,
     filter_frequent_primitives,
     generate_motion_primitives,
+    make_bridge_v2_config,
     make_libero_config,
 )
 
@@ -50,6 +54,121 @@ def test_values_exactly_at_threshold_are_not_significant() -> None:
     result = classify_motion_primitive(current, future, make_libero_config())
 
     assert result == "stop"
+
+
+def test_bridge_v2_config_classifies_all_seven_action_axes_in_stable_order() -> None:
+    current, future = _libero_states(
+        {
+            0: 0.031,
+            1: -0.031,
+            2: 0.031,
+            3: 0.121,
+            4: 0.121,
+            5: 0.181,
+            7: 0.201,
+        }
+    )
+
+    result = classify_motion_primitive(current, future, make_bridge_v2_config())
+
+    assert result == (
+        "move forward right up, roll positive, tilt up, "
+        "rotate counterclockwise, open gripper"
+    )
+
+
+def test_bridge_v2_config_classifies_all_negative_directions_in_stable_order() -> None:
+    current, future = _libero_states(
+        {
+            0: -0.031,
+            1: 0.031,
+            2: -0.031,
+            3: -0.121,
+            4: -0.121,
+            5: -0.181,
+            7: -0.201,
+        }
+    )
+
+    result = classify_motion_primitive(current, future, make_bridge_v2_config())
+
+    assert result == (
+        "move backward left down, roll negative, tilt down, "
+        "rotate clockwise, close gripper"
+    )
+
+
+def test_bridge_v2_values_exactly_at_per_family_thresholds_are_not_significant() -> None:
+    current, future = _libero_states(
+        {0: 0.03, 1: -0.03, 2: 0.03, 3: -0.12, 4: 0.12, 5: -0.18, 7: 0.20}
+    )
+
+    result = classify_motion_primitive(current, future, make_bridge_v2_config())
+
+    assert result == "stop"
+
+
+@pytest.mark.parametrize(
+    ("current_angle", "future_angle", "expected"),
+    [
+        (
+            np.pi - 0.10,
+            -np.pi + 0.10,
+            "roll positive, rotate counterclockwise",
+        ),
+        (
+            -np.pi + 0.10,
+            np.pi - 0.10,
+            "roll negative, rotate clockwise",
+        ),
+    ],
+)
+def test_bridge_v2_roll_and_yaw_use_shortest_wrapped_angle_delta(
+    current_angle: float,
+    future_angle: float,
+    expected: str,
+) -> None:
+    current = np.zeros(8, dtype=np.float64)
+    future = current.copy()
+    current[[3, 5]] = current_angle
+    future[[3, 5]] = future_angle
+
+    result = classify_motion_primitive(current, future, make_bridge_v2_config())
+
+    assert result == expected
+
+
+def test_libero_config_continues_to_ignore_roll_axis() -> None:
+    current, future = _libero_states({3: 0.5})
+
+    result = classify_motion_primitive(current, future, make_libero_config())
+
+    assert result == "stop"
+
+
+def test_custom_roll_labels_are_emitted_when_roll_axis_is_enabled() -> None:
+    current, future = _libero_states({3: 0.2})
+    config = replace(
+        make_bridge_v2_config(),
+        roll_positive_label="bank left",
+        roll_negative_label="bank right",
+    )
+
+    result = classify_motion_primitive(current, future, config)
+
+    assert result == "bank left"
+
+
+@pytest.mark.parametrize("value", [-0.01, np.nan, np.inf])
+def test_primitive_thresholds_reject_invalid_values(value: float) -> None:
+    with pytest.raises(ValueError, match="threshold"):
+        PrimitiveThresholds(
+            translation=0.03,
+            roll=value,
+            tilt=0.12,
+            rotation=0.18,
+            gripper=0.20,
+        )
 
 
 def test_custom_sign_mapping_flips_every_semantic_direction() -> None:

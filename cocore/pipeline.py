@@ -48,18 +48,11 @@ from cocore.graph import SEQUENCE_ADJACENCY, build_graph
 from cocore.index import CLIP_LENGTH, WINDOW_POLICY, build_clip_records
 from cocore.objective import CocoreObjectiveContext
 from cocore.prototypes import (
-    FULL_KMEANS_MAX_TRAINING_COUNT,
-    FULL_KMEANS_OPENMP_THREADS,
-    MAX_VISUAL_CENTERS,
-    MINIBATCH_KMEANS_OPENMP_THREADS,
-    MIN_ACTION_COUNT,
-    MIN_DISTANCE_WEIGHT,
-    MIN_ACTION_FREQUENCY,
-    STATE_THRESHOLD,
-    TRAJECTORY_WINDOW_LENGTH,
-    TRAJECTORY_WINDOW_POLICY,
     build_hierarchical_motion_prototypes,
     cluster_count_for_training_count,
+    motion_primitive_catalog_constants,
+    motion_primitive_contract,
+    resolve_motion_primitive_profile,
     trajectory_window_starts,
 )
 from cocore.random_multibranch import (
@@ -80,9 +73,9 @@ from cocore.selection import (
 from cocore.timing import emit_completed_timing, timed_step
 
 
-GRAPH_DIRECTORY = "graph-17-motion-hard-nearest-pca"
+GRAPH_DIRECTORY = "graph-18-motion-hard-nearest-pca"
 RELIABILITY_METRICS = ("support", "progress")
-PROTOTYPE_SCHEMA_VERSION = 9
+PROTOTYPE_SCHEMA_VERSION = 10
 PROTOTYPE_STRATEGY = (
     "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_half_visual_"
     "hybrid_kmeans_nearest"
@@ -763,9 +756,11 @@ def graph_stage(
     visual_dim = int(resolved["encoding"]["visual_dim"])
     pca_components = _load_visual_pca_components(root / "encode", visual_dim=visual_dim)
     prototype_config = resolved["prototypes"]
+    prototype_profile = str(prototype_config["profile"])
+    primitive_contract = motion_primitive_contract(prototype_profile)
     prototype_fingerprint_config = {
         key: prototype_config[key]
-        for key in ("method", "batch_size", "max_iter", "tol", "use_stop_bucket")
+        for key in ("method", "profile", "batch_size", "max_iter", "tol", "use_stop_bucket")
     }
     fingerprint = stable_hash(
         {
@@ -776,6 +771,7 @@ def graph_stage(
             "upstream": encoded.fingerprint,
             "quality": resolved["quality"],
             "prototypes": prototype_fingerprint_config,
+            "motion_primitive": primitive_contract,
             "graph": resolved["graph"],
             "seed": resolved["seed"],
             "max_episodes": resolved["runtime"].get("max_episodes"),
@@ -820,6 +816,7 @@ def graph_stage(
                 num_workers=int(resolved["runtime"].get("num_workers", 0)),
                 num_threads=int(prototype_config["num_threads"]),
                 use_stop_bucket=bool(prototype_config["use_stop_bucket"]),
+                profile=prototype_profile,
                 timing_callback=emit_completed_timing,
             )
         source_clip_indices = np.flatnonzero(hierarchy.eligible_mask).astype(np.int64)
@@ -875,6 +872,8 @@ def graph_stage(
                 "prototype_method": "motion_primitives",
                 "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
                 "prototype_strategy": PROTOTYPE_STRATEGY,
+                "prototype_profile": prototype_profile,
+                "motion_primitive": primitive_contract,
                 "use_stop_bucket": bool(prototype_config["use_stop_bucket"]),
                 "prototype_visual_dim": visual_dim,
                 "prototype_visual_projection": PROTOTYPE_VISUAL_PROJECTION,
@@ -974,11 +973,17 @@ def _load_source_clip_indices(graph_root: Path, candidate_count: int) -> np.ndar
 
 def _prototype_catalog(graph_root: Path) -> Mapping[str, Any]:
     payload = json.loads((graph_root / "prototype_catalog.json").read_text(encoding="utf-8"))
+    profile = payload.get("profile") if isinstance(payload, Mapping) else None
+    try:
+        expected_constants = motion_primitive_catalog_constants(str(profile))
+    except ValueError as error:
+        raise ValueError("cocore prototype catalog schema is incompatible") from error
     if (
         not isinstance(payload, Mapping)
         or payload.get("method") != "motion_primitives"
         or payload.get("schema_version") != PROTOTYPE_SCHEMA_VERSION
         or payload.get("strategy") != PROTOTYPE_STRATEGY
+        or payload.get("constants") != expected_constants
     ):
         raise ValueError("cocore prototype catalog schema is incompatible")
     return payload
@@ -1024,42 +1029,20 @@ def _load_graph(root: Path) -> tuple[list[ClipRecord], GraphData, Mapping[str, n
     return clips, graph, nodes
 
 
-def _validate_schema_nine_catalog(
+def _validate_schema_ten_catalog(
     payload: Mapping[str, Any],
     *,
     expected_total_raw_actions: int,
     use_stop_bucket: bool,
+    profile: str,
 ) -> tuple[Mapping[str, Any], ...]:
-    expected_constants = {
-        "state_threshold": STATE_THRESHOLD,
-        "min_action_count": MIN_ACTION_COUNT,
-        "min_action_frequency": MIN_ACTION_FREQUENCY,
-        "max_visual_centers": MAX_VISUAL_CENTERS,
-        "full_kmeans_max_training_count": FULL_KMEANS_MAX_TRAINING_COUNT,
-        "full_kmeans_openmp_threads": FULL_KMEANS_OPENMP_THREADS,
-        "minibatch_kmeans_openmp_threads": MINIBATCH_KMEANS_OPENMP_THREADS,
-        "kmeans_n_init": 1,
-        "large_bucket_parallelism": "serial",
-        "trajectory_window_length": TRAJECTORY_WINDOW_LENGTH,
-        "trajectory_window_policy": TRAJECTORY_WINDOW_POLICY,
-        "visual_half_windows": [[0, 8], [7, 15]],
-        "visual_projection": PROTOTYPE_VISUAL_PROJECTION,
-        "visual_projection_centering": "none",
-        "visual_projection_padding": "right_zero_to_128",
-        "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
-        "cluster_count": (
-            "min(training_count, min(30, max(10, "
-            "floor(4 * log2(training_count) - 30))))"
-        ),
-        "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
-        "distance_quantiles": [0.1, 0.9],
-        "distance_weight_range": [1.0, MIN_DISTANCE_WEIGHT],
-        "duplicate_merge": "max + 0.5 * min",
-    }
+    resolved_profile = resolve_motion_primitive_profile(profile)
+    expected_constants = motion_primitive_catalog_constants(profile)
     if (
         payload.get("method") != "motion_primitives"
         or payload.get("schema_version") != PROTOTYPE_SCHEMA_VERSION
         or payload.get("strategy") != PROTOTYPE_STRATEGY
+        or payload.get("profile") != profile
         or payload.get("use_stop_bucket") is not use_stop_bucket
         or payload.get("constants") != expected_constants
         or not isinstance(payload.get("action_categories"), list)
@@ -1096,7 +1079,10 @@ def _validate_schema_nine_catalog(
     ):
         raise ValueError("hierarchical prototype action order is invalid")
 
-    threshold = max(MIN_ACTION_COUNT, math.ceil(MIN_ACTION_FREQUENCY * total))
+    threshold = max(
+        resolved_profile.min_action_count,
+        math.ceil(resolved_profile.min_action_frequency * total),
+    )
     assigned_labels = [
         str(category["label"])
         for category in categories
@@ -1257,10 +1243,12 @@ def _validate_hierarchical_graph_artifacts(
         raise ValueError("hierarchical prototype node shape or dtype is invalid")
 
     payload = json.loads((graph_root / "prototype_catalog.json").read_text(encoding="utf-8"))
-    leaves = _validate_schema_nine_catalog(
+    profile = str(resolved["prototypes"]["profile"])
+    leaves = _validate_schema_ten_catalog(
         payload,
         expected_total_raw_actions=expected_total_raw_actions,
         use_stop_bucket=bool(resolved["prototypes"]["use_stop_bucket"]),
+        profile=profile,
     )
     visual_halves = np.load(root / "encode" / "visual_half_embeddings.npy", allow_pickle=False)
     visual_dim = int(resolved["encoding"]["visual_dim"])
@@ -1333,6 +1321,7 @@ def _validate_hierarchical_graph_artifacts(
         num_workers=int(resolved["runtime"].get("num_workers", 0)),
         num_threads=int(prototype_config["num_threads"]),
         use_stop_bucket=bool(prototype_config["use_stop_bucket"]),
+        profile=profile,
     )
     replay_centers = replay.prototypes.centers
     if replay_centers is None:
@@ -1457,6 +1446,10 @@ def select_stage(
         "algorithm": algorithm,
         "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
         "prototype_strategy": PROTOTYPE_STRATEGY,
+        "prototype_profile": str(resolved["prototypes"]["profile"]),
+        "motion_primitive": motion_primitive_contract(
+            str(resolved["prototypes"]["profile"])
+        ),
     }
     legacy_random_fingerprint = (
         stable_hash(fingerprint_payload) if method == "random_multibranch" else None
@@ -1554,6 +1547,10 @@ def select_stage(
             "prototype_method": "motion_primitives",
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
             "prototype_strategy": PROTOTYPE_STRATEGY,
+            "prototype_profile": str(resolved["prototypes"]["profile"]),
+            "motion_primitive": motion_primitive_contract(
+                str(resolved["prototypes"]["profile"])
+            ),
             "use_stop_bucket": bool(resolved["prototypes"]["use_stop_bucket"]),
             "initial_set_size": len(coverage_seed.selected_indices),
             "coverage": {
@@ -1623,6 +1620,10 @@ def select_stage(
                 "prototype_method": "motion_primitives",
                 "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
                 "prototype_strategy": PROTOTYPE_STRATEGY,
+                "prototype_profile": str(resolved["prototypes"]["profile"]),
+                "motion_primitive": motion_primitive_contract(
+                    str(resolved["prototypes"]["profile"])
+                ),
                 "use_stop_bucket": bool(resolved["prototypes"]["use_stop_bucket"]),
             },
         )
@@ -1679,6 +1680,10 @@ def select_stage(
             "prototype_method": "motion_primitives",
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
             "prototype_strategy": PROTOTYPE_STRATEGY,
+            "prototype_profile": str(resolved["prototypes"]["profile"]),
+            "motion_primitive": motion_primitive_contract(
+                str(resolved["prototypes"]["profile"])
+            ),
             "use_stop_bucket": bool(resolved["prototypes"]["use_stop_bucket"]),
             "window_policy": WINDOW_POLICY,
             "sequence_adjacency": SEQUENCE_ADJACENCY,
@@ -1751,6 +1756,13 @@ def validate_output(
         raise ValueError("cocore prototype schema version is incompatible")
     if run_manifest.get("prototype_strategy") != PROTOTYPE_STRATEGY:
         raise ValueError("cocore prototype strategy is incompatible")
+    run_profile = run_manifest.get("prototype_profile")
+    try:
+        run_motion_primitive = motion_primitive_contract(str(run_profile))
+    except ValueError as error:
+        raise ValueError("cocore motion primitive profile is incompatible") from error
+    if run_manifest.get("motion_primitive") != run_motion_primitive:
+        raise ValueError("cocore motion primitive contract is incompatible")
     if run_manifest.get("window_policy") != WINDOW_POLICY:
         raise ValueError("cocore run manifest window policy is incompatible")
     if run_manifest.get("sequence_adjacency") != SEQUENCE_ADJACENCY:
@@ -1850,6 +1862,8 @@ def validate_output(
     if (
         stage_manifests["graph"].get("prototype_schema_version") != PROTOTYPE_SCHEMA_VERSION
         or stage_manifests["graph"].get("prototype_strategy") != PROTOTYPE_STRATEGY
+        or stage_manifests["graph"].get("prototype_profile") != run_profile
+        or stage_manifests["graph"].get("motion_primitive") != run_motion_primitive
         or stage_manifests["graph"].get("use_stop_bucket")
         is not bool(run_manifest.get("use_stop_bucket"))
         or stage_manifests["graph"].get("prototype_visual_dim") != 128
@@ -1918,6 +1932,12 @@ def validate_output(
     elif int(replay_resolved["seed"]) != int(algorithm["seed"]):
         raise ValueError("configuration seed does not match output")
     expected_use_stop_bucket = bool(replay_resolved["prototypes"]["use_stop_bucket"])
+    expected_profile = str(replay_resolved["prototypes"]["profile"])
+    expected_motion_primitive = motion_primitive_contract(expected_profile)
+    if run_profile != expected_profile or run_motion_primitive != expected_motion_primitive:
+        raise ValueError(
+            "cocore motion primitive configuration does not match the run manifest"
+        )
     if run_manifest.get("use_stop_bucket") is not expected_use_stop_bucket:
         raise ValueError("cocore stop bucket configuration does not match the run manifest")
     replay_resolved["output"]["directory"] = str(root)
@@ -1953,6 +1973,10 @@ def validate_output(
         select_manifest.get("prototype_schema_version") != PROTOTYPE_SCHEMA_VERSION
         or select_manifest.get("prototype_strategy") != PROTOTYPE_STRATEGY
         or report.get("prototype_strategy") != PROTOTYPE_STRATEGY
+        or select_manifest.get("prototype_profile") != expected_profile
+        or report.get("prototype_profile") != expected_profile
+        or select_manifest.get("motion_primitive") != expected_motion_primitive
+        or report.get("motion_primitive") != expected_motion_primitive
     ):
         raise ValueError("selection prototype schema metadata mismatch")
     if (

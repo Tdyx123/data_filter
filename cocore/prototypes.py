@@ -18,7 +18,12 @@ from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.exceptions import ConvergenceWarning
 from threadpoolctl import threadpool_limits
 
-from libero_motion_primitives import classify_motion_primitive, make_libero_config
+from libero_motion_primitives import (
+    PrimitiveConfig,
+    classify_motion_primitive,
+    make_bridge_v2_config,
+    make_libero_config,
+)
 from relcore.graph.prototypes import PrototypeData
 from relcore.schemas import ClipRecord
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
@@ -31,6 +36,7 @@ _ActionResult = TypeVar("_ActionResult")
 
 MIN_ACTION_COUNT = 400
 MIN_ACTION_FREQUENCY = 0.005
+BRIDGE_V2_MIN_ACTION_FREQUENCY = 0.001
 MIN_VISUAL_CENTERS = 10
 MAX_VISUAL_CENTERS = 30
 FULL_KMEANS_MAX_TRAINING_COUNT = 65_536
@@ -50,6 +56,8 @@ _ATOMIC_ACTION_ORDER = (
     ("move", "left"),
     ("move", "up"),
     ("move", "down"),
+    ("block", "roll positive"),
+    ("block", "roll negative"),
     ("block", "tilt up"),
     ("block", "tilt down"),
     ("block", "rotate counterclockwise"),
@@ -59,6 +67,108 @@ _ATOMIC_ACTION_ORDER = (
 )
 _MOVE_TOKENS = {value for kind, value in _ATOMIC_ACTION_ORDER if kind == "move"}
 _BLOCK_ACTIONS = {value for kind, value in _ATOMIC_ACTION_ORDER if kind == "block"}
+
+
+@dataclass(frozen=True)
+class MotionPrimitiveProfile:
+    name: str
+    primitive_config: PrimitiveConfig
+    min_action_count: int
+    min_action_frequency: float
+
+
+def resolve_motion_primitive_profile(name: str) -> MotionPrimitiveProfile:
+    """Resolve one fixed Cocore motion-primitive classification profile."""
+
+    if name == "libero":
+        return MotionPrimitiveProfile(
+            name="libero",
+            primitive_config=make_libero_config(threshold=STATE_THRESHOLD),
+            min_action_count=MIN_ACTION_COUNT,
+            min_action_frequency=MIN_ACTION_FREQUENCY,
+        )
+    if name == "bridge_v2":
+        return MotionPrimitiveProfile(
+            name="bridge_v2",
+            primitive_config=make_bridge_v2_config(),
+            min_action_count=MIN_ACTION_COUNT,
+            min_action_frequency=BRIDGE_V2_MIN_ACTION_FREQUENCY,
+        )
+    raise ValueError(f"unknown motion primitive profile {name!r}")
+
+
+def motion_primitive_contract(name: str) -> dict[str, object]:
+    """Return the serialized classification and retention contract for a profile."""
+
+    profile = resolve_motion_primitive_profile(name)
+    config = profile.primitive_config
+    thresholds = config.thresholds
+    primitive_thresholds: dict[str, float | None]
+    if thresholds is None:
+        primitive_thresholds = {
+            "translation": config.threshold,
+            "roll": None,
+            "tilt": config.threshold,
+            "rotation": config.threshold,
+            "gripper": config.threshold,
+        }
+    else:
+        primitive_thresholds = {
+            "translation": thresholds.translation,
+            "roll": thresholds.roll,
+            "tilt": thresholds.tilt,
+            "rotation": thresholds.rotation,
+            "gripper": thresholds.gripper,
+        }
+    roll_labels: dict[str, str] | None = None
+    if config.roll_axis is not None:
+        roll_labels = {
+            "positive": config.roll_positive_label,
+            "negative": config.roll_negative_label,
+        }
+    return {
+        "profile": profile.name,
+        "primitive_thresholds": primitive_thresholds,
+        "roll_axis": config.roll_axis,
+        "roll_labels": roll_labels,
+        "cyclic_axes": list(config.cyclic_axes),
+        "min_action_count": profile.min_action_count,
+        "min_action_frequency": profile.min_action_frequency,
+        "retention_threshold": (
+            "max(min_action_count, ceil(min_action_frequency * W))"
+        ),
+    }
+
+
+def motion_primitive_catalog_constants(name: str) -> dict[str, object]:
+    """Return all schema-10 catalog constants for a fixed profile."""
+
+    contract = motion_primitive_contract(name)
+    return {
+        key: value for key, value in contract.items() if key != "profile"
+    } | {
+        "max_visual_centers": MAX_VISUAL_CENTERS,
+        "full_kmeans_max_training_count": FULL_KMEANS_MAX_TRAINING_COUNT,
+        "full_kmeans_openmp_threads": FULL_KMEANS_OPENMP_THREADS,
+        "minibatch_kmeans_openmp_threads": MINIBATCH_KMEANS_OPENMP_THREADS,
+        "kmeans_n_init": 1,
+        "large_bucket_parallelism": "serial",
+        "trajectory_window_length": TRAJECTORY_WINDOW_LENGTH,
+        "trajectory_window_policy": TRAJECTORY_WINDOW_POLICY,
+        "visual_half_windows": [[0, 8], [7, 15]],
+        "visual_projection": ("frame @ visual_pca.components[:, :frame_embedding_dim].T"),
+        "visual_projection_centering": "none",
+        "visual_projection_padding": "right_zero_to_128",
+        "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
+        "cluster_count": (
+            "min(training_count, min(30, max(10, "
+            "floor(4 * log2(training_count) - 30))))"
+        ),
+        "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
+        "distance_quantiles": [0.1, 0.9],
+        "distance_weight_range": [1.0, MIN_DISTANCE_WEIGHT],
+        "duplicate_merge": "max + 0.5 * min",
+    }
 
 
 @dataclass(frozen=True)
@@ -88,6 +198,7 @@ class LeafPrototype:
 class ActionCatalog:
     total_raw_actions: int
     action_categories: tuple[ActionCategory, ...]
+    profile: str = "libero"
     use_stop_bucket: bool = True
     leaf_prototypes: tuple[LeafPrototype, ...] = ()
 
@@ -111,38 +222,14 @@ class ActionCatalog:
     def to_dict(self) -> dict[str, object]:
         return {
             "method": "motion_primitives",
-            "schema_version": 9,
+            "schema_version": 10,
+            "profile": self.profile,
             "use_stop_bucket": self.use_stop_bucket,
             "strategy": (
                 "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_"
                 "half_visual_hybrid_kmeans_nearest"
             ),
-            "constants": {
-                "state_threshold": STATE_THRESHOLD,
-                "min_action_count": MIN_ACTION_COUNT,
-                "min_action_frequency": MIN_ACTION_FREQUENCY,
-                "max_visual_centers": MAX_VISUAL_CENTERS,
-                "full_kmeans_max_training_count": FULL_KMEANS_MAX_TRAINING_COUNT,
-                "full_kmeans_openmp_threads": FULL_KMEANS_OPENMP_THREADS,
-                "minibatch_kmeans_openmp_threads": MINIBATCH_KMEANS_OPENMP_THREADS,
-                "kmeans_n_init": 1,
-                "large_bucket_parallelism": "serial",
-                "trajectory_window_length": TRAJECTORY_WINDOW_LENGTH,
-                "trajectory_window_policy": TRAJECTORY_WINDOW_POLICY,
-                "visual_half_windows": [[0, 8], [7, 15]],
-                "visual_projection": ("frame @ visual_pca.components[:, :frame_embedding_dim].T"),
-                "visual_projection_centering": "none",
-                "visual_projection_padding": "right_zero_to_128",
-                "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
-                "cluster_count": (
-                    "min(training_count, min(30, max(10, "
-                    "floor(4 * log2(training_count) - 30))))"
-                ),
-                "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
-                "distance_quantiles": [0.1, 0.9],
-                "distance_weight_range": [1.0, MIN_DISTANCE_WEIGHT],
-                "duplicate_merge": "max + 0.5 * min",
-            },
+            "constants": motion_primitive_catalog_constants(self.profile),
             "total_raw_actions": self.total_raw_actions,
             "action_categories": [asdict(category) for category in self.action_categories],
             "leaf_prototypes": [asdict(leaf) for leaf in self.leaf_prototypes],
@@ -181,6 +268,12 @@ def _atomic_actions(label: str) -> list[tuple[str, str]]:
         else:
             raise ValueError(f"unknown motion primitive label {label!r}")
     return actions
+
+
+def atomic_action_count(label: str) -> int:
+    """Return the number of ordered atomic actions represented by one label."""
+
+    return len(_atomic_actions(label))
 
 
 def maximum_retained_parents(
@@ -345,11 +438,13 @@ def create_action_catalog(
     total_labels: int,
     *,
     use_stop_bucket: bool = True,
+    profile: str = "libero",
 ) -> ActionCatalog:
-    """Build a deterministic schema-9 action catalog from raw action counts."""
+    """Build a deterministic schema-10 action catalog from raw action counts."""
 
     if not isinstance(use_stop_bucket, bool):
         raise ValueError("use_stop_bucket must be a boolean")
+    resolved_profile = resolve_motion_primitive_profile(profile)
     if isinstance(total_labels, bool) or not isinstance(total_labels, Integral):
         raise ValueError("motion primitive total_labels must be a non-negative integer")
     total = int(total_labels)
@@ -369,8 +464,8 @@ def create_action_catalog(
 
     ordered = sorted(normalized.items(), key=lambda item: (-item[1], item[0]))
     threshold = max(
-        MIN_ACTION_COUNT,
-        math.ceil(MIN_ACTION_FREQUENCY * total),
+        resolved_profile.min_action_count,
+        math.ceil(resolved_profile.min_action_frequency * total),
     )
     retained = {label for label, count in ordered if count >= threshold}
     retained_non_stop_counts = {
@@ -405,6 +500,7 @@ def create_action_catalog(
     return ActionCatalog(
         total_raw_actions=total,
         action_categories=tuple(categories),
+        profile=resolved_profile.name,
         use_stop_bucket=use_stop_bucket,
     )
 
@@ -777,6 +873,7 @@ def build_hierarchical_motion_prototypes(
     tol: float = 1.0e-4,
     num_threads: int = 4,
     use_stop_bucket: bool = True,
+    profile: str = "libero",
     timing_callback: TimingCallback | None = None,
 ) -> HierarchicalPrototypeResult:
     """Learn exact action buckets and assign one nearest visual leaf per clip half."""
@@ -856,7 +953,8 @@ def build_hierarchical_motion_prototypes(
             raise ValueError("motion_primitives requires aligned 15-frame clips")
         clips_by_episode.setdefault(clip.episode_id, []).append((clip_index, clip))
 
-    primitive_config = make_libero_config(threshold=STATE_THRESHOLD)
+    resolved_profile = resolve_motion_primitive_profile(profile)
+    primitive_config = resolved_profile.primitive_config
     raw_counts: Counter[str] = Counter()
     candidate_labels: dict[int, tuple[str, str]] = {}
     seen: set[int] = set()
@@ -894,6 +992,7 @@ def build_hierarchical_motion_prototypes(
         raw_counts,
         total_windows,
         use_stop_bucket=use_stop_bucket,
+        profile=resolved_profile.name,
     )
 
     categories_by_label = {category.label: category for category in catalog.action_categories}
@@ -1042,6 +1141,7 @@ def build_hierarchical_motion_prototypes(
             else category
             for category in catalog.action_categories
         ),
+        profile=catalog.profile,
         use_stop_bucket=use_stop_bucket,
         leaf_prototypes=tuple(leaves),
     )

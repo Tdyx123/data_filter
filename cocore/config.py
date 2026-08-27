@@ -47,6 +47,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "output": {"directory": "outputs/cocore/libero90"},
 }
 DEFAULT_CONFIG["prototypes"]["method"] = "motion_primitives"
+DEFAULT_CONFIG["prototypes"]["profile"] = "libero"
 DEFAULT_CONFIG["prototypes"]["tol"] = 1.0e-4
 DEFAULT_CONFIG["prototypes"]["num_threads"] = 4
 DEFAULT_CONFIG["prototypes"]["use_stop_bucket"] = True
@@ -112,6 +113,7 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
             )
         unsupported = configured_prototypes.keys() - {
             "method",
+            "profile",
             "batch_size",
             "max_iter",
             "tol",
@@ -128,6 +130,10 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("cocore reliability_metrics are fixed to support,progress")
     resolved = _merge(DEFAULT_CONFIG, config)
     resolved["prototypes"]["method"] = "motion_primitives"
+    profile = resolved["prototypes"].get("profile")
+    if not isinstance(profile, str) or profile not in {"libero", "bridge_v2"}:
+        raise ValueError("cocore prototypes.profile must be libero or bridge_v2")
+    resolved["prototypes"]["profile"] = profile
     use_stop_bucket = resolved["prototypes"].get("use_stop_bucket")
     if not isinstance(use_stop_bucket, bool):
         raise ValueError("cocore prototypes.use_stop_bucket must be a boolean")
@@ -225,7 +231,7 @@ def to_relcore_config(resolved: Mapping[str, Any]) -> dict[str, Any]:
                 {
                     key: copy.deepcopy(value)
                     for key, value in resolved[section].items()
-                    if key not in {"num_threads", "tol", "use_stop_bucket"}
+                    if key not in {"num_threads", "profile", "tol", "use_stop_bucket"}
                 }
             )
         else:

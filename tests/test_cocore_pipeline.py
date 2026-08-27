@@ -387,21 +387,22 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert (root / "scan" / "manifest.json").is_file()
     assert (root / "encode" / "manifest.json").is_file()
     assert (root / "encode" / "visual_half_embeddings.npy").is_file()
-    assert (root / "graph-17-motion-hard-nearest-pca" / "prototype_catalog.json").is_file()
-    assert (root / "graph-17-motion-hard-nearest-pca" / "prototype_centers.npy").is_file()
-    assert (root / "graph-17-motion-hard-nearest-pca" / "half_action_labels.npy").is_file()
-    assert (root / "graph-17-motion-hard-nearest-pca" / "source_clip_indices.npy").is_file()
-    for directory in ("scan", "encode", "graph-17-motion-hard-nearest-pca"):
+    assert (root / "graph-18-motion-hard-nearest-pca" / "prototype_catalog.json").is_file()
+    assert (root / "graph-18-motion-hard-nearest-pca" / "prototype_centers.npy").is_file()
+    assert (root / "graph-18-motion-hard-nearest-pca" / "half_action_labels.npy").is_file()
+    assert (root / "graph-18-motion-hard-nearest-pca" / "source_clip_indices.npy").is_file()
+    for directory in ("scan", "encode", "graph-18-motion-hard-nearest-pca"):
         manifest = json.loads((root / directory / "manifest.json").read_text())
         assert manifest["producer"] == "cocore"
-        assert manifest["cocore_version"] == "0.15.0"
+        assert manifest["cocore_version"] == "0.16.0"
     scan_manifest = json.loads((root / "scan" / "manifest.json").read_text())
     assert scan_manifest["window_policy"] == "near_uniform_full_coverage"
     assert scan_manifest["clip_length"] == 15
     catalog = json.loads(
-        (root / "graph-17-motion-hard-nearest-pca" / "prototype_catalog.json").read_text()
+        (root / "graph-18-motion-hard-nearest-pca" / "prototype_catalog.json").read_text()
     )
-    assert catalog["schema_version"] == 9
+    assert catalog["schema_version"] == 10
+    assert catalog["profile"] == "libero"
     assert catalog["use_stop_bucket"] is True
     assert catalog["strategy"] == (
         "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_half_visual_"
@@ -409,9 +410,19 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     )
     assert catalog["total_raw_actions"] == 400
     assert catalog["constants"] == {
-        "state_threshold": 0.03,
+        "primitive_thresholds": {
+            "translation": 0.03,
+            "roll": None,
+            "tilt": 0.03,
+            "rotation": 0.03,
+            "gripper": 0.03,
+        },
+        "roll_axis": None,
+        "roll_labels": None,
+        "cyclic_axes": [],
         "min_action_count": 400,
         "min_action_frequency": 0.005,
+        "retention_threshold": "max(min_action_count, ceil(min_action_frequency * W))",
         "max_visual_centers": 30,
         "full_kmeans_max_training_count": 65536,
         "full_kmeans_openmp_threads": 1,
@@ -436,23 +447,40 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     }
     assert catalog["leaf_prototypes"]
     half_action_labels = np.load(
-        root / "graph-17-motion-hard-nearest-pca" / "half_action_labels.npy"
+        root / "graph-18-motion-hard-nearest-pca" / "half_action_labels.npy"
     )
     assert half_action_labels.shape == (82, 2)
     assert half_action_labels.dtype.kind == "U"
     assert set(half_action_labels.flat) == {"move forward"}
-    centers = np.load(root / "graph-17-motion-hard-nearest-pca" / "prototype_centers.npy")
+    centers = np.load(root / "graph-18-motion-hard-nearest-pca" / "prototype_centers.npy")
     assert centers.shape[1] == 128
-    nodes = np.load(root / "graph-17-motion-hard-nearest-pca" / "nodes.npz")
+    nodes = np.load(root / "graph-18-motion-hard-nearest-pca" / "nodes.npz")
     source_clip_indices = np.load(
-        root / "graph-17-motion-hard-nearest-pca" / "source_clip_indices.npy"
+        root / "graph-18-motion-hard-nearest-pca" / "source_clip_indices.npy"
     )
     np.testing.assert_array_equal(source_clip_indices, np.arange(82, dtype=np.int64))
-    sequence_edges = np.load(root / "graph-17-motion-hard-nearest-pca" / "sequence_edges.npz")
+    sequence_edges = np.load(root / "graph-18-motion-hard-nearest-pca" / "sequence_edges.npz")
     assert len(sequence_edges["source"]) == 80
     graph_manifest = json.loads(
-        (root / "graph-17-motion-hard-nearest-pca" / "manifest.json").read_text()
+        (root / "graph-18-motion-hard-nearest-pca" / "manifest.json").read_text()
     )
+    assert graph_manifest["prototype_profile"] == "libero"
+    assert graph_manifest["motion_primitive"] == {
+        "profile": "libero",
+        "primitive_thresholds": {
+            "translation": 0.03,
+            "roll": None,
+            "tilt": 0.03,
+            "rotation": 0.03,
+            "gripper": 0.03,
+        },
+        "roll_axis": None,
+        "roll_labels": None,
+        "cyclic_axes": [],
+        "min_action_count": 400,
+        "min_action_frequency": 0.005,
+        "retention_threshold": "max(min_action_count, ceil(min_action_frequency * W))",
+    }
     assert graph_manifest["sequence_adjacency"] == "ordered_candidates"
     assert graph_manifest["prototype_visual_dim"] == 128
     assert graph_manifest["prototype_visual_projection"] == (
@@ -505,7 +533,8 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert all("prototype_distance_weights" not in row for row in all_rows)
     assert all("prototype_action_weights" not in row for row in selected)
     assert all("prototype_distance_weights" not in row for row in selected)
-    assert report["prototype_schema_version"] == 9
+    assert report["prototype_schema_version"] == 10
+    assert report["prototype_profile"] == "libero"
     assert report["use_stop_bucket"] is True
     assert report["prototype_strategy"] == (
         "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_half_visual_"
@@ -528,24 +557,26 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     }
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.15.0"
+    assert run_manifest["cocore_version"] == "0.16.0"
     assert run_manifest["relation_type"] == relation
     assert run_manifest["relation_weight"] == 1.0
-    assert run_manifest["prototype_schema_version"] == 9
+    assert run_manifest["prototype_schema_version"] == 10
+    assert run_manifest["prototype_profile"] == "libero"
     assert run_manifest["use_stop_bucket"] is True
     assert run_manifest["prototype_strategy"] == (
         "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_half_visual_"
         "hybrid_kmeans_nearest"
     )
-    assert run_manifest["stage_directories"]["graph"] == "graph-17-motion-hard-nearest-pca"
+    assert run_manifest["stage_directories"]["graph"] == "graph-18-motion-hard-nearest-pca"
     assert run_manifest["algorithm"] == report["algorithm"]
     assert run_manifest["window_policy"] == "near_uniform_full_coverage"
     assert run_manifest["sequence_adjacency"] == "ordered_candidates"
     select_manifest = json.loads((result / "manifest.json").read_text())
-    assert select_manifest["cocore_version"] == "0.15.0"
+    assert select_manifest["cocore_version"] == "0.16.0"
     assert select_manifest["relation_type"] == relation
     assert select_manifest["relation_weight"] == 1.0
-    assert select_manifest["prototype_schema_version"] == 9
+    assert select_manifest["prototype_schema_version"] == 10
+    assert select_manifest["prototype_profile"] == "libero"
     assert select_manifest["use_stop_bucket"] is True
     assert select_manifest["prototype_strategy"] == (
         "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_half_visual_"
@@ -560,7 +591,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     (result / "manifest.json").write_text(json.dumps(select_manifest))
     with pytest.raises(ValueError, match="selection manifest Cocore version"):
         validate_output(result, config=config)
-    select_manifest["cocore_version"] = "0.15.0"
+    select_manifest["cocore_version"] = "0.16.0"
     (result / "manifest.json").write_text(json.dumps(select_manifest))
 
     report["relation_type"] = "sequence" if relation == "cooccurrence" else "cooccurrence"
@@ -827,7 +858,7 @@ def test_disabled_stop_bucket_excludes_unlabeled_candidates_from_graph_and_selec
     config["selection"]["ratio"] = 0.5
 
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    graph_root = result.parent / "graph-17-motion-hard-nearest-pca"
+    graph_root = result.parent / "graph-18-motion-hard-nearest-pca"
 
     source_indices = np.load(graph_root / "source_clip_indices.npy", allow_pickle=False)
     np.testing.assert_array_equal(source_indices, np.arange(82, dtype=np.int64))
@@ -861,7 +892,7 @@ def test_validate_rejects_tampered_source_clip_indices(tmp_path: Path) -> None:
     config["dataset"]["type"] = "cocore_pipeline_mixed_stop"
     config["prototypes"]["use_stop_bucket"] = False
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    path = result.parent / "graph-17-motion-hard-nearest-pca" / "source_clip_indices.npy"
+    path = result.parent / "graph-18-motion-hard-nearest-pca" / "source_clip_indices.npy"
     source_indices = np.load(path, allow_pickle=False)
     source_indices[-1] = 82
     np.save(path, source_indices)
@@ -874,7 +905,7 @@ def test_validate_rejects_tampered_graph_candidate_counts(tmp_path: Path) -> Non
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    path = result.parent / "graph-17-motion-hard-nearest-pca" / "manifest.json"
+    path = result.parent / "graph-18-motion-hard-nearest-pca" / "manifest.json"
     manifest = json.loads(path.read_text())
     manifest["excluded_unlabeled_nodes"] = 1
     path.write_text(json.dumps(manifest))
@@ -975,7 +1006,7 @@ def test_validate_rejects_tampered_absolute_leaf_weights_by_replay(tmp_path: Pat
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    nodes_path = result.parent / "graph-17-motion-hard-nearest-pca" / "nodes.npz"
+    nodes_path = result.parent / "graph-18-motion-hard-nearest-pca" / "nodes.npz"
     with np.load(nodes_path) as stored:
         nodes = {name: stored[name].copy() for name in stored.files}
     nodes["prototype_weights"][0] *= np.float32(0.9)
@@ -989,7 +1020,7 @@ def test_validate_rejects_tampered_hierarchical_catalog(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    catalog_path = result.parent / "graph-17-motion-hard-nearest-pca" / "prototype_catalog.json"
+    catalog_path = result.parent / "graph-18-motion-hard-nearest-pca" / "prototype_catalog.json"
     catalog = json.loads(catalog_path.read_text())
     catalog["leaf_prototypes"][0]["label"] = "wrong"
     catalog_path.write_text(json.dumps(catalog))
@@ -1016,7 +1047,7 @@ def test_validate_recomputes_hierarchical_catalog_diagnostics(
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    catalog_path = result.parent / "graph-17-motion-hard-nearest-pca" / "prototype_catalog.json"
+    catalog_path = result.parent / "graph-18-motion-hard-nearest-pca" / "prototype_catalog.json"
     catalog = json.loads(catalog_path.read_text())
     category = next(
         category
@@ -1049,7 +1080,7 @@ def test_validate_rejects_missing_hierarchical_centers(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    (result.parent / "graph-17-motion-hard-nearest-pca" / "prototype_centers.npy").unlink()
+    (result.parent / "graph-18-motion-hard-nearest-pca" / "prototype_centers.npy").unlink()
 
     with pytest.raises(ValueError, match="invalid stage artifacts: graph"):
         validate_output(result, config=config)
@@ -1147,7 +1178,7 @@ def test_graph_build_rejects_semantically_tampered_visual_half_cache(
 
     with pytest.raises(FileExistsError, match="visual half embedding.*--force"):
         graph_stage(config, visual_encoder=FailingCocoreVisualEncoder())
-    assert not (root / "graph-17-motion-hard-nearest-pca").exists()
+    assert not (root / "graph-18-motion-hard-nearest-pca").exists()
 
 
 def test_graph_stage_reports_aggregate_and_prototype_step_timings(
@@ -1233,11 +1264,28 @@ def test_graph_fingerprint_includes_prototype_convergence_tolerance(tmp_path: Pa
         graph_stage(config, visual_encoder=FailingCocoreVisualEncoder())
 
 
+def test_graph_fingerprint_includes_motion_primitive_profile(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    first = graph_stage(config, visual_encoder=CocoreVisualEncoder())
+    config["prototypes"]["profile"] = "bridge_v2"  # type: ignore[index]
+
+    with pytest.raises(FileExistsError, match="--force"):
+        graph_stage(config, visual_encoder=FailingCocoreVisualEncoder())
+
+    second = graph_stage(
+        config,
+        force=True,
+        visual_encoder=CocoreVisualEncoder(),
+    )
+    assert first[4] != second[4]
+
+
 def test_validate_rejects_tampered_visual_prototype_center(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    path = result.parent / "graph-17-motion-hard-nearest-pca" / "prototype_centers.npy"
+    path = result.parent / "graph-18-motion-hard-nearest-pca" / "prototype_centers.npy"
     centers = np.load(path)
     centers[0] = np.zeros(128, dtype=np.float32)
     centers[0, 0] = 1.0
@@ -1277,7 +1325,7 @@ def test_validate_rejects_tampered_graph_projection_contract(
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    path = result.parent / "graph-17-motion-hard-nearest-pca" / "manifest.json"
+    path = result.parent / "graph-18-motion-hard-nearest-pca" / "manifest.json"
     manifest = json.loads(path.read_text())
     manifest[field] = value
     path.write_text(json.dumps(manifest))
@@ -1290,7 +1338,7 @@ def test_validate_rejects_tampered_half_action_labels(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    path = result.parent / "graph-17-motion-hard-nearest-pca" / "half_action_labels.npy"
+    path = result.parent / "graph-18-motion-hard-nearest-pca" / "half_action_labels.npy"
     labels = np.load(path)
     labels[0, 0] = "stop"
     np.save(path, labels)
@@ -1332,26 +1380,26 @@ def test_validate_rejects_obsolete_schema_three_field_in_selected_row(
         validate_output(result, config=config)
 
 
-def test_validate_rejects_schema_six_manifest_explicitly(tmp_path: Path) -> None:
+def test_validate_rejects_schema_nine_manifest_explicitly(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
     run_path = result / "run_manifest.json"
     manifest = json.loads(run_path.read_text())
-    manifest["prototype_schema_version"] = 6
+    manifest["prototype_schema_version"] = 9
     run_path.write_text(json.dumps(manifest))
 
     with pytest.raises(ValueError, match="prototype schema version is incompatible"):
         validate_output(result, config=config)
 
 
-def test_validate_rejects_schema_six_graph_catalog_explicitly(tmp_path: Path) -> None:
+def test_validate_rejects_schema_nine_graph_catalog_explicitly(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    catalog_path = result.parent / "graph-17-motion-hard-nearest-pca" / "prototype_catalog.json"
+    catalog_path = result.parent / "graph-18-motion-hard-nearest-pca" / "prototype_catalog.json"
     catalog = json.loads(catalog_path.read_text())
-    catalog["schema_version"] = 6
+    catalog["schema_version"] = 9
     catalog_path.write_text(json.dumps(catalog))
 
     with pytest.raises(ValueError, match="catalog schema"):
@@ -1359,11 +1407,46 @@ def test_validate_rejects_schema_six_graph_catalog_explicitly(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("primitive_thresholds", {"translation": 9.0}),
+        ("cyclic_axes", [5]),
+    ],
+)
+def test_validate_rejects_tampered_motion_primitive_catalog_contract(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    catalog_path = result.parent / "graph-18-motion-hard-nearest-pca" / "prototype_catalog.json"
+    catalog = json.loads(catalog_path.read_text())
+    catalog["constants"][field] = value
+    catalog_path.write_text(json.dumps(catalog))
+
+    with pytest.raises(ValueError, match="catalog schema"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_motion_primitive_profile_config_mismatch(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    mismatched = copy.deepcopy(config)
+    mismatched["prototypes"]["profile"] = "bridge_v2"  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="motion primitive configuration"):
+        validate_output(result, config=mismatched)
+
+
+@pytest.mark.parametrize(
     ("stage", "directory"),
     [
         ("scan", "scan"),
         ("encode", "encode"),
-        ("graph", "graph-17-motion-hard-nearest-pca"),
+        ("graph", "graph-18-motion-hard-nearest-pca"),
     ],
 )
 def test_validate_rejects_tampered_stage_manifest_contract(
@@ -1395,7 +1478,7 @@ def test_validate_rejects_tampered_stage_manifest_contract(
         ("scan", "window_policy", "legacy_stride", "window policy"),
         ("encode", "window_policy", "legacy_stride", "window policy"),
         (
-            "graph-17-motion-hard-nearest-pca",
+            "graph-18-motion-hard-nearest-pca",
             "sequence_adjacency",
             "contiguous",
             "graph manifest prototype schema",

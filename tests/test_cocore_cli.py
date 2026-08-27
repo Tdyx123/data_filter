@@ -15,7 +15,7 @@ def _objective(relation: str = "cooccurrence", weight: float = 1.0) -> dict[str,
 
 
 def test_package_version_matches_optional_stop_release() -> None:
-    assert cocore.__version__ == "0.15.0"
+    assert cocore.__version__ == "0.16.0"
 
 
 def test_config_requires_explicit_relation_and_weight() -> None:
@@ -43,6 +43,7 @@ def test_config_accepts_supported_relations(relation: str) -> None:
         "epsilon": 1.0e-8,
     }
     assert resolved["prototypes"]["method"] == "motion_primitives"
+    assert resolved["prototypes"]["profile"] == "libero"
     assert resolved["prototypes"]["tol"] == 1.0e-4
     assert resolved["prototypes"]["num_threads"] == 4
     assert resolved["prototypes"]["use_stop_bucket"] is True
@@ -50,6 +51,28 @@ def test_config_accepts_supported_relations(relation: str) -> None:
     assert resolved["objective"] == {"relation": relation, "relation_weight": 1.0}
     assert resolved["selection"]["method"] == "lazy_heap"
     assert resolved["selection"]["max_refreshes"] == 100
+
+
+def test_config_accepts_bridge_v2_motion_primitive_profile() -> None:
+    resolved = resolve_config(
+        {
+            **_objective(),
+            "prototypes": {"profile": "bridge_v2"},
+        }
+    )
+
+    assert resolved["prototypes"]["profile"] == "bridge_v2"
+
+
+@pytest.mark.parametrize("profile", ["", "bridge", 7, None])
+def test_config_rejects_unknown_motion_primitive_profile(profile: object) -> None:
+    with pytest.raises(ValueError, match="prototypes.profile"):
+        resolve_config(
+            {
+                **_objective(),
+                "prototypes": {"profile": profile},
+            }
+        )
 
 
 def test_config_accepts_random_multibranch_selection_method() -> None:
@@ -419,7 +442,7 @@ def test_main_applies_cli_overrides_to_run_pipeline(monkeypatch, capsys) -> None
     assert capsys.readouterr().out.strip().endswith("select-sequence-w2-top25pct")
 
 
-def test_build_graph_cli_reports_schema_seven_graph_directory(monkeypatch, capsys) -> None:
+def test_build_graph_cli_reports_schema_ten_graph_directory(monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli, "load_config", lambda _: _objective())
     monkeypatch.setattr(
         cli,
@@ -436,7 +459,7 @@ def test_build_graph_cli_reports_schema_seven_graph_directory(monkeypatch, capsy
     cli.main(["build-graph", "--config", "unused.yaml"])
 
     assert capsys.readouterr().out.strip() == (
-        "cocore_output=outputs/cocore/test/graph-17-motion-hard-nearest-pca nodes=2"
+        "cocore_output=outputs/cocore/test/graph-18-motion-hard-nearest-pca nodes=2"
     )
 
 
@@ -455,8 +478,10 @@ def test_shipped_configs_resolve_to_fixed_cocore_contract(path: str) -> None:
         "epsilon": 1.0e-8,
     }
     assert config["prototypes"]["method"] == "motion_primitives"
+    assert config["prototypes"]["profile"] == "libero"
     assert set(config["prototypes"]) == {
         "method",
+        "profile",
         "batch_size",
         "max_iter",
         "tol",

@@ -19,6 +19,25 @@
 索引 3 和 6 不参与分类。LIBERO 的旋转状态是 axis-angle 向量，其单个分量并不
 严格等价于欧拉角；若数据预处理或坐标系不同，请显式创建自定义配置。
 
+## BridgeData V2 状态约定
+
+`make_bridge_v2_config()` 固定使用 8 维
+`[x, y, z, roll, pitch, yaw, pad, gripper]` 状态和 7 帧 horizon。xyz 阈值为
+`0.03 m`，roll/pitch 为 `0.12 rad`，yaw 为 `0.18 rad`，gripper 为 `0.20`。
+roll 与 yaw 使用 `[-π, π)` 最短角差；动作顺序固定为平移、
+`roll positive/negative`、pitch tilt、yaw rotate、gripper。所有边界仍为严格
+`>`/`<`，等于阈值返回不显著。
+
+```python
+from libero_motion_primitives import classify_motion_primitive, make_bridge_v2_config
+
+config = make_bridge_v2_config()
+label = classify_motion_primitive(current_state, future_state, config)
+```
+
+LIBERO 工厂仍走原有单一 `threshold` 路径，不启用 roll 或角度环绕，因此现有标签行为
+保持不变。
+
 ## 快速使用
 
 从仓库根目录运行：
@@ -84,7 +103,7 @@ move right,400,0.2
 所有状态索引和正负方向都由配置指定，不在分类算法中硬编码：
 
 ```python
-from libero_motion_primitives import PrimitiveConfig
+from libero_motion_primitives import PrimitiveConfig, PrimitiveThresholds
 
 config = PrimitiveConfig(
     horizon=8,
@@ -104,6 +123,10 @@ config = PrimitiveConfig(
     tail_strategy="clip",
 )
 ```
+
+异构单位数据可通过 `thresholds=PrimitiveThresholds(...)` 分别配置 translation、roll、
+tilt、rotation 与 gripper 阈值，并用 `roll_axis`、roll 正负标签及 `cyclic_axes` 声明
+额外语义。未提供 `thresholds` 时，所有已启用动作轴继续使用标量 `threshold`。
 
 例如 `gripper_open_positive=False` 表示夹爪状态的负向变化是 `open gripper`，
 正向变化是 `close gripper`。

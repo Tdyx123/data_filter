@@ -11,8 +11,16 @@ Cocore 的编码、运动原语、关系目标或选择算法，而是固定 Bri
 - LeRobot `v2.0`、WidowX、5 Hz；
 - 只读取 `observation.images.image_0`、8 维 `observation.state` 和 7 维 `action`；
 - 排除任务名为空的 episode，再应用 `--max-episodes`；
-- 固定使用 15 帧近似均匀候选和 Cocore schema 9 两级动作原型；原型学习在完整轨迹
+- 固定使用 15 帧近似均匀候选和 Cocore schema 10 两级动作原型；原型学习在完整轨迹
   上使用首尾覆盖、起点间隔最大为 3 的八帧窗口，只用精确保留动作训练硬视觉桶；
+- 固定 `prototypes.profile: bridge_v2`，CLI 不提供 profile 覆盖；八帧窗口始终使用
+  `state[t] → state[t+7]`；
+- xyz 严格阈值为 `0.03 m`，roll/pitch 为 `0.12 rad`，yaw 为 `0.18 rad`，gripper
+  为 `0.20`；等于阈值不激活动作；
+- roll 与 yaw 使用 `[-π, π)` 最短角差。原子顺序固定为平移、
+  `roll positive/negative`、pitch tilt、yaw rotate、gripper，再合成为单一复合标签；
+- 设完整轨迹窗口数为 `W`，非 stop 动作桶保留条件固定为
+  `count >= max(400, ceil(0.001 * W))`；
 - 令 `M_a` 为单动作桶的训练窗口数，视觉中心数固定为
   `min(M_a, min(30, max(10, floor(4 * log2(M_a) - 30))))`；保留的非 stop 动作使用
   10～30 个中心；
@@ -27,8 +35,8 @@ Cocore 的编码、运动原语、关系目标或选择算法，而是固定 Bri
   置信度的乘积；同叶合并，最终绝对权重不归一；
 - 全局选择，不施加逐任务配额。
 
-Bridge 为 5 Hz，因此 15 帧片段覆盖约 3 秒，现有运动原语的 7–8 帧比较跨度约为
-1.4–1.6 秒。本适配包不重采样轨迹帧，也不改变 Cocore 的帧级语义；最大间隔 3 只控制
+Bridge 为 5 Hz，因此 15 帧片段覆盖约 3 秒，运动原语的 7 帧状态差跨度为
+1.4 秒。本适配包不重采样轨迹帧，也不改变 Cocore 的帧级语义；最大间隔 3 只控制
 动作原型训练窗口的起点。
 
 安装依赖：
@@ -74,7 +82,7 @@ python -m cocore_bridge_v2 run \
 - `--no-use-stop-bucket`：仅用于 `build-graph`、`select`、`run` 和 `validate`，关闭 stop
   桶并排除双半段均无非 stop 标签的候选；未传时保持默认启用。
 
-首版不接受任意 YAML `--config`，以防绕过固定相机、空任务策略或运动原语契约。
+本包不接受任意 YAML `--config`，以防绕过固定相机、空任务策略或运动原语契约。
 
 ## 输出与验证
 
@@ -84,7 +92,7 @@ python -m cocore_bridge_v2 run \
 outputs/cocore_bridge_v2/bridge_orig_1.0.0
 ```
 
-其中包含 `scan/`、`encode/`、`graph-17-motion-hard-nearest-pca/` 和
+其中包含 `scan/`、`encode/`、`graph-18-motion-hard-nearest-pca/` 和
 `select-<relation>-w<weight>-top<ratio>pct/`；随机多分支结果追加
 `-random-multibranch`。选择目录继续提供
 `selected_manifest.jsonl`、`all_clips.parquet`、`selection_report.json`、
@@ -92,25 +100,26 @@ outputs/cocore_bridge_v2/bridge_orig_1.0.0
 `embeddings.npy`、`visual_pca.npz`、`numeric_normalizers.npz`、按 episode 分片的
 `frame_embeddings/`、对应索引以及候选双半段均值
 `visual_half_embeddings.npy`。逐帧缓存覆盖所有已索引 episode，包括短 episode。
-graph 目录提供 schema 9 的 `prototype_catalog.json`、128 维
+graph 目录提供 schema 10 的 `prototype_catalog.json`、128 维
 `prototype_centers.npy`、节点到 scan/encode 行号的 `source_clip_indices.npy` 和内部
 校验用 `half_action_labels.npy`。聚类复用 Encode 的
 PCA components 前半列进行逐帧纯矩阵投影，不使用 mean/scale。选择输出包含最终
 原型标签、动作标签、绝对置信度和 `half_action_labels`，不包含旧的 action/distance
-分解权重。manifest 的生产者仍为 `cocore`；Cocore 版本为 0.15.0，Bridge 包版本为
-0.6.0。
+分解权重。catalog 与 manifest 记录 `bridge_v2` profile、分轴阈值、roll 标签、环绕轴
+和 `0.1%/400` 保留策略。manifest 的生产者仍为 `cocore`；Cocore 版本为 0.16.0，
+Bridge 包版本为 0.7.0。
 
 视觉中心训练只物化一次保留窗口投影；小桶并行执行完整 KMeans，大桶串行执行
 MiniBatchKMeans。Bridge V2 完整生产数据的基础额外内存约为 273 MiB（保留窗口数 ×
 128 × 4 字节），不使用 memmap 或磁盘 fallback。
 
-0.14.x 及更早的 Cocore 缓存不迁移。升级后必须重新构建 scan、encode、graph 和
-selection；建议使用新的输出目录，或在确认目标后使用 `--force`。
+Cocore schema 9 artifact 不迁移且 validator 会拒绝。升级到 Cocore 0.16.0 / Bridge
+0.7.0 后必须使用 `--force` 重新构建 scan、encode、graph 和 selection，不能复用旧缓存。
 
 验证时必须重复传入生成该选择结果时使用的目标、比例、数据集路径以及
 `--max-episodes`（若生成时设置）。省略 `--max-episodes` 表示按完整有效数据集重放；
-若生成阶段只处理前 N 条有效 episode，验证也必须传入相同的 N。Bridge CLI 不执行
-数据 schema preflight，但 Cocore validator 会从该路径重放源 episode 的 state/trajectory，
+若生成阶段只处理前 N 条有效 episode，验证也必须传入相同的 N。执行类命令会先做
+Bridge schema preflight；validator 会从该路径重放源 episode 的 state/trajectory，
 并核对 artifact 中的逐帧视觉缓存，因此源数据仍必须可访问：
 
 ```bash
@@ -125,7 +134,7 @@ python -m cocore_bridge_v2 validate \
   --no-use-stop-bucket
 ```
 
-只有生成结果时传入了 `--no-use-stop-bucket`，验证时才重复传入。升级自 0.14.x / 0.5.x
+只有生成结果时传入了 `--no-use-stop-bucket`，验证时才重复传入。升级自 schema 9 / 0.6.x
 或切换 stop 设置并复用同一输出根目录时，应使用 `--force` 重建全部不兼容阶段。
 
 ## 运行基线
@@ -133,6 +142,19 @@ python -m cocore_bridge_v2 validate \
 正式数据预期包含 53,192 条源 episode。排除 14,532 条空任务 episode 后保留
 38,660 条、1,305,714 帧；其中 537 条短于 15 帧。最终产生 106,625 个候选片段，
 Top 10% 预算为 10,663。
+
+只读动作诊断不加载图像、不创建缓存：
+
+```bash
+.venv/bin/python scripts/analyze_cocore_bridge_action_thresholds.py \
+  --dataset-path /data/dwb/datasets/bridge_orig_1.0.0_lerobot \
+  --verify-reference
+```
+
+它输出七轴绝对差分位与激活率、复合类别数、stop/回退率、精确覆盖、原子保留质量、
+动作桶数和预计视觉叶原型数。完整训练集参考契约为 384,946 个窗口、2,089 个实际复合
+标签、179 个保留的非 stop 桶和约 2,058 个叶原型；非 stop 精确覆盖约 65.60%，原始
+stop 约 3.04%，stop 与无父动作回退合计不超过 3.5%，原子动作保留质量至少 86.8%。
 
 无需 GPU 的 100 episode scan 冒烟：
 

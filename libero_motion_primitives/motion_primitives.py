@@ -1,4 +1,4 @@
-"""Generate ECoT motion-primitive labels from robot state changes."""
+"""Generate ECoT motion-primitive labels from configured robot state changes."""
 
 from __future__ import annotations
 
@@ -14,6 +14,29 @@ TailStrategy: TypeAlias = Literal["truncate", "clip", "pad_last"]
 
 
 @dataclass(frozen=True, kw_only=True)
+class PrimitiveThresholds:
+    """Per-family significance thresholds for heterogeneous robot state units."""
+
+    translation: float
+    roll: float
+    tilt: float
+    rotation: float
+    gripper: float
+
+    def __post_init__(self) -> None:
+        for field_name in ("translation", "roll", "tilt", "rotation", "gripper"):
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+            ):
+                raise ValueError(f"{field_name} threshold must be a finite, non-negative number")
+            object.__setattr__(self, field_name, float(value))
+
+
+@dataclass(frozen=True, kw_only=True)
 class PrimitiveConfig:
     """Configuration mapping state-vector axes and signs to motion semantics.
 
@@ -25,10 +48,12 @@ class PrimitiveConfig:
 
     horizon: int = 4
     threshold: float = 0.03
+    thresholds: PrimitiveThresholds | None = None
 
     forward_axis: int
     left_right_axis: int
     vertical_axis: int
+    roll_axis: int | None = None
     tilt_axis: int
     rotation_axis: int
     gripper_axis: int
@@ -36,9 +61,14 @@ class PrimitiveConfig:
     forward_positive: bool
     right_positive: bool
     up_positive: bool
+    roll_positive: bool = True
     tilt_up_positive: bool
     counterclockwise_positive: bool
     gripper_open_positive: bool
+
+    roll_positive_label: str = "roll positive"
+    roll_negative_label: str = "roll negative"
+    cyclic_axes: tuple[int, ...] = ()
 
     tail_strategy: TailStrategy = "truncate"
 
@@ -58,6 +88,10 @@ class PrimitiveConfig:
         ):
             raise ValueError("threshold must be a finite, non-negative number")
         object.__setattr__(self, "threshold", float(self.threshold))
+        if self.thresholds is not None and not isinstance(
+            self.thresholds, PrimitiveThresholds
+        ):
+            raise ValueError("thresholds must be PrimitiveThresholds or null")
 
         if self.tail_strategy not in {"truncate", "clip", "pad_last"}:
             raise ValueError("tail_strategy must be one of 'truncate', 'clip', or 'pad_last'")
@@ -66,12 +100,25 @@ class PrimitiveConfig:
             "forward_axis",
             "left_right_axis",
             "vertical_axis",
-            "tilt_axis",
-            "rotation_axis",
-            "gripper_axis",
         )
         axes: list[int] = []
         for field_name in axis_fields:
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, Integral) or int(value) < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
+            normalized = int(value)
+            object.__setattr__(self, field_name, normalized)
+            axes.append(normalized)
+        if self.roll_axis is not None:
+            if (
+                isinstance(self.roll_axis, bool)
+                or not isinstance(self.roll_axis, Integral)
+                or int(self.roll_axis) < 0
+            ):
+                raise ValueError("roll_axis must be a non-negative integer or null")
+            object.__setattr__(self, "roll_axis", int(self.roll_axis))
+            axes.append(int(self.roll_axis))
+        for field_name in ("tilt_axis", "rotation_axis", "gripper_axis"):
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, Integral) or int(value) < 0:
                 raise ValueError(f"{field_name} must be a non-negative integer")
@@ -85,6 +132,7 @@ class PrimitiveConfig:
             "forward_positive",
             "right_positive",
             "up_positive",
+            "roll_positive",
             "tilt_up_positive",
             "counterclockwise_positive",
             "gripper_open_positive",
@@ -92,6 +140,23 @@ class PrimitiveConfig:
         for field_name in sign_fields:
             if not isinstance(getattr(self, field_name), bool):
                 raise ValueError(f"{field_name} must be a bool")
+
+        for field_name in ("roll_positive_label", "roll_negative_label"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip() or "," in value:
+                raise ValueError(f"{field_name} must be a non-empty label without commas")
+            object.__setattr__(self, field_name, value.strip())
+        if self.roll_positive_label == self.roll_negative_label:
+            raise ValueError("roll labels must be distinct")
+
+        cyclic_axes: list[int] = []
+        for value in self.cyclic_axes:
+            if isinstance(value, bool) or not isinstance(value, Integral) or int(value) < 0:
+                raise ValueError("cyclic_axes must contain non-negative integers")
+            cyclic_axes.append(int(value))
+        if len(set(cyclic_axes)) != len(cyclic_axes) or not set(cyclic_axes).issubset(axes):
+            raise ValueError("cyclic_axes must be unique configured semantic axes")
+        object.__setattr__(self, "cyclic_axes", tuple(cyclic_axes))
 
 
 def make_libero_config(
@@ -126,6 +191,38 @@ def make_libero_config(
     )
 
 
+def make_bridge_v2_config() -> PrimitiveConfig:
+    """Return the fixed BridgeData V2 7-DoF motion-primitive contract."""
+
+    return PrimitiveConfig(
+        horizon=7,
+        threshold=0.03,
+        thresholds=PrimitiveThresholds(
+            translation=0.03,
+            roll=0.12,
+            tilt=0.12,
+            rotation=0.18,
+            gripper=0.20,
+        ),
+        forward_axis=0,
+        left_right_axis=1,
+        vertical_axis=2,
+        roll_axis=3,
+        tilt_axis=4,
+        rotation_axis=5,
+        gripper_axis=7,
+        forward_positive=True,
+        right_positive=False,
+        up_positive=True,
+        roll_positive=True,
+        tilt_up_positive=True,
+        counterclockwise_positive=True,
+        gripper_open_positive=True,
+        cyclic_axes=(3, 5),
+        tail_strategy="truncate",
+    )
+
+
 def _as_state_vector(value: np.ndarray, *, name: str) -> np.ndarray:
     try:
         array = np.asarray(value, dtype=np.float64)
@@ -139,14 +236,23 @@ def _as_state_vector(value: np.ndarray, *, name: str) -> np.ndarray:
 
 
 def _required_state_dimension(config: PrimitiveConfig) -> int:
-    return 1 + max(
+    axes = [
         config.forward_axis,
         config.left_right_axis,
         config.vertical_axis,
         config.tilt_axis,
         config.rotation_axis,
         config.gripper_axis,
-    )
+    ]
+    if config.roll_axis is not None:
+        axes.append(config.roll_axis)
+    return 1 + max(axes)
+
+
+def _threshold(config: PrimitiveConfig, family: str) -> float:
+    if config.thresholds is None:
+        return config.threshold
+    return float(getattr(config.thresholds, family))
 
 
 def _mapped_token(
@@ -198,24 +304,29 @@ def classify_motion_primitive(
         )
 
     delta = future - current
+    if config.cyclic_axes:
+        delta = delta.copy()
+        for axis in config.cyclic_axes:
+            if delta[axis] < -math.pi or delta[axis] >= math.pi:
+                delta[axis] = (delta[axis] + math.pi) % (2.0 * math.pi) - math.pi
     move_tokens = [
         _mapped_token(
             float(delta[config.forward_axis]),
-            threshold=config.threshold,
+            threshold=_threshold(config, "translation"),
             positive_token="forward",
             negative_token="backward",
             positive_delta_is_positive_token=config.forward_positive,
         ),
         _mapped_token(
             float(delta[config.left_right_axis]),
-            threshold=config.threshold,
+            threshold=_threshold(config, "translation"),
             positive_token="right",
             negative_token="left",
             positive_delta_is_positive_token=config.right_positive,
         ),
         _mapped_token(
             float(delta[config.vertical_axis]),
-            threshold=config.threshold,
+            threshold=_threshold(config, "translation"),
             positive_token="up",
             negative_token="down",
             positive_delta_is_positive_token=config.up_positive,
@@ -226,9 +337,20 @@ def classify_motion_primitive(
     if active_move_tokens:
         blocks.append("move " + " ".join(active_move_tokens))
 
+    if config.roll_axis is not None:
+        roll = _mapped_token(
+            float(delta[config.roll_axis]),
+            threshold=_threshold(config, "roll"),
+            positive_token=config.roll_positive_label,
+            negative_token=config.roll_negative_label,
+            positive_delta_is_positive_token=config.roll_positive,
+        )
+        if roll is not None:
+            blocks.append(roll)
+
     tilt = _mapped_token(
         float(delta[config.tilt_axis]),
-        threshold=config.threshold,
+        threshold=_threshold(config, "tilt"),
         positive_token="tilt up",
         negative_token="tilt down",
         positive_delta_is_positive_token=config.tilt_up_positive,
@@ -238,7 +360,7 @@ def classify_motion_primitive(
 
     rotation = _mapped_token(
         float(delta[config.rotation_axis]),
-        threshold=config.threshold,
+        threshold=_threshold(config, "rotation"),
         positive_token="rotate counterclockwise",
         negative_token="rotate clockwise",
         positive_delta_is_positive_token=config.counterclockwise_positive,
@@ -248,7 +370,7 @@ def classify_motion_primitive(
 
     gripper = _mapped_token(
         float(delta[config.gripper_axis]),
-        threshold=config.threshold,
+        threshold=_threshold(config, "gripper"),
         positive_token="open gripper",
         negative_token="close gripper",
         positive_delta_is_positive_token=config.gripper_open_positive,
@@ -429,10 +551,12 @@ def filter_frequent_primitives(
 
 __all__ = [
     "PrimitiveConfig",
+    "PrimitiveThresholds",
     "TailStrategy",
     "classify_motion_primitive",
     "compute_primitive_statistics",
     "filter_frequent_primitives",
     "generate_motion_primitives",
+    "make_bridge_v2_config",
     "make_libero_config",
 ]

@@ -21,6 +21,7 @@ encoding:
 
 prototypes:
   method: motion_primitives
+  profile: libero
   num_threads: 1
   use_stop_bucket: true
 

@@ -1,6 +1,6 @@
 # Cocore：运动原语关系筛选
 
-Cocore 从 LeRobot v2 LIBERO episode 中选择固定预算的 15 帧片段。它独立管理候选
+Cocore 从 LeRobot v2 机器人 episode 中选择固定预算的 15 帧片段。它独立管理候选
 索引、稀疏图、Quality 风格编码流水线、两级动作原型、配置、缓存与输出产物；
 运行时代码不依赖 `quality_filter` 或 `segment_filter_core` 的切片逻辑。
 
@@ -26,7 +26,17 @@ episode 只执行一次视觉模型前向；候选片段的视觉特征
 `visual_pca.npz`，裁剪 `components` 的前 `D` 列，对每帧执行纯矩阵乘法
 `v @ components[:, :D].T`，不应用 PCA 的 `mean` 或 `scale`，分量不足时右补零到
 128 维。窗口在投影后取 8 帧均值并 L2 归一化，再学习视觉中心；候选两个半段也投影到
-同一空间后分配最近中心。设全部窗口数为 `W`，动作保留条件为：
+同一空间后分配最近中心。`prototypes.profile` 固定分类与动作保留契约：
+
+- `libero`（通用 Cocore 默认）：沿用单一严格阈值 `0.03`，不分类 roll，动作保留条件为
+  `count >= max(400, ceil(0.005 * W))`；
+- `bridge_v2`：xyz 为 `0.03 m`，roll/pitch 为 `0.12 rad`，yaw 为 `0.18 rad`，
+  gripper 为 `0.20`；roll 与 yaw 取 `[-π, π)` 最短角差，动作保留条件为
+  `count >= max(400, ceil(0.001 * W))`。
+
+Bridge 原子顺序固定为平移、`roll positive/negative`、pitch tilt、yaw rotate、gripper，
+仍合成为一个复合标签。所有阈值边界都使用严格 `>`/`<`，等于阈值不激活动作。
+设全部窗口数为 `W`，LIBERO 默认保留条件为：
 
 ```text
 count >= max(400, ceil(0.005 * W))
@@ -184,6 +194,7 @@ objective:
 
 prototypes:
   method: motion_primitives
+  profile: libero
   batch_size: 4096
   max_iter: 100
   tol: 1.0e-4
@@ -201,10 +212,11 @@ selection:
 配置中不接受 `clip` section。
 Quality 风格编码取代了旧关系编码，因此不再接受顶层 `relation` 或 `normalization`；
 `encoding.visual_dim` 固定为 128，`pca_fit_max_samples` 可限制 PCA 拟合样本数。
-动作门槛、中心数公式、30 个中心上限、距离分位和权重公式都是 Cocore 固定算法，
-不可配置；`prototypes` 只接受 `method`、`batch_size`、`max_iter`、正数 `tol`、正整数
+动作门槛、中心数公式、30 个中心上限、距离分位和权重公式都是 Cocore profile 的固定算法，
+不可单独配置；`prototypes` 只接受 `method`、`profile`、`batch_size`、`max_iter`、正数 `tol`、正整数
 `num_threads` 和布尔值 `use_stop_bucket`，并明确拒绝旧 `count`、`top_r` 或
-`temperature`。`batch_size` 只影响
+`temperature`。`profile` 只接受 `libero` 或 `bridge_v2`；通用配置默认 `libero`。
+`batch_size` 只影响
 超过 65,536 个训练窗口的大桶；`num_threads` 默认为 4，只并行不超过阈值的小桶，
 debug 配置固定为 1。它与 `runtime.num_workers` 相互独立，后者仍只控制 episode 读取
 进程。
@@ -214,7 +226,9 @@ debug 配置固定为 1。它与 `runtime.num_workers` 相互独立，后者仍�
 基础额外内存约为“保留窗口数 × 128 × 4 字节”：LIBERO90 约 106 MiB，Bridge V2
 约 273 MiB；完整 KMeans 拟合小桶时还会产生有界于 65,536 个窗口的工作副本。改变
 `num_threads` 不改变 graph 指纹或产物，因此可复用同一 graph 缓存；改变
-`batch_size`、`max_iter`、`tol` 或 `use_stop_bucket` 会使 graph 缓存失效。
+`profile`、`batch_size`、`max_iter`、`tol` 或 `use_stop_bucket` 会使 graph 缓存失效。
+profile、分轴阈值、roll 标签、环绕轴和保留公式同时写入 catalog、各级 manifest 与
+graph/select 指纹。
 
 可在运行时覆盖选择方法、选择比例、关系类型与关系权重：
 
@@ -250,24 +264,25 @@ RelCore 的 `--reliability-metrics`、`--prototype-method` 或
 python -m cocore run --config cocore/config_debug.yaml --force
 ```
 
-Cocore 0.15.0 使用 prototype schema 9、10～30 个桶内视觉中心、可选 stop 桶、无标签
+Cocore 0.16.0 使用 prototype schema 10、10～30 个桶内视觉中心、可选 stop 桶、无标签
 候选诱导子图、65,536 窗口的混合 KMeans 阈值、最大间隔 3 的动作训练窗口、裁剪 PCA
 的 128 维聚类空间、近似均匀候选和原始相邻 sequence 图，并按 episode 持久化完整原始
-逐帧 CLIP 特征，并提供 lazy heap 与随机多分支两种选择方法。0.14.x 及更早版本的
-scan、encode、graph 和 selection 缓存不迁移；
+逐帧 CLIP 特征，并提供 lazy heap 与随机多分支两种选择方法。0.15.x 的 schema 9
+artifact 不迁移，也不会被 validator 接受；既有 scan、encode、graph 和 selection 缓存
+全部视为不兼容；
 升级后必须通过 `--force` 重建全部阶段，或使用新的输出目录。
 
 ## 输出与校验
 
-输出根目录包含 `scan/`、`encode/`、`graph-17-motion-hard-nearest-pca/` 和一个或多个
+输出根目录包含 `scan/`、`encode/`、`graph-18-motion-hard-nearest-pca/` 和一个或多个
 `select-<关系>-w<权重>-top<比例>pct/`；随机多分支方法追加
 `-random-multibranch`。选择目录包含：
 
 - scan 目录中的 `episodes.parquet` 与 `clips.parquet`：episode 元数据和可重放的
   近似均匀候选；Cocore scan 不再生成未被后续阶段消费的 `normalization.npz`；
 - graph 目录中的 `prototype_catalog.json` 与 `prototype_centers.npy`：动作类别、
-  原始计数、训练计数、视觉中心数量、距离 q10/q90、投影契约以及按叶 ID 对齐的
-  128 维中心；
+  profile、分轴阈值、环绕策略、roll 标签、保留策略、原始计数、训练计数、视觉中心
+  数量、距离 q10/q90、投影契约以及按叶 ID 对齐的 128 维中心；
 - graph 目录中的 `source_clip_indices.npy`：每个 eligible graph 节点对应的 scan/encode
   候选行号；关闭 stop 桶后它同时记录被排除候选形成的空洞；
 - encode 目录中的 `embeddings.npy`、`visual_pca.npz` 和
@@ -300,7 +315,7 @@ python -m cocore validate \
 只有生成结果时关闭了 stop 桶，验证时才应传入该开关。若省略 `--config`，CLI 会从
 选择目录的 `resolved_config.yaml` 读取重放配置；验证随机多分支结果时必须使用生成时
 相同的方法和 seed，校验器会重放每个分支的 FAISS 阈值检索并核对增量惩罚。复用
-0.14.x 或其他 stop 设置不同的
+0.15.x/schema 9、profile、阈值、环绕策略或 stop 设置不同的
 输出目录时，应使用 `--force` 重建全部不兼容阶段。
 
 校验还会从 episode 元数据重放近似均匀候选，逐字段核对 `clips.parquet`，逐个检查
@@ -308,7 +323,8 @@ python -m cocore validate \
 投影窗口、中心、距离分位和候选分配。编码中断时临时缓存会被清理，下次从头执行；
 只有完整发布的 encode 阶段才会被复用。
 
-当前版本只支持本仓库约定的 8 维 LIBERO `observation.state`。selection 的
+当前版本支持本仓库约定的 8 维 LIBERO 与 BridgeData V2 `observation.state`；必须选择
+对应 profile。selection 的
 parquet/JSONL 导出最终 `prototype_indices`、`prototype_weights`、叶标签、动作标签与
 `half_action_labels`，不导出可分解的 action/distance 权重。所有图关系与选择目标直接
 消费绝对 `prototype_weights`，不对每行额外归一或截断。

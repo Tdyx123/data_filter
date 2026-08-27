@@ -282,6 +282,57 @@ def test_schema_seven_action_catalog_uses_400_count_floor() -> None:
     assert fractional_by_label["move backward"].retained is False
 
 
+def test_bridge_profile_uses_point_one_percent_retention_without_changing_libero() -> None:
+    counts = Counter(
+        {
+            "move forward": 400,
+            "move right": 2_000,
+            "stop": 397_600,
+        }
+    )
+
+    bridge = prototypes.create_action_catalog(
+        counts,
+        total_labels=400_000,
+        profile="bridge_v2",
+    )
+    libero = prototypes.create_action_catalog(
+        counts,
+        total_labels=400_000,
+        profile="libero",
+    )
+
+    bridge_by_label = {category.label: category for category in bridge.action_categories}
+    libero_by_label = {category.label: category for category in libero.action_categories}
+    assert bridge_by_label["move forward"].retained is True
+    assert libero_by_label["move forward"].retained is False
+
+
+def test_roll_actions_participate_in_parent_fallback_and_retention_weight() -> None:
+    parents = prototypes.maximum_retained_parents(
+        "move forward, roll positive, tilt up",
+        {
+            "move forward, roll positive": 600,
+            "roll positive, tilt up": 800,
+            "move forward": 10_000,
+        },
+    )
+
+    assert parents == (
+        "roll positive, tilt up",
+        "move forward, roll positive",
+    )
+    assert prototypes.retention_weight(
+        "move forward, roll positive, tilt up",
+        "roll positive, tilt up",
+    ) == pytest.approx(5.0 / 6.0)
+
+
+def test_motion_primitive_profile_rejects_unknown_name() -> None:
+    with pytest.raises(ValueError, match="motion primitive profile"):
+        prototypes.resolve_motion_primitive_profile("unknown")
+
+
 def test_maximum_retained_parents_keeps_all_largest_atomic_subsets() -> None:
     parents = prototypes.maximum_retained_parents(
         "move forward right, tilt up, open gripper",
@@ -644,7 +695,7 @@ def test_episode_window_visuals_project_each_frame_before_pooling(tmp_path: Path
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-7)
 
 
-def test_action_catalog_serializes_schema_nine_sampling_strategy_and_metadata() -> None:
+def test_action_catalog_serializes_schema_ten_sampling_strategy_and_metadata() -> None:
     catalog = prototypes.create_action_catalog(
         Counter({"move forward": 400, "move right": 600}),
         total_labels=1_000,
@@ -678,16 +729,27 @@ def test_action_catalog_serializes_schema_nine_sampling_strategy_and_metadata() 
 
     payload = catalog.to_dict()
 
-    assert payload["schema_version"] == 9
+    assert payload["schema_version"] == 10
+    assert payload["profile"] == "libero"
     assert payload["use_stop_bucket"] is True
     assert payload["strategy"] == (
         "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_half_visual_"
         "hybrid_kmeans_nearest"
     )
     assert payload["constants"] == {
-        "state_threshold": 0.03,
+        "primitive_thresholds": {
+            "translation": 0.03,
+            "roll": None,
+            "tilt": 0.03,
+            "rotation": 0.03,
+            "gripper": 0.03,
+        },
+        "roll_axis": None,
+        "roll_labels": None,
+        "cyclic_axes": [],
         "min_action_count": 400,
         "min_action_frequency": 0.005,
+        "retention_threshold": "max(min_action_count, ceil(min_action_frequency * W))",
         "max_visual_centers": 30,
         "full_kmeans_max_training_count": 65536,
         "full_kmeans_openmp_threads": 1,
@@ -730,6 +792,32 @@ def test_action_catalog_serializes_schema_nine_sampling_strategy_and_metadata() 
             "center_id": 0,
         }
     ]
+
+
+def test_bridge_catalog_serializes_seven_dof_threshold_and_wrap_contract() -> None:
+    catalog = prototypes.create_action_catalog(
+        Counter({"roll positive": 400, "stop": 600}),
+        total_labels=1_000,
+        profile="bridge_v2",
+    )
+
+    payload = catalog.to_dict()
+
+    assert payload["profile"] == "bridge_v2"
+    assert payload["constants"]["primitive_thresholds"] == {
+        "translation": 0.03,
+        "roll": 0.12,
+        "tilt": 0.12,
+        "rotation": 0.18,
+        "gripper": 0.2,
+    }
+    assert payload["constants"]["roll_axis"] == 3
+    assert payload["constants"]["roll_labels"] == {
+        "positive": "roll positive",
+        "negative": "roll negative",
+    }
+    assert payload["constants"]["cyclic_axes"] == [3, 5]
+    assert payload["constants"]["min_action_frequency"] == 0.001
 
 
 def test_full_trajectory_builder_trains_exact_buckets_and_labels_each_half_once(
