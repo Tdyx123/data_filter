@@ -739,9 +739,9 @@ def test_bridge_default_config_and_cli_contract(tmp_path: Path) -> None:
     assert config["model"]["use_proprio"] is False
     assert config["data"]["prior_selection"] == {"prefiltered_scores": None}
     assert config["train"]["gpu_ids"] == [0, 1, 2, 3]
-    assert config["train"]["batch_size"] == 128
-    assert config["train"]["micro_batch_size_per_gpu"] == 8
-    assert config["train"]["gradient_accumulation_steps"] == 4
+    assert config["train"]["batch_size"] == 1024
+    assert config["train"]["micro_batch_size_per_gpu"] == 16
+    assert config["train"]["gradient_accumulation_steps"] == 16
     assert config["train"]["max_steps"] == 20_000
     assert config["train"]["learning_rate"]["warmup_steps"] == 400
     assert config["train"]["learning_rate"]["peak_value"] == pytest.approx(3.0e-4)

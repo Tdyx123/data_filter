@@ -33,9 +33,9 @@ train:
   seed: 42
   gpu_count: 4
   gpu_ids: [0, 1, 2, 3]
-  batch_size: 128
-  micro_batch_size_per_gpu: 8
-  gradient_accumulation_steps: 4
+  batch_size: 1024
+  micro_batch_size_per_gpu: 16
+  gradient_accumulation_steps: 16
   max_steps: 20000
   num_workers_per_rank: 4
   prefetch_factor: 2

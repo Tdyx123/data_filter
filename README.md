@@ -90,7 +90,7 @@ bash scripts/train_bridge_octo_small_4x4090.sh \
   --output-dir outputs/octo_small_bridge
 ```
 
-默认使用 GPU `0,1,2,3`、每卡 micro-batch 8、梯度累积 4、全局 batch 128、
+默认使用 GPU `0,1,2,3`、每卡 micro-batch 16、梯度累积 16、全局 batch 1024、
 20,000 optimizer steps、400 步 warmup、峰值学习率 `3e-4`、weight decay `0.01`、
 cosine 和 BF16。预检使用单进程，训练使用四进程；预检会严格校验基础权重、config、
 statistics、T5 资源及哈希，再验证 LeRobot v2/WidowX/5 Hz/AV1、固定计数和代表性
