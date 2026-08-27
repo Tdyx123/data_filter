@@ -77,6 +77,19 @@ def test_bridge_v2_config_classifies_all_seven_action_axes_in_stable_order() -> 
     )
 
 
+def test_bridge_v2_config_uses_three_step_endpoint_delta_without_threshold_changes() -> None:
+    config = make_bridge_v2_config()
+
+    assert config.horizon == 3
+    assert config.thresholds == PrimitiveThresholds(
+        translation=0.03,
+        roll=0.12,
+        tilt=0.12,
+        rotation=0.18,
+        gripper=0.20,
+    )
+
+
 def test_bridge_v2_config_classifies_all_negative_directions_in_stable_order() -> None:
     current, future = _libero_states(
         {

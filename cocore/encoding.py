@@ -15,7 +15,11 @@ from relcore.schemas import ClipRecord
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
 
 from cocore.index import CLIP_LENGTH, build_clip_records
+from cocore.temporal import resolve_temporal_geometry
 from cocore.timing import TimingCallback, timed_step
+
+
+DEFAULT_VISUAL_HALF_WINDOWS = resolve_temporal_geometry("libero").visual_half_windows
 
 
 def _sha256(path: Path) -> str:
@@ -231,12 +235,18 @@ def temporal_pool(sequence: np.ndarray) -> np.ndarray:
     )
 
 
-def visual_fragment_feature(frame_features: np.ndarray) -> np.ndarray:
-    """Return ``[sum(v_0..v_14), v_14-v_0]`` for one fragment."""
+def visual_fragment_feature(
+    frame_features: np.ndarray,
+    *,
+    clip_length: int = CLIP_LENGTH,
+) -> np.ndarray:
+    """Return the summed frames and endpoint delta for one fragment."""
 
     values = np.asarray(frame_features, dtype=np.float32)
-    if values.ndim != 2 or values.shape[0] != CLIP_LENGTH:
-        raise ValueError(f"visual fragment features must have shape [15, dim], got {values.shape}")
+    if values.ndim != 2 or values.shape[0] != clip_length:
+        raise ValueError(
+            f"visual fragment features must have shape [{clip_length}, dim], got {values.shape}"
+        )
     if not np.all(np.isfinite(values)):
         raise ValueError("visual fragment features contain NaN or infinity")
     return np.concatenate([values.sum(axis=0), values[-1] - values[0]]).astype(np.float32)
@@ -281,15 +291,26 @@ def fuse_fragment_features(
     return fused_raw, _l2_normalize_rows(fused_raw)
 
 
-def visual_half_means(frame_features: np.ndarray) -> np.ndarray:
-    """Return normalized means for overlapping frames ``[0..7]`` and ``[7..14]``."""
+def visual_half_means(
+    frame_features: np.ndarray,
+    *,
+    half_windows: tuple[tuple[int, int], tuple[int, int]] = DEFAULT_VISUAL_HALF_WINDOWS,
+) -> np.ndarray:
+    """Return normalized means for two explicit overlapping half windows."""
 
     values = np.asarray(frame_features, dtype=np.float32)
-    if values.ndim != 2 or values.shape[0] != CLIP_LENGTH or values.shape[1] == 0:
-        raise ValueError("visual clip features must have shape [15, positive dimensions]")
+    windows = tuple((int(start), int(end)) for start, end in half_windows)
+    if (
+        len(windows) != 2
+        or any(start < 0 or end <= start for start, end in windows)
+        or values.ndim != 2
+        or values.shape[0] != max(end for _, end in windows)
+        or values.shape[1] == 0
+    ):
+        raise ValueError("visual clip features must match two valid half windows")
     if not np.all(np.isfinite(values)):
         raise ValueError("visual clip features must be finite")
-    means = np.stack([values[:8].mean(axis=0), values[7:].mean(axis=0)])
+    means = np.stack([values[start:end].mean(axis=0) for start, end in windows])
     norms = np.linalg.norm(means, axis=1, keepdims=True)
     if not np.all(np.isfinite(norms)) or np.any(norms <= 1.0e-8):
         raise ValueError("visual half means must have finite positive norms")
@@ -359,6 +380,7 @@ def encode_cocore_dataset(
     adapter: DatasetAdapter,
     visual_encoder: VisualEncoder,
     *,
+    profile: str = "libero",
     visual_dim: int = 128,
     pca_fit_max_samples: int | None = None,
     quantile_low: float = 0.01,
@@ -373,11 +395,12 @@ def encode_cocore_dataset(
 ) -> CocoreEncodedClips:
     """Encode Quality-style fragments and cache each usable episode's frames."""
 
+    geometry = resolve_temporal_geometry(profile)
     records = list(adapter.episodes())
     if max_episodes is not None:
         records = records[:max_episodes]
     records_by_id = _records_by_id(records)
-    clips = build_clip_records(records)
+    clips = build_clip_records(records, clip_length=geometry.clip_length)
     if not clips:
         raise ValueError("dataset contains no complete clips")
 
@@ -471,14 +494,18 @@ def encode_cocore_dataset(
             normalized_action = normalizers.action(episode.actions)
             for start, end in candidate_windows[episode.episode_id]:
                 raw_visual[(episode.episode_id, start, end)] = visual_fragment_feature(
-                    frame_features[start : end + 1]
+                    frame_features[start : end + 1],
+                    clip_length=geometry.clip_length,
                 )
             for clip_index, clip in clips_by_episode.get(episode.episode_id, ()):
                 window = slice(clip.start_step, clip.end_step + 1)
                 visual = frame_features[window]
                 state = normalized_state[window]
                 action = normalized_action[window]
-                half_visual_by_index[clip_index] = visual_half_means(visual)
+                half_visual_by_index[clip_index] = visual_half_means(
+                    visual,
+                    half_windows=geometry.visual_half_windows,
+                )
                 state_by_index[clip_index] = state
                 action_by_index[clip_index] = action
                 position_by_index[clip_index] = float(clip.start_step) / float(episode.length)

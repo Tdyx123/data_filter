@@ -74,6 +74,58 @@ class _TrajectoryPrototypeAdapter(DatasetAdapter):
         return "trajectory-prototype-test-v1"
 
 
+class _BridgeTrajectoryPrototypeAdapter(DatasetAdapter):
+    def __init__(self) -> None:
+        self._records = (
+            EpisodeRecord(0, 1205, 0, "forward training"),
+            EpisodeRecord(1, 1205, 0, "right training"),
+            EpisodeRecord(2, 7, 0, "union candidate"),
+        )
+
+    @property
+    def vector_observation_keys(self) -> tuple[str, ...]:
+        return ("observation.state",)
+
+    @property
+    def image_observation_keys(self) -> tuple[str, ...]:
+        return ("observation.images.image",)
+
+    def episodes(self) -> Sequence[EpisodeRecord]:
+        return self._records
+
+    def iter_episodes(
+        self,
+        *,
+        num_workers: int = 0,
+        max_episodes: int | None = None,
+        load_images: bool = True,
+    ) -> Iterator[EpisodeData]:
+        del num_workers, load_images
+        records = self._records[:max_episodes] if max_episodes else self._records
+        for record in records:
+            steps = np.arange(record.length, dtype=np.float32)
+            states = np.zeros((record.length, 8), dtype=np.float32)
+            if record.episode_id == 0:
+                states[:, 0] = steps * np.float32(0.011)
+            elif record.episode_id == 1:
+                states[:, 1] = steps * np.float32(-0.011)
+            else:
+                states[:, 0] = np.minimum(steps, 3.0) * np.float32(0.011)
+                states[:, 1] = np.maximum(steps - 3.0, 0.0) * np.float32(-0.011)
+            yield EpisodeData(
+                episode_id=record.episode_id,
+                timestamps=steps.astype(np.float64) / 5.0,
+                frame_indices=np.arange(record.length, dtype=np.int64),
+                observations={"observation.state": states},
+                actions=np.zeros((record.length, 2), dtype=np.float32),
+                task_index=record.task_index,
+                task_name=record.task_name,
+            )
+
+    def fingerprint(self) -> str:
+        return "bridge-trajectory-prototype-test-v1"
+
+
 class _PowerBoundaryAdapter(DatasetAdapter):
     def __init__(self) -> None:
         self._records = (
@@ -260,6 +312,20 @@ def _candidate_clip() -> ClipRecord:
         start_step=0,
         end_step=14,
         length=15,
+        previous_sample_id=None,
+        next_sample_id=None,
+    )
+
+
+def _bridge_candidate_clip() -> ClipRecord:
+    return ClipRecord(
+        sample_id="ep000002_chunk_000000_000006",
+        episode_id=2,
+        task_index=0,
+        task_name="union candidate",
+        start_step=0,
+        end_step=6,
+        length=7,
         previous_sample_id=None,
         next_sample_id=None,
     )
@@ -558,6 +624,44 @@ def test_trajectory_window_starts_preserve_full_coverage_and_gap_policy() -> Non
             assert all(gap == 3 for gap in gaps)
 
 
+@pytest.mark.parametrize(
+    ("trajectory_length", "expected"),
+    [
+        (3, ()),
+        (4, (0,)),
+        (5, (0, 1)),
+        (6, (0, 2)),
+        (7, (0, 3)),
+        (8, (0, 2, 4)),
+        (9, (0, 3, 5)),
+        (10, (0, 3, 6)),
+        (11, (0, 3, 5, 7)),
+    ],
+)
+def test_four_frame_trajectory_window_starts_cover_tail_with_rebalanced_gaps(
+    trajectory_length: int,
+    expected: tuple[int, ...],
+) -> None:
+    assert prototypes.trajectory_window_starts(
+        trajectory_length,
+        window_length=4,
+    ) == expected
+
+
+def test_four_frame_trajectory_window_starts_preserve_full_coverage_and_gap_policy() -> None:
+    for trajectory_length in range(4, 501):
+        starts = prototypes.trajectory_window_starts(
+            trajectory_length,
+            window_length=4,
+        )
+        gaps = tuple(right - left for left, right in zip(starts, starts[1:], strict=False))
+
+        assert starts[0] == 0
+        assert starts[-1] == trajectory_length - 4
+        assert tuple(sorted(set(starts))) == starts
+        assert all(1 <= gap <= 3 for gap in gaps)
+
+
 def test_nearest_distance_bounds_and_confidence_use_q10_q90_linear_mapping() -> None:
     lower, upper = prototypes.nearest_distance_bounds(np.arange(11, dtype=np.float32))
 
@@ -818,6 +922,11 @@ def test_bridge_catalog_serializes_seven_dof_threshold_and_wrap_contract() -> No
     }
     assert payload["constants"]["cyclic_axes"] == [3, 5]
     assert payload["constants"]["min_action_frequency"] == 0.001
+    assert payload["constants"]["trajectory_window_length"] == 4
+    assert payload["constants"]["visual_half_windows"] == [[0, 4], [3, 7]]
+    assert payload["constants"]["visual_half_encoding"] == (
+        "l2_normalized_mean_of_four_projected_frames"
+    )
 
 
 def test_full_trajectory_builder_trains_exact_buckets_and_labels_each_half_once(
@@ -875,6 +984,40 @@ def test_full_trajectory_builder_trains_exact_buckets_and_labels_each_half_once(
         for leaf_id in result.prototypes.indices[0]
     }
     assert assigned_actions == {"move forward", "move right"}
+
+
+def test_bridge_trajectory_builder_uses_seven_frame_anchors_and_four_frame_windows(
+    tmp_path: Path,
+) -> None:
+    adapter = _BridgeTrajectoryPrototypeAdapter()
+    cache = tmp_path / "frame_embeddings"
+    _write_frame_caches(cache, adapter)
+    candidate_frames = np.load(cache / "ep000002.npy", allow_pickle=False)
+    candidate_halves = np.stack(
+        [candidate_frames[:4].mean(axis=0), candidate_frames[3:].mean(axis=0)]
+    )
+    candidate_halves /= np.linalg.norm(candidate_halves, axis=1, keepdims=True)
+
+    result = prototypes.build_hierarchical_motion_prototypes(
+        adapter,
+        [_bridge_candidate_clip()],
+        candidate_halves[None, :, :],
+        pca_components=_identity_fragment_pca(2),
+        visual_dim=2,
+        frame_cache_dir=cache,
+        batch_size=32,
+        max_iter=2,
+        seed=23,
+        max_episodes=None,
+        num_workers=0,
+        profile="bridge_v2",
+    )
+
+    assert result.half_action_labels.tolist() == [["move forward", "move right"]]
+    assert result.catalog.total_raw_actions == 806
+    by_label = {category.label: category for category in result.catalog.action_categories}
+    assert by_label["move forward"].training_count == 403
+    assert by_label["move right"].training_count == 403
 
 
 def test_full_trajectory_builder_materializes_each_episode_visual_once(

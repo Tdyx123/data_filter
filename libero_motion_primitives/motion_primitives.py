@@ -195,7 +195,7 @@ def make_bridge_v2_config() -> PrimitiveConfig:
     """Return the fixed BridgeData V2 7-DoF motion-primitive contract."""
 
     return PrimitiveConfig(
-        horizon=7,
+        horizon=3,
         threshold=0.03,
         thresholds=PrimitiveThresholds(
             translation=0.03,

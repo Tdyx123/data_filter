@@ -151,6 +151,32 @@ def test_visual_half_means_use_overlapping_eight_frame_windows() -> None:
     np.testing.assert_allclose(actual, expected, atol=1.0e-7)
 
 
+def test_visual_half_means_accept_overlapping_four_frame_windows() -> None:
+    steps = np.arange(7, dtype=np.float32)
+    frames = np.stack([steps + 1.0, steps**2 + 1.0], axis=1)
+
+    actual = visual_half_means(frames, half_windows=((0, 4), (3, 7)))
+
+    expected = np.stack([frames[:4].mean(axis=0), frames[3:].mean(axis=0)])
+    expected /= np.linalg.norm(expected, axis=1, keepdims=True)
+    np.testing.assert_allclose(actual, expected, atol=1.0e-7)
+
+
+def test_cocore_encoder_uses_bridge_profile_clip_geometry(tmp_path: Path) -> None:
+    encoded = encode_cocore_dataset(
+        _EncodingAdapter(),
+        _CountingVisualEncoder(),
+        profile="bridge_v2",
+        frame_cache_dir=tmp_path / "frame_embeddings",
+    )
+
+    assert len(encoded.clips) == 11
+    assert {clip.length for clip in encoded.clips} == {7}
+    assert encoded.state_sequences.shape == (11, 7, 8)
+    assert encoded.action_sequences.shape == (11, 7, 2)
+    assert encoded.visual_half_embeddings.shape == (11, 2, 3)
+
+
 def test_cocore_encoder_uses_quality_fusion_and_caches_episode_frames(
     tmp_path: Path,
 ) -> None:

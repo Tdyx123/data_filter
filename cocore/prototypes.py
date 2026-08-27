@@ -28,6 +28,7 @@ from relcore.graph.prototypes import PrototypeData
 from relcore.schemas import ClipRecord
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
 
+from cocore.temporal import resolve_temporal_geometry
 from cocore.timing import TimingCallback
 
 
@@ -45,9 +46,9 @@ MINIBATCH_KMEANS_OPENMP_THREADS = 4
 MIN_DISTANCE_WEIGHT = 0.3
 STATE_THRESHOLD = 0.03
 STATE_KEY = "observation.state"
-TRAJECTORY_WINDOW_LENGTH = 8
+TRAJECTORY_WINDOW_LENGTH = resolve_temporal_geometry("libero").trajectory_window_length
 TRAJECTORY_WINDOW_POLICY = "full_coverage_max_gap_3_tail_rebalanced"
-CLIP_LENGTH = 15
+CLIP_LENGTH = resolve_temporal_geometry("libero").clip_length
 
 _ATOMIC_ACTION_ORDER = (
     ("move", "forward"),
@@ -144,6 +145,11 @@ def motion_primitive_catalog_constants(name: str) -> dict[str, object]:
     """Return all schema-10 catalog constants for a fixed profile."""
 
     contract = motion_primitive_contract(name)
+    geometry = resolve_temporal_geometry(name)
+    frame_count_name = {
+        4: "four",
+        8: "eight",
+    }[geometry.trajectory_window_length]
     return {
         key: value for key, value in contract.items() if key != "profile"
     } | {
@@ -153,13 +159,15 @@ def motion_primitive_catalog_constants(name: str) -> dict[str, object]:
         "minibatch_kmeans_openmp_threads": MINIBATCH_KMEANS_OPENMP_THREADS,
         "kmeans_n_init": 1,
         "large_bucket_parallelism": "serial",
-        "trajectory_window_length": TRAJECTORY_WINDOW_LENGTH,
+        "trajectory_window_length": geometry.trajectory_window_length,
         "trajectory_window_policy": TRAJECTORY_WINDOW_POLICY,
-        "visual_half_windows": [[0, 8], [7, 15]],
+        "visual_half_windows": [list(window) for window in geometry.visual_half_windows],
         "visual_projection": ("frame @ visual_pca.components[:, :frame_embedding_dim].T"),
         "visual_projection_centering": "none",
         "visual_projection_padding": "right_zero_to_128",
-        "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
+        "visual_half_encoding": (
+            f"l2_normalized_mean_of_{frame_count_name}_projected_frames"
+        ),
         "cluster_count": (
             "min(training_count, min(30, max(10, "
             "floor(4 * log2(training_count) - 30))))"
@@ -335,15 +343,24 @@ def cluster_count_for_training_count(training_count: float) -> int:
     return min(int(value), clusters)
 
 
-def trajectory_window_starts(trajectory_length: int) -> tuple[int, ...]:
-    """Return full-coverage eight-frame starts with gaps of at most three."""
+def trajectory_window_starts(
+    trajectory_length: int,
+    window_length: int = TRAJECTORY_WINDOW_LENGTH,
+) -> tuple[int, ...]:
+    """Return full-coverage fixed-length starts with gaps of at most three."""
 
     if isinstance(trajectory_length, bool) or not isinstance(trajectory_length, Integral):
         raise ValueError("trajectory length must be a non-negative integer")
     length = int(trajectory_length)
     if length < 0:
         raise ValueError("trajectory length must be a non-negative integer")
-    last_start = length - TRAJECTORY_WINDOW_LENGTH
+    if (
+        isinstance(window_length, bool)
+        or not isinstance(window_length, Integral)
+        or int(window_length) <= 0
+    ):
+        raise ValueError("trajectory window length must be a positive integer")
+    last_start = length - int(window_length)
     if last_start < 0:
         return ()
     if last_start == 0:
@@ -588,6 +605,7 @@ def _episode_window_visuals(
     *,
     pca_components: np.ndarray,
     visual_dim: int,
+    window_length: int = TRAJECTORY_WINDOW_LENGTH,
 ) -> np.ndarray:
     path = cache_root / f"ep{record.episode_id:06d}.npy"
     if not path.is_file():
@@ -612,15 +630,18 @@ def _episode_window_visuals(
         output_dim=visual_dim,
     )
 
-    window_starts = np.asarray(trajectory_window_starts(record.length), dtype=np.int64)
+    window_starts = np.asarray(
+        trajectory_window_starts(record.length, window_length=window_length),
+        dtype=np.int64,
+    )
     if len(window_starts) == 0:
         return np.empty((0, int(visual_dim)), dtype=np.float32)
     prefix = np.empty((record.length + 1, int(visual_dim)), dtype=np.float64)
     prefix[0] = 0.0
     np.cumsum(projected, axis=0, dtype=np.float64, out=prefix[1:])
     means = (
-        prefix[window_starts + TRAJECTORY_WINDOW_LENGTH] - prefix[window_starts]
-    ) / float(TRAJECTORY_WINDOW_LENGTH)
+        prefix[window_starts + window_length] - prefix[window_starts]
+    ) / float(window_length)
     norms = np.linalg.norm(means, axis=1, keepdims=True)
     if not np.all(np.isfinite(norms)) or np.any(norms <= 1.0e-8):
         raise ValueError(
@@ -651,12 +672,16 @@ def _episode_exact_memberships(
     states: np.ndarray,
     categories_by_label: Mapping[str, ActionCategory],
     primitive_config: object,
+    *,
+    window_length: int = TRAJECTORY_WINDOW_LENGTH,
 ) -> dict[int, np.ndarray]:
     local_rows: dict[int, list[int]] = {}
-    for row, timestep in enumerate(trajectory_window_starts(len(states))):
+    for row, timestep in enumerate(
+        trajectory_window_starts(len(states), window_length=window_length)
+    ):
         raw_label = classify_motion_primitive(
             states[timestep],
-            states[timestep + TRAJECTORY_WINDOW_LENGTH - 1],
+            states[timestep + window_length - 1],
             primitive_config,
         )
         category = categories_by_label.get(raw_label)
@@ -680,6 +705,7 @@ def _materialize_action_training_data(
     visual_dim: int,
     max_episodes: int | None,
     num_workers: int,
+    window_length: int = TRAJECTORY_WINDOW_LENGTH,
 ) -> dict[int, _ActionTrainingData]:
     values = {
         action_id: np.empty((category.training_count, int(visual_dim)), dtype=np.float32)
@@ -698,18 +724,30 @@ def _materialize_action_training_data(
     ):
         states = _validated_states(episode, expected, seen, pass_name="training data")
         record = expected[episode.episode_id]
-        window_visuals = _episode_window_visuals(
-            cache_root,
-            record,
-            pca_components=pca_components,
-            visual_dim=visual_dim,
-        )
-        if len(window_visuals) != len(trajectory_window_starts(len(states))):
+        if window_length == TRAJECTORY_WINDOW_LENGTH:
+            window_visuals = _episode_window_visuals(
+                cache_root,
+                record,
+                pca_components=pca_components,
+                visual_dim=visual_dim,
+            )
+        else:
+            window_visuals = _episode_window_visuals(
+                cache_root,
+                record,
+                pca_components=pca_components,
+                visual_dim=visual_dim,
+                window_length=window_length,
+            )
+        if len(window_visuals) != len(
+            trajectory_window_starts(len(states), window_length=window_length)
+        ):
             raise ValueError(f"episode {episode.episode_id}: state/cache length mismatch")
         memberships = _episode_exact_memberships(
             states,
             categories_by_label,
             primitive_config,
+            window_length=window_length,
         )
         for action_id in sorted(memberships):
             rows = memberships[action_id]
@@ -930,6 +968,8 @@ def build_hierarchical_motion_prototypes(
     if STATE_KEY not in adapter.vector_observation_keys:
         raise ValueError(f"motion_primitives requires vector observation {STATE_KEY!r}")
 
+    resolved_profile = resolve_motion_primitive_profile(profile)
+    geometry = resolve_temporal_geometry(resolved_profile.name)
     action_scan_started = time.perf_counter()
     records = list(adapter.episodes())
     if max_episodes is not None:
@@ -945,15 +985,16 @@ def build_hierarchical_motion_prototypes(
             raise ValueError(f"clip {clip.sample_id} has no indexed episode")
         record = expected[clip.episode_id]
         if (
-            clip.length != CLIP_LENGTH
-            or clip.end_step - clip.start_step + 1 != CLIP_LENGTH
+            clip.length != geometry.clip_length
+            or clip.end_step - clip.start_step + 1 != geometry.clip_length
             or clip.start_step < 0
             or clip.end_step >= record.length
         ):
-            raise ValueError("motion_primitives requires aligned 15-frame clips")
+            raise ValueError(
+                f"motion_primitives requires aligned {geometry.clip_length}-frame clips"
+            )
         clips_by_episode.setdefault(clip.episode_id, []).append((clip_index, clip))
 
-    resolved_profile = resolve_motion_primitive_profile(profile)
     primitive_config = resolved_profile.primitive_config
     raw_counts: Counter[str] = Counter()
     candidate_labels: dict[int, tuple[str, str]] = {}
@@ -964,21 +1005,29 @@ def build_hierarchical_motion_prototypes(
         load_images=False,
     ):
         states = _validated_states(episode, expected, seen, pass_name="action")
-        window_starts = trajectory_window_starts(len(states))
+        window_starts = trajectory_window_starts(
+            len(states),
+            window_length=geometry.trajectory_window_length,
+        )
         raw_counts.update(
             classify_motion_primitive(
                 states[t],
-                states[t + TRAJECTORY_WINDOW_LENGTH - 1],
+                states[t + geometry.state_delta_horizon],
                 primitive_config,
             )
             for t in window_starts
         )
         for clip_index, clip in clips_by_episode.get(episode.episode_id, ()):
+            first_anchor, middle_anchor, last_anchor = geometry.clip_anchors
             first = classify_motion_primitive(
-                states[clip.start_step], states[clip.start_step + 7], primitive_config
+                states[clip.start_step + first_anchor],
+                states[clip.start_step + middle_anchor],
+                primitive_config,
             )
             second = classify_motion_primitive(
-                states[clip.start_step + 7], states[clip.end_step], primitive_config
+                states[clip.start_step + middle_anchor],
+                states[clip.start_step + last_anchor],
+                primitive_config,
             )
             candidate_labels[clip_index] = (first, second)
     if seen != set(expected):
@@ -1036,6 +1085,7 @@ def build_hierarchical_motion_prototypes(
         visual_dim=visual_dim,
         max_episodes=max_episodes,
         num_workers=num_workers,
+        window_length=geometry.trajectory_window_length,
     )
     if timing_callback is not None:
         timing_callback(
