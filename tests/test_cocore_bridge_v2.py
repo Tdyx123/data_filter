@@ -156,7 +156,7 @@ def _write_synthetic_bridge_dataset(
         states = np.zeros((605, 8), dtype=np.float32)
         if not (stop_first_valid_episode and episode_id == 1):
             states[:, 0] = steps * 0.02
-            states[:, 3] = steps * 0.05
+            states[:, 3] = steps * 0.07
         actions = np.zeros((605, 7), dtype=np.float32)
         actions[:, 0] = 0.01
         table = pa.table(
@@ -214,7 +214,7 @@ def test_package_exposes_only_version() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["0.8.0", "['__version__']"]
+    assert result.stdout.splitlines() == ["0.9.0", "['__version__']"]
 
 
 def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None:
@@ -887,11 +887,12 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     assert catalog["profile"] == "bridge_v2"
     assert catalog["constants"]["primitive_thresholds"] == {
         "translation": 0.03,
-        "roll": 0.12,
-        "tilt": 0.12,
-        "rotation": 0.18,
+        "roll": 0.18,
+        "tilt": 0.18,
+        "rotation": 0.24,
         "gripper": 0.2,
     }
+    assert catalog["constants"]["min_action_frequency"] == 0.005
     assert catalog["constants"]["roll_labels"] == {
         "positive": "roll positive",
         "negative": "roll negative",
@@ -911,6 +912,22 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
         "status": "valid",
         "selected_clips": 10,
     }
+
+    legacy_run_manifest = copy.deepcopy(run_manifest)
+    legacy_run_manifest["motion_primitive"]["min_action_frequency"] = 0.001
+    (result / "run_manifest.json").write_text(json.dumps(legacy_run_manifest))
+    with pytest.raises(ValueError, match="motion primitive contract"):
+        validate_output(result, config=config)
+    (result / "run_manifest.json").write_text(json.dumps(run_manifest))
+
+    legacy_catalog = copy.deepcopy(catalog)
+    legacy_catalog["constants"]["primitive_thresholds"].update(
+        {"roll": 0.12, "tilt": 0.12, "rotation": 0.18}
+    )
+    (graph_root / "prototype_catalog.json").write_text(json.dumps(legacy_catalog))
+    with pytest.raises(ValueError, match="prototype catalog schema"):
+        validate_output(result, config=config)
+    (graph_root / "prototype_catalog.json").write_text(json.dumps(catalog))
 
     run_manifest["clip_length"] = 15
     run_manifest["clip_anchors"] = [0, 7, 14]

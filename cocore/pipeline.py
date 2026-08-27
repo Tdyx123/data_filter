@@ -803,12 +803,22 @@ def graph_stage(
 ) -> tuple[Path, object, list[ClipRecord], GraphData, str]:
     resolved = resolve_config(config)
     seed_everything(int(resolved["seed"]))
-    root, adapter, encoded = encode_stage(
-        resolved,
-        output_dir=output_dir,
-        force=force,
-        visual_encoder=visual_encoder,
-    )
+    try:
+        root, adapter, encoded = encode_stage(
+            resolved,
+            output_dir=output_dir,
+            force=False,
+            visual_encoder=visual_encoder,
+        )
+    except FileExistsError:
+        if not force:
+            raise
+        root, adapter, encoded = encode_stage(
+            resolved,
+            output_dir=output_dir,
+            force=True,
+            visual_encoder=visual_encoder,
+        )
     visual_dim = int(resolved["encoding"]["visual_dim"])
     pca_components = _load_visual_pca_components(root / "encode", visual_dim=visual_dim)
     prototype_config = resolved["prototypes"]

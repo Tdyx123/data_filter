@@ -224,29 +224,42 @@ def validate_reference_acceptance(report: Mapping[str, object]) -> tuple[str, ..
 
     checks = (
         (report.get("window_count") == 434_370, "window_count must equal 434370"),
+        (report.get("retention_cutoff") == 2_172, "retention_cutoff must equal 2172"),
         (
-            report.get("unique_compound_labels") == 1_399,
-            "unique_compound_labels must equal 1399",
+            report.get("unique_compound_labels") == 1_104,
+            "unique_compound_labels must equal 1104",
         ),
         (
-            report.get("retained_non_stop_action_buckets") == 83,
-            "retained_non_stop_action_buckets must equal 83",
+            report.get("retained_non_stop_action_buckets") == 24,
+            "retained_non_stop_action_buckets must equal 24",
         ),
         (
-            report.get("estimated_leaf_prototypes") == 1_139,
-            "estimated_leaf_prototypes must equal 1139",
+            report.get("estimated_leaf_prototypes") == 530,
+            "estimated_leaf_prototypes must equal 530",
         ),
         (
-            abs(float(report.get("exact_non_stop_coverage", math.nan)) - 0.6539) <= 0.0005,
-            "exact_non_stop_coverage must be within 0.05 percentage points of 65.39%",
+            abs(float(report.get("exact_non_stop_coverage", math.nan)) - 0.6018) <= 0.0005,
+            "exact_non_stop_coverage must be within 0.05 percentage points of 60.18%",
         ),
         (
-            abs(float(report.get("raw_stop_rate", math.nan)) - 0.2236) <= 0.0005,
-            "raw_stop_rate must be within 0.05 percentage points of 22.36%",
+            abs(float(report.get("parent_fallback_rate", math.nan)) - 0.1456) <= 0.0005,
+            "parent_fallback_rate must be within 0.05 percentage points of 14.56%",
         ),
         (
-            float(report.get("atomic_action_retention_quality", -math.inf)) >= 0.730,
-            "atomic_action_retention_quality must be at least 73.0%",
+            float(report.get("no_parent_fallback_rate", math.inf)) <= 0.013,
+            "no_parent_fallback_rate must not exceed 1.30%",
+        ),
+        (
+            abs(float(report.get("raw_stop_rate", math.nan)) - 0.2400) <= 0.0005,
+            "raw_stop_rate must be within 0.05 percentage points of 24.00%",
+        ),
+        (
+            float(report.get("atomic_action_retention_quality", -math.inf)) >= 0.684,
+            "atomic_action_retention_quality must be at least 68.4%",
+        ),
+        (
+            float(report.get("atomic_occurrence_retention_quality", -math.inf)) >= 0.841,
+            "atomic_occurrence_retention_quality must be at least 84.1%",
         ),
     )
     return tuple(message for passed, message in checks if not passed)

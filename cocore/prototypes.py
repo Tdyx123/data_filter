@@ -37,7 +37,6 @@ _ActionResult = TypeVar("_ActionResult")
 
 MIN_ACTION_COUNT = 400
 MIN_ACTION_FREQUENCY = 0.005
-BRIDGE_V2_MIN_ACTION_FREQUENCY = 0.001
 MIN_VISUAL_CENTERS = 10
 MAX_VISUAL_CENTERS = 30
 FULL_KMEANS_MAX_TRAINING_COUNT = 65_536
@@ -93,7 +92,7 @@ def resolve_motion_primitive_profile(name: str) -> MotionPrimitiveProfile:
             name="bridge_v2",
             primitive_config=make_bridge_v2_config(),
             min_action_count=MIN_ACTION_COUNT,
-            min_action_frequency=BRIDGE_V2_MIN_ACTION_FREQUENCY,
+            min_action_frequency=MIN_ACTION_FREQUENCY,
         )
     raise ValueError(f"unknown motion primitive profile {name!r}")
 

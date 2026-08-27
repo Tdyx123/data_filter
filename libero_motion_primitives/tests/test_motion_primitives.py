@@ -62,9 +62,9 @@ def test_bridge_v2_config_classifies_all_seven_action_axes_in_stable_order() -> 
             0: 0.031,
             1: -0.031,
             2: 0.031,
-            3: 0.121,
-            4: 0.121,
-            5: 0.181,
+            3: 0.181,
+            4: 0.181,
+            5: 0.241,
             7: 0.201,
         }
     )
@@ -77,15 +77,15 @@ def test_bridge_v2_config_classifies_all_seven_action_axes_in_stable_order() -> 
     )
 
 
-def test_bridge_v2_config_uses_three_step_endpoint_delta_without_threshold_changes() -> None:
+def test_bridge_v2_config_uses_balanced_four_frame_action_thresholds() -> None:
     config = make_bridge_v2_config()
 
     assert config.horizon == 3
     assert config.thresholds == PrimitiveThresholds(
         translation=0.03,
-        roll=0.12,
-        tilt=0.12,
-        rotation=0.18,
+        roll=0.18,
+        tilt=0.18,
+        rotation=0.24,
         gripper=0.20,
     )
 
@@ -96,9 +96,9 @@ def test_bridge_v2_config_classifies_all_negative_directions_in_stable_order() -
             0: -0.031,
             1: 0.031,
             2: -0.031,
-            3: -0.121,
-            4: -0.121,
-            5: -0.181,
+            3: -0.181,
+            4: -0.181,
+            5: -0.241,
             7: -0.201,
         }
     )
@@ -113,7 +113,7 @@ def test_bridge_v2_config_classifies_all_negative_directions_in_stable_order() -
 
 def test_bridge_v2_values_exactly_at_per_family_thresholds_are_not_significant() -> None:
     current, future = _libero_states(
-        {0: 0.03, 1: -0.03, 2: 0.03, 3: -0.12, 4: 0.12, 5: -0.18, 7: 0.20}
+        {0: 0.03, 1: -0.03, 2: 0.03, 3: -0.18, 4: 0.18, 5: -0.24, 7: 0.20}
     )
 
     result = classify_motion_primitive(current, future, make_bridge_v2_config())
@@ -125,13 +125,13 @@ def test_bridge_v2_values_exactly_at_per_family_thresholds_are_not_significant()
     ("current_angle", "future_angle", "expected"),
     [
         (
-            np.pi - 0.10,
-            -np.pi + 0.10,
+            np.pi - 0.13,
+            -np.pi + 0.13,
             "roll positive, rotate counterclockwise",
         ),
         (
-            -np.pi + 0.10,
-            np.pi - 0.10,
+            -np.pi + 0.13,
+            np.pi - 0.13,
             "roll negative, rotate clockwise",
         ),
     ],

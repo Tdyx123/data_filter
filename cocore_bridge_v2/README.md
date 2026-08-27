@@ -15,12 +15,12 @@ Cocore 的编码、运动原语、关系目标或选择算法，而是固定 Bri
   上使用首尾覆盖、起点间隔最大为 3 的四帧窗口，只用精确保留动作训练硬视觉桶；
 - 固定 `prototypes.profile: bridge_v2`，CLI 不提供 profile 覆盖；四帧窗口始终使用
   `state[t] → state[t+3]`；
-- xyz 严格阈值为 `0.03 m`，roll/pitch 为 `0.12 rad`，yaw 为 `0.18 rad`，gripper
+- xyz 严格阈值为 `0.03 m`，roll/pitch 为 `0.18 rad`，yaw 为 `0.24 rad`，gripper
   为 `0.20`；等于阈值不激活动作；
 - roll 与 yaw 使用 `[-π, π)` 最短角差。原子顺序固定为平移、
   `roll positive/negative`、pitch tilt、yaw rotate、gripper，再合成为单一复合标签；
 - 设完整轨迹窗口数为 `W`，非 stop 动作桶保留条件固定为
-  `count >= max(400, ceil(0.001 * W))`；
+  `count >= max(400, ceil(0.005 * W))`；
 - 令 `M_a` 为单动作桶的训练窗口数，视觉中心数固定为
   `min(M_a, min(30, max(10, floor(4 * log2(M_a) - 30))))`；保留的非 stop 动作使用
   10～30 个中心；
@@ -107,16 +107,17 @@ graph 目录提供 schema 10 的 `prototype_catalog.json`、128 维
 PCA components 前半列进行逐帧纯矩阵投影，不使用 mean/scale。选择输出包含最终
 原型标签、动作标签、绝对置信度和 `half_action_labels`，不包含旧的 action/distance
 分解权重。catalog 与 manifest 记录 `bridge_v2` profile、分轴阈值、roll 标签、环绕轴
-和 `0.1%/400` 保留策略。manifest 的生产者仍为 `cocore`；Cocore 版本为 0.16.0，
-Bridge 包版本为 0.8.0。
+和 `0.5%/400` 保留策略。manifest 的生产者仍为 `cocore`；Cocore 版本为 0.16.0，
+Bridge 包版本为 0.9.0。
 
 视觉中心训练只物化一次保留窗口投影；小桶并行执行完整 KMeans，大桶串行执行
-MiniBatchKMeans。Bridge V2 完整生产数据的基础额外内存约为 186 MiB（按参考精确保留
+MiniBatchKMeans。Bridge V2 完整生产数据的基础额外内存约为 179 MiB（按参考精确保留
 非 stop 与原始 stop 窗口估算，每窗口 `128 × 4` 字节），不使用 memmap 或磁盘 fallback。
 
 Cocore schema 9 artifact 不迁移且 validator 会拒绝。Cocore 仍为 0.16.0/schema 10；
-Bridge 0.8.0 的 7/4 几何与 0.7.x 的 15/8 artifact 不兼容。升级后必须使用 `--force`
-重新构建 scan、encode、graph 和 selection，不能复用旧缓存。
+Bridge 0.9.0 的动作契约与 0.8.0 的 `0.1%` 保留率和旧角阈值不兼容。旧 graph/selection
+artifact 会被 validator 拒绝，必须使用 `--force` 重建；契约兼容的 scan/encode 缓存
+继续复用。0.7.x 的 15/8 artifact 与 7/4 几何不兼容，升级时仍需重建全部阶段。
 
 验证时必须重复传入生成该选择结果时使用的目标、比例、数据集路径以及
 `--max-episodes`（若生成时设置）。省略 `--max-episodes` 表示按完整有效数据集重放；
@@ -154,9 +155,10 @@ Top 10% 预算为 20,274。
 ```
 
 它输出七轴绝对差分位与激活率、复合类别数、stop/回退率、精确覆盖、原子保留质量、
-动作桶数和预计视觉叶原型数。完整训练集参考契约为 434,370 个四帧窗口、1,399 个实际
-复合标签、83 个保留的非 stop 桶和约 1,139 个叶原型；非 stop 精确覆盖约 65.39%，
-原始 stop 约 22.36%，原子动作保留质量至少 73.0%。
+动作桶数和预计视觉叶原型数。完整训练集参考契约为 434,370 个四帧窗口、保留门槛
+2,172、1,104 个实际复合标签、24 个保留的非 stop 桶和约 530 个叶原型；非 stop 精确
+覆盖约 60.18%，父类回退约 14.56%，无父类回退不超过 1.30%，原始 stop 约 24.00%。
+原子动作保留质量至少 68.40%，原子 occurrence 保留质量至少 84.10%。
 
 无需 GPU 的 100 episode scan 冒烟：
 
