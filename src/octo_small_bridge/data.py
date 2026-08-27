@@ -389,7 +389,7 @@ class BridgeFrameDataset:
         hue_shift = int(round(randomizer.uniform(-0.05, 0.05) * 255))
         hsv = np.asarray(image.convert("HSV"), dtype=np.uint8).copy()
         hsv[..., 0] = (hsv[..., 0].astype(np.int16) + hue_shift) % 256
-        return Image.fromarray(hsv).convert("RGB")
+        return Image.frombytes("HSV", image.size, hsv.tobytes()).convert("RGB")
 
     def _tokens(self, instruction: str) -> tuple[np.ndarray, np.ndarray] | None:
         if self.tokenizer is None:
