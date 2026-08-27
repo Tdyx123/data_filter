@@ -26,9 +26,13 @@ def test_config_requires_explicit_relation_and_weight() -> None:
         resolve_config({"objective": {"relation": "cooccurrence"}})
 
 
-def test_config_rejects_clip_overrides_with_uniform_window_contract() -> None:
-    with pytest.raises(ValueError, match="near-uniform 15-frame"):
+def test_config_rejects_clip_overrides_with_profile_defined_window_contract() -> None:
+    with pytest.raises(ValueError) as error:
         resolve_config({**_objective(), "clip": {"length": 15, "stride": 15}})
+
+    message = str(error.value)
+    assert "profile-defined fixed near-uniform windows" in message
+    assert "15-frame" not in message
 
 
 @pytest.mark.parametrize("relation", ["sequence", "cooccurrence"])
@@ -108,16 +112,6 @@ def test_config_rejects_removed_cooccurrence_weight_with_migration_message() -> 
                     "relation_weight": 1.0,
                     "cooccurrence_weight": 1.0,
                 }
-            }
-        )
-
-
-def test_config_rejects_clip_section_because_cocore_uses_fixed_windows() -> None:
-    with pytest.raises(ValueError, match="clip.*fixed.*15"):
-        resolve_config(
-            {
-                **_objective(),
-                "clip": {"length": 15, "stride": 15},
             }
         )
 
