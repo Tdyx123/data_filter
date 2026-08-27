@@ -49,7 +49,7 @@ class _DiagnosticAdapter(DatasetAdapter):
             states[:, 0] = steps * np.float32(0.02)
             states[:, 1] = steps * np.float32(0.008)
             if record.episode_id == 1:
-                states[:, 3] = steps * np.float32(0.05)
+                states[:, 3] = steps * np.float32(0.07)
             yield EpisodeData(
                 episode_id=record.episode_id,
                 timestamps=steps.astype(np.float64) / 5.0,
@@ -117,29 +117,37 @@ def test_reference_acceptance_reports_every_failed_contract() -> None:
     failures = validate_reference_acceptance(
         {
             "window_count": 1,
+            "retention_cutoff": 1,
             "unique_compound_labels": 1,
             "retained_non_stop_action_buckets": 1,
             "estimated_leaf_prototypes": 1,
             "exact_non_stop_coverage": 0.0,
+            "parent_fallback_rate": 1.0,
+            "no_parent_fallback_rate": 1.0,
             "raw_stop_rate": 1.0,
             "atomic_action_retention_quality": 0.0,
+            "atomic_occurrence_retention_quality": 0.0,
         }
     )
 
-    assert len(failures) == 7
+    assert len(failures) == 11
     assert all(isinstance(failure, str) and failure for failure in failures)
 
 
-def test_reference_acceptance_accepts_new_four_frame_production_baseline() -> None:
+def test_reference_acceptance_accepts_balanced_point_five_percent_baseline() -> None:
     failures = validate_reference_acceptance(
         {
             "window_count": 434_370,
-            "unique_compound_labels": 1_399,
-            "retained_non_stop_action_buckets": 83,
-            "estimated_leaf_prototypes": 1_139,
-            "exact_non_stop_coverage": 0.6539,
-            "raw_stop_rate": 0.2236,
-            "atomic_action_retention_quality": 0.730,
+            "retention_cutoff": 2_172,
+            "unique_compound_labels": 1_104,
+            "retained_non_stop_action_buckets": 24,
+            "estimated_leaf_prototypes": 530,
+            "exact_non_stop_coverage": 0.6018,
+            "parent_fallback_rate": 0.1456,
+            "no_parent_fallback_rate": 0.0126,
+            "raw_stop_rate": 0.2400,
+            "atomic_action_retention_quality": 0.684,
+            "atomic_occurrence_retention_quality": 0.841,
         }
     )
 

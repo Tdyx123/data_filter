@@ -199,9 +199,9 @@ def make_bridge_v2_config() -> PrimitiveConfig:
         threshold=0.03,
         thresholds=PrimitiveThresholds(
             translation=0.03,
-            roll=0.12,
-            tilt=0.12,
-            rotation=0.18,
+            roll=0.18,
+            tilt=0.18,
+            rotation=0.24,
             gripper=0.20,
         ),
         forward_axis=0,

@@ -348,12 +348,12 @@ def test_schema_seven_action_catalog_uses_400_count_floor() -> None:
     assert fractional_by_label["move backward"].retained is False
 
 
-def test_bridge_profile_uses_point_one_percent_retention_without_changing_libero() -> None:
+def test_bridge_profile_uses_point_five_percent_retention_like_libero() -> None:
     counts = Counter(
         {
-            "move forward": 400,
+            "move forward": 1_999,
             "move right": 2_000,
-            "stop": 397_600,
+            "stop": 396_001,
         }
     )
 
@@ -370,8 +370,10 @@ def test_bridge_profile_uses_point_one_percent_retention_without_changing_libero
 
     bridge_by_label = {category.label: category for category in bridge.action_categories}
     libero_by_label = {category.label: category for category in libero.action_categories}
-    assert bridge_by_label["move forward"].retained is True
+    assert bridge_by_label["move forward"].retained is False
+    assert bridge_by_label["move right"].retained is True
     assert libero_by_label["move forward"].retained is False
+    assert libero_by_label["move right"].retained is True
 
 
 def test_roll_actions_participate_in_parent_fallback_and_retention_weight() -> None:
@@ -910,9 +912,9 @@ def test_bridge_catalog_serializes_seven_dof_threshold_and_wrap_contract() -> No
     assert payload["profile"] == "bridge_v2"
     assert payload["constants"]["primitive_thresholds"] == {
         "translation": 0.03,
-        "roll": 0.12,
-        "tilt": 0.12,
-        "rotation": 0.18,
+        "roll": 0.18,
+        "tilt": 0.18,
+        "rotation": 0.24,
         "gripper": 0.2,
     }
     assert payload["constants"]["roll_axis"] == 3
@@ -921,7 +923,7 @@ def test_bridge_catalog_serializes_seven_dof_threshold_and_wrap_contract() -> No
         "negative": "roll negative",
     }
     assert payload["constants"]["cyclic_axes"] == [3, 5]
-    assert payload["constants"]["min_action_frequency"] == 0.001
+    assert payload["constants"]["min_action_frequency"] == 0.005
     assert payload["constants"]["trajectory_window_length"] == 4
     assert payload["constants"]["visual_half_windows"] == [[0, 4], [3, 7]]
     assert payload["constants"]["visual_half_encoding"] == (

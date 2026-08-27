@@ -35,13 +35,13 @@ episode 只执行一次视觉模型前向；候选片段的视觉特征
 
 - `libero`（通用 Cocore 默认）：沿用单一严格阈值 `0.03`，不分类 roll，动作保留条件为
   `count >= max(400, ceil(0.005 * W))`；
-- `bridge_v2`：xyz 为 `0.03 m`，roll/pitch 为 `0.12 rad`，yaw 为 `0.18 rad`，
+- `bridge_v2`：xyz 为 `0.03 m`，roll/pitch 为 `0.18 rad`，yaw 为 `0.24 rad`，
   gripper 为 `0.20`；roll 与 yaw 取 `[-π, π)` 最短角差，动作保留条件为
-  `count >= max(400, ceil(0.001 * W))`。
+  `count >= max(400, ceil(0.005 * W))`。
 
 Bridge 原子顺序固定为平移、`roll positive/negative`、pitch tilt、yaw rotate、gripper，
 仍合成为一个复合标签。所有阈值边界都使用严格 `>`/`<`，等于阈值不激活动作。
-设全部窗口数为 `W`，LIBERO 默认保留条件为：
+设全部窗口数为 `W`，LIBERO 与 Bridge 的保留条件统一为：
 
 ```text
 count >= max(400, ceil(0.005 * W))
@@ -231,11 +231,17 @@ debug 配置固定为 1。它与 `runtime.num_workers` 相互独立，后者仍�
 视觉中心训练会一次物化所有保留窗口的 128 维 `float32` 投影。小桶用完整 KMeans
 并行拟合，大桶用 MiniBatchKMeans 串行拟合，避免多个大桶同时占用 CPU 和临时内存。
 基础额外内存约为“保留窗口数 × 128 × 4 字节”：LIBERO90 约 106 MiB，Bridge V2
-按 4 帧参考基线估算约 186 MiB；完整 KMeans 拟合小桶时还会产生有界于 65,536 个窗口的工作副本。改变
+按 4 帧参考基线估算约 179 MiB；完整 KMeans 拟合小桶时还会产生有界于 65,536 个窗口的工作副本。改变
 `num_threads` 不改变 graph 指纹或产物，因此可复用同一 graph 缓存；改变
 `profile`、`batch_size`、`max_iter`、`tol` 或 `use_stop_bucket` 会使 graph 缓存失效。
 profile、分轴阈值、roll 标签、环绕轴和保留公式同时写入 catalog、各级 manifest 与
 graph/select 指纹。
+
+Bridge Orig V2 参考数据（排除空任务 episode）包含 38,660 条有效 episode 和 434,370
+个四帧窗口；完整集门槛为 2,172。参考结果为 1,104 个复合标签、24 个保留的非 stop
+动作桶和约 530 个叶原型，非 stop 精确覆盖约 60.18%，父类回退约 14.56%，无父类
+回退不超过 1.30%，原始 stop 约 24.00%；原子动作与 occurrence 保留质量分别至少为
+68.40% 和 84.10%。
 
 可在运行时覆盖选择方法、选择比例、关系类型与关系权重：
 
@@ -277,9 +283,11 @@ Cocore 0.16.0 使用 prototype schema 10、profile 固定的 15/8（LIBERO）或
 的 128 维聚类空间、近似均匀候选和原始相邻 sequence 图，并按 episode 持久化完整原始
 逐帧 CLIP 特征，并提供 lazy heap 与随机多分支两种选择方法。0.15.x 的 schema 9
 artifact 不迁移，也不会被 validator 接受；既有 scan、encode、graph 和 selection 缓存
-全部视为不兼容。Bridge 适配器 0.8.0 保持 Cocore 0.16.0/schema 10，但 7/4 几何与旧
-Bridge 15/8 artifact 不兼容；升级这两类旧产物后都必须通过 `--force` 重建全部阶段，
-或使用新的输出目录。LIBERO 的 15/8 缓存契约不变。
+全部视为不兼容。Bridge 适配器 0.9.0 保持 Cocore 0.16.0/schema 10；相对 0.8.0，新的
+角阈值与 `0.5%/400` 保留公式进入 graph/select 指纹和 catalog，旧 graph/selection
+artifact 会被拒绝，必须通过 `--force` 重建，兼容的 scan/encode 缓存继续复用。旧
+Bridge 15/8 artifact 与 7/4 几何不兼容，升级时仍需重建全部阶段。LIBERO 的 15/8
+缓存契约不变。
 
 ## 输出与校验
 

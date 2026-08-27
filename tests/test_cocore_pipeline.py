@@ -14,6 +14,7 @@ import pytest
 import yaml
 
 from cocore import pipeline as cocore_pipeline
+from cocore import prototypes as cocore_prototypes
 from cocore.config import to_relcore_config
 from cocore.pipeline import encode_stage, graph_stage, run_pipeline, scan_stage, validate_output
 from relcore.schemas import ClipRecord
@@ -1322,6 +1323,53 @@ def test_graph_fingerprint_includes_motion_primitive_profile(tmp_path: Path) -> 
         visual_encoder=CocoreVisualEncoder(),
     )
     assert first[4] != second[4]
+
+
+def test_bridge_action_contract_rebuilds_only_graph_and_select_caches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["prototypes"]["profile"] = "bridge_v2"  # type: ignore[index]
+    monkeypatch.setattr(cocore_prototypes, "MIN_ACTION_FREQUENCY", 0.001)
+
+    legacy_result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    root = legacy_result.parent
+    stage_directories = {
+        "scan": root / "scan",
+        "encode": root / "encode",
+        "graph": root / "graph-18-motion-hard-nearest-pca",
+        "select": legacy_result,
+    }
+    legacy_fingerprints = {
+        stage: json.loads((directory / "manifest.json").read_text())["fingerprint"]
+        for stage, directory in stage_directories.items()
+    }
+    monkeypatch.setattr(cocore_prototypes, "MIN_ACTION_FREQUENCY", 0.005)
+
+    with pytest.raises(FileExistsError, match="--force"):
+        run_pipeline(config, visual_encoder=FailingCocoreVisualEncoder())
+
+    rebuilt_result = run_pipeline(
+        config,
+        force=True,
+        visual_encoder=FailingCocoreVisualEncoder(),
+    )
+    rebuilt_fingerprints = {
+        stage: json.loads((directory / "manifest.json").read_text())["fingerprint"]
+        for stage, directory in stage_directories.items()
+    }
+
+    assert rebuilt_result == legacy_result
+    assert rebuilt_fingerprints["scan"] == legacy_fingerprints["scan"]
+    assert rebuilt_fingerprints["encode"] == legacy_fingerprints["encode"]
+    assert rebuilt_fingerprints["graph"] != legacy_fingerprints["graph"]
+    assert rebuilt_fingerprints["select"] != legacy_fingerprints["select"]
+    assert validate_output(rebuilt_result, config=config) == {
+        "status": "valid",
+        "selected_clips": 10,
+    }
 
 
 def test_validate_rejects_tampered_visual_prototype_center(tmp_path: Path) -> None:
