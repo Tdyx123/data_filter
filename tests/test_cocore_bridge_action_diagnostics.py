@@ -73,7 +73,9 @@ def test_diagnostic_scans_states_without_loading_images_and_reports_axes() -> No
     assert report["episode_count"] == 2
     assert report["trajectory_window_length"] == 4
     assert report["trajectory_horizon"] == 3
-    assert report["window_count"] == 804
+    assert report["trajectory_window_max_gap"] == 2
+    assert report["trajectory_window_policy"] == "full_coverage_max_gap_2_tail_rebalanced"
+    assert report["window_count"] == 1_204
     assert report["unique_compound_labels"] == 2
     assert report["retained_non_stop_action_buckets"] == 2
     assert report["estimated_leaf_prototypes"] == 20
@@ -117,6 +119,8 @@ def test_reference_acceptance_reports_every_failed_contract() -> None:
     failures = validate_reference_acceptance(
         {
             "window_count": 1,
+            "trajectory_window_max_gap": 3,
+            "trajectory_window_policy": "full_coverage_max_gap_3_tail_rebalanced",
             "retention_cutoff": 1,
             "unique_compound_labels": 1,
             "retained_non_stop_action_buckets": 1,
@@ -130,24 +134,26 @@ def test_reference_acceptance_reports_every_failed_contract() -> None:
         }
     )
 
-    assert len(failures) == 11
+    assert len(failures) == 13
     assert all(isinstance(failure, str) and failure for failure in failures)
 
 
-def test_reference_acceptance_accepts_balanced_point_five_percent_baseline() -> None:
+def test_reference_acceptance_accepts_two_frame_gap_baseline() -> None:
     failures = validate_reference_acceptance(
         {
-            "window_count": 434_370,
-            "retention_cutoff": 2_172,
-            "unique_compound_labels": 1_104,
-            "retained_non_stop_action_buckets": 24,
-            "estimated_leaf_prototypes": 530,
-            "exact_non_stop_coverage": 0.6018,
-            "parent_fallback_rate": 0.1456,
-            "no_parent_fallback_rate": 0.0126,
-            "raw_stop_rate": 0.2400,
-            "atomic_action_retention_quality": 0.684,
-            "atomic_occurrence_retention_quality": 0.841,
+            "window_count": 622_782,
+            "trajectory_window_max_gap": 2,
+            "trajectory_window_policy": "full_coverage_max_gap_2_tail_rebalanced",
+            "retention_cutoff": 3_114,
+            "unique_compound_labels": 1_181,
+            "retained_non_stop_action_buckets": 25,
+            "estimated_leaf_prototypes": 594,
+            "exact_non_stop_coverage": 0.6062,
+            "parent_fallback_rate": 0.1422,
+            "no_parent_fallback_rate": 0.0122,
+            "raw_stop_rate": 0.2394,
+            "atomic_action_retention_quality": 0.6879,
+            "atomic_occurrence_retention_quality": 0.8467,
         }
     )
 

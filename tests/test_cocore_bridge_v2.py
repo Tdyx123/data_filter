@@ -214,7 +214,7 @@ def test_package_exposes_only_version() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["0.9.0", "['__version__']"]
+    assert result.stdout.splitlines() == ["0.10.0", "['__version__']"]
 
 
 def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None:
@@ -873,12 +873,20 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     assert run_manifest["visual_half_encoding"] == "l2_normalized_four_frame_mean"
     assert run_manifest["trajectory_window_length"] == 4
     assert run_manifest["trajectory_horizon"] == 3
+    assert run_manifest["trajectory_window_max_gap"] == 2
+    assert run_manifest["trajectory_window_policy"] == (
+        "full_coverage_max_gap_2_tail_rebalanced"
+    )
     assert graph_manifest["prototype_profile"] == "bridge_v2"
     assert graph_manifest["prototype_visual_normalization"] == (
         "l2_normalized_four_frame_mean_after_projection"
     )
     assert graph_manifest["trajectory_window_length"] == 4
     assert graph_manifest["trajectory_horizon"] == 3
+    assert graph_manifest["trajectory_window_max_gap"] == 2
+    assert graph_manifest["trajectory_window_policy"] == (
+        "full_coverage_max_gap_2_tail_rebalanced"
+    )
     assert graph_manifest["motion_primitive"]["roll_labels"] == {
         "positive": "roll positive",
         "negative": "roll negative",
@@ -898,8 +906,12 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
         "negative": "roll negative",
     }
     assert catalog["constants"]["cyclic_axes"] == [3, 5]
-    assert catalog["total_raw_actions"] == 404
+    assert catalog["total_raw_actions"] == 604
     assert catalog["constants"]["trajectory_window_length"] == 4
+    assert catalog["constants"]["trajectory_window_max_gap"] == 2
+    assert catalog["constants"]["trajectory_window_policy"] == (
+        "full_coverage_max_gap_2_tail_rebalanced"
+    )
     assert catalog["constants"]["visual_half_windows"] == [[0, 4], [3, 7]]
     assert catalog["constants"]["visual_half_encoding"] == (
         "l2_normalized_mean_of_four_projected_frames"
@@ -925,6 +937,26 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
         {"roll": 0.12, "tilt": 0.12, "rotation": 0.18}
     )
     (graph_root / "prototype_catalog.json").write_text(json.dumps(legacy_catalog))
+    with pytest.raises(ValueError, match="prototype catalog schema"):
+        validate_output(result, config=config)
+    (graph_root / "prototype_catalog.json").write_text(json.dumps(catalog))
+
+    legacy_temporal_manifest = copy.deepcopy(run_manifest)
+    legacy_temporal_manifest["trajectory_window_max_gap"] = 3
+    legacy_temporal_manifest["trajectory_window_policy"] = (
+        "full_coverage_max_gap_3_tail_rebalanced"
+    )
+    (result / "run_manifest.json").write_text(json.dumps(legacy_temporal_manifest))
+    with pytest.raises(ValueError, match="temporal geometry"):
+        validate_output(result, config=config)
+    (result / "run_manifest.json").write_text(json.dumps(run_manifest))
+
+    legacy_temporal_catalog = copy.deepcopy(catalog)
+    legacy_temporal_catalog["constants"]["trajectory_window_max_gap"] = 3
+    legacy_temporal_catalog["constants"]["trajectory_window_policy"] = (
+        "full_coverage_max_gap_3_tail_rebalanced"
+    )
+    (graph_root / "prototype_catalog.json").write_text(json.dumps(legacy_temporal_catalog))
     with pytest.raises(ValueError, match="prototype catalog schema"):
         validate_output(result, config=config)
     (graph_root / "prototype_catalog.json").write_text(json.dumps(catalog))

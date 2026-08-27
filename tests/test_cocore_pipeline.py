@@ -527,6 +527,8 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     )
     assert graph_manifest["trajectory_window_length"] == 8
     assert graph_manifest["trajectory_horizon"] == 7
+    assert "trajectory_window_max_gap" not in graph_manifest
+    assert "trajectory_window_policy" not in graph_manifest
     assert "prototype_action_weights" not in nodes.files
     assert "prototype_distance_weights" not in nodes.files
     assert np.all(nodes["prototype_weights"].sum(axis=1) > 0.0)
@@ -614,6 +616,8 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert run_manifest["visual_half_encoding"] == "l2_normalized_eight_frame_mean"
     assert run_manifest["trajectory_window_length"] == 8
     assert run_manifest["trajectory_horizon"] == 7
+    assert "trajectory_window_max_gap" not in run_manifest
+    assert "trajectory_window_policy" not in run_manifest
     assert run_manifest["sequence_adjacency"] == "ordered_candidates"
     select_manifest = json.loads((result / "manifest.json").read_text())
     assert select_manifest["cocore_version"] == "0.16.0"

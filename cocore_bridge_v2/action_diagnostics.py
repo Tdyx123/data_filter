@@ -187,6 +187,7 @@ def analyze_bridge_action_windows(
             trajectory_window_starts(
                 len(states),
                 window_length=geometry.trajectory_window_length,
+                max_gap=geometry.trajectory_window_max_gap,
             ),
             dtype=np.int64,
         )
@@ -214,6 +215,8 @@ def analyze_bridge_action_windows(
         "episode_count": len(records),
         "trajectory_window_length": geometry.trajectory_window_length,
         "trajectory_horizon": geometry.state_delta_horizon,
+        "trajectory_window_max_gap": geometry.trajectory_window_max_gap,
+        "trajectory_window_policy": geometry.trajectory_window_policy,
         "motion_primitive": motion_primitive_contract(_PROFILE),
         "axis_statistics": _axis_statistics(axis_deltas),
     }
@@ -223,43 +226,52 @@ def validate_reference_acceptance(report: Mapping[str, object]) -> tuple[str, ..
     """Return deviations from the fixed full BridgeData V2 acceptance contract."""
 
     checks = (
-        (report.get("window_count") == 434_370, "window_count must equal 434370"),
-        (report.get("retention_cutoff") == 2_172, "retention_cutoff must equal 2172"),
         (
-            report.get("unique_compound_labels") == 1_104,
-            "unique_compound_labels must equal 1104",
+            report.get("trajectory_window_max_gap") == 2,
+            "trajectory_window_max_gap must equal 2",
         ),
         (
-            report.get("retained_non_stop_action_buckets") == 24,
-            "retained_non_stop_action_buckets must equal 24",
+            report.get("trajectory_window_policy")
+            == "full_coverage_max_gap_2_tail_rebalanced",
+            "trajectory_window_policy must use full coverage with maximum gap 2",
+        ),
+        (report.get("window_count") == 622_782, "window_count must equal 622782"),
+        (report.get("retention_cutoff") == 3_114, "retention_cutoff must equal 3114"),
+        (
+            report.get("unique_compound_labels") == 1_181,
+            "unique_compound_labels must equal 1181",
         ),
         (
-            report.get("estimated_leaf_prototypes") == 530,
-            "estimated_leaf_prototypes must equal 530",
+            report.get("retained_non_stop_action_buckets") == 25,
+            "retained_non_stop_action_buckets must equal 25",
         ),
         (
-            abs(float(report.get("exact_non_stop_coverage", math.nan)) - 0.6018) <= 0.0005,
-            "exact_non_stop_coverage must be within 0.05 percentage points of 60.18%",
+            report.get("estimated_leaf_prototypes") == 594,
+            "estimated_leaf_prototypes must equal 594",
         ),
         (
-            abs(float(report.get("parent_fallback_rate", math.nan)) - 0.1456) <= 0.0005,
-            "parent_fallback_rate must be within 0.05 percentage points of 14.56%",
+            abs(float(report.get("exact_non_stop_coverage", math.nan)) - 0.6062) <= 0.0005,
+            "exact_non_stop_coverage must be within 0.05 percentage points of 60.62%",
         ),
         (
-            float(report.get("no_parent_fallback_rate", math.inf)) <= 0.013,
-            "no_parent_fallback_rate must not exceed 1.30%",
+            abs(float(report.get("parent_fallback_rate", math.nan)) - 0.1422) <= 0.0005,
+            "parent_fallback_rate must be within 0.05 percentage points of 14.22%",
         ),
         (
-            abs(float(report.get("raw_stop_rate", math.nan)) - 0.2400) <= 0.0005,
-            "raw_stop_rate must be within 0.05 percentage points of 24.00%",
+            float(report.get("no_parent_fallback_rate", math.inf)) <= 0.0123,
+            "no_parent_fallback_rate must not exceed 1.23%",
         ),
         (
-            float(report.get("atomic_action_retention_quality", -math.inf)) >= 0.684,
-            "atomic_action_retention_quality must be at least 68.4%",
+            abs(float(report.get("raw_stop_rate", math.nan)) - 0.2394) <= 0.0005,
+            "raw_stop_rate must be within 0.05 percentage points of 23.94%",
         ),
         (
-            float(report.get("atomic_occurrence_retention_quality", -math.inf)) >= 0.841,
-            "atomic_occurrence_retention_quality must be at least 84.1%",
+            float(report.get("atomic_action_retention_quality", -math.inf)) >= 0.6879,
+            "atomic_action_retention_quality must be at least 68.79%",
+        ),
+        (
+            float(report.get("atomic_occurrence_retention_quality", -math.inf)) >= 0.8467,
+            "atomic_occurrence_retention_quality must be at least 84.67%",
         ),
     )
     return tuple(message for passed, message in checks if not passed)

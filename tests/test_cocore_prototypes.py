@@ -664,6 +664,52 @@ def test_four_frame_trajectory_window_starts_preserve_full_coverage_and_gap_poli
         assert all(1 <= gap <= 3 for gap in gaps)
 
 
+@pytest.mark.parametrize(
+    ("trajectory_length", "expected"),
+    [
+        (3, ()),
+        (4, (0,)),
+        (5, (0, 1)),
+        (6, (0, 2)),
+        (7, (0, 2, 3)),
+        (8, (0, 2, 4)),
+        (9, (0, 2, 4, 5)),
+        (10, (0, 2, 4, 6)),
+        (11, (0, 2, 4, 6, 7)),
+    ],
+)
+def test_bridge_four_frame_trajectory_starts_use_two_frame_gap_and_cover_tail(
+    trajectory_length: int,
+    expected: tuple[int, ...],
+) -> None:
+    assert prototypes.trajectory_window_starts(
+        trajectory_length,
+        window_length=4,
+        max_gap=2,
+    ) == expected
+
+
+def test_bridge_four_frame_trajectory_starts_never_exceed_two_frame_gap() -> None:
+    for trajectory_length in range(4, 501):
+        starts = prototypes.trajectory_window_starts(
+            trajectory_length,
+            window_length=4,
+            max_gap=2,
+        )
+        gaps = tuple(right - left for left, right in zip(starts, starts[1:], strict=False))
+
+        assert starts[0] == 0
+        assert starts[-1] == trajectory_length - 4
+        assert tuple(sorted(set(starts))) == starts
+        assert all(1 <= gap <= 2 for gap in gaps)
+
+
+@pytest.mark.parametrize("max_gap", [True, 0, -1, 1.5])
+def test_trajectory_window_starts_rejects_invalid_max_gap(max_gap: object) -> None:
+    with pytest.raises(ValueError, match="maximum gap"):
+        prototypes.trajectory_window_starts(8, max_gap=max_gap)  # type: ignore[arg-type]
+
+
 def test_nearest_distance_bounds_and_confidence_use_q10_q90_linear_mapping() -> None:
     lower, upper = prototypes.nearest_distance_bounds(np.arange(11, dtype=np.float32))
 
@@ -925,6 +971,10 @@ def test_bridge_catalog_serializes_seven_dof_threshold_and_wrap_contract() -> No
     assert payload["constants"]["cyclic_axes"] == [3, 5]
     assert payload["constants"]["min_action_frequency"] == 0.005
     assert payload["constants"]["trajectory_window_length"] == 4
+    assert payload["constants"]["trajectory_window_max_gap"] == 2
+    assert payload["constants"]["trajectory_window_policy"] == (
+        "full_coverage_max_gap_2_tail_rebalanced"
+    )
     assert payload["constants"]["visual_half_windows"] == [[0, 4], [3, 7]]
     assert payload["constants"]["visual_half_encoding"] == (
         "l2_normalized_mean_of_four_projected_frames"
@@ -1016,10 +1066,10 @@ def test_bridge_trajectory_builder_uses_seven_frame_anchors_and_four_frame_windo
     )
 
     assert result.half_action_labels.tolist() == [["move forward", "move right"]]
-    assert result.catalog.total_raw_actions == 806
+    assert result.catalog.total_raw_actions == 1_207
     by_label = {category.label: category for category in result.catalog.action_categories}
-    assert by_label["move forward"].training_count == 403
-    assert by_label["move right"].training_count == 403
+    assert by_label["move forward"].training_count == 603
+    assert by_label["move right"].training_count == 603
 
 
 def test_full_trajectory_builder_materializes_each_episode_visual_once(

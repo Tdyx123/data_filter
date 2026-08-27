@@ -14,6 +14,7 @@ class TemporalGeometry:
     clip_anchors: tuple[int, int, int]
     visual_half_windows: tuple[tuple[int, int], tuple[int, int]]
     trajectory_window_length: int
+    trajectory_window_max_gap: int
 
     @property
     def state_delta_horizon(self) -> int:
@@ -27,6 +28,15 @@ class TemporalGeometry:
 
         return self.trajectory_window_length
 
+    @property
+    def trajectory_window_policy(self) -> str:
+        """Return the serialized full-coverage start-sampling policy."""
+
+        return (
+            f"full_coverage_max_gap_{self.trajectory_window_max_gap}_"
+            "tail_rebalanced"
+        )
+
 
 _TEMPORAL_GEOMETRIES = {
     "libero": TemporalGeometry(
@@ -35,6 +45,7 @@ _TEMPORAL_GEOMETRIES = {
         clip_anchors=(0, 7, 14),
         visual_half_windows=((0, 8), (7, 15)),
         trajectory_window_length=8,
+        trajectory_window_max_gap=3,
     ),
     "bridge_v2": TemporalGeometry(
         profile="bridge_v2",
@@ -42,6 +53,7 @@ _TEMPORAL_GEOMETRIES = {
         clip_anchors=(0, 3, 6),
         visual_half_windows=((0, 4), (3, 7)),
         trajectory_window_length=4,
+        trajectory_window_max_gap=2,
     ),
 }
 

@@ -46,7 +46,9 @@ MIN_DISTANCE_WEIGHT = 0.3
 STATE_THRESHOLD = 0.03
 STATE_KEY = "observation.state"
 TRAJECTORY_WINDOW_LENGTH = resolve_temporal_geometry("libero").trajectory_window_length
-TRAJECTORY_WINDOW_POLICY = "full_coverage_max_gap_3_tail_rebalanced"
+TRAJECTORY_WINDOW_MAX_GAP = resolve_temporal_geometry(
+    "libero"
+).trajectory_window_max_gap
 CLIP_LENGTH = resolve_temporal_geometry("libero").clip_length
 
 _ATOMIC_ACTION_ORDER = (
@@ -149,7 +151,7 @@ def motion_primitive_catalog_constants(name: str) -> dict[str, object]:
         4: "four",
         8: "eight",
     }[geometry.trajectory_window_length]
-    return {
+    constants = {
         key: value for key, value in contract.items() if key != "profile"
     } | {
         "max_visual_centers": MAX_VISUAL_CENTERS,
@@ -159,7 +161,7 @@ def motion_primitive_catalog_constants(name: str) -> dict[str, object]:
         "kmeans_n_init": 1,
         "large_bucket_parallelism": "serial",
         "trajectory_window_length": geometry.trajectory_window_length,
-        "trajectory_window_policy": TRAJECTORY_WINDOW_POLICY,
+        "trajectory_window_policy": geometry.trajectory_window_policy,
         "visual_half_windows": [list(window) for window in geometry.visual_half_windows],
         "visual_projection": ("frame @ visual_pca.components[:, :frame_embedding_dim].T"),
         "visual_projection_centering": "none",
@@ -176,6 +178,9 @@ def motion_primitive_catalog_constants(name: str) -> dict[str, object]:
         "distance_weight_range": [1.0, MIN_DISTANCE_WEIGHT],
         "duplicate_merge": "max + 0.5 * min",
     }
+    if name != "libero":
+        constants["trajectory_window_max_gap"] = geometry.trajectory_window_max_gap
+    return constants
 
 
 @dataclass(frozen=True)
@@ -345,8 +350,9 @@ def cluster_count_for_training_count(training_count: float) -> int:
 def trajectory_window_starts(
     trajectory_length: int,
     window_length: int = TRAJECTORY_WINDOW_LENGTH,
+    max_gap: int = TRAJECTORY_WINDOW_MAX_GAP,
 ) -> tuple[int, ...]:
-    """Return full-coverage fixed-length starts with gaps of at most three."""
+    """Return full-coverage fixed-length starts with a bounded maximum gap."""
 
     if isinstance(trajectory_length, bool) or not isinstance(trajectory_length, Integral):
         raise ValueError("trajectory length must be a non-negative integer")
@@ -359,21 +365,29 @@ def trajectory_window_starts(
         or int(window_length) <= 0
     ):
         raise ValueError("trajectory window length must be a positive integer")
+    if (
+        isinstance(max_gap, bool)
+        or not isinstance(max_gap, Integral)
+        or int(max_gap) <= 0
+    ):
+        raise ValueError("trajectory window maximum gap must be a positive integer")
     last_start = length - int(window_length)
     if last_start < 0:
         return ()
     if last_start == 0:
         return (0,)
 
-    full_gaps, remainder = divmod(last_start, 3)
+    maximum_gap = int(max_gap)
+    full_gaps, remainder = divmod(last_start, maximum_gap)
     if remainder == 0:
-        gaps = [3] * full_gaps
-    elif remainder == 2:
-        gaps = [3] * full_gaps + [2]
-    elif last_start == 1:
-        gaps = [1]
+        gaps = [maximum_gap] * full_gaps
+    elif full_gaps == 0:
+        gaps = [remainder]
     else:
-        gaps = [3] * (full_gaps - 1) + [2, 2]
+        tail_span = maximum_gap + remainder
+        first_tail_gap = math.ceil(tail_span / 2)
+        second_tail_gap = tail_span - first_tail_gap
+        gaps = [maximum_gap] * (full_gaps - 1) + [first_tail_gap, second_tail_gap]
 
     starts = [0]
     for gap in gaps:
@@ -605,6 +619,7 @@ def _episode_window_visuals(
     pca_components: np.ndarray,
     visual_dim: int,
     window_length: int = TRAJECTORY_WINDOW_LENGTH,
+    max_gap: int = TRAJECTORY_WINDOW_MAX_GAP,
 ) -> np.ndarray:
     path = cache_root / f"ep{record.episode_id:06d}.npy"
     if not path.is_file():
@@ -630,7 +645,11 @@ def _episode_window_visuals(
     )
 
     window_starts = np.asarray(
-        trajectory_window_starts(record.length, window_length=window_length),
+        trajectory_window_starts(
+            record.length,
+            window_length=window_length,
+            max_gap=max_gap,
+        ),
         dtype=np.int64,
     )
     if len(window_starts) == 0:
@@ -673,10 +692,15 @@ def _episode_exact_memberships(
     primitive_config: object,
     *,
     window_length: int = TRAJECTORY_WINDOW_LENGTH,
+    max_gap: int = TRAJECTORY_WINDOW_MAX_GAP,
 ) -> dict[int, np.ndarray]:
     local_rows: dict[int, list[int]] = {}
     for row, timestep in enumerate(
-        trajectory_window_starts(len(states), window_length=window_length)
+        trajectory_window_starts(
+            len(states),
+            window_length=window_length,
+            max_gap=max_gap,
+        )
     ):
         raw_label = classify_motion_primitive(
             states[timestep],
@@ -705,6 +729,7 @@ def _materialize_action_training_data(
     max_episodes: int | None,
     num_workers: int,
     window_length: int = TRAJECTORY_WINDOW_LENGTH,
+    max_gap: int = TRAJECTORY_WINDOW_MAX_GAP,
 ) -> dict[int, _ActionTrainingData]:
     values = {
         action_id: np.empty((category.training_count, int(visual_dim)), dtype=np.float32)
@@ -723,7 +748,10 @@ def _materialize_action_training_data(
     ):
         states = _validated_states(episode, expected, seen, pass_name="training data")
         record = expected[episode.episode_id]
-        if window_length == TRAJECTORY_WINDOW_LENGTH:
+        if (
+            window_length == TRAJECTORY_WINDOW_LENGTH
+            and max_gap == TRAJECTORY_WINDOW_MAX_GAP
+        ):
             window_visuals = _episode_window_visuals(
                 cache_root,
                 record,
@@ -737,9 +765,14 @@ def _materialize_action_training_data(
                 pca_components=pca_components,
                 visual_dim=visual_dim,
                 window_length=window_length,
+                max_gap=max_gap,
             )
         if len(window_visuals) != len(
-            trajectory_window_starts(len(states), window_length=window_length)
+            trajectory_window_starts(
+                len(states),
+                window_length=window_length,
+                max_gap=max_gap,
+            )
         ):
             raise ValueError(f"episode {episode.episode_id}: state/cache length mismatch")
         memberships = _episode_exact_memberships(
@@ -747,6 +780,7 @@ def _materialize_action_training_data(
             categories_by_label,
             primitive_config,
             window_length=window_length,
+            max_gap=max_gap,
         )
         for action_id in sorted(memberships):
             rows = memberships[action_id]
@@ -1007,6 +1041,7 @@ def build_hierarchical_motion_prototypes(
         window_starts = trajectory_window_starts(
             len(states),
             window_length=geometry.trajectory_window_length,
+            max_gap=geometry.trajectory_window_max_gap,
         )
         raw_counts.update(
             classify_motion_primitive(
@@ -1085,6 +1120,7 @@ def build_hierarchical_motion_prototypes(
         max_episodes=max_episodes,
         num_workers=num_workers,
         window_length=geometry.trajectory_window_length,
+        max_gap=geometry.trajectory_window_max_gap,
     )
     if timing_callback is not None:
         timing_callback(

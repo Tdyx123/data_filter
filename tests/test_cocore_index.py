@@ -21,14 +21,34 @@ def test_temporal_geometries_define_immutable_libero_and_bridge_contracts() -> N
         libero.visual_half_windows,
         libero.trajectory_window_length,
         libero.state_delta_horizon,
-    ) == (15, (0, 7, 14), ((0, 8), (7, 15)), 8, 7)
+        libero.trajectory_window_max_gap,
+        libero.trajectory_window_policy,
+    ) == (
+        15,
+        (0, 7, 14),
+        ((0, 8), (7, 15)),
+        8,
+        7,
+        3,
+        "full_coverage_max_gap_3_tail_rebalanced",
+    )
     assert (
         bridge.clip_length,
         bridge.clip_anchors,
         bridge.visual_half_windows,
         bridge.trajectory_window_length,
         bridge.state_delta_horizon,
-    ) == (7, (0, 3, 6), ((0, 4), (3, 7)), 4, 3)
+        bridge.trajectory_window_max_gap,
+        bridge.trajectory_window_policy,
+    ) == (
+        7,
+        (0, 3, 6),
+        ((0, 4), (3, 7)),
+        4,
+        3,
+        2,
+        "full_coverage_max_gap_2_tail_rebalanced",
+    )
     with pytest.raises(FrozenInstanceError):
         bridge.clip_length = 15  # type: ignore[misc]
 
