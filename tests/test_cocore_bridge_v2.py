@@ -269,9 +269,7 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
     }
     assert config["prototypes"]["num_threads"] == 4
     assert config["objective"] == {"relation": "sequence", "relation_weight": 1.5}
-    assert config["selection"]["ratio"] == 0.2
-    assert config["selection"]["budget"] is None
-    assert config["selection"]["method"] == "lazy_heap"
+    assert config["selection"] == {"ratio": 0.2, "budget": None}
     assert config["runtime"]["max_episodes"] == 100
     assert config["output"]["directory"] == ("outputs/cocore_bridge_v2/bridge_orig_1.0.0")
     translated = to_relcore_config(config)
@@ -283,17 +281,16 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
     assert translated["selection"]["minimum_per_task"] == 0
 
 
-def test_bridge_config_accepts_random_multibranch_selection(tmp_path: Path) -> None:
+def test_bridge_config_rejects_removed_selection_method(tmp_path: Path) -> None:
     from cocore_bridge_v2.config import build_config
 
-    config = build_config(
-        relation="sequence",
-        relation_weight=1.0,
-        selection_method="random_multibranch",
-        dataset_path=tmp_path / "bridge",
-    )
-
-    assert config["selection"]["method"] == "random_multibranch"
+    with pytest.raises(TypeError, match="selection_method"):
+        build_config(
+            relation="sequence",
+            relation_weight=1.0,
+            selection_method="random_multibranch",  # type: ignore[call-arg]
+            dataset_path=tmp_path / "bridge",
+        )
 
 
 def test_bridge_config_can_disable_stop_bucket(tmp_path: Path) -> None:
@@ -463,11 +460,10 @@ def test_every_command_accepts_explicit_relation_and_weight(command: str) -> Non
     assert parsed.max_episodes == 7
     if command in {"select", "run", "validate"}:
         assert parsed.selection_ratio == 0.10
-        assert parsed.selection_method == "lazy_heap"
 
 
 @pytest.mark.parametrize("command", ["select", "run", "validate"])
-def test_bridge_selection_commands_accept_random_multibranch_method(command: str) -> None:
+def test_bridge_selection_commands_reject_removed_selection_method(command: str) -> None:
     from cocore_bridge_v2 import cli
 
     arguments = [
@@ -482,9 +478,8 @@ def test_bridge_selection_commands_accept_random_multibranch_method(command: str
     if command == "validate":
         arguments += ["--output-dir", "result"]
 
-    parsed = cli.build_parser().parse_args(arguments)
-
-    assert parsed.selection_method == "random_multibranch"
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(arguments)
 
 
 @pytest.mark.parametrize("command", ["build-graph", "select", "run", "validate"])

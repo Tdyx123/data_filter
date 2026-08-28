@@ -51,10 +51,8 @@ graph:
   cooccurrence_max_gap: 4
 
 selection:
-  method: lazy_heap
   ratio: 0.10
   budget: null
-  max_refreshes: 100
 
 runtime:
   num_workers: 4

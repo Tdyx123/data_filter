@@ -33,7 +33,7 @@ Cocore 的编码、运动原语、关系目标或选择算法，而是固定 Bri
   独立，改变线程数不改变 graph 指纹；
 - 候选按 `[0..3]`、`[3..6]` 独立选择最近叶原型，权重为保留比例置信度与桶内距离
   置信度的乘积；同叶合并，最终绝对权重不归一；
-- 全局选择，不施加逐任务配额。
+- 固定使用随机多分支全局选择，不施加逐任务配额。
 
 Bridge 为 5 Hz，因此 7 帧片段按帧数计约 1.4 秒，运动原语的
 `state[t] → state[t+3]` 状态差跨度为 0.6 秒。本适配包不重采样轨迹帧，也不改变 Cocore
@@ -62,7 +62,6 @@ python -m cocore_bridge_v2 build-graph \
 
 python -m cocore_bridge_v2 select \
   --relation sequence --relation-weight 1.0 \
-  --selection-method random_multibranch \
   --selection-ratio 0.10
 
 python -m cocore_bridge_v2 run \
@@ -72,9 +71,8 @@ python -m cocore_bridge_v2 run \
   --force
 ```
 
-关系可选择 `sequence` 或 `cooccurrence`。`select`、`run` 和 `validate` 的
-`--selection-method` 可选 `lazy_heap`（默认）或 `random_multibranch`，
-`--selection-ratio` 默认是 `0.10`。执行阶段还支持：
+关系可选择 `sequence` 或 `cooccurrence`。选择算法固定为 `random_multibranch`；
+`select`、`run` 和 `validate` 的 `--selection-ratio` 默认是 `0.10`。执行阶段还支持：
 
 - `--dataset-path PATH`：覆盖默认挂载点，但目标必须满足同一 Bridge schema；
 - `--output-dir PATH`：覆盖默认输出根目录；
@@ -94,8 +92,7 @@ outputs/cocore_bridge_v2/bridge_orig_1.0.0
 ```
 
 其中包含 `scan/`、`encode/`、`graph-18-motion-hard-nearest-pca/` 和
-`select-<relation>-w<weight>-top<ratio>pct/`；随机多分支结果追加
-`-random-multibranch`。选择目录继续提供
+`select-<relation>-w<weight>-top<ratio>pct-random-multibranch/`。选择目录继续提供
 `selected_manifest.jsonl`、`all_clips.parquet`、`selection_report.json`、
 `manifest.json` 和 `run_manifest.json`；encode 目录提供 Quality 融合
 `embeddings.npy`、`visual_pca.npz`、`numeric_normalizers.npz`、按 episode 分片的
@@ -107,8 +104,9 @@ graph 目录提供 schema 10 的 `prototype_catalog.json`、128 维
 PCA components 前半列进行逐帧纯矩阵投影，不使用 mean/scale。选择输出包含最终
 原型标签、动作标签、绝对置信度和 `half_action_labels`，不包含旧的 action/distance
 分解权重。catalog 与 manifest 记录 `bridge_v2` profile、分轴阈值、roll 标签、环绕轴
-和 `0.5%/400` 保留策略，并记录起点最大间隔 2 的窗口策略。manifest 的生产者仍为
-`cocore`；Cocore 版本为 0.16.0，Bridge 包版本为 0.10.0。
+和 `0.5%/400` 保留策略，并记录起点最大间隔 2 的窗口策略。select manifest 与报告
+使用 selection schema 1；manifest 的生产者仍为 `cocore`。Cocore 版本为 0.16.0，
+Bridge 包版本为 0.10.0。
 
 视觉中心训练只物化一次保留窗口投影；小桶并行执行完整 KMeans，大桶串行执行
 MiniBatchKMeans。Bridge V2 完整生产数据的基础额外内存约为 257 MiB（按参考精确保留
@@ -117,7 +115,9 @@ MiniBatchKMeans。Bridge V2 完整生产数据的基础额外内存约为 257 Mi
 Cocore schema 9 artifact 不迁移且 validator 会拒绝。Cocore 仍为 0.16.0/schema 10；
 Bridge 0.10.0 的最大起点间隔 2 与 0.9.0 的最大间隔 3 不兼容。旧 graph/selection
 artifact 会被 validator 拒绝，必须使用 `--force` 重建；契约兼容的 scan/encode 缓存
-继续复用。0.7.x 的 15/8 artifact 与 7/4 几何不兼容，升级时仍需重建全部阶段。
+继续复用。缺少 selection schema 1、但上游 graph 指纹与随机多分支算法契约匹配的旧
+select 缓存会自动仅重建选择阶段；旧堆算法产物不会迁移。0.7.x 的 15/8 artifact 与
+7/4 几何不兼容，升级时仍需重建全部阶段。
 
 验证时必须重复传入生成该选择结果时使用的目标、比例、数据集路径以及
 `--max-episodes`（若生成时设置）。省略 `--max-episodes` 表示按完整有效数据集重放；
@@ -128,10 +128,9 @@ Bridge schema preflight；validator 会从该路径重放源 episode 的 state/t
 ```bash
 python -m cocore_bridge_v2 validate \
   --output-dir \
-    outputs/cocore_bridge_v2/bridge_orig_1.0.0/select-sequence-w1-top10pct \
+    outputs/cocore_bridge_v2/bridge_orig_1.0.0/select-sequence-w1-top10pct-random-multibranch \
   --dataset-path /data/dwb/datasets/bridge_orig_1.0.0_lerobot \
   --relation sequence --relation-weight 1.0 \
-  --selection-method lazy_heap \
   --selection-ratio 0.10 \
   --max-episodes 100 \
   --no-use-stop-bucket

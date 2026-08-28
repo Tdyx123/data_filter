@@ -89,7 +89,7 @@ w_half = w_r * w_d
 
 可靠性固定为 `sqrt(support * progress)`。初始集合为每个可达运动原语选择
 `reliability * assignment` 最大的片段并取并集，使所有原型 coverage 达到全池最大值。
-`selection.method` 默认使用 `lazy_heap`，其余预算使用确定性的惰性最大堆近似优化：
+其余预算固定使用可复现的随机多分支搜索，并优化以下目标：
 
 ```text
 c_p(S) = max_{i in S}(reliability_i * assignment_{i,p})
@@ -109,17 +109,7 @@ score(S) = relation_weight * relation(S) - redundancy(S)
 加权相似边定义。由于覆盖种子已经使每个 `c_p(S)` 达到全池最大值，`cooccurrence`
 模式在初始化后不再产生正向关系增益，剩余候选主要按冗余惩罚竞争。
 
-初始化后，所有剩余片段按相对初始集合的边际增益建成最大堆。每选一个片段后，堆顶的
-旧增益按当前集合惰性重算；如果已更新条目成为堆顶就立即选择，否则每轮最多重算
-`selection.max_refreshes` 个条目（默认 100），达到上限时选择本轮已更新条目中增益
-最大的片段。初始化集合不计入堆选择步数；在准备选择第 8、16、32、……个堆候选前，
-算法会按当前集合重算全部未选片段的边际增益并重建堆，再选择新的堆顶。全量重建次数
-不计入 `heap_refreshes` 等惰性刷新统计。增益相同时按 `sample_id` 稳定排序。
-
-堆阶段不施加任务配额，所有剩余片段全局竞争。由于 sequence 项可能使边际增益随集合增长，
-旧堆值不一定是严格上界，因此这是有界近似算法，不保证与全量贪心或旧束搜索结果一致。
-
-`selection.method: random_multibranch` 改用可复现的随机多分支搜索。coverage seed 始终作为
+coverage seed 始终作为
 固定集合；初始化 8 个活动分支，各无放回抽取 10 个片段并记作第 1 轮。以后每个父分支
 生成 4 个各补入 10 个片段的子分支，从 32 个子分支中保留 8 个。cooccurrence 关系项仍
 使用全部固定片段和当前分支片段。sequence 分支在初始化和每次重组后从零开始，只保留
@@ -148,9 +138,9 @@ denominator 仍使用全池 sequence 计数。
 更新；8、4、10、20、10 和两个用途不同的 100 都是固定算法常量，不提供额外配置项。
 
 增量 sequence、冗余口径与 `recombination_ranking` 排序规则记录在选择算法元数据中，
-因此旧 `random_multibranch` select 缓存与新口径不兼容。升级后可运行
-`python -m cocore select --config <config> --force` 仅重建 select 产物；既有 scan、
-encode 和 graph 产物继续复用。sequence 随机多分支产物中，`selection_report.json` 的
+selection 产物使用独立 schema 1。缺少该 schema、但算法与上游 graph 指纹均匹配的旧
+随机多分支缓存会自动只重建 select 产物，继续复用 scan、encode 和 graph；旧堆选择
+产物不迁移且 validator 会拒绝。sequence 随机多分支产物中，`selection_report.json` 的
 `objective.relation`、`weighted_relation`、`total` 及逐片段增益均使用上述分支局部口径。
 
 随机多分支选择会用单调高精度时钟记录每轮分支生成、评分与保留耗时；发生重组时，
@@ -210,10 +200,8 @@ prototypes:
   use_stop_bucket: true
 
 selection:
-  method: lazy_heap  # 或 random_multibranch
   ratio: 0.10
   budget: null
-  max_refreshes: 100  # 仅 lazy_heap 使用
 ```
 
 片段长度由 profile 固定为 LIBERO 15 帧或 Bridge 7 帧，候选数量、首尾锚定与近似均匀
@@ -246,11 +234,10 @@ Bridge Orig V2 参考数据（排除空任务 episode）包含 38,660 条有效 
 回退不超过 1.23%，原始 stop 约 23.94%；原子动作与 occurrence 保留质量分别至少为
 68.79% 和 84.67%。
 
-可在运行时覆盖选择方法、选择比例、关系类型与关系权重：
+可在运行时覆盖选择比例、关系类型与关系权重：
 
 ```bash
 python -m cocore run --config cocore/config_libero90.yaml \
-  --selection-method random_multibranch \
   --selection-ratio 0.20 \
   --relation sequence \
   --relation-weight 1.5
@@ -268,8 +255,7 @@ python -m cocore run --config cocore/config_libero90.yaml \
 ```
 
 上述选择写入
-`outputs/cocore/libero90/select-sequence-w1p5-top20pct-random-multibranch/`；默认
-`lazy_heap` 仍写入原目录名。
+`outputs/cocore/libero90/select-sequence-w1p5-top20pct-random-multibranch/`。
 `--cooccurrence-weight` 已移除；Cocore 也不接受
 RelCore 的 `--reliability-metrics`、`--prototype-method` 或
 `--prototype-gain-metrics` 参数。
@@ -285,7 +271,7 @@ Cocore 0.16.0 使用 prototype schema 10、profile 固定的 15/8（LIBERO）或
 候选诱导子图、65,536 窗口的混合 KMeans 阈值、LIBERO 最大间隔 3、Bridge 最大间隔 2
 的动作训练窗口、裁剪 PCA
 的 128 维聚类空间、近似均匀候选和原始相邻 sequence 图，并按 episode 持久化完整原始
-逐帧 CLIP 特征，并提供 lazy heap 与随机多分支两种选择方法。0.15.x 的 schema 9
+逐帧 CLIP 特征，选择阶段固定使用 selection schema 1 的随机多分支算法。0.15.x 的 schema 9
 artifact 不迁移，也不会被 validator 接受；既有 scan、encode、graph 和 selection 缓存
 全部视为不兼容。Bridge 适配器 0.10.0 保持 Cocore 0.16.0/schema 10；相对 0.9.0，
 新的动作窗口最大间隔 2 进入 graph/select 指纹、manifest 和 catalog，旧 graph/selection
@@ -296,8 +282,7 @@ Bridge 15/8 artifact 与 7/4 几何不兼容，升级时仍需重建全部阶段
 ## 输出与校验
 
 输出根目录包含 `scan/`、`encode/`、`graph-18-motion-hard-nearest-pca/` 和一个或多个
-`select-<关系>-w<权重>-top<比例>pct/`；随机多分支方法追加
-`-random-multibranch`。选择目录包含：
+`select-<关系>-w<权重>-top<比例>pct-random-multibranch/`。选择目录包含：
 
 - scan 目录中的 `episodes.parquet` 与 `clips.parquet`：episode 元数据和可重放的
   近似均匀候选；Cocore scan 不再生成未被后续阶段消费的 `normalization.npz`；
@@ -317,8 +302,8 @@ Bridge 15/8 artifact 与 7/4 几何不兼容，升级时仍需重建全部阶段
 - `selected_manifest.jsonl`：训练入口可直接消费的片段清单；
 - `all_clips.parquet`：eligible 筛选池的 support、progress、reliability、运动原语与选择
   诊断，不包含无标签候选；
-- `selection_report.json`：coverage、目标分解、任务计数、lazy heap 刷新统计或
-  `branch_search` 轮次/评估/重组统计、逐轮与逐次重组耗时，以及 scanned、eligible、
+- `selection_report.json`：coverage、目标分解、任务计数、`branch_search`
+  轮次/评估/重组统计、逐轮与逐次重组耗时，以及 scanned、eligible、
   excluded-unlabeled 候选数量；
 - `manifest.json`、`run_manifest.json`：Cocore 参数、阶段目录与指纹；
 - `resolved_config.yaml`、`environment.json`：`run` 的完整配置与环境。
@@ -327,15 +312,14 @@ Bridge 15/8 artifact 与 7/4 几何不兼容，升级时仍需重建全部阶段
 
 ```bash
 python -m cocore validate \
-  --output-dir outputs/cocore/libero90/select-cooccurrence-w1-top10pct \
+  --output-dir outputs/cocore/libero90/select-cooccurrence-w1-top10pct-random-multibranch \
   --config cocore/config_libero90.yaml \
-  --selection-method lazy_heap \
   --no-use-stop-bucket
 ```
 
 只有生成结果时关闭了 stop 桶，验证时才应传入该开关。若省略 `--config`，CLI 会从
-选择目录的 `resolved_config.yaml` 读取重放配置；验证随机多分支结果时必须使用生成时
-相同的方法和 seed，校验器会重放每个分支的 FAISS 阈值检索并核对增量惩罚。复用
+选择目录的 `resolved_config.yaml` 读取重放配置；验证时必须使用生成时相同的 seed，
+校验器会重放每个分支的 FAISS 阈值检索并核对增量惩罚。复用
 0.15.x/schema 9、旧 Bridge 15/8 几何、profile、阈值、环绕策略或 stop 设置不同的
 输出目录时，应使用 `--force` 重建全部不兼容阶段。
 

@@ -53,8 +53,7 @@ def test_config_accepts_supported_relations(relation: str) -> None:
     assert resolved["prototypes"]["use_stop_bucket"] is True
     assert resolved["reliability_metrics"] == ["support", "progress"]
     assert resolved["objective"] == {"relation": relation, "relation_weight": 1.0}
-    assert resolved["selection"]["method"] == "lazy_heap"
-    assert resolved["selection"]["max_refreshes"] == 100
+    assert resolved["selection"] == {"ratio": 0.1, "budget": None}
 
 
 def test_config_accepts_bridge_v2_motion_primitive_profile() -> None:
@@ -79,17 +78,10 @@ def test_config_rejects_unknown_motion_primitive_profile(profile: object) -> Non
         )
 
 
-def test_config_accepts_random_multibranch_selection_method() -> None:
-    resolved = resolve_config(
-        {**_objective(), "selection": {"method": "random_multibranch"}}
-    )
-
-    assert resolved["selection"]["method"] == "random_multibranch"
-
-
-def test_config_rejects_unknown_selection_method() -> None:
-    with pytest.raises(ValueError, match="selection.method"):
-        resolve_config({**_objective(), "selection": {"method": "beam"}})
+@pytest.mark.parametrize("name", ["method", "max_refreshes"])
+def test_config_rejects_removed_selection_controls(name: str) -> None:
+    with pytest.raises(ValueError, match=rf"selection\.{name} was removed"):
+        resolve_config({**_objective(), "selection": {name: "unused"}})
 
 
 @pytest.mark.parametrize("weight", [-1.0, float("nan"), float("inf")])
@@ -239,12 +231,6 @@ def test_config_rejects_invalid_prototype_convergence_tolerance(tol: object) -> 
         )
 
 
-@pytest.mark.parametrize("max_refreshes", [0, -1, 1.5, True])
-def test_config_rejects_non_positive_or_non_integer_max_refreshes(max_refreshes) -> None:
-    with pytest.raises(ValueError, match="selection.max_refreshes"):
-        resolve_config({**_objective(), "selection": {"max_refreshes": max_refreshes}})
-
-
 @pytest.mark.parametrize(
     "obsolete",
     [
@@ -260,24 +246,23 @@ def test_config_rejects_removed_candidate_pool_options(obsolete: str) -> None:
 
 
 def test_selection_directory_encodes_relation_weight_and_ratio() -> None:
-    assert selection_directory_name("sequence", 1.5, 0.1) == "select-sequence-w1p5-top10pct"
-    assert (
-        selection_directory_name("cooccurrence", 0.0, 0.125) == "select-cooccurrence-w0-top12p5pct"
+    assert selection_directory_name("sequence", 1.5, 0.1) == (
+        "select-sequence-w1p5-top10pct-random-multibranch"
     )
-    assert selection_directory_name(
-        "sequence", 1.0, 0.1, "random_multibranch"
-    ) == "select-sequence-w1-top10pct-random-multibranch"
+    assert (
+        selection_directory_name("cooccurrence", 0.0, 0.125)
+        == "select-cooccurrence-w0-top12p5pct-random-multibranch"
+    )
 
 
 @pytest.mark.parametrize("command", ["select", "run", "validate"])
-def test_selection_commands_accept_random_multibranch_method(command: str) -> None:
+def test_selection_commands_reject_removed_selection_method(command: str) -> None:
     arguments = [command, "--selection-method", "random_multibranch"]
     if command == "validate":
         arguments += ["--output-dir", "result"]
 
-    parsed = cli.build_parser().parse_args(arguments)
-
-    assert parsed.selection_method == "random_multibranch"
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(arguments)
 
 
 def test_run_cli_accepts_relation_weight_and_ratio_but_rejects_old_weight() -> None:
@@ -490,7 +475,7 @@ def test_shipped_configs_resolve_to_fixed_cocore_contract(path: str) -> None:
         "relation": "cooccurrence",
         "relation_weight": 1.0,
     }
-    assert config["selection"]["max_refreshes"] == 100
+    assert set(config["selection"]) == {"ratio", "budget"}
     assert (
         not {
             "global_candidates",

@@ -66,10 +66,7 @@ from cocore.random_multibranch import (
     RandomMultiBranchSelectionResult,
     RandomMultiBranchSelector,
 )
-from cocore.selection import (
-    LazyHeapSelector,
-    build_max_coverage_seed,
-)
+from cocore.selection import build_max_coverage_seed
 from cocore.temporal import TemporalGeometry, resolve_temporal_geometry
 from cocore.timing import emit_completed_timing, timed_step
 
@@ -82,7 +79,7 @@ PROTOTYPE_STRATEGY = (
     "hybrid_kmeans_nearest"
 )
 PROTOTYPE_VISUAL_PROJECTION = "frame @ visual_pca.components[:, :frame_embedding_dim].T"
-RANDOM_MULTIBRANCH_TIMING_SCHEMA_VERSION = 1
+SELECTION_SCHEMA_VERSION = 1
 
 
 def _frame_count_name(frame_count: int) -> str:
@@ -127,60 +124,54 @@ def selection_directory_name(
     relation_type: str,
     relation_weight: float,
     ratio: float,
-    method: str = "lazy_heap",
 ) -> str:
     directory = (
         f"select-{relation_type}-w{_number_tag(relation_weight)}-top{_number_tag(ratio * 100.0)}pct"
     )
-    if method == "random_multibranch":
-        return f"{directory}-random-multibranch"
-    return directory
+    return f"{directory}-random-multibranch"
 
 
-def _selection_algorithm(
-    method: str,
-    *,
-    max_refreshes: int,
-    seed: int,
-) -> dict[str, Any]:
-    if method == "lazy_heap":
-        return {"type": "lazy_max_heap", "max_refreshes": max_refreshes}
-    if method == "random_multibranch":
-        return {
-            "type": "random_multibranch",
-            "branches": BRANCH_COUNT,
-            "children_per_branch": CHILDREN_PER_BRANCH,
-            "batch_size": BATCH_SIZE,
-            "first_recombination_round": FIRST_RECOMBINATION_ROUND,
-            "recombination_interval": RECOMBINATION_INTERVAL,
-            "commit_size": COMMIT_SIZE,
-            "retained_size": RETAINED_SIZE,
-            "seed": seed,
-            "recombination_ranking": {
-                "committed": "branch_frequency_then_seeded_random",
-                "retained": "branch_frequency_then_reliability_then_sample_id",
-            },
-            "similarity_penalty": {
-                "backend": "faiss",
-                "index": "IndexFlatIP",
-                "metric": "cosine_on_l2_normalized_embeddings",
-                "query": "range_search",
-                "main_reference": "all_fixed",
-                "scope": "new_active_to_all_main_and_previous_active",
-                "pairs": "incremental_cross_pairs_only",
-                "accumulation": "parent_plus_child_delta",
-                "recombination": "reset_then_replay_retained",
-                "final_objective": "winner_accumulated_incremental_redundancy",
-            },
-            "sequence_relation": {
-                "scope": "new_active_to_all_main_and_previous_active",
-                "pairs": "incremental_cross_edges_only",
-                "accumulation": "parent_plus_child_delta",
-                "recombination": "reset_then_replay_retained",
-                "final_objective": "winner_accumulated_incremental_sequence",
-            },
-        }
-    raise ValueError(f"unknown selection method {method!r}")
+def _selection_algorithm(*, seed: int) -> dict[str, Any]:
+    return {
+        "type": "random_multibranch",
+        "branches": BRANCH_COUNT,
+        "children_per_branch": CHILDREN_PER_BRANCH,
+        "batch_size": BATCH_SIZE,
+        "first_recombination_round": FIRST_RECOMBINATION_ROUND,
+        "recombination_interval": RECOMBINATION_INTERVAL,
+        "commit_size": COMMIT_SIZE,
+        "retained_size": RETAINED_SIZE,
+        "seed": seed,
+        "recombination_ranking": {
+            "committed": "branch_frequency_then_seeded_random",
+            "retained": "branch_frequency_then_reliability_then_sample_id",
+        },
+        "similarity_penalty": {
+            "backend": "faiss",
+            "index": "IndexFlatIP",
+            "metric": "cosine_on_l2_normalized_embeddings",
+            "query": "range_search",
+            "main_reference": "all_fixed",
+            "scope": "new_active_to_all_main_and_previous_active",
+            "pairs": "incremental_cross_pairs_only",
+            "accumulation": "parent_plus_child_delta",
+            "recombination": "reset_then_replay_retained",
+            "final_objective": "winner_accumulated_incremental_redundancy",
+        },
+        "sequence_relation": {
+            "scope": "new_active_to_all_main_and_previous_active",
+            "pairs": "incremental_cross_edges_only",
+            "accumulation": "parent_plus_child_delta",
+            "recombination": "reset_then_replay_retained",
+            "final_objective": "winner_accumulated_incremental_sequence",
+        },
+    }
+
+
+def _selection_schema_fields() -> dict[str, int]:
+    if SELECTION_SCHEMA_VERSION <= 0:
+        return {}
+    return {"selection_schema_version": SELECTION_SCHEMA_VERSION}
 
 
 def _average_runtime_seconds(values: tuple[float, ...]) -> float | None:
@@ -300,6 +291,42 @@ def _output_root(config: Mapping[str, Any], output_dir: str | Path | None) -> Pa
     return Path(
         output_dir if output_dir is not None else config["output"]["directory"]
     ).expanduser()
+
+
+def _matches_legacy_selection_cache(
+    destination: Path,
+    *,
+    required: tuple[str, ...],
+    upstream_fingerprint: str,
+    algorithm: Mapping[str, Any],
+    relation_type: str,
+    relation_weight: float,
+    ratio: float,
+) -> bool:
+    if SELECTION_SCHEMA_VERSION <= 0:
+        return False
+    manifest_path = destination / "manifest.json"
+    if not manifest_path.is_file() or any(
+        not (destination / name).is_file() for name in required
+    ):
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        recorded_weight = float(manifest.get("relation_weight", np.nan))
+        recorded_ratio = float(manifest.get("selection_ratio", np.nan))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return (
+        manifest.get("status") == "complete"
+        and manifest.get("producer") == "cocore"
+        and manifest.get("cocore_version") == __version__
+        and "selection_schema_version" not in manifest
+        and manifest.get("upstream_fingerprint") == upstream_fingerprint
+        and manifest.get("algorithm") == algorithm
+        and manifest.get("relation_type") == relation_type
+        and np.isclose(recorded_weight, relation_weight)
+        and np.isclose(recorded_ratio, ratio)
+    )
 
 
 def _write_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -1471,7 +1498,6 @@ def _selection_rows(
             "selection_order": position + 1 if position is not None else None,
             "selection_phase": result.selection_phases[position] if position is not None else None,
             "selection_step": result.selection_steps[position] if position is not None else None,
-            "heap_refreshes": result.heap_refreshes[position] if position is not None else None,
             "selection_score_delta": (
                 float(result.score_deltas[position]) if position is not None else None
             ),
@@ -1508,16 +1534,9 @@ def select_stage(
     relation_type = str(resolved["objective"]["relation"])
     relation_weight = float(resolved["objective"]["relation_weight"])
     ratio = float(resolved["selection"]["ratio"])
-    selection_config = resolved["selection"]
-    method = str(selection_config["method"])
-    directory = selection_directory_name(relation_type, relation_weight, ratio, method)
+    directory = selection_directory_name(relation_type, relation_weight, ratio)
     destination = root / directory
-    max_refreshes = int(selection_config["max_refreshes"])
-    algorithm = _selection_algorithm(
-        method,
-        max_refreshes=max_refreshes,
-        seed=int(resolved["seed"]),
-    )
+    algorithm = _selection_algorithm(seed=int(resolved["seed"]))
     fingerprint_payload = {
         "producer": "cocore",
         "version": __version__,
@@ -1533,17 +1552,8 @@ def select_stage(
         "motion_primitive": motion_primitive_contract(
             str(resolved["prototypes"]["profile"])
         ),
+        **_selection_schema_fields(),
     }
-    legacy_random_fingerprint = (
-        stable_hash(fingerprint_payload) if method == "random_multibranch" else None
-    )
-    if (
-        method == "random_multibranch"
-        and RANDOM_MULTIBRANCH_TIMING_SCHEMA_VERSION > 0
-    ):
-        fingerprint_payload["random_multibranch_timing_schema_version"] = (
-            RANDOM_MULTIBRANCH_TIMING_SCHEMA_VERSION
-        )
     fingerprint = stable_hash(fingerprint_payload)
 
     def build(temporary: Path) -> None:
@@ -1557,38 +1567,29 @@ def select_stage(
             )
         with timed_step("select.coverage_seed", emit_completed_timing):
             coverage_seed = build_max_coverage_seed(context, budget=budget)
-        selector_step = "select.lazy_heap" if method == "lazy_heap" else "select.random_multibranch"
-        with timed_step(selector_step, emit_completed_timing):
-            if method == "lazy_heap":
-                selector = LazyHeapSelector(
-                    context,
-                    max_refreshes=max_refreshes,
-                )
-            else:
-                selector = RandomMultiBranchSelector(
-                    context,
-                    seed=int(resolved["seed"]),
-                )
+        with timed_step("select.random_multibranch", emit_completed_timing):
+            selector = RandomMultiBranchSelector(
+                context,
+                seed=int(resolved["seed"]),
+            )
             result = selector.select(budget, initial_indices=coverage_seed.selected_indices)
 
-        branch_search_timings: dict[str, Any] | None = None
-        if method == "random_multibranch":
-            assert isinstance(result, RandomMultiBranchSelectionResult)
-            branch_search_timings = _random_multibranch_timing_report(result)
-            average_round_seconds = branch_search_timings["average_round_seconds"]
-            if average_round_seconds is not None:
-                emit_completed_timing(
-                    "select.random_multibranch.round_average",
-                    float(average_round_seconds),
-                )
-            average_recombination_seconds = branch_search_timings[
-                "average_recombination_seconds"
-            ]
-            if average_recombination_seconds is not None:
-                emit_completed_timing(
-                    "select.random_multibranch.recombination_average",
-                    float(average_recombination_seconds),
-                )
+        assert isinstance(result, RandomMultiBranchSelectionResult)
+        branch_search_timings = _random_multibranch_timing_report(result)
+        average_round_seconds = branch_search_timings["average_round_seconds"]
+        if average_round_seconds is not None:
+            emit_completed_timing(
+                "select.random_multibranch.round_average",
+                float(average_round_seconds),
+            )
+        average_recombination_seconds = branch_search_timings[
+            "average_recombination_seconds"
+        ]
+        if average_recombination_seconds is not None:
+            emit_completed_timing(
+                "select.random_multibranch.recombination_average",
+                float(average_recombination_seconds),
+            )
 
         export_started = time.perf_counter()
         graph_nodes = np.load(root / GRAPH_DIRECTORY / "nodes.npz")
@@ -1649,27 +1650,19 @@ def select_stage(
                 "total": float(result.objective_value),
             },
             "algorithm": algorithm,
+            **_selection_schema_fields(),
             "task_counts": task_counts,
             "skipped_short_episodes": scan_manifest.get("skipped_short_episodes", []),
             "runtime_seconds": {"select": time.perf_counter() - started},
         }
-        if method == "lazy_heap":
-            report["heap"] = {
-                "initial_size": result.initial_heap_size,
-                "total_refreshes": result.total_refreshes,
-                "capped_selections": result.capped_selections,
-                "max_refreshes_observed": result.max_refreshes_observed,
-            }
-        else:
-            assert branch_search_timings is not None
-            report["branch_search"] = {
-                "rounds": result.rounds,
-                "evaluated_branches": result.evaluated_branches,
-                "recombinations": result.recombinations,
-                "committed_clips": result.committed_clips,
-                "final_active_clips": result.final_active_clips,
-                "timings": branch_search_timings,
-            }
+        report["branch_search"] = {
+            "rounds": result.rounds,
+            "evaluated_branches": result.evaluated_branches,
+            "recombinations": result.recombinations,
+            "committed_clips": result.committed_clips,
+            "final_active_clips": result.final_active_clips,
+            "timings": branch_search_timings,
+        }
         for stage, stage_directory in {
             "scan": "scan",
             "encode": "encode",
@@ -1700,6 +1693,7 @@ def select_stage(
                 "relation_type": relation_type,
                 "relation_weight": relation_weight,
                 "algorithm": algorithm,
+                **_selection_schema_fields(),
                 "prototype_method": "motion_primitives",
                 "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
                 "prototype_strategy": PROTOTYPE_STRATEGY,
@@ -1717,18 +1711,21 @@ def select_stage(
         "all_clips.parquet",
         "selection_report.json",
     )
-    upgrade_legacy_random_cache = (
-        method == "random_multibranch"
-        and legacy_random_fingerprint is not None
-        and legacy_random_fingerprint != fingerprint
-        and cache_is_valid(destination, legacy_random_fingerprint, selection_required)
+    upgrade_legacy_selection_cache = _matches_legacy_selection_cache(
+        destination,
+        required=selection_required,
+        upstream_fingerprint=graph_fingerprint,
+        algorithm=algorithm,
+        relation_type=relation_type,
+        relation_weight=relation_weight,
+        ratio=ratio,
     )
     stage_started = time.perf_counter()
     built = publish_stage(
         destination,
         fingerprint=fingerprint,
         required=selection_required,
-        force=force or upgrade_legacy_random_cache,
+        force=force or upgrade_legacy_selection_cache,
         resume=bool(resolved["runtime"].get("resume", True)),
         build=build,
     )
@@ -1776,6 +1773,7 @@ def select_stage(
             "relation_weight": relation_weight,
             "similarity_threshold": float(resolved["graph"]["similarity_threshold"]),
             "algorithm": algorithm,
+            **_selection_schema_fields(),
             "stage_directories": stage_directories,
             "stage_fingerprints": stage_fingerprints,
         },
@@ -1838,6 +1836,8 @@ def validate_output(
         raise ValueError("cocore run manifest version is incompatible")
     if run_manifest.get("prototype_schema_version") != PROTOTYPE_SCHEMA_VERSION:
         raise ValueError("cocore prototype schema version is incompatible")
+    if run_manifest.get("selection_schema_version") != SELECTION_SCHEMA_VERSION:
+        raise ValueError("cocore selection schema version is incompatible")
     if run_manifest.get("prototype_strategy") != PROTOTYPE_STRATEGY:
         raise ValueError("cocore prototype strategy is incompatible")
     run_profile = run_manifest.get("prototype_profile")
@@ -1864,35 +1864,14 @@ def validate_output(
     algorithm = run_manifest.get("algorithm")
     if not isinstance(algorithm, Mapping):
         raise ValueError("cocore run manifest algorithm is invalid")
-    algorithm_type = algorithm.get("type")
-    max_refreshes: int | None = None
-    if algorithm_type == "lazy_max_heap":
-        method = "lazy_heap"
-        configured_refreshes = algorithm.get("max_refreshes")
-        if (
-            isinstance(configured_refreshes, bool)
-            or not isinstance(configured_refreshes, int)
-            or configured_refreshes <= 0
-        ):
-            raise ValueError("cocore max_refreshes is invalid")
-        max_refreshes = configured_refreshes
-        expected_algorithm = _selection_algorithm(
-            method,
-            max_refreshes=max_refreshes,
-            seed=0,
-        )
-    elif algorithm_type == "random_multibranch":
-        method = "random_multibranch"
-        algorithm_seed = algorithm.get("seed")
-        if isinstance(algorithm_seed, bool) or not isinstance(algorithm_seed, int):
-            raise ValueError("cocore random multibranch seed is invalid")
-        expected_algorithm = _selection_algorithm(
-            method,
-            max_refreshes=1,
-            seed=algorithm_seed,
-        )
-    else:
+    algorithm_seed = algorithm.get("seed")
+    if (
+        algorithm.get("type") != "random_multibranch"
+        or isinstance(algorithm_seed, bool)
+        or not isinstance(algorithm_seed, int)
+    ):
         raise ValueError("cocore run manifest algorithm is invalid")
+    expected_algorithm = _selection_algorithm(seed=algorithm_seed)
     if dict(algorithm) != expected_algorithm:
         raise ValueError("cocore run manifest algorithm is invalid")
     relation_type = str(run_manifest["relation_type"])
@@ -1900,7 +1879,7 @@ def validate_output(
         raise ValueError("cocore relation type is invalid")
     weight = float(run_manifest["relation_weight"])
     ratio = float(run_manifest["selection_ratio"])
-    if result.name != selection_directory_name(relation_type, weight, ratio, method):
+    if result.name != selection_directory_name(relation_type, weight, ratio):
         raise ValueError("selection directory does not match relation, weight, and ratio")
     expected_directories = {
         "scan": "scan",
@@ -2048,13 +2027,7 @@ def validate_output(
     else:
         validation_config = config
     replay_resolved = resolve_config(validation_config)
-    if str(replay_resolved["selection"]["method"]) != method:
-        raise ValueError("configuration selection method does not match output")
-    if method == "lazy_heap":
-        assert max_refreshes is not None
-        if int(replay_resolved["selection"]["max_refreshes"]) != max_refreshes:
-            raise ValueError("configuration max_refreshes does not match output")
-    elif int(replay_resolved["seed"]) != int(algorithm["seed"]):
+    if int(replay_resolved["seed"]) != int(algorithm["seed"]):
         raise ValueError("configuration seed does not match output")
     expected_use_stop_bucket = bool(replay_resolved["prototypes"]["use_stop_bucket"])
     expected_profile = str(replay_resolved["prototypes"]["profile"])
@@ -2095,8 +2068,17 @@ def validate_output(
     ]
     all_rows = pq.read_table(required["all"]).to_pylist()
     report = json.loads(required["report"].read_text(encoding="utf-8"))
+    if any("heap_refreshes" in row for row in (*selected_rows, *all_rows)):
+        raise ValueError("selection row heap metadata is invalid")
+    if (
+        select_manifest.get("selection_schema_version") != SELECTION_SCHEMA_VERSION
+        or report.get("selection_schema_version") != SELECTION_SCHEMA_VERSION
+    ):
+        raise ValueError("cocore selection schema version is incompatible")
     if select_manifest.get("algorithm") != algorithm or report.get("algorithm") != algorithm:
         raise ValueError("cocore selection algorithm metadata does not match")
+    if "heap" in report:
+        raise ValueError("selection report heap metadata is invalid")
     if report.get("relation_type") != relation_type:
         raise ValueError("selection report relation type mismatch")
     if report.get("prototype_schema_version") != PROTOTYPE_SCHEMA_VERSION:
@@ -2219,76 +2201,45 @@ def validate_output(
     if tuple(selected_indices[:initial_set_size]) != expected_seed.selected_indices:
         raise ValueError("selected coverage seed does not match the deterministic seed")
 
-    replayed_random = None
-    if method == "random_multibranch":
-        replayed_random = RandomMultiBranchSelector(
-            context,
-            seed=int(algorithm["seed"]),
-        ).select(
-            len(selected_indices),
-            initial_indices=expected_seed.selected_indices,
-        )
-        if tuple(selected_indices) != replayed_random.selected_indices:
-            raise ValueError("selected random multibranch order does not match replay")
-        expected_branch_search = {
-            "rounds": replayed_random.rounds,
-            "evaluated_branches": replayed_random.evaluated_branches,
-            "recombinations": replayed_random.recombinations,
-            "committed_clips": replayed_random.committed_clips,
-            "final_active_clips": replayed_random.final_active_clips,
-        }
-        branch_search = report.get("branch_search")
-        if not isinstance(branch_search, Mapping):
-            raise ValueError("selection report branch search metadata is invalid")
-        recorded_branch_search = {
-            key: value for key, value in branch_search.items() if key != "timings"
-        }
-        if recorded_branch_search != expected_branch_search or "heap" in report:
-            raise ValueError("selection report branch search metadata is invalid")
-        _validate_random_multibranch_timing_report(
-            branch_search.get("timings"),
-            replayed_random,
-        )
-    elif "branch_search" in report:
+    replayed_random = RandomMultiBranchSelector(
+        context,
+        seed=int(algorithm["seed"]),
+    ).select(
+        len(selected_indices),
+        initial_indices=expected_seed.selected_indices,
+    )
+    if tuple(selected_indices) != replayed_random.selected_indices:
+        raise ValueError("selected random multibranch order does not match replay")
+    expected_branch_search = {
+        "rounds": replayed_random.rounds,
+        "evaluated_branches": replayed_random.evaluated_branches,
+        "recombinations": replayed_random.recombinations,
+        "committed_clips": replayed_random.committed_clips,
+        "final_active_clips": replayed_random.final_active_clips,
+    }
+    branch_search = report.get("branch_search")
+    if not isinstance(branch_search, Mapping):
         raise ValueError("selection report branch search metadata is invalid")
+    recorded_branch_search = {
+        key: value for key, value in branch_search.items() if key != "timings"
+    }
+    if recorded_branch_search != expected_branch_search:
+        raise ValueError("selection report branch search metadata is invalid")
+    _validate_random_multibranch_timing_report(
+        branch_search.get("timings"),
+        replayed_random,
+    )
 
-    state = context.empty_state()
-    refresh_counts: list[int] = []
-    for position, (index, row) in enumerate(
-        zip(selected_indices, selected_rows, strict=True), start=1
-    ):
+    for position, row in enumerate(selected_rows, start=1):
         phase = row.get("selection_phase")
         step = row.get("selection_step")
-        refreshes = row.get("heap_refreshes")
-        if method == "random_multibranch":
-            assert replayed_random is not None
-            expected_position = position - 1
-            if (
-                phase != replayed_random.selection_phases[expected_position]
-                or step != replayed_random.selection_steps[expected_position]
-                or refreshes is not None
-            ):
-                raise ValueError("random multibranch selection metadata is invalid")
-        elif position <= initial_set_size:
-            if phase != "coverage_seed" or step != 0 or refreshes != 0:
-                raise ValueError("coverage seed heap metadata is invalid")
-        else:
-            assert max_refreshes is not None
-            expected_step = position - initial_set_size
-            if phase != "heap" or step != expected_step:
-                raise ValueError("heap selection order metadata is invalid")
-            if (
-                isinstance(refreshes, bool)
-                or not isinstance(refreshes, int)
-                or not 0 <= refreshes <= max_refreshes
-            ):
-                raise ValueError("heap refresh count is invalid")
-            refresh_counts.append(refreshes)
-        if method == "random_multibranch":
-            assert replayed_random is not None
-            gain = replayed_random.score_deltas[position - 1]
-        else:
-            gain = context.marginal_gain(state, index)
+        expected_position = position - 1
+        if (
+            phase != replayed_random.selection_phases[expected_position]
+            or step != replayed_random.selection_steps[expected_position]
+        ):
+            raise ValueError("random multibranch selection metadata is invalid")
+        gain = replayed_random.score_deltas[expected_position]
         recorded_gain = float(row.get("selection_score_delta", np.nan))
         if not np.isfinite(recorded_gain) or not np.isclose(
             recorded_gain, gain, rtol=1.0e-7, atol=1.0e-8
@@ -2296,7 +2247,6 @@ def validate_output(
             raise ValueError("selection score delta does not match the objective")
         if not np.isclose(float(row.get("marginal_gain", np.nan)), gain, rtol=1.0e-7, atol=1.0e-8):
             raise ValueError("selected marginal gain does not match the objective")
-        context.add_candidate(state, index)
 
     target = context.prototype_mass.max(axis=0)
     achieved = context.prototype_mass[np.asarray(selected_indices, dtype=np.int64)].max(axis=0)
@@ -2308,21 +2258,9 @@ def validate_output(
     ):
         raise ValueError("selection report coverage does not match artifacts")
     objective = report.get("objective", {})
-    expected_relation = (
-        replayed_random.relation
-        if replayed_random is not None
-        else state.relation
-    )
-    expected_redundancy = (
-        replayed_random.redundancy
-        if replayed_random is not None
-        else state.redundancy
-    )
-    expected_total = (
-        replayed_random.objective_value
-        if replayed_random is not None
-        else state.score
-    )
+    expected_relation = replayed_random.relation
+    expected_redundancy = replayed_random.redundancy
+    expected_total = replayed_random.objective_value
     for name, actual in {
         "relation": expected_relation,
         "redundancy": expected_redundancy,
@@ -2338,29 +2276,6 @@ def validate_output(
     ):
         raise ValueError("selection report objective weighted_relation mismatch")
 
-    if method == "lazy_heap":
-        assert max_refreshes is not None
-        expected_heap = {
-            "initial_size": (
-                0
-                if initial_set_size == len(selected_rows)
-                else len(graph.sample_ids) - initial_set_size
-            ),
-            "total_refreshes": sum(refresh_counts),
-            "capped_selections": sum(value == max_refreshes for value in refresh_counts),
-            "max_refreshes_observed": max(refresh_counts, default=0),
-        }
-        heap_report = report.get("heap")
-        if not isinstance(heap_report, Mapping):
-            raise ValueError("selection report heap metadata is invalid")
-        if heap_report.get("initial_size") != expected_heap["initial_size"]:
-            raise ValueError("selection report heap initial size mismatch")
-        if heap_report.get("total_refreshes") != expected_heap["total_refreshes"]:
-            raise ValueError("selection report heap total refreshes mismatch")
-        if heap_report.get("capped_selections") != expected_heap["capped_selections"]:
-            raise ValueError("selection report heap capped selections mismatch")
-        if heap_report.get("max_refreshes_observed") != expected_heap["max_refreshes_observed"]:
-            raise ValueError("selection report heap maximum refreshes mismatch")
     actual_task_counts = {
         str(task): sum(int(graph.task_indices[index]) == task for index in selected_indices)
         for task in sorted({int(value) for value in graph.task_indices})
@@ -2375,6 +2290,4 @@ def validate_output(
             raise ValueError("configuration relation weight does not match output")
         if not np.isclose(float(resolved["selection"]["ratio"]), ratio):
             raise ValueError("configuration selection ratio does not match output")
-        if method == "lazy_heap" and int(resolved["selection"]["max_refreshes"]) != max_refreshes:
-            raise ValueError("configuration max_refreshes does not match output")
     return {"status": "valid", "selected_clips": len(selected_rows)}

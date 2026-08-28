@@ -13,7 +13,6 @@ from cocore.config import resolve_config
 
 DEFAULT_DATASET_PATH = Path("/data/dwb/datasets/bridge_orig_1.0.0_lerobot")
 DEFAULT_SELECTION_RATIO = 0.10
-DEFAULT_SELECTION_METHOD = "lazy_heap"
 _CONFIG_PATH = Path(__file__).with_name("config_bridge_v2.yaml")
 
 
@@ -29,7 +28,6 @@ def build_config(
     relation: str,
     relation_weight: float,
     selection_ratio: float = DEFAULT_SELECTION_RATIO,
-    selection_method: str = DEFAULT_SELECTION_METHOD,
     dataset_path: str | Path = DEFAULT_DATASET_PATH,
     max_episodes: int | None = None,
     use_stop_bucket: bool = True,
@@ -44,7 +42,6 @@ def build_config(
     }
     config["selection"]["ratio"] = selection_ratio
     config["selection"]["budget"] = None
-    config["selection"]["method"] = selection_method
     config["runtime"]["max_episodes"] = max_episodes
     config["prototypes"]["use_stop_bucket"] = use_stop_bucket
     return resolve_config(config)

@@ -28,7 +28,6 @@ class RandomMultiBranchSelectionResult:
     score_deltas: tuple[float, ...]
     selection_phases: tuple[str, ...]
     selection_steps: tuple[int, ...]
-    heap_refreshes: tuple[None, ...]
     objective_value: float
     relation: float
     redundancy: float
@@ -274,7 +273,6 @@ class RandomMultiBranchSelector:
             score_deltas=tuple(gains),
             selection_phases=tuple(phases),
             selection_steps=tuple(steps),
-            heap_refreshes=(None,) * len(selected),
             objective_value=float(score),
             relation=float(relation),
             redundancy=float(redundancy),

@@ -171,7 +171,6 @@ def _config(tmp_path: Path, relation: str = "cooccurrence") -> dict[str, object]
         "selection": {
             "ratio": 0.5,
             "budget": 10,
-            "max_refreshes": 2,
         },
         "runtime": {"num_workers": 0, "max_episodes": None, "resume": True},
         "output": {"directory": str(tmp_path / "cocore-output")},
@@ -419,7 +418,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
 
     result = run_pipeline(config, output_dir=root, visual_encoder=CocoreVisualEncoder())
 
-    assert result == root / f"select-{relation}-w1-top50pct"
+    assert result == root / f"select-{relation}-w1-top50pct-random-multibranch"
     assert (root / "scan" / "manifest.json").is_file()
     assert (root / "encode" / "manifest.json").is_file()
     assert (root / "encode" / "visual_half_embeddings.npy").is_file()
@@ -545,11 +544,16 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     report = json.loads((result / "selection_report.json").read_text())
     assert len(selected) == 10
     assert len(all_rows) == 82
-    assert {row["selection_phase"] for row in selected} == {"coverage_seed", "heap"}
+    assert {row["selection_phase"] for row in selected} == {
+        "coverage_seed",
+        "branch_final",
+    }
     assert all(
-        {"selection_step", "selection_score_delta", "heap_refreshes"} <= row.keys()
+        {"selection_step", "selection_score_delta"} <= row.keys()
+        and "heap_refreshes" not in row
         for row in selected
     )
+    assert all("heap_refreshes" not in row for row in all_rows)
     assert all(
         {
             "support",
@@ -585,22 +589,17 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     )
     assert report["objective"]["weighted_relation"] == report["objective"]["relation"]
     assert report["coverage"]["target"] == report["coverage"]["achieved"]
-    assert report["algorithm"] == {
-        "type": "lazy_max_heap",
-        "max_refreshes": 2,
-    }
-    assert report["heap"] == {
-        "initial_size": len(all_rows) - report["initial_set_size"],
-        "total_refreshes": sum(row["heap_refreshes"] for row in selected),
-        "capped_selections": sum(row["heap_refreshes"] == 2 for row in selected),
-        "max_refreshes_observed": max(row["heap_refreshes"] for row in selected),
-    }
+    assert report["algorithm"]["type"] == "random_multibranch"
+    assert report["selection_schema_version"] == 1
+    assert "heap" not in report
+    assert "branch_search" in report
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert run_manifest["producer"] == "cocore"
     assert run_manifest["cocore_version"] == "0.16.0"
     assert run_manifest["relation_type"] == relation
     assert run_manifest["relation_weight"] == 1.0
     assert run_manifest["prototype_schema_version"] == 10
+    assert run_manifest["selection_schema_version"] == 1
     assert run_manifest["prototype_profile"] == "libero"
     assert run_manifest["use_stop_bucket"] is True
     assert run_manifest["prototype_strategy"] == (
@@ -624,6 +623,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert select_manifest["relation_type"] == relation
     assert select_manifest["relation_weight"] == 1.0
     assert select_manifest["prototype_schema_version"] == 10
+    assert select_manifest["selection_schema_version"] == 1
     assert select_manifest["prototype_profile"] == "libero"
     assert select_manifest["use_stop_bucket"] is True
     assert select_manifest["prototype_strategy"] == (
@@ -648,9 +648,9 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
         validate_output(result, config=config)
 
     report["relation_type"] = relation
-    report["heap"]["total_refreshes"] += 1
+    report["heap"] = {}
     (result / "selection_report.json").write_text(json.dumps(report))
-    with pytest.raises(ValueError, match="heap total refreshes"):
+    with pytest.raises(ValueError, match="heap metadata"):
         validate_output(result, config=config)
 
 
@@ -660,7 +660,6 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
 ) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path, "sequence")
-    config["selection"]["method"] = "random_multibranch"
     root = tmp_path / "random-multibranch-output"
 
     result = run_pipeline(config, output_dir=root, visual_encoder=CocoreVisualEncoder())
@@ -737,9 +736,14 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
         "coverage_seed",
         "branch_final",
     }
-    assert all(row["heap_refreshes"] is None for row in selected)
-    assert json.loads((result / "manifest.json").read_text())["algorithm"] == algorithm
-    assert json.loads((result / "run_manifest.json").read_text())["algorithm"] == algorithm
+    assert all("heap_refreshes" not in row for row in selected)
+    select_manifest = json.loads((result / "manifest.json").read_text())
+    run_manifest = json.loads((result / "run_manifest.json").read_text())
+    assert select_manifest["algorithm"] == algorithm
+    assert run_manifest["algorithm"] == algorithm
+    assert report["selection_schema_version"] == 1
+    assert select_manifest["selection_schema_version"] == 1
+    assert run_manifest["selection_schema_version"] == 1
     assert validate_output(result, config=config) == {
         "status": "valid",
         "selected_clips": 10,
@@ -755,6 +759,39 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
     assert cached_output.out == ""
     assert "cocore_timing" not in cached_output.err
 
+    run_path = result / "run_manifest.json"
+    run_manifest["selection_schema_version"] = 0
+    run_path.write_text(json.dumps(run_manifest))
+    with pytest.raises(ValueError, match="selection schema version"):
+        validate_output(result, config=config)
+    run_manifest["selection_schema_version"] = 1
+    run_path.write_text(json.dumps(run_manifest))
+
+    run_manifest["algorithm"] = {"type": "lazy_max_heap", "max_refreshes": 2}
+    run_path.write_text(json.dumps(run_manifest))
+    with pytest.raises(ValueError, match="algorithm"):
+        validate_output(result, config=config)
+    run_manifest["algorithm"] = algorithm
+    run_path.write_text(json.dumps(run_manifest))
+
+    selected_path = result / "selected_manifest.jsonl"
+    selected[0]["heap_refreshes"] = None
+    selected_path.write_text("\n".join(json.dumps(row) for row in selected) + "\n")
+    with pytest.raises(ValueError, match="heap metadata"):
+        validate_output(result, config=config)
+    del selected[0]["heap_refreshes"]
+    selected_path.write_text("\n".join(json.dumps(row) for row in selected) + "\n")
+
+    all_path = result / "all_clips.parquet"
+    all_rows = pq.read_table(all_path).to_pylist()
+    all_rows[0]["heap_refreshes"] = None
+    pq.write_table(pa.Table.from_pylist(all_rows), all_path)
+    with pytest.raises(ValueError, match="heap metadata"):
+        validate_output(result, config=config)
+    for row in all_rows:
+        row.pop("heap_refreshes", None)
+    pq.write_table(pa.Table.from_pylist(all_rows), all_path)
+
     report["branch_search"]["rounds"] += 1
     (result / "selection_report.json").write_text(json.dumps(report))
     with pytest.raises(ValueError, match="branch search"):
@@ -764,7 +801,6 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
 def test_validate_rejects_invalid_random_multibranch_timings(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path, "sequence")
-    config["selection"]["method"] = "random_multibranch"
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
     report_path = result / "selection_report.json"
     report = json.loads(report_path.read_text())
@@ -807,7 +843,6 @@ def test_random_multibranch_reports_recombination_detail_and_average_log(
 ) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path, "sequence")
-    config["selection"]["method"] = "random_multibranch"
     config["selection"]["budget"] = 13
     monkeypatch.setattr("cocore.random_multibranch.BATCH_SIZE", 1)
     monkeypatch.setattr("cocore.random_multibranch.FIRST_RECOMBINATION_ROUND", 2)
@@ -839,17 +874,16 @@ def test_random_multibranch_reports_recombination_detail_and_average_log(
     ]
 
 
-def test_random_multibranch_timing_schema_rebuilds_legacy_select_only(
+def test_selection_schema_rebuilds_legacy_select_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path, "sequence")
-    config["selection"]["method"] = "random_multibranch"
     root = tmp_path / "random-multibranch-schema-upgrade"
     monkeypatch.setattr(
         cocore_pipeline,
-        "RANDOM_MULTIBRANCH_TIMING_SCHEMA_VERSION",
+        "SELECTION_SCHEMA_VERSION",
         0,
     )
     legacy_result = run_pipeline(
@@ -861,14 +895,11 @@ def test_random_multibranch_timing_schema_rebuilds_legacy_select_only(
     legacy_fingerprint = json.loads((legacy_result / "manifest.json").read_text())[
         "fingerprint"
     ]
-    legacy_report_path = legacy_result / "selection_report.json"
-    legacy_report = json.loads(legacy_report_path.read_text())
-    del legacy_report["branch_search"]["timings"]
-    legacy_report_path.write_text(json.dumps(legacy_report))
+    assert "selection_schema_version" not in legacy_run
 
     monkeypatch.setattr(
         cocore_pipeline,
-        "RANDOM_MULTIBRANCH_TIMING_SCHEMA_VERSION",
+        "SELECTION_SCHEMA_VERSION",
         1,
     )
     upgraded_result = run_pipeline(
@@ -892,7 +923,10 @@ def test_random_multibranch_timing_schema_rebuilds_legacy_select_only(
         for stage in ("scan", "encode", "graph")
     }
     upgraded_report = json.loads((upgraded_result / "selection_report.json").read_text())
-    assert "timings" in upgraded_report["branch_search"]
+    upgraded_manifest = json.loads((upgraded_result / "manifest.json").read_text())
+    assert upgraded_report["selection_schema_version"] == 1
+    assert upgraded_manifest["selection_schema_version"] == 1
+    assert upgraded_run["selection_schema_version"] == 1
 
 
 def test_disabled_stop_bucket_excludes_unlabeled_candidates_from_graph_and_selection(
@@ -1004,7 +1038,8 @@ def test_run_pipeline_reports_all_completed_timings_and_cached_run_is_silent(
         "graph",
         "select.context",
         "select.coverage_seed",
-        "select.lazy_heap",
+        "select.random_multibranch",
+        "select.random_multibranch.round_average",
         "select.export",
         "select",
     ]
@@ -1654,8 +1689,8 @@ def test_sequence_and_cooccurrence_outputs_can_coexist(tmp_path: Path) -> None:
         visual_encoder=CocoreVisualEncoder(),
     )
 
-    assert cooccurrence == root / "select-cooccurrence-w1-top50pct"
-    assert sequence == root / "select-sequence-w1-top50pct"
+    assert cooccurrence == root / "select-cooccurrence-w1-top50pct-random-multibranch"
+    assert sequence == root / "select-sequence-w1-top50pct-random-multibranch"
     assert cooccurrence.is_dir()
     assert sequence.is_dir()
     assert validate_output(cooccurrence, config=_config(tmp_path, "cooccurrence")) == {

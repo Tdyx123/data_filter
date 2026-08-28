@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter
-from dataclasses import dataclass
 from itertools import count
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,10 +10,7 @@ from scipy import sparse
 
 from cocore.objective import CocoreObjectiveContext, recompute_objective
 from cocore.random_multibranch import RandomMultiBranchSelector
-from cocore.selection import (
-    LazyHeapSelector,
-    build_max_coverage_seed,
-)
+from cocore.selection import build_max_coverage_seed
 from relcore.graph import build_graph
 from relcore.graph.prototypes import PrototypeData
 from relcore.schemas import ClipRecord, EdgeTable, GraphData
@@ -263,7 +258,7 @@ def test_objective_empty_update_state_resets_branch_redundancy() -> None:
 
 
 def test_sequence_empty_update_state_resets_branch_relation_and_counts() -> None:
-    graph = _heap_graph(3)
+    graph = _selection_graph(3)
     graph.reliability = np.ones(3, dtype=np.float32)
     graph.sequence_edges = _edges([(0, 1, 1.0), (0, 2, 1.0)], "sequence")
     graph.transition_matrix = sparse.csr_matrix(
@@ -288,7 +283,7 @@ def test_sequence_empty_update_state_resets_branch_relation_and_counts() -> None
 
 
 def test_sequence_update_state_accumulates_only_current_to_previous_edges() -> None:
-    graph = _heap_graph(5)
+    graph = _selection_graph(5)
     graph.reliability = np.ones(5, dtype=np.float32)
     graph.sequence_edges = _edges(
         [
@@ -376,7 +371,7 @@ def test_objective_extend_state_matches_full_ordered_replay_without_mutating_bas
 
 
 def test_objective_update_state_accumulates_only_new_candidate_redundancy() -> None:
-    graph = _heap_graph(5)
+    graph = _selection_graph(5)
     graph.reliability = np.ones(5, dtype=np.float32)
     graph.similarity_edges = _edges(
         [
@@ -419,7 +414,7 @@ def test_objective_update_state_accumulates_only_new_candidate_redundancy() -> N
 
 def test_objective_update_state_accumulates_explicit_redundancy_deltas() -> None:
     context = CocoreObjectiveContext(
-        _heap_graph(4), "cooccurrence", relation_weight=1.0, similarity_threshold=0.8
+        _selection_graph(4), "cooccurrence", relation_weight=1.0, similarity_threshold=0.8
     )
     main = context.state_from_indices([0])
     root = context.empty_update_state(main)
@@ -446,7 +441,7 @@ def test_objective_update_state_rejects_invalid_redundancy_deltas(
     redundancy_deltas: tuple[float, ...],
 ) -> None:
     context = CocoreObjectiveContext(
-        _heap_graph(2), "cooccurrence", relation_weight=1.0, similarity_threshold=0.8
+        _selection_graph(2), "cooccurrence", relation_weight=1.0, similarity_threshold=0.8
     )
     root = context.empty_update_state(context.state_from_indices([0]))
 
@@ -459,7 +454,7 @@ def test_objective_update_state_rejects_invalid_redundancy_deltas(
 
 
 def test_objective_recombination_resets_and_replays_retained_redundancy() -> None:
-    graph = _heap_graph(3)
+    graph = _selection_graph(3)
     graph.reliability = np.ones(3, dtype=np.float32)
     graph.similarity_edges = _edges(
         [(0, 1, 1.0), (0, 2, 1.0), (1, 2, 1.0)],
@@ -490,7 +485,7 @@ def test_objective_recombination_resets_and_replays_retained_redundancy() -> Non
 
 
 def test_sequence_recombination_resets_and_replays_retained_relation() -> None:
-    graph = _heap_graph(4)
+    graph = _selection_graph(4)
     graph.reliability = np.ones(4, dtype=np.float32)
     graph.sequence_edges = _edges(
         [(0, 1, 1.0), (0, 2, 1.0), (1, 3, 1.0), (2, 3, 1.0)],
@@ -532,7 +527,7 @@ def test_sequence_recombination_resets_and_replays_retained_relation() -> None:
 
 
 def test_objective_update_state_penalizes_only_new_active_pairs() -> None:
-    graph = _heap_graph(103)
+    graph = _selection_graph(103)
     graph.reliability = np.ones(103, dtype=np.float32)
     graph.similarity_edges = _edges(
         [
@@ -587,7 +582,7 @@ def test_max_coverage_seed_rejects_budget_smaller_than_required_union() -> None:
         build_max_coverage_seed(context, budget=1)
 
 
-def _heap_graph(count: int = 14) -> GraphData:
+def _selection_graph(count: int = 14) -> GraphData:
     reliabilities = np.linspace(0.1, 1.0, count, dtype=np.float32)
     return GraphData(
         sample_ids=[f"node-{index:02d}" for index in range(count)],
@@ -606,7 +601,7 @@ def _heap_graph(count: int = 14) -> GraphData:
 
 def test_random_multibranch_returns_coverage_without_starting_search() -> None:
     context = CocoreObjectiveContext(
-        _heap_graph(), "cooccurrence", 1.0, similarity_threshold=0.8
+        _selection_graph(), "cooccurrence", 1.0, similarity_threshold=0.8
     )
     seed = build_max_coverage_seed(context, budget=1)
 
@@ -617,7 +612,7 @@ def test_random_multibranch_returns_coverage_without_starting_search() -> None:
     assert result.selected_indices == seed.selected_indices
     assert result.selection_phases == ("coverage_seed",)
     assert result.selection_steps == (0,)
-    assert result.heap_refreshes == (None,)
+    assert not hasattr(result, "heap_refreshes")
     assert result.rounds == 0
     assert result.evaluated_branches == 0
     assert result.recombinations == 0
@@ -628,7 +623,7 @@ def test_random_multibranch_returns_coverage_without_starting_search() -> None:
 
 
 def test_random_multibranch_coverage_only_result_has_zero_redundancy() -> None:
-    graph = _heap_graph(2)
+    graph = _selection_graph(2)
     graph.reliability = np.ones(2, dtype=np.float32)
     graph.similarity_edges = _edges([(0, 1, 1.0)], "similarity")
     context = CocoreObjectiveContext(
@@ -647,7 +642,7 @@ def test_random_multibranch_coverage_only_result_has_zero_redundancy() -> None:
 
 
 def test_random_multibranch_sequence_coverage_only_result_has_zero_objective() -> None:
-    graph = _heap_graph(2)
+    graph = _selection_graph(2)
     graph.reliability = np.ones(2, dtype=np.float32)
     graph.sequence_edges = _edges([(0, 1, 1.0)], "sequence")
     graph.transition_matrix = sparse.csr_matrix(
@@ -669,7 +664,7 @@ def test_random_multibranch_sequence_coverage_only_result_has_zero_objective() -
 
 
 def test_random_multibranch_sequence_result_uses_winner_incremental_deltas() -> None:
-    graph = _heap_graph(4)
+    graph = _selection_graph(4)
     sine = np.sqrt(0.19)
     graph.embeddings = np.asarray(
         [
@@ -715,7 +710,7 @@ def test_random_multibranch_sequence_result_uses_winner_incremental_deltas() -> 
 
 
 def test_random_multibranch_result_preserves_incremental_branch_redundancy() -> None:
-    graph = _heap_graph(4)
+    graph = _selection_graph(4)
     sine = np.sqrt(0.19)
     graph.embeddings = np.asarray(
         [
@@ -748,7 +743,7 @@ def test_random_multibranch_result_preserves_incremental_branch_redundancy() -> 
 
 
 def test_random_multibranch_fills_a_partial_final_batch_reproducibly() -> None:
-    graph = _heap_graph(30)
+    graph = _selection_graph(30)
     first_context = CocoreObjectiveContext(
         graph, "cooccurrence", 1.0, similarity_threshold=0.8
     )
@@ -800,7 +795,7 @@ def test_random_multibranch_times_rounds_separately_from_recombination(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context = CocoreObjectiveContext(
-        _heap_graph(10), "cooccurrence", 1.0, similarity_threshold=0.8
+        _selection_graph(10), "cooccurrence", 1.0, similarity_threshold=0.8
     )
     coverage = build_max_coverage_seed(context, budget=4)
     ticks = count(step=0.25)
@@ -825,7 +820,7 @@ def test_random_multibranch_times_rounds_separately_from_recombination(
 def test_random_multibranch_recombination_adds_committed_clips_to_faiss_main(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    graph = _heap_graph(4)
+    graph = _selection_graph(4)
     graph.embeddings = np.ones((4, 1), dtype=np.float32)
     graph.reliability = np.ones(4, dtype=np.float32)
     graph.similarity_edges = _edges(
@@ -854,7 +849,7 @@ def test_random_multibranch_recombination_adds_committed_clips_to_faiss_main(
 
 def test_random_multibranch_does_not_clone_complete_branch_states(monkeypatch) -> None:
     context = CocoreObjectiveContext(
-        _heap_graph(30), "cooccurrence", 1.0, similarity_threshold=0.8
+        _selection_graph(30), "cooccurrence", 1.0, similarity_threshold=0.8
     )
     coverage = build_max_coverage_seed(context, budget=17)
 
@@ -891,7 +886,7 @@ def test_random_multibranch_does_not_clone_complete_branch_states(monkeypatch) -
 
 
 def test_random_multibranch_faiss_penalizes_against_all_fixed_clips() -> None:
-    graph = _heap_graph(102)
+    graph = _selection_graph(102)
     graph.embeddings = np.tile(np.asarray([[0.0, 1.0]], dtype=np.float32), (102, 1))
     graph.embeddings[0] = np.asarray([1.0, 0.0], dtype=np.float32)
     graph.embeddings[101] = np.asarray([0.9, np.sqrt(0.19)], dtype=np.float32)
@@ -912,7 +907,7 @@ def test_random_multibranch_faiss_penalizes_against_all_fixed_clips() -> None:
 
 
 def test_random_multibranch_final_result_excludes_main_internal_pairs() -> None:
-    graph = _heap_graph(103)
+    graph = _selection_graph(103)
     sine = np.sqrt(0.19)
     graph.embeddings = np.tile(np.asarray([[-1.0, 0.0]], dtype=np.float32), (103, 1))
     graph.embeddings[0] = np.asarray([1.0, 0.0], dtype=np.float32)
@@ -947,7 +942,7 @@ def test_random_multibranch_final_result_excludes_main_internal_pairs() -> None:
 
 
 def test_random_multibranch_uses_seed_to_break_equal_branch_scores() -> None:
-    graph = _heap_graph(30)
+    graph = _selection_graph(30)
 
     selected = []
     for random_seed in (3, 19):
@@ -965,7 +960,7 @@ def test_random_multibranch_uses_seed_to_break_equal_branch_scores() -> None:
 
 
 def test_random_multibranch_selects_the_highest_scoring_initial_branch() -> None:
-    graph = _heap_graph(9)
+    graph = _selection_graph(9)
     graph.embeddings = np.tile(np.asarray([[1.0, 0.0]], dtype=np.float32), (9, 1))
     graph.embeddings[0] = np.asarray([0.0, 1.0], dtype=np.float32)
     graph.similarity_edges = _edges(
@@ -993,7 +988,7 @@ def test_random_multibranch_selects_the_highest_scoring_initial_branch() -> None
 
 def test_random_multibranch_ranks_committed_clips_by_frequency_then_seed() -> None:
     context = CocoreObjectiveContext(
-        _heap_graph(4), "cooccurrence", 1.0, similarity_threshold=0.8
+        _selection_graph(4), "cooccurrence", 1.0, similarity_threshold=0.8
     )
     selector = RandomMultiBranchSelector(context, seed=13)
     counts = Counter({0: 1, 1: 1, 2: 1, 3: 1})
@@ -1024,7 +1019,7 @@ def test_random_multibranch_ranks_committed_clips_by_frequency_then_seed() -> No
 
 
 def test_random_multibranch_ranks_retained_clips_by_frequency_then_reliability() -> None:
-    graph = _heap_graph(4)
+    graph = _selection_graph(4)
     graph.reliability = np.asarray([0.1, 0.9, 0.8, 0.7], dtype=np.float32)
     context = CocoreObjectiveContext(
         graph, "cooccurrence", 1.0, similarity_threshold=0.8
@@ -1041,7 +1036,7 @@ def test_random_multibranch_ranks_retained_clips_by_frequency_then_reliability()
 
 
 def test_random_multibranch_breaks_equal_retained_reliability_by_sample_id() -> None:
-    graph = _heap_graph(3)
+    graph = _selection_graph(3)
     graph.sample_ids = ["clip-c", "clip-a", "clip-b"]
     graph.reliability = np.full(3, 0.5, dtype=np.float32)
     context = CocoreObjectiveContext(
@@ -1063,7 +1058,7 @@ def test_random_multibranch_breaks_equal_retained_reliability_by_sample_id() -> 
 def test_random_multibranch_recombination_retains_reliability_ranked_clips(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    graph = _heap_graph(100)
+    graph = _selection_graph(100)
     context = CocoreObjectiveContext(
         graph, "cooccurrence", 1.0, similarity_threshold=0.8
     )
@@ -1124,7 +1119,7 @@ def test_random_multibranch_recombination_retains_reliability_ranked_clips(
 
 
 def test_random_multibranch_recombines_first_at_20_then_every_10_rounds() -> None:
-    graph = _heap_graph(340)
+    graph = _selection_graph(340)
     context = CocoreObjectiveContext(
         graph, "cooccurrence", 1.0, similarity_threshold=0.8
     )
@@ -1158,7 +1153,7 @@ def test_random_multibranch_recombines_first_at_20_then_every_10_rounds() -> Non
 
 
 def test_random_multibranch_builds_main_state_from_scratch_only_once() -> None:
-    graph = _heap_graph(340)
+    graph = _selection_graph(340)
 
     class RecordingContext(CocoreObjectiveContext):
         def __init__(self) -> None:
@@ -1187,7 +1182,7 @@ def test_random_multibranch_builds_main_state_from_scratch_only_once() -> None:
 
 
 def test_random_multibranch_sequence_does_not_replay_fixed_sequence_state() -> None:
-    graph = _heap_graph(3)
+    graph = _selection_graph(3)
     graph.reliability = np.ones(3, dtype=np.float32)
     graph.sequence_edges = _edges([(0, 1, 1.0), (1, 2, 1.0)], "sequence")
     graph.transition_matrix = sparse.csr_matrix(
@@ -1212,249 +1207,3 @@ def test_random_multibranch_sequence_does_not_replay_fixed_sequence_state() -> N
     assert result.relation == pytest.approx(
         np.log1p(1.0) / (np.log1p(2.0) + context.epsilon)
     )
-
-
-def test_lazy_heap_selects_current_top_then_refreshes_the_next_stale_top() -> None:
-    graph = _heap_graph()
-    context = CocoreObjectiveContext(graph, "cooccurrence", 1.0, similarity_threshold=0.8)
-    seed = build_max_coverage_seed(context, budget=3)
-    selector = LazyHeapSelector(context, max_refreshes=100)
-
-    result = selector.select(3, initial_indices=seed.selected_indices)
-
-    assert result.selected_indices == (13, 0, 1)
-    assert result.selection_phases == ("coverage_seed", "heap", "heap")
-    assert result.selection_steps == (0, 1, 2)
-    assert result.heap_refreshes == (0, 0, 1)
-    assert result.initial_heap_size == 13
-    assert result.total_refreshes == 1
-    assert result.capped_selections == 0
-    assert result.max_refreshes_observed == 1
-
-
-def test_lazy_heap_returns_seed_without_building_a_heap_when_budget_is_full() -> None:
-    graph = _heap_graph()
-    context = CocoreObjectiveContext(graph, "cooccurrence", 1.0, similarity_threshold=0.8)
-    seed = build_max_coverage_seed(context, budget=1)
-    selector = LazyHeapSelector(context)
-
-    result = selector.select(1, initial_indices=seed.selected_indices)
-
-    assert result.selected_indices == seed.selected_indices
-    assert result.initial_heap_size == 0
-    assert result.total_refreshes == 0
-
-
-@dataclass
-class _ScriptedState:
-    selected_mask: np.ndarray
-    score: float = 0.0
-    relation: float = 0.0
-    redundancy: float = 0.0
-
-
-class _ScriptedContext:
-    def __init__(self, sample_ids: list[str], gain) -> None:
-        self.graph = SimpleNamespace(sample_ids=sample_ids)
-        self._gain = gain
-
-    def empty_state(self) -> _ScriptedState:
-        return _ScriptedState(np.zeros(len(self.graph.sample_ids), dtype=bool))
-
-    def marginal_gain(self, state: _ScriptedState, index: int) -> float:
-        return float(self._gain(int(state.selected_mask.sum()), index))
-
-    def add_candidate(self, state: _ScriptedState, index: int) -> None:
-        gain = float(self._gain(int(state.selected_mask.sum()), index))
-        state.selected_mask[index] = True
-        state.score += gain
-        state.relation = state.score
-
-
-class _RecordingScriptedContext(_ScriptedContext):
-    def __init__(self, sample_ids: list[str], gain) -> None:
-        super().__init__(sample_ids, gain)
-        self.marginal_gain_candidates: dict[int, list[int]] = {}
-
-    def marginal_gain(self, state: _ScriptedState, index: int) -> float:
-        selected_count = int(state.selected_mask.sum())
-        self.marginal_gain_candidates.setdefault(selected_count, []).append(index)
-        return super().marginal_gain(state, index)
-
-
-def test_lazy_heap_keeps_refreshing_when_a_recomputed_gain_falls_below_stale_entries() -> None:
-    def gain(selected_count: int, index: int) -> float:
-        if selected_count == 0:
-            return 0.0
-        if selected_count == 1:
-            return {1: 10.0, 2: 9.0, 3: 8.0}[index]
-        return {2: 1.0, 3: 7.0}[index]
-
-    selector = LazyHeapSelector(
-        _ScriptedContext(["seed", "first", "falls", "winner"], gain),
-        max_refreshes=100,
-    )
-
-    result = selector.select(3, initial_indices=[0])
-
-    assert result.selected_indices == (0, 1, 3)
-    assert result.heap_refreshes == (0, 0, 2)
-
-
-def test_lazy_heap_selects_a_refreshed_entry_as_soon_as_it_returns_to_the_top() -> None:
-    def gain(selected_count: int, index: int) -> float:
-        if selected_count == 0:
-            return 0.0
-        if selected_count == 1:
-            return {1: 10.0, 2: 9.0, 3: 8.0}[index]
-        return {2: 20.0, 3: 7.0}[index]
-
-    selector = LazyHeapSelector(
-        _ScriptedContext(["seed", "first", "winner", "other"], gain),
-        max_refreshes=100,
-    )
-
-    result = selector.select(3, initial_indices=[0])
-
-    assert result.selected_indices == (0, 1, 2)
-    assert result.heap_refreshes == (0, 0, 1)
-
-
-def test_lazy_heap_fully_rebuilds_before_heap_steps_8_16_and_32() -> None:
-    candidate_count = 42
-    context = _RecordingScriptedContext(
-        [f"node-{index:02d}" for index in range(candidate_count)],
-        lambda selected_count, index: float(candidate_count - index),
-    )
-    initial = [0, 1, 2]
-
-    result = LazyHeapSelector(context, max_refreshes=3).select(
-        36,
-        initial_indices=initial,
-    )
-
-    assert result.selected_indices == tuple(range(36))
-    assert len(context.marginal_gain_candidates[8]) == 1
-    assert len(context.marginal_gain_candidates[10]) == 32
-    assert len(context.marginal_gain_candidates[18]) == 24
-    assert len(context.marginal_gain_candidates[34]) == 8
-    assert result.heap_refreshes[9] == 1
-    assert result.heap_refreshes[10] == 0
-    assert result.heap_refreshes[11] == 1
-    assert result.heap_refreshes[18] == 0
-    assert result.heap_refreshes[34] == 0
-
-
-def test_lazy_heap_step_8_rebuild_selects_the_new_global_maximum() -> None:
-    def gain(selected_count: int, index: int) -> float:
-        if selected_count >= 8 and index == 9:
-            return 200.0
-        if index <= 7:
-            return float(100 - index)
-        return {8: 20.0, 9: 0.0, 10: 10.0, 11: 5.0}[index]
-
-    selector = LazyHeapSelector(
-        _ScriptedContext([f"node-{index:02d}" for index in range(12)], gain),
-        max_refreshes=3,
-    )
-
-    result = selector.select(9, initial_indices=[0])
-
-    assert result.selected_indices == (0, 1, 2, 3, 4, 5, 6, 7, 9)
-    assert result.score_deltas[-1] == pytest.approx(200.0)
-    assert result.heap_refreshes[-1] == 0
-
-
-def test_lazy_heap_caps_refreshes_and_lazily_skips_the_selected_heap_entry() -> None:
-    sample_ids = [f"node-{index:03d}" for index in range(102)]
-
-    def gain(selected_count: int, index: int) -> float:
-        if selected_count == 0:
-            return 0.0
-        if selected_count == 1:
-            return 10_000.0 - index
-        return float(index)
-
-    selector = LazyHeapSelector(_ScriptedContext(sample_ids, gain), max_refreshes=100)
-
-    result = selector.select(4, initial_indices=[0])
-
-    assert result.selected_indices == (0, 1, 101, 100)
-    assert result.heap_refreshes == (0, 0, 100, 1)
-    assert len(set(result.selected_indices)) == 4
-    assert result.total_refreshes == 101
-    assert result.capped_selections == 1
-    assert result.max_refreshes_observed == 100
-
-
-def test_lazy_heap_breaks_equal_gain_ties_by_sample_id() -> None:
-    context = _ScriptedContext(
-        ["seed", "z-candidate", "a-candidate"],
-        lambda selected_count, index: 0.0 if selected_count == 0 else 1.0,
-    )
-
-    result = LazyHeapSelector(context).select(2, initial_indices=[0])
-
-    assert result.selected_indices == (0, 2)
-
-
-def test_lazy_heap_has_no_task_quota_and_can_select_one_task_repeatedly() -> None:
-    graph = _heap_graph(6)
-    graph.task_indices = np.asarray([1, 1, 1, 0, 0, 1], dtype=np.int64)
-    context = CocoreObjectiveContext(graph, "cooccurrence", 1.0, similarity_threshold=0.8)
-    seed = build_max_coverage_seed(context, budget=3)
-
-    result = LazyHeapSelector(context).select(3, initial_indices=seed.selected_indices)
-
-    assert result.selected_indices == (5, 0, 1)
-    assert graph.task_indices[list(result.selected_indices)].tolist() == [1, 1, 1]
-
-
-def test_lazy_heap_rejects_non_finite_gains() -> None:
-    context = _ScriptedContext(
-        ["seed", "bad"],
-        lambda selected_count, index: 0.0 if selected_count == 0 else float("nan"),
-    )
-
-    with pytest.raises(ValueError, match="finite marginal gain"):
-        LazyHeapSelector(context).select(2, initial_indices=[0])
-
-
-class _CountingObjectiveContext(CocoreObjectiveContext):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.marginal_gain_calls = 0
-
-    def marginal_gain(self, state, candidate: int) -> float:
-        self.marginal_gain_calls += 1
-        return super().marginal_gain(state, candidate)
-
-
-def test_lazy_heap_bounds_marginal_gain_recomputations() -> None:
-    graph = _heap_graph(20)
-    context = _CountingObjectiveContext(
-        graph, "cooccurrence", 1.0, similarity_threshold=0.8
-    )
-    budget = 10
-    seed = build_max_coverage_seed(context, budget=budget)
-    selector = LazyHeapSelector(context, max_refreshes=3)
-
-    result = selector.select(budget, initial_indices=seed.selected_indices)
-
-    heap_selections = budget - len(seed.selected_indices)
-    remaining_candidates = len(graph.sample_ids) - len(seed.selected_indices)
-    full_refresh_candidates = sum(
-        remaining_candidates - (step - 1)
-        for step in range(8, heap_selections + 1)
-        if (step & (step - 1)) == 0
-    )
-    calls_excluding_seed = context.marginal_gain_calls - len(seed.selected_indices)
-    assert calls_excluding_seed <= (
-        remaining_candidates + 3 * heap_selections + full_refresh_candidates
-    )
-    recomputed = CocoreObjectiveContext(
-        graph, "cooccurrence", 1.0, similarity_threshold=0.8
-    ).state_from_indices(result.selected_indices)
-    assert result.objective_value == pytest.approx(recomputed.score)
-    assert result.relation == pytest.approx(recomputed.relation)
-    assert result.redundancy == pytest.approx(recomputed.redundancy)
