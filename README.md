@@ -13,6 +13,9 @@ Coverage、Diversity 和 Novelty；以及仿照 SQCN 两遍数据流、面向 LI
 运动原语、以可配置 sequence/cooccurrence 关系减冗余目标执行有界惰性最大堆选择的
 [Cocore](cocore/README.md)。
 
+[Cocore Ablation](cocore_ablation/README.md) 提供仅面向 LIBERO 的独立组件消融入口，
+复用 Cocore scan/encode 缓存并使用独立 graph、select 和 validator 契约。
+
 BridgeData V2 可通过独立的仓库内命令包
 [Cocore BridgeV2](cocore_bridge_v2/README.md) 使用同一 Cocore 算法。该适配入口固定
 读取 LeRobot v2 的 `image_0`、8 维 state 和 7 维 action，排除空任务 episode，

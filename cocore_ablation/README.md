@@ -1,0 +1,105 @@
+# Cocore Ablation：LIBERO 独立消融模块
+
+`cocore_ablation` 在不改变生产 `cocore` 配置、CLI、版本和 artifact schema 的前提下，
+运行 LIBERO 组件消融。它读取或补建现有 Cocore 的 `scan/`、`encode/` 缓存，并把自己的
+graph 和 select 产物写入 `outputs/cocore_ablation/libero90/`。
+
+## 运行
+
+```bash
+pip install -r cocore_ablation/requirements.txt
+
+python -m cocore_ablation run \
+  --config cocore_ablation/config_libero90.yaml
+
+python -m cocore_ablation validate \
+  --output-dir outputs/cocore_ablation/libero90/<graph>/<select>
+```
+
+`run --force` 只替换消融模块自己的 graph/select 目录，不会向 Cocore upstream 传递
+`force`。如果 upstream 中存在不兼容的 scan/encode，命令会停止并要求先显式处理或改用
+新的 `upstream.directory`。
+
+## 核心消融
+
+完整模型默认配置为：
+
+```yaml
+reliability_metrics: [support, progress]
+
+prototypes:
+  representation: action_visual
+  use_assignment_confidence: true
+  use_stop_bucket: true
+
+objective:
+  relation: sequence
+  relation_weight: 1.0
+  redundancy_weight: 1.0
+
+selection:
+  strategy: random_multibranch
+  use_coverage_seed: true
+```
+
+建议一次只改变一个组件：
+
+| 实验 | 配置或 CLI |
+|---|---|
+| 去可靠性 | `reliability_metrics: []` / `--reliability-metrics none` |
+| 只用 support | `[support]` / `--reliability-metrics support` |
+| 只用 progress | `[progress]` / `--reliability-metrics progress` |
+| 动作原型，无视觉细分 | `prototypes.representation: action_only` |
+| 去分配置信度 | `prototypes.use_assignment_confidence: false` |
+| 去关系项 | `objective.relation_weight: 0` |
+| 去冗余项 | `objective.redundancy_weight: 0` |
+| 去 coverage seed | `selection.use_coverage_seed: false` |
+| 严格随机 | `strategy: random` 且 `use_coverage_seed: false` |
+| 去 stop 桶 | `prototypes.use_stop_bucket: false` |
+| 关系对照 | `objective.relation: sequence` 或 `cooccurrence` |
+
+对应 CLI 覆盖为：
+
+```bash
+python -m cocore_ablation run \
+  --prototype-representation action_only \
+  --no-assignment-confidence \
+  --no-use-stop-bucket \
+  --relation cooccurrence \
+  --relation-weight 0 \
+  --redundancy-weight 0 \
+  --no-coverage-seed \
+  --selection-strategy random \
+  --selection-ratio 0.10
+```
+
+`action_only` 为每个有训练样本的动作桶生成一个叶原型。复合动作回退存在多个同阶父动作
+时，使用已有的“动作出现次数降序、标签升序”稳定顺序选择第一个，不使用视觉距离。
+关闭 assignment confidence 后，每个半片段权重为 1；同叶双半段仍按
+`max + 0.5 * min` 合并。
+
+## 产物与缓存
+
+输出结构如下：
+
+```text
+outputs/cocore_ablation/libero90/
+  graph-<metrics>-<representation>-conf<0|1>-stop<0|1>-<fingerprint>/
+    nodes.npz
+    prototype_catalog.json
+    ...
+    select-<relation>-rw<...>-dw<...>-cov<0|1>-<strategy>-<budget>-<fingerprint>/
+      selected_manifest.jsonl
+      all_clips.parquet
+      selection_report.json
+      manifest.json
+      run_manifest.json
+      resolved_config.yaml
+```
+
+可靠性指标、原型表示、分配置信度和 stop 桶改变 graph 指纹；关系类型、两个目标权重、
+coverage seed、选择策略、预算及 seed 改变 select 指纹。报告保留 raw/weighted relation、
+raw/weighted redundancy、总分、coverage、初始集合大小及 upstream fingerprint。
+
+本模块 schema 固定为 1，仅支持 `prototypes.profile: libero`，不会接入
+`cocore_bridge_v2`。

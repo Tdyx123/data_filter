@@ -250,7 +250,8 @@ class RandomMultiBranchSelector:
             raise ValueError("active redundancy deltas do not match branch redundancy")
         relation = math.fsum(relation_deltas)
         gains = [
-            self.context.relation_weight * relation_delta - redundancy_delta
+            self.context.relation_weight * relation_delta
+            - self.context.redundancy_weight * redundancy_delta
             for relation_delta, redundancy_delta in zip(
                 relation_deltas,
                 redundancy_deltas,
@@ -260,7 +261,7 @@ class RandomMultiBranchSelector:
         for index, gain in zip(selected, gains, strict=True):
             if not math.isfinite(gain):
                 raise ValueError(f"candidate {index} has a non-finite marginal gain")
-        score = self.context.relation_weight * relation - float(redundancy)
+        score = self.context.objective_value(relation, redundancy)
         if not math.isclose(
             math.fsum(gains),
             score,
@@ -297,8 +298,8 @@ class RandomMultiBranchSelector:
             raise ValueError("initial_indices cannot contain duplicates")
         if any(index < 0 or index >= candidate_count for index in initial):
             raise ValueError("initial_indices must contain in-range values")
-        if not 0 < len(initial) <= budget <= candidate_count:
-            raise ValueError("budget must contain a non-empty initial selection")
+        if not 0 <= len(initial) <= budget <= candidate_count or budget <= 0:
+            raise ValueError("budget must include the initial selection and fit the pool")
 
         fixed = list(initial)
         fixed_set = set(initial)

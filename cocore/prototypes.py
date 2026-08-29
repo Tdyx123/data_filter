@@ -928,6 +928,121 @@ def _fit_action_models(
     return {action_id: models[action_id] for action_id in action_ids}
 
 
+def _build_action_only_prototypes(
+    catalog: ActionCatalog,
+    clips: Sequence[ClipRecord],
+    candidate_labels: Mapping[int, tuple[str, str]],
+    *,
+    visual_dim: int,
+    use_assignment_confidence: bool,
+) -> HierarchicalPrototypeResult:
+    """Collapse each trained action bucket to one leaf without visual matching."""
+
+    updated_categories: dict[int, ActionCategory] = {}
+    leaves: list[LeafPrototype] = []
+    leaf_by_action: dict[int, int] = {}
+    for category in sorted(
+        (
+            value
+            for value in catalog.action_categories
+            if value.action_id is not None and value.training_count > 0
+        ),
+        key=lambda value: int(value.action_id),
+    ):
+        action_id = int(category.action_id)
+        leaf_id = len(leaves)
+        leaves.append(
+            LeafPrototype(
+                prototype_id=leaf_id,
+                label=f"{category.label}::action",
+                action_id=action_id,
+                action_label=category.label,
+                center_id=0,
+            )
+        )
+        leaf_by_action[action_id] = leaf_id
+        updated_categories[action_id] = replace(
+            category,
+            requested_centers=1,
+            actual_centers=1,
+            nearest_distance_q10=None,
+            nearest_distance_q90=None,
+        )
+
+    refined_catalog = ActionCatalog(
+        total_raw_actions=catalog.total_raw_actions,
+        action_categories=tuple(
+            updated_categories.get(int(category.action_id), category)
+            if category.action_id is not None
+            else category
+            for category in catalog.action_categories
+        ),
+        profile=catalog.profile,
+        use_stop_bucket=catalog.use_stop_bucket,
+        leaf_prototypes=tuple(leaves),
+    )
+    categories_by_label = {
+        category.label: category for category in refined_catalog.action_categories
+    }
+    retained_counts = {
+        category.label: category.raw_count
+        for category in refined_catalog.action_categories
+        if category.retained and category.label != "stop"
+    }
+    per_clip: list[tuple[tuple[int, float], ...]] = []
+    for clip_index in range(len(clips)):
+        half_assignments: list[tuple[int, float]] = []
+        for raw_label in candidate_labels[clip_index]:
+            parent_labels = maximum_retained_parents(
+                raw_label,
+                retained_counts,
+                use_stop_bucket=refined_catalog.use_stop_bucket,
+            )
+            if not parent_labels:
+                continue
+            parent_label = parent_labels[0]
+            parent = categories_by_label.get(parent_label)
+            if parent is None or parent.action_id is None:
+                raise ValueError(f"missing parent action {parent_label!r} for clip {clip_index}")
+            leaf_id = leaf_by_action.get(int(parent.action_id))
+            if leaf_id is None:
+                raise ValueError(
+                    f"missing action-only leaf for parent action {parent_label!r}"
+                )
+            weight = (
+                retention_weight(raw_label, parent_label)
+                if use_assignment_confidence
+                else 1.0
+            )
+            half_assignments.append((leaf_id, weight))
+        per_clip.append(
+            merge_half_leaf_assignments(tuple(half_assignments))
+            if half_assignments
+            else ()
+        )
+
+    prototype_indices = np.full((len(clips), 2), -1, dtype=np.int32)
+    prototype_weights = np.zeros((len(clips), 2), dtype=np.float32)
+    for clip_index, assignments in enumerate(per_clip):
+        for slot, (leaf_id, weight) in enumerate(assignments):
+            prototype_indices[clip_index, slot] = leaf_id
+            prototype_weights[clip_index, slot] = np.float32(weight)
+    centers = np.zeros((len(leaves), int(visual_dim)), dtype=np.float32)
+    return HierarchicalPrototypeResult(
+        prototypes=PrototypeData(
+            centers=centers,
+            indices=prototype_indices,
+            weights=prototype_weights,
+            labels=refined_catalog.labels,
+        ),
+        catalog=refined_catalog,
+        half_action_labels=np.asarray(
+            [candidate_labels[index] for index in range(len(clips))], dtype=np.str_
+        ),
+        eligible_mask=np.any(prototype_indices >= 0, axis=1),
+    )
+
+
 def build_hierarchical_motion_prototypes(
     adapter: DatasetAdapter,
     clips: Sequence[ClipRecord],
@@ -945,6 +1060,8 @@ def build_hierarchical_motion_prototypes(
     num_threads: int = 4,
     use_stop_bucket: bool = True,
     profile: str = "libero",
+    representation: str = "action_visual",
+    use_assignment_confidence: bool = True,
     timing_callback: TimingCallback | None = None,
 ) -> HierarchicalPrototypeResult:
     """Learn exact action buckets and assign one nearest visual leaf per clip half."""
@@ -955,6 +1072,14 @@ def build_hierarchical_motion_prototypes(
         raise ValueError("visual half embeddings must align with clips and be finite") from error
     if not isinstance(use_stop_bucket, bool):
         raise ValueError("hierarchical prototype use_stop_bucket must be a boolean")
+    if representation not in {"action_visual", "action_only"}:
+        raise ValueError(
+            "hierarchical prototype representation must be action_visual or action_only"
+        )
+    if not isinstance(use_assignment_confidence, bool):
+        raise ValueError(
+            "hierarchical prototype use_assignment_confidence must be a boolean"
+        )
     if (
         raw_candidate_values.ndim != 3
         or raw_candidate_values.shape[0] != len(clips)
@@ -1077,6 +1202,26 @@ def build_hierarchical_motion_prototypes(
         use_stop_bucket=use_stop_bucket,
         profile=resolved_profile.name,
     )
+
+    if representation == "action_only":
+        candidate_assignment_started = time.perf_counter()
+        result = _build_action_only_prototypes(
+            catalog,
+            clips,
+            candidate_labels,
+            visual_dim=visual_dim,
+            use_assignment_confidence=use_assignment_confidence,
+        )
+        if timing_callback is not None:
+            timing_callback(
+                "graph.prototypes.action_scan",
+                time.perf_counter() - action_scan_started,
+            )
+            timing_callback(
+                "graph.prototypes.candidate_assignment",
+                time.perf_counter() - candidate_assignment_started,
+            )
+        return result
 
     categories_by_label = {category.label: category for category in catalog.action_categories}
     categories_by_id = {
@@ -1277,10 +1422,15 @@ def build_hierarchical_motion_prototypes(
             parent_category = refined_by_label[parent_label]
             assert parent_category.nearest_distance_q10 is not None
             assert parent_category.nearest_distance_q90 is not None
-            weight = retention_weight(raw_label, parent_label) * distance_confidence(
-                distance,
-                parent_category.nearest_distance_q10,
-                parent_category.nearest_distance_q90,
+            weight = (
+                retention_weight(raw_label, parent_label)
+                * distance_confidence(
+                    distance,
+                    parent_category.nearest_distance_q10,
+                    parent_category.nearest_distance_q90,
+                )
+                if use_assignment_confidence
+                else 1.0
             )
             half_assignments.append((leaf_id, weight))
         per_clip.append(

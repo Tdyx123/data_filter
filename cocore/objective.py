@@ -48,6 +48,7 @@ class CocoreObjectiveContext:
         relation_type: str,
         relation_weight: float = 1.0,
         *,
+        redundancy_weight: float = 1.0,
         similarity_threshold: float,
         epsilon: float = 1.0e-8,
     ) -> None:
@@ -57,12 +58,16 @@ class CocoreObjectiveContext:
         weight = float(relation_weight)
         if not math.isfinite(weight) or weight < 0.0:
             raise ValueError("relation_weight must be finite and non-negative")
+        redundancy = float(redundancy_weight)
+        if not math.isfinite(redundancy) or redundancy < 0.0:
+            raise ValueError("redundancy_weight must be finite and non-negative")
         threshold = float(similarity_threshold)
         if not 0.0 <= threshold < 1.0:
             raise ValueError("similarity_threshold must be in [0, 1)")
         self.graph = graph
         self.relation_type = relation
         self.relation_weight = weight
+        self.redundancy_weight = redundancy
         self.similarity_threshold = threshold
         self.epsilon = float(epsilon)
         self.relation_metrics = RelationMetricKernel(
@@ -96,6 +101,12 @@ class CocoreObjectiveContext:
             self.redundancy_adjacency[right].append((left, penalty))
             raw_total += penalty
         self.redundancy_normalizer = max(raw_total, self.epsilon)
+
+    def objective_value(self, relation: float, redundancy: float) -> float:
+        return float(
+            self.relation_weight * float(relation)
+            - self.redundancy_weight * float(redundancy)
+        )
 
     def empty_state(self) -> CocoreObjectiveState:
         return CocoreObjectiveState(
@@ -166,7 +177,7 @@ class CocoreObjectiveContext:
             task_count_deltas=np.zeros_like(main_state.task_counts),
             relation=relation,
             redundancy=0.0,
-            score=self.relation_weight * relation,
+            score=self.objective_value(relation, 0.0),
         )
 
     def materialize_update_state(
@@ -247,7 +258,7 @@ class CocoreObjectiveContext:
             previous_redundancy = float(state.redundancy)
             self.add_candidate(state, index)
             state.redundancy = previous_redundancy + redundancy_delta
-            state.score = self.relation_weight * state.relation - state.redundancy
+            state.score = self.objective_value(state.relation, state.redundancy)
             relation_deltas.append(float(state.relation) - previous_relation)
             accumulated_redundancy.append(float(redundancy_delta))
         selected_indices = update_state.selected_indices + added
@@ -302,7 +313,7 @@ class CocoreObjectiveContext:
         )
         relation = state.relation + relation_delta
         redundancy = state.redundancy + redundancy_delta
-        score = self.relation_weight * relation - redundancy
+        score = self.objective_value(relation, redundancy)
         return relation, redundancy, float(score), metric_delta
 
     def marginal_gain(self, state: CocoreObjectiveState, candidate: int) -> float:
@@ -339,12 +350,14 @@ def recompute_objective(
     *,
     relation_type: str,
     relation_weight: float = 1.0,
+    redundancy_weight: float = 1.0,
     similarity_threshold: float,
 ) -> CocoreObjectiveState:
     context = CocoreObjectiveContext(
         graph,
         relation_type,
         relation_weight,
+        redundancy_weight=redundancy_weight,
         similarity_threshold=similarity_threshold,
     )
     return context.state_from_indices(selected_indices)
