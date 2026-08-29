@@ -397,7 +397,6 @@ class Qwen3VLGrootPolicy(nn.Module):
         self.default_denoising_steps = int(flow["denoising_steps"])
         self.max_context_tokens = int(model["max_context_tokens"])
         self.context_dim = int(model["context_dim"])
-        self.context_forward = str(model.get("context_forward", "causal_lm"))
         self.normalization_contract = data.get("normalization_contract")
         self._static_action_head_context_buckets_enabled = False
 
@@ -627,24 +626,11 @@ class Qwen3VLGrootPolicy(nn.Module):
                 if isinstance(value, torch.Tensor)
             }
 
-    def _forward_context_model(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    def _forward_backbone_context(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
         with record_function("qwen_backbone"):
-            if self.context_forward == "causal_lm":
-                outputs = self.backbone(
-                    **inputs,
-                    output_hidden_states=True,
-                    use_cache=False,
-                    return_dict=True,
-                )
-                return outputs.hidden_states[-1]
-
-            if self.context_forward != "backbone":
-                raise ModelContractError(
-                    f"Unknown Qwen context forward mode: {self.context_forward}"
-                )
             if not hasattr(self.backbone, "get_base_model"):
                 raise ModelContractError(
-                    "Direct Qwen context forward requires a PEFT model with get_base_model()"
+                    "Qwen context encoding requires a PEFT model with get_base_model()"
                 )
             conditional_generation = self.backbone.get_base_model()
             context_model = getattr(conditional_generation, "model", None)
@@ -657,7 +643,13 @@ class Qwen3VLGrootPolicy(nn.Module):
                 use_cache=False,
                 return_dict=True,
             )
-            return outputs.last_hidden_state
+            context = getattr(outputs, "last_hidden_state", None)
+            if not isinstance(context, torch.Tensor):
+                raise ModelContractError(
+                    "Direct Qwen backbone context output must provide tensor "
+                    "last_hidden_state"
+                )
+            return context
 
     def encode_context(
         self,
@@ -670,7 +662,7 @@ class Qwen3VLGrootPolicy(nn.Module):
         )
         gradient_context = nullcontext() if lora_requires_grad else torch.no_grad()
         with gradient_context:
-            context = self._forward_context_model(inputs)
+            context = self._forward_backbone_context(inputs)
         attention_mask = inputs.get("attention_mask")
         if attention_mask is None:
             attention_mask = torch.ones(

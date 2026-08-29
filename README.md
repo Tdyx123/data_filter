@@ -619,6 +619,11 @@ LoRA 与 GR00T 动作头使用独立 optimizer parameter group，可分别通过
 `--lora-learning-rate` 和 `--action-head-learning-rate` 覆盖；默认分别为
 `1e-5` 与 `1e-4`。
 
+所有 Qwen GROOT 入口固定直接调用 PEFT 基座内的多模态 backbone，并读取其
+`last_hidden_state`；不会执行 conditional-generation LM head，也不会生成未使用的
+LM logits。`model.context_forward` 配置和 `--qwen-context-forward` 命令行参数均已
+删除。下述独立 `qwen_vl_oft` 路径不受这一 GROOT 前向契约影响。
+
 ### QwenVL-4B-OFT（starVLA 兼容）
 
 独立的 `qwen_vl_oft` 路径复刻 starVLA QwenOFT 的因果动作查询语义：先把当前
@@ -724,7 +729,7 @@ bash scripts/train_libero_qwen3_5_0_8b_groot_all_tasks_4x4090.sh \
   --output-dir outputs/qwen3_5_0_8b_groot_libero
 ```
 
-该入口默认直接读取主干最后一层 hidden state，不计算未使用的 LM logits。LoRA
+该入口同样遵循固定的 GROOT backbone 前向契约。LoRA
 覆盖 6 个全注意力层的 `q_proj/k_proj/v_proj/o_proj`，以及 18 个 DeltaNet 层的
 `in_proj_qkv/in_proj_z/in_proj_b/in_proj_a/out_proj`；匹配范围严格限制在文本层。
 
@@ -770,6 +775,9 @@ RNG 或数据迭代位置；因此这里提供的是新 optimizer 的 warm-start
 恢复紧凑权重、沿用 checkpoint normalization，并把 scheduler 与 DeepSpeed
 `global_steps` 对齐到该 step。除 `paths.output` 外，当前运行配置必须与 checkpoint
 完全一致，且新输出目录必须不存在或为空，也不能是原训练输出目录。
+旧 checkpoint manifest 中只要包含已删除的 `model.context_forward` 字段，就会被
+warm-start、LIBERO/SIMPLER 评测和直接策略加载入口拒绝；只支持本版本生成的
+backbone-only GROOT checkpoint。
 
 先使用独立临时输出目录做预检，避免预检文件占用正式输出目录：
 

@@ -39,7 +39,6 @@ model:
   text_layers: 24
   context_dim: 1024
   max_context_tokens: 512
-  context_forward: backbone
   attn_implementation: auto
   gradient_checkpointing: false
   torch_compile:

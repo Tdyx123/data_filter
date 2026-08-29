@@ -21,7 +21,6 @@ def test_benchmark_command_preserves_effective_batch_and_phase_schedule(tmp_path
         "backbone_mbs4",
         micro_batch_size=4,
         gradient_accumulation_steps=4,
-        context_forward="backbone",
         compile_action_head=True,
         episode_cache_size=16,
     )
@@ -46,7 +45,7 @@ def test_benchmark_command_preserves_effective_batch_and_phase_schedule(tmp_path
     assert value("--lora-freeze-steps") == "0"
     assert value("--lora-cycle-steps") == "100"
     assert value("--lora-active-steps") == "100"
-    assert value("--qwen-context-forward") == "backbone"
+    assert "--qwen-context-forward" not in command
     assert value("--episode-cache-size") == "16"
     assert "--compile-action-head" in command
     assert "--no-compile-qwen-backbone" in command

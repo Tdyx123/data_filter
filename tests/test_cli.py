@@ -146,7 +146,7 @@ def test_launch_cli_overrides_lora_update_schedule(tmp_path):
     assert config["train"]["lora_active_steps"] == 10
 
 
-def test_launch_cli_overrides_context_and_independent_compile_targets(tmp_path):
+def test_launch_cli_overrides_independent_compile_targets(tmp_path):
     parser = build_parser()
     arguments = parser.parse_args(
         [
@@ -155,8 +155,6 @@ def test_launch_cli_overrides_context_and_independent_compile_targets(tmp_path):
             str(PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"),
             "--output-dir",
             str(tmp_path / "run"),
-            "--qwen-context-forward",
-            "backbone",
             "--no-compile-qwen-backbone",
             "--compile-action-head",
             "--episode-cache-size",
@@ -166,10 +164,27 @@ def test_launch_cli_overrides_context_and_independent_compile_targets(tmp_path):
 
     config = _resolve_config(arguments)
 
-    assert config["model"]["context_forward"] == "backbone"
+    assert "context_forward" not in config["model"]
     assert config["model"]["torch_compile"]["backbone_enabled"] is False
     assert config["model"]["torch_compile"]["action_head_enabled"] is True
     assert config["data"]["episode_cache_size"] == 16
+
+
+def test_launch_cli_rejects_removed_context_forward_option(tmp_path):
+    parser = build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "launch",
+                "--config",
+                str(PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"),
+                "--output-dir",
+                str(tmp_path / "run"),
+                "--qwen-context-forward",
+                "backbone",
+            ]
+        )
 
 
 def test_launch_cli_can_disable_default_action_head_compile(tmp_path):

@@ -490,7 +490,6 @@ def test_runtime_metadata_records_resolved_attention_and_compile_targets(monkeyp
         PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
     )
     config["model"]["attn_implementation"] = "eager"
-    config["model"]["context_forward"] = "backbone"
     monkeypatch.setattr(
         "qwen3_vl_groot.training._runtime_versions",
         lambda: {"torch": "test"},

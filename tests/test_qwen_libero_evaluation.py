@@ -192,6 +192,19 @@ def test_resolve_qwen_checkpoint_rejects_attention_only_manifest_before_base_mod
         evaluation.resolve_qwen_checkpoint(checkpoint)
 
 
+@pytest.mark.parametrize("mode", ["causal_lm", "backbone"])
+def test_resolve_qwen_checkpoint_rejects_legacy_context_forward_manifest(tmp_path, mode):
+    evaluation = _evaluation()
+    checkpoint, _ = _write_checkpoint(tmp_path)
+    manifest_path = checkpoint / "policy_config.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["config"]["model"]["context_forward"] = mode
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(evaluation.EvaluationError, match="context_forward"):
+        evaluation.resolve_qwen_checkpoint(checkpoint)
+
+
 @pytest.mark.parametrize(
     "config_text",
     [

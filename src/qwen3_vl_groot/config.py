@@ -151,7 +151,6 @@ def apply_overrides(config: dict[str, Any], overrides: dict[str, Any]) -> dict[s
         "micro_batch_size": ("train", "micro_batch_size"),
         "gradient_accumulation_steps": ("train", "gradient_accumulation_steps"),
         "max_steps": ("train", "max_steps"),
-        "context_forward": ("model", "context_forward"),
         "compile_qwen_backbone": (
             "model",
             "torch_compile",
@@ -268,9 +267,10 @@ def validate_config(config: dict[str, Any]) -> None:
             f"{contract['display_name']} requires model.context_dim={expected_context_dim}"
         )
     validated_lora_target_modules(model)
-    if model.get("context_forward", "causal_lm") not in {"causal_lm", "backbone"}:
+    if "context_forward" in model:
         raise ConfigError(
-            "model.context_forward must be either causal_lm or backbone"
+            "model.context_forward is no longer supported; "
+            "Qwen GROOT always uses direct backbone context encoding"
         )
     if not isinstance(model["gradient_checkpointing"], bool):
         raise ConfigError("model.gradient_checkpointing must be a boolean")
