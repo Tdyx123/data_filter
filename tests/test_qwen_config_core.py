@@ -187,6 +187,7 @@ def test_libero_config_rejects_non_integer_global_source_quota():
     )
     config["train"]["gpu_count"] = 2
     config["train"]["gpu_ids"] = [0, 1]
+    config["train"]["micro_batch_size"] = 1
     config["data"]["sample_weights"] = [3.0, 1.0]
 
     with pytest.raises(ConfigError, match="global micro-batch"):
