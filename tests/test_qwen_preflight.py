@@ -123,5 +123,5 @@ def test_libero_target_only_preflight_does_not_access_prior(tmp_path, monkeypatc
     )
     assert report["target"]["selection"]["frames"] == 14_144
     assert report["prior"] is None
-    assert report["global_micro_batch_source_counts"] == [4]
+    assert report["global_micro_batch_source_counts"] == [8]
     assert report["offline_validation"] is False
