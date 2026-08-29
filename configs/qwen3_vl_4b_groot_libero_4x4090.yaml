@@ -75,18 +75,18 @@ train:
   seed: 42
   gpu_count: 4
   gpu_ids: [0, 1, 2, 3]
-  micro_batch_size: 1
-  gradient_accumulation_steps: 16
-  max_steps: 20000
-  head_learning_rate: 1.0e-4
-  lora_learning_rate: 1.0e-5
+  micro_batch_size: 2
+  gradient_accumulation_steps: 32
+  max_steps: 5000
+  head_learning_rate: 2.0e-4
+  lora_learning_rate: 2.0e-5
   weight_decay: 0.01
-  head_warmup_steps: 1000
-  lora_freeze_steps: 2000
-  lora_warmup_steps: 500
+  head_warmup_steps: 250
+  lora_freeze_steps: 500
+  lora_warmup_steps: 125
   max_grad_norm: 1.0
   log_every_steps: 10
-  save_every_steps: 1000
+  save_every_steps: 250
   validation_enabled: false
   bf16: true
   deepspeed_stage: 2

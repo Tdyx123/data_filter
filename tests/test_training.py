@@ -23,6 +23,7 @@ from qwen3_vl_groot.training import (  # noqa: E402
     _should_save_checkpoint,
     _should_save_final_checkpoint,
     _validate_warm_start_output,
+    build_deepspeed_config,
     build_optimizer_and_scheduler,
 )
 from qwen3_vl_groot.schedules import LoraUpdateSchedule  # noqa: E402
@@ -44,6 +45,43 @@ class TinyPolicy(nn.Module):
 
     def lora_parameters(self):
         return [self.lora_a, self.lora_b]
+
+
+def test_libero_four_gpu_config_resolves_batch_256_training_plan():
+    config = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
+    )
+
+    assert {
+        name: config["train"][name]
+        for name in (
+            "micro_batch_size",
+            "gradient_accumulation_steps",
+            "max_steps",
+            "head_learning_rate",
+            "lora_learning_rate",
+            "head_warmup_steps",
+            "lora_freeze_steps",
+            "lora_warmup_steps",
+            "save_every_steps",
+        )
+    } == {
+        "micro_batch_size": 2,
+        "gradient_accumulation_steps": 32,
+        "max_steps": 5_000,
+        "head_learning_rate": 2.0e-4,
+        "lora_learning_rate": 2.0e-5,
+        "head_warmup_steps": 250,
+        "lora_freeze_steps": 500,
+        "lora_warmup_steps": 125,
+        "save_every_steps": 250,
+    }
+
+    deepspeed_config = build_deepspeed_config(config, world_size=4)
+
+    assert deepspeed_config["train_micro_batch_size_per_gpu"] == 2
+    assert deepspeed_config["gradient_accumulation_steps"] == 32
+    assert deepspeed_config["train_batch_size"] == 256
 
 
 def test_rank_zero_logger_mirrors_persisted_payload_to_stdout(tmp_path, capsys):
@@ -102,9 +140,7 @@ def test_optimizer_groups_receive_independent_configured_learning_rates():
 
 
 def test_warm_start_scheduler_is_aligned_to_completed_step():
-    config = load_config(
-        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
-    )
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
     config["train"]["lora_learning_rate"] = 5e-5
 
     optimizer, scheduler = build_optimizer_and_scheduler(
@@ -258,9 +294,7 @@ def test_initial_metrics_record_warm_start_provenance(tmp_path):
 
 
 def test_training_engine_starts_at_checkpoint_global_step(monkeypatch):
-    config = load_config(
-        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
-    )
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
     checkpoint = SimpleNamespace(global_step=12_000)
     engine = SimpleNamespace(global_steps=0)
     optimizer = object()
@@ -292,9 +326,7 @@ def test_training_engine_starts_at_checkpoint_global_step(monkeypatch):
 
 
 def test_warm_start_training_clocks_continue_after_step_12000():
-    config = load_config(
-        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
-    )
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
     train_config = config["train"]
     lora_schedule = LoraUpdateSchedule.from_train_config(train_config)
     performance = PerformanceWindow(
@@ -478,13 +510,11 @@ def test_runtime_metadata_records_resolved_attention_and_compile_targets(monkeyp
         384,
         512,
     ]
-    assert metadata["effective_batch_size"] == 64
+    assert metadata["effective_batch_size"] == 256
 
 
 def test_runtime_metadata_records_warm_start_provenance(monkeypatch, tmp_path):
-    config = load_config(
-        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
-    )
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
     checkpoint = SimpleNamespace(
         path=(tmp_path / "step-00012000").resolve(),
         global_step=12_000,
