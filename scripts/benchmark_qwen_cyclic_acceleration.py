@@ -32,7 +32,6 @@ class Candidate:
     name: str
     micro_batch_size: int
     gradient_accumulation_steps: int
-    context_forward: str
     compile_action_head: bool = False
     episode_cache_size: int = 2
 
@@ -85,8 +84,6 @@ def _command(
         str(cycle_steps),
         "--lora-active-steps",
         str(active_steps),
-        "--qwen-context-forward",
-        candidate.context_forward,
         "--no-compile-qwen-backbone",
         (
             "--compile-action-head"
@@ -240,27 +237,19 @@ def main() -> None:
         "report_path": report_path,
     }
 
-    baseline_spec = Candidate("baseline_causal_mbs1", 1, 16, "causal_lm")
+    baseline_spec = Candidate("backbone_mbs1", 1, 16)
     baseline = _try_candidate(baseline_spec, **common)
     if baseline is None:
         raise SystemExit("baseline benchmark failed; see benchmark_summary.json")
 
-    direct_spec = Candidate("backbone_mbs1", 1, 16, "backbone")
-    direct = _try_candidate(direct_spec, **common)
     current_spec = baseline_spec
     current = baseline
-    if direct is not None and direct["weighted_step_seconds"] < baseline["weighted_step_seconds"]:
-        current_spec, current = direct_spec, direct
-        report["decisions"].append("accepted direct Qwen backbone context forward")
-    else:
-        report["decisions"].append("kept causal-LM context forward")
 
     for micro_batch_size, accumulation in ((2, 8), (4, 4)):
         candidate_spec = Candidate(
-            f"{current_spec.context_forward}_mbs{micro_batch_size}",
+            f"backbone_mbs{micro_batch_size}",
             micro_batch_size,
             accumulation,
-            current_spec.context_forward,
         )
         candidate = _try_candidate(candidate_spec, **common)
         if candidate is not None and _accepted(current, candidate):
@@ -274,10 +263,9 @@ def main() -> None:
             )
 
     compiled_spec = Candidate(
-        f"{current_spec.context_forward}_mbs{current_spec.micro_batch_size}_head_compile",
+        f"{current_spec.name}_head_compile",
         current_spec.micro_batch_size,
         current_spec.gradient_accumulation_steps,
-        current_spec.context_forward,
         compile_action_head=True,
     )
     compiled = _try_candidate(compiled_spec, **common)
@@ -293,9 +281,8 @@ def main() -> None:
                 f"{current_spec.name}_cache{cache_size}",
                 current_spec.micro_batch_size,
                 current_spec.gradient_accumulation_steps,
-                current_spec.context_forward,
-                current_spec.compile_action_head,
-                cache_size,
+                compile_action_head=current_spec.compile_action_head,
+                episode_cache_size=cache_size,
             )
             cache_result = _try_candidate(cache_spec, **common)
             if cache_result is not None and _accepted(current, cache_result):

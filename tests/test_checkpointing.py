@@ -95,6 +95,7 @@ def test_compact_safetensors_round_trip(tmp_path):
     checkpoint_config = json.loads(
         (target / "policy_config.json").read_text(encoding="utf-8")
     )["config"]
+    assert "context_forward" not in checkpoint_config["model"]
     assert checkpoint_config["model"]["backbone_family"] == "qwen3_vl"
     assert checkpoint_config["model"]["lora"]["target_modules"] == {
         "full_attention": ["q_proj", "k_proj", "v_proj", "o_proj"],
@@ -167,6 +168,21 @@ def test_inspect_compact_checkpoint_rejects_unsupported_format(tmp_path):
 def test_inspect_compact_checkpoint_rejects_configuration_change(tmp_path):
     checkpoint, current_config = _save_inspectable_checkpoint(tmp_path)
     current_config["train"]["gradient_accumulation_steps"] += 1
+
+    with pytest.raises(CheckpointError, match="only paths.output may change"):
+        inspect_compact_checkpoint(checkpoint, config=current_config)
+
+
+@pytest.mark.parametrize("mode", ["causal_lm", "backbone"])
+def test_inspect_compact_checkpoint_rejects_legacy_context_forward_config(
+    tmp_path,
+    mode,
+):
+    checkpoint, current_config = _save_inspectable_checkpoint(tmp_path)
+    manifest_path = checkpoint / "policy_config.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["config"]["model"]["context_forward"] = mode
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(CheckpointError, match="only paths.output may change"):
         inspect_compact_checkpoint(checkpoint, config=current_config)

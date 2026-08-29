@@ -31,6 +31,12 @@ class BridgePolicy:
         if manifest.get("format") != "qwen3-vl-groot-bridge-compact-v1":
             raise ValueError(f"Unsupported inference checkpoint format: {manifest.get('format')}")
         config = manifest["config"]
+        model_config = config.get("model")
+        if isinstance(model_config, dict) and "context_forward" in model_config:
+            raise ValueError(
+                "Checkpoint uses removed model.context_forward metadata; "
+                "only backbone-only Qwen GROOT checkpoints are supported"
+            )
         try:
             data_config = config["data"]
             if data_config.get("dataset_type", "bridge") == "bridge":

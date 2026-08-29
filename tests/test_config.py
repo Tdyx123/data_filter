@@ -42,6 +42,7 @@ def test_default_config_keeps_all_qwen_layers():
 )
 def test_qwen3_vl_4b_configs_disable_checkpointing_and_compile_only_action_head(name):
     config = load_config(PROJECT_ROOT / "configs" / name)
+    assert "context_forward" not in config["model"]
     assert config["model"]["gradient_checkpointing"] is False
     assert config["model"]["torch_compile"] == {
         "enabled": False,
@@ -96,10 +97,11 @@ def test_config_rejects_non_boolean_compile_target_switch():
         validate_config(config)
 
 
-def test_config_rejects_unknown_context_forward_mode():
+@pytest.mark.parametrize("mode", ["causal_lm", "backbone", "hidden_states_and_logits"])
+def test_config_rejects_removed_context_forward_option(mode):
     config = load_config(PROJECT_ROOT / "configs" / "bridge_8x4090.yaml")
-    config["model"]["context_forward"] = "hidden_states_and_logits"
-    with pytest.raises(ConfigError, match="model.context_forward"):
+    config["model"]["context_forward"] = mode
+    with pytest.raises(ConfigError, match="no longer supported"):
         validate_config(config)
 
 

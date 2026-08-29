@@ -178,6 +178,11 @@ def resolve_qwen_checkpoint(
     model_config = config.get("model", {})
     if not isinstance(model_config, Mapping):
         raise EvaluationError("Qwen policy config model section must be a mapping")
+    if "context_forward" in model_config:
+        raise EvaluationError(
+            "Qwen checkpoint uses removed model.context_forward metadata; "
+            "only checkpoints created by the backbone-only runtime are supported"
+        )
     backbone_family = str(model_config.get("backbone_family", "qwen3_vl"))
     from .config import ConfigError, validated_lora_target_modules
 

@@ -39,7 +39,6 @@ model:
   text_layers: 36
   context_dim: 2560
   max_context_tokens: 512
-  context_forward: causal_lm
   attn_implementation: auto
   gradient_checkpointing: false
   torch_compile:

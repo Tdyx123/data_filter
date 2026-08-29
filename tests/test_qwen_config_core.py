@@ -252,7 +252,7 @@ def test_qwen35_libero_config_keeps_groot_head_and_effective_batch_64():
     assert config["model"]["backbone_family"] == "qwen3_5"
     assert config["model"]["text_layers"] == 24
     assert config["model"]["context_dim"] == 1024
-    assert config["model"]["context_forward"] == "backbone"
+    assert "context_forward" not in config["model"]
     assert config["model"]["lora"]["target_modules"] == {
         "full_attention": ["q_proj", "k_proj", "v_proj", "o_proj"],
         "linear_attention": [

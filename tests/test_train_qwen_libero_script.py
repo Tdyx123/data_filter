@@ -161,7 +161,7 @@ def test_cyclic_bridge_script_injects_schedule_and_bridge_defaults(tmp_path):
     assert arguments[arguments.index("--lora-active-steps") + 1] == "10"
     assert arguments[arguments.index("--micro-batch-size") + 1] == "1"
     assert arguments[arguments.index("--gradient-accumulation-steps") + 1] == "16"
-    assert arguments[arguments.index("--qwen-context-forward") + 1] == "backbone"
+    assert "--qwen-context-forward" not in arguments
     assert "--no-compile-qwen-backbone" in arguments
     assert "--no-compile-action-head" not in arguments
     assert arguments[arguments.index("--episode-cache-size") + 1] == "2"
@@ -370,7 +370,7 @@ def test_cyclic_libero_script_uses_full_prior_and_preserves_schedule_defaults(tm
     assert arguments[arguments.index("--lora-active-steps") + 1] == "10"
     assert arguments[arguments.index("--micro-batch-size") + 1] == "1"
     assert arguments[arguments.index("--gradient-accumulation-steps") + 1] == "16"
-    assert arguments[arguments.index("--qwen-context-forward") + 1] == "backbone"
+    assert "--qwen-context-forward" not in arguments
     assert "--no-compile-qwen-backbone" in arguments
     assert "--no-compile-action-head" not in arguments
     assert arguments[arguments.index("--episode-cache-size") + 1] == "2"

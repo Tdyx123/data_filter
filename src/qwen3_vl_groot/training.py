@@ -123,9 +123,7 @@ def _runtime_metadata(
             "requested": attention_requested,
             "resolved": select_attention_implementation(attention_requested),
         },
-        "context_forward": str(
-            model_config.get("context_forward", "causal_lm")
-        ),
+        "context_forward": "backbone",
         "torch_compile": {
             "backbone_enabled": compile_backbone,
             "action_head_enabled": compile_action_head,

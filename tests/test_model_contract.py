@@ -12,6 +12,7 @@ from torch import nn  # noqa: E402
 
 from qwen3_vl_groot.modeling import (  # noqa: E402
     _configure_qwen_gradient_checkpointing,
+    ModelContractError,
     Qwen3VLGrootPolicy,
     assert_full_lora_coverage,
     assert_qwen_freeze_contract,
@@ -166,13 +167,12 @@ class FakeProcessor:
         }
 
 
-def _tiny_policy_config(context_forward="causal_lm"):
+def _tiny_policy_config():
     return {
         "data": {"state_dim": 8, "action_dim": 7, "action_horizon": 8},
         "model": {
             "context_dim": 16,
             "max_context_tokens": 32,
-            "context_forward": context_forward,
             "gradient_checkpointing": False,
             "state_dropout_prob": 0.0,
             "flow": {
@@ -192,7 +192,7 @@ def _tiny_policy_config(context_forward="causal_lm"):
     }
 
 
-def _tiny_context_policy(context_forward):
+def _tiny_context_policy():
     return Qwen3VLGrootPolicy(
         backbone=FakePeftBackbone(),
         processor=FakeProcessor(),
@@ -202,7 +202,7 @@ def _tiny_context_policy(context_forward):
             action_q01=np.zeros(7),
             action_q99=np.ones(7),
         ),
-        config=_tiny_policy_config(context_forward),
+        config=_tiny_policy_config(),
     )
 
 
@@ -419,8 +419,8 @@ def test_attention_only_lora_target_is_rejected_before_loading_the_base_model(
         load_qwen_backbone("/unused/base-model", config["model"])
 
 
-def test_direct_context_forward_skips_lm_head_and_preserves_lora_gradients():
-    policy = _tiny_context_policy("backbone")
+def test_backbone_context_encoding_skips_lm_head_and_preserves_lora_gradients():
+    policy = _tiny_context_policy()
     policy.train()
     policy.set_lora_trainable(True)
 
@@ -435,18 +435,17 @@ def test_direct_context_forward_skips_lm_head_and_preserves_lora_gradients():
     assert attention_mask.dtype == torch.bool
 
 
-def test_direct_and_legacy_context_paths_return_identical_hidden_states():
-    legacy = _tiny_context_policy("causal_lm")
-    direct = _tiny_context_policy("backbone")
-    direct.load_state_dict(legacy.state_dict())
+def test_backbone_context_output_requires_tensor_last_hidden_state():
+    class MissingLastHiddenState(nn.Module):
+        def forward(self, **inputs):
+            del inputs
+            return SimpleNamespace()
 
-    legacy_context, legacy_mask = legacy.encode_context([object()], ["pick up the cup"])
-    direct_context, direct_mask = direct.encode_context([object()], ["pick up the cup"])
+    policy = _tiny_context_policy()
+    policy.backbone.get_base_model().model = MissingLastHiddenState()
 
-    assert legacy.backbone.get_base_model().lm_head_calls == 1
-    assert direct.backbone.get_base_model().lm_head_calls == 0
-    torch.testing.assert_close(direct_context, legacy_context)
-    torch.testing.assert_close(direct_mask, legacy_mask)
+    with pytest.raises(ModelContractError, match="last_hidden_state"):
+        policy.encode_context([object()], ["pick up the cup"])
 
 
 class CompileRecorder:
@@ -557,7 +556,7 @@ class RecordingActionHead(nn.Module):
 
 
 def _tiny_action_head_policy(*, compile_action_head=True):
-    config = _tiny_policy_config("backbone")
+    config = _tiny_policy_config()
     config["model"]["max_context_tokens"] = 512
     config["model"]["torch_compile"] = {
         "enabled": False,
@@ -772,6 +771,30 @@ def test_bridge_policy_rejects_legacy_checkpoint_before_loading_model(tmp_path):
     )
 
     with pytest.raises(ValueError, match="normalization_contract"):
+        BridgePolicy.from_pretrained(tmp_path, device="cpu")
+
+
+def test_bridge_policy_rejects_removed_context_forward_checkpoint(tmp_path):
+    (tmp_path / "policy_config.json").write_text(
+        json.dumps(
+            {
+                "format": "qwen3-vl-groot-bridge-compact-v1",
+                "base_model": "/unused/base-model",
+                "config": {
+                    "data": {
+                        "dataset_type": "libero",
+                        "state_dim": 8,
+                        "action_dim": 7,
+                        "action_horizon": 8,
+                    },
+                    "model": {"context_forward": "causal_lm"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="context_forward"):
         BridgePolicy.from_pretrained(tmp_path, device="cpu")
 
 
