@@ -294,9 +294,7 @@ def test_initial_metrics_record_warm_start_provenance(tmp_path):
 
 
 def test_training_engine_starts_at_checkpoint_global_step(monkeypatch):
-    config = load_config(
-        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
-    )
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
     checkpoint = SimpleNamespace(global_step=12_000)
     engine = SimpleNamespace(global_steps=0)
     optimizer = object()
@@ -516,9 +514,7 @@ def test_runtime_metadata_records_resolved_attention_and_compile_targets(monkeyp
 
 
 def test_runtime_metadata_records_warm_start_provenance(monkeypatch, tmp_path):
-    config = load_config(
-        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
-    )
+    config = load_config(PROJECT_ROOT / "configs" / "bridge_4x4090.yaml")
     checkpoint = SimpleNamespace(
         path=(tmp_path / "step-00012000").resolve(),
         global_step=12_000,
