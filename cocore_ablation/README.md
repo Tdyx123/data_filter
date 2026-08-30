@@ -1,8 +1,8 @@
 # Cocore Ablation：LIBERO 独立消融模块
 
 `cocore_ablation` 在不改变生产 `cocore` 配置、CLI、版本和 artifact schema 的前提下，
-运行 LIBERO 组件消融。它读取或补建现有 Cocore 的 `scan/`、`encode/` 缓存，并把自己的
-graph 和 select 产物写入 `outputs/cocore_ablation/libero90/`。
+运行 LIBERO 组件消融。它读取或补建现有 Cocore 的共享 `scan/`、`encode/` 缓存，并按
+实验子文件夹隔离自己的 graph 和 select 产物。
 
 ## 运行
 
@@ -10,13 +10,18 @@ graph 和 select 产物写入 `outputs/cocore_ablation/libero90/`。
 pip install -r cocore_ablation/requirements.txt
 
 python -m cocore_ablation run \
-  --config cocore_ablation/config_libero90.yaml
+  --config cocore_ablation/config_libero90.yaml \
+  --subfolder-name full-model
 
 python -m cocore_ablation validate \
-  --output-dir outputs/cocore_ablation/libero90/<graph>/<select>
+  --output-dir outputs/cocore_ablation/libero90/full-model/select
 ```
 
-`run --force` 只替换消融模块自己的 graph/select 目录，不会向 Cocore upstream 传递
+`run` 会连续完成 graph 和 select，并打印最终的 `select/` 路径。CLI 不单独暴露
+`build-graph` 或 `select` 子命令。`--subfolder-name` 必须是单个相对目录名，不能包含路径
+分隔符，也不能是 `.` 或 `..`。
+
+`run --force` 只替换指定实验子文件夹中的 `graph/` 和 `select/`，不会向 Cocore upstream 传递
 `force`。如果 upstream 中存在不兼容的 scan/encode，命令会停止并要求先显式处理或改用
 新的 `upstream.directory`。
 
@@ -62,6 +67,7 @@ selection:
 
 ```bash
 python -m cocore_ablation run \
+  --subfolder-name action-only-no-objective \
   --prototype-representation action_only \
   --no-assignment-confidence \
   --no-use-stop-bucket \
@@ -84,11 +90,13 @@ python -m cocore_ablation run \
 
 ```text
 outputs/cocore_ablation/libero90/
-  graph-<metrics>-<representation>-conf<0|1>-stop<0|1>-<fingerprint>/
-    nodes.npz
-    prototype_catalog.json
-    ...
-    select-<relation>-rw<...>-dw<...>-cov<0|1>-<strategy>-<budget>-<fingerprint>/
+  <subfolder-name>/
+    graph/
+      nodes.npz
+      prototype_catalog.json
+      manifest.json
+      ...
+    select/
       selected_manifest.jsonl
       all_clips.parquet
       selection_report.json
@@ -97,9 +105,12 @@ outputs/cocore_ablation/libero90/
       resolved_config.yaml
 ```
 
-可靠性指标、原型表示、分配置信度和 stop 桶改变 graph 指纹；关系类型、两个目标权重、
-coverage seed、选择策略、预算及 seed 改变 select 指纹。报告保留 raw/weighted relation、
-raw/weighted redundancy、总分、coverage、初始集合大小及 upstream fingerprint。
+目录名不再包含配置语义或指纹。可靠性指标、原型表示、分配置信度和 stop 桶仍会改变
+graph manifest 指纹；关系类型、两个目标权重、coverage seed、选择策略、预算及 seed 仍会
+改变 select manifest 指纹。相同子文件夹只恢复完全兼容的缓存；要在同一路径替换不兼容
+配置需传 `--force`，不同消融实验建议使用不同的 `--subfolder-name`。报告保留
+raw/weighted relation、raw/weighted redundancy、总分、coverage、初始集合大小及 upstream
+fingerprint。
 
 本模块 schema 固定为 1，仅支持 `prototypes.profile: libero`，不会接入
 `cocore_bridge_v2`。

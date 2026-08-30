@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config
-from .pipeline import graph_stage, run_pipeline, select_stage, validate_output
+from .pipeline import _validate_subfolder_name, run_pipeline, validate_output
 
 
 def _nonnegative(value: str) -> float:
@@ -42,6 +42,13 @@ def _metrics(value: str) -> list[str]:
         ) from error
 
 
+def _subfolder_name(value: str) -> str:
+    try:
+        return _validate_subfolder_name(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def _add_common_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--reliability-metrics", type=_metrics, default=None)
     parser.add_argument(
@@ -69,12 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     default_config = str(Path(__file__).with_name("config_libero90.yaml"))
-    for command in ("build-graph", "select", "run"):
-        child = subparsers.add_parser(command)
-        child.add_argument("--config", default=default_config)
-        child.add_argument("--output-dir", default=None)
-        child.add_argument("--force", action="store_true")
-        _add_common_overrides(child)
+    run = subparsers.add_parser("run")
+    run.add_argument("--config", default=default_config)
+    run.add_argument("--output-dir", default=None)
+    run.add_argument("--subfolder-name", type=_subfolder_name, required=True)
+    run.add_argument("--force", action="store_true")
+    _add_common_overrides(run)
     validate = subparsers.add_parser("validate")
     validate.add_argument("--output-dir", required=True)
     validate.add_argument("--config", default=None)
@@ -136,11 +143,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     config = load_config(args.config)
     _apply_overrides(config, args)
-    kwargs = {"output_dir": args.output_dir, "force": args.force}
-    if args.command == "build-graph":
-        graph_root = graph_stage(config, **kwargs)[7]
-        print(f"cocore_ablation_graph={graph_root}")
-    elif args.command == "select":
-        print(f"cocore_ablation_output={select_stage(config, **kwargs)}")
-    else:
-        print(f"cocore_ablation_output={run_pipeline(config, **kwargs)}")
+    result = run_pipeline(
+        config,
+        output_dir=args.output_dir,
+        subfolder_name=args.subfolder_name,
+        force=args.force,
+    )
+    print(f"cocore_ablation_output={result}")

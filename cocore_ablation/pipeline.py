@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import math
 import platform
-import shutil
 import sys
 import time
 from collections.abc import Mapping
@@ -37,6 +36,8 @@ from .selection import SeededRandomSelector, initial_selection
 
 
 SCHEMA_VERSION = 1
+GRAPH_DIRECTORY = "graph"
+SELECT_DIRECTORY = "select"
 _GRAPH_REQUIRED = (
     "nodes.npz",
     "source_clip_indices.npy",
@@ -56,13 +57,22 @@ _SELECT_REQUIRED = (
 )
 
 
-def _number_tag(value: float) -> str:
-    return f"{float(value):.8g}".replace("-", "m").replace(".", "p")
-
-
 def _output_root(config: Mapping[str, Any], output_dir: str | Path | None) -> Path:
     value = output_dir if output_dir is not None else config["output"]["directory"]
     return Path(value).expanduser()
+
+
+def _validate_subfolder_name(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or value in {".", ".."}
+        or Path(value).is_absolute()
+        or "/" in value
+        or "\\" in value
+    ):
+        raise ValueError("subfolder_name must be one non-empty relative path component")
+    return value
 
 
 def _graph_fingerprint(resolved: Mapping[str, Any], encoded_fingerprint: str) -> str:
@@ -97,16 +107,6 @@ def _graph_fingerprint(resolved: Mapping[str, Any], encoded_fingerprint: str) ->
     )
 
 
-def _graph_directory(resolved: Mapping[str, Any], fingerprint: str) -> str:
-    metrics = "+".join(resolved["reliability_metrics"]) or "uniform"
-    prototypes = resolved["prototypes"]
-    return (
-        f"graph-{metrics}-{prototypes['representation']}-"
-        f"conf{int(prototypes['use_assignment_confidence'])}-"
-        f"stop{int(prototypes['use_stop_bucket'])}-{fingerprint[:8]}"
-    )
-
-
 def _selection_fingerprint(
     resolved: Mapping[str, Any], graph_fingerprint: str
 ) -> str:
@@ -120,24 +120,6 @@ def _selection_fingerprint(
             "selection": resolved["selection"],
             "seed": resolved["seed"],
         }
-    )
-
-
-def _selection_directory(resolved: Mapping[str, Any], fingerprint: str) -> str:
-    objective = resolved["objective"]
-    selection = resolved["selection"]
-    configured_budget = selection.get("budget")
-    budget_tag = (
-        f"budget{int(configured_budget)}"
-        if configured_budget is not None
-        else f"top{_number_tag(float(selection['ratio']) * 100.0)}pct"
-    )
-    return (
-        f"select-{objective['relation']}-"
-        f"rw{_number_tag(objective['relation_weight'])}-"
-        f"dw{_number_tag(objective['redundancy_weight'])}-"
-        f"cov{int(selection['use_coverage_seed'])}-"
-        f"{selection['strategy']}-{budget_tag}-{fingerprint[:8]}"
     )
 
 
@@ -258,7 +240,7 @@ def graph_stage(
         resolved, visual_encoder=visual_encoder
     )
     fingerprint = _graph_fingerprint(resolved, encoded.fingerprint)
-    destination = root / _graph_directory(resolved, fingerprint)
+    destination = root / GRAPH_DIRECTORY
 
     def build(temporary: Path) -> None:
         started = time.perf_counter()
@@ -371,11 +353,6 @@ def graph_stage(
                 "runtime_seconds": time.perf_counter() - started,
             },
         )
-        if destination.is_dir():
-            for child in destination.iterdir():
-                if child.is_dir() and child.name.startswith("select-"):
-                    shutil.copytree(child, temporary / child.name)
-
     stage_started = time.perf_counter()
     built = publish_stage(
         destination,
@@ -506,7 +483,7 @@ def select_stage(
     )
     resolved["output"]["directory"] = str(root)
     fingerprint = _selection_fingerprint(resolved, graph_fingerprint)
-    destination = graph_root / _selection_directory(resolved, fingerprint)
+    destination = root / SELECT_DIRECTORY
     budget = _selection_budget(resolved, len(graph.sample_ids))
 
     def build(temporary: Path) -> None:
@@ -619,13 +596,18 @@ def select_stage(
 def run_pipeline(
     config: Mapping[str, Any],
     *,
+    subfolder_name: str,
     output_dir: str | Path | None = None,
     force: bool = False,
     visual_encoder: VisualEncoder | None = None,
 ) -> Path:
+    resolved = resolve_config(config)
+    name = _validate_subfolder_name(subfolder_name)
+    root = _output_root(resolved, output_dir) / name
+    resolved["output"]["directory"] = str(root)
     return select_stage(
-        config,
-        output_dir=output_dir,
+        resolved,
+        output_dir=root,
         force=force,
         visual_encoder=visual_encoder,
     )
@@ -811,8 +793,10 @@ def validate_output(
     if missing:
         raise ValueError(f"cocore_ablation output is missing files: {missing}")
     stored = yaml.safe_load(required["resolved_config.yaml"].read_text())
-    resolved = resolve_config(config if config is not None else stored)
     stored_resolved = resolve_config(stored)
+    resolved = resolve_config(config if config is not None else stored)
+    if config is not None:
+        resolved["output"]["directory"] = stored_resolved["output"]["directory"]
     if stable_hash(resolved) != stable_hash(stored_resolved):
         raise ValueError("validation configuration does not match the stored run")
 
@@ -844,9 +828,7 @@ def validate_output(
             "select": expected_select_fingerprint,
         }
     )
-    expected_result = graph_root / _selection_directory(
-        resolved, expected_select_fingerprint
-    )
+    expected_result = graph_root.parent / SELECT_DIRECTORY
     if expected_result.resolve() != result.resolve():
         raise ValueError("selection output path does not match its configuration")
     graph_manifest = json.loads((graph_root / "manifest.json").read_text())

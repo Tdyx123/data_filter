@@ -11,6 +11,8 @@ def test_cli_exposes_all_ablation_overrides() -> None:
     args = cli.build_parser().parse_args(
         [
             "run",
+            "--subfolder-name",
+            "no-reliability",
             "--reliability-metrics",
             "none",
             "--prototype-representation",
@@ -31,6 +33,7 @@ def test_cli_exposes_all_ablation_overrides() -> None:
         ]
     )
 
+    assert args.subfolder_name == "no-reliability"
     assert args.reliability_metrics == []
     assert args.prototype_representation == "action_only"
     assert args.no_assignment_confidence is True
@@ -43,10 +46,46 @@ def test_cli_exposes_all_ablation_overrides() -> None:
     assert args.selection_ratio == 0.2
 
 
+def test_cli_requires_subfolder_name_for_run() -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["run"])
+
+
+@pytest.mark.parametrize("command", ["build-graph", "select"])
+def test_cli_does_not_expose_individual_pipeline_stages(command: str) -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args([command])
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", ".", "..", "/absolute", "nested/name", r"nested\name"],
+)
+def test_cli_rejects_invalid_subfolder_names(value: str) -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["run", "--subfolder-name", value])
+
+
+def test_cli_keeps_validate_as_a_public_command() -> None:
+    args = cli.build_parser().parse_args(
+        ["validate", "--output-dir", "outputs/experiment/select"]
+    )
+
+    assert args.command == "validate"
+
+
 @pytest.mark.parametrize("value", ["smoothness", "support,support", "progress,support"])
 def test_cli_rejects_noncanonical_reliability_metric_lists(value: str) -> None:
     with pytest.raises(SystemExit):
-        cli.build_parser().parse_args(["run", "--reliability-metrics", value])
+        cli.build_parser().parse_args(
+            [
+                "run",
+                "--subfolder-name",
+                "invalid-metrics",
+                "--reliability-metrics",
+                value,
+            ]
+        )
 
 
 def test_cli_applies_overrides_before_running(monkeypatch, capsys) -> None:
@@ -84,6 +123,8 @@ def test_cli_applies_overrides_before_running(monkeypatch, capsys) -> None:
     cli.main(
         [
             "run",
+            "--subfolder-name",
+            "action-only",
             "--config",
             "unused.yaml",
             "--prototype-representation",
@@ -100,6 +141,7 @@ def test_cli_applies_overrides_before_running(monkeypatch, capsys) -> None:
     assert config["objective"]["redundancy_weight"] == 0.5
     assert config["selection"]["use_coverage_seed"] is False
     assert received["force"] is True
+    assert received["subfolder_name"] == "action-only"
     assert capsys.readouterr().out.strip() == (
         "cocore_ablation_output=outputs/cocore_ablation/result"
     )

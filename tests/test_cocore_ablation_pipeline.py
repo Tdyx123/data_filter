@@ -8,6 +8,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import yaml
 
 from cocore.pipeline import run_pipeline as run_cocore_pipeline
 from cocore_ablation.pipeline import run_pipeline, select_stage, validate_output
@@ -39,13 +40,32 @@ def _config(tmp_path: Path) -> dict[str, object]:
     return config
 
 
-def test_run_pipeline_reuses_upstream_encode_and_publishes_nested_ablation_artifacts(
+def _run(config: dict[str, object], *, subfolder_name: str = "experiment", **kwargs):
+    return run_pipeline(config, subfolder_name=subfolder_name, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", ".", "..", "/absolute", "nested/name", r"nested\name"],
+)
+def test_run_pipeline_rejects_invalid_subfolder_names(
+    tmp_path: Path, value: str
+) -> None:
+    with pytest.raises(ValueError, match="subfolder_name"):
+        run_pipeline(_config(tmp_path), subfolder_name=value)
+
+
+def test_run_pipeline_reuses_upstream_encode_and_publishes_named_sibling_artifacts(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
 
-    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    result = run_pipeline(
+        config,
+        subfolder_name="full-model",
+        visual_encoder=CocoreVisualEncoder(),
+    )
     timing_lines = [
         line
         for line in capsys.readouterr().err.splitlines()
@@ -58,13 +78,15 @@ def test_run_pipeline_reuses_upstream_encode_and_publishes_nested_ablation_artif
     assert (upstream / "scan" / "manifest.json").is_file()
     assert (upstream / "encode" / "manifest.json").is_file()
     assert not (upstream / "graph-18-motion-hard-nearest-pca").exists()
-    graph_root = result.parent
-    assert graph_root.parent == tmp_path / "ablation-output"
-    assert graph_root.name.startswith("graph-support+progress-action_visual-conf1-stop1-")
-    assert result.name.startswith("select-sequence-rw1-dw1-cov1-random_multibranch-")
+    experiment_root = tmp_path / "ablation-output" / "full-model"
+    graph_root = experiment_root / "graph"
+    assert result == experiment_root / "select"
+    assert graph_root.parent == result.parent
     assert (graph_root / "nodes.npz").is_file()
     assert (result / "selected_manifest.jsonl").is_file()
     assert (result / "resolved_config.yaml").is_file()
+    stored = yaml.safe_load((result / "resolved_config.yaml").read_text())
+    assert stored["output"]["directory"] == str(experiment_root)
 
     report = json.loads((result / "selection_report.json").read_text())
     assert report["producer"] == "cocore_ablation"
@@ -80,20 +102,28 @@ def test_run_pipeline_reuses_upstream_encode_and_publishes_nested_ablation_artif
     assert validate_output(result)["status"] == "valid"
 
 
-def test_select_only_change_reuses_identical_ablation_graph(tmp_path: Path) -> None:
+def test_different_subfolders_isolate_graph_and_select_but_reuse_upstream_encode(
+    tmp_path: Path,
+) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
-    first = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    graph_root = first.parent
-    graph_mtime = (graph_root / "manifest.json").stat().st_mtime_ns
+    first = _run(
+        config,
+        subfolder_name="full-model",
+        visual_encoder=CocoreVisualEncoder(),
+    )
+    upstream_manifest = tmp_path / "upstream-cocore" / "encode" / "manifest.json"
+    upstream_mtime = upstream_manifest.stat().st_mtime_ns
 
     second_config = copy.deepcopy(config)
     second_config["objective"]["relation_weight"] = 0.0  # type: ignore[index]
-    second = run_pipeline(second_config)
+    second = _run(second_config, subfolder_name="no-relation")
 
-    assert second.parent == graph_root
-    assert second != first
-    assert (graph_root / "manifest.json").stat().st_mtime_ns == graph_mtime
+    assert first == tmp_path / "ablation-output" / "full-model" / "select"
+    assert second == tmp_path / "ablation-output" / "no-relation" / "select"
+    assert (first.parent / "graph" / "manifest.json").is_file()
+    assert (second.parent / "graph" / "manifest.json").is_file()
+    assert upstream_manifest.stat().st_mtime_ns == upstream_mtime
 
 
 def test_graph_change_reuses_upstream_but_builds_new_graph_and_selection(
@@ -101,43 +131,54 @@ def test_graph_change_reuses_upstream_but_builds_new_graph_and_selection(
 ) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
-    first = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    first = _run(
+        config,
+        subfolder_name="full-model",
+        visual_encoder=CocoreVisualEncoder(),
+    )
     upstream_manifest = tmp_path / "upstream-cocore" / "encode" / "manifest.json"
     upstream_mtime = upstream_manifest.stat().st_mtime_ns
 
     changed = copy.deepcopy(config)
     changed["prototypes"]["representation"] = "action_only"  # type: ignore[index]
-    second = run_pipeline(changed)
+    second = _run(changed, subfolder_name="action-only")
 
     assert second.parent != first.parent
     assert second != first
     assert upstream_manifest.stat().st_mtime_ns == upstream_mtime
 
 
-def test_force_rebuilds_only_requested_selection_and_preserves_siblings(
+def test_force_rebuilds_named_graph_and_selection_without_rebuilding_upstream(
     tmp_path: Path,
 ) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     config = _config(tmp_path)
-    first = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
-    graph_manifest = first.parent / "manifest.json"
+    first = _run(config, visual_encoder=CocoreVisualEncoder())
+    graph_manifest = first.parent / "graph" / "manifest.json"
     select_manifest = first / "manifest.json"
     upstream_manifest = tmp_path / "upstream-cocore" / "encode" / "manifest.json"
     graph_mtime = graph_manifest.stat().st_mtime_ns
     select_mtime = select_manifest.stat().st_mtime_ns
     upstream_mtime = upstream_manifest.stat().st_mtime_ns
-    sibling_config = copy.deepcopy(config)
-    sibling_config["objective"]["relation_weight"] = 0.0  # type: ignore[index]
-    sibling = run_pipeline(sibling_config)
-
-    rebuilt = run_pipeline(config, force=True)
+    rebuilt = _run(config, force=True)
 
     assert rebuilt == first
     assert graph_manifest.stat().st_mtime_ns > graph_mtime
     assert select_manifest.stat().st_mtime_ns > select_mtime
     assert upstream_manifest.stat().st_mtime_ns == upstream_mtime
-    assert sibling.is_dir()
-    assert (sibling / "selected_manifest.jsonl").is_file()
+
+
+def test_same_subfolder_rejects_incompatible_selection_without_force(
+    tmp_path: Path,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    _run(config, visual_encoder=CocoreVisualEncoder())
+    changed = copy.deepcopy(config)
+    changed["objective"]["relation_weight"] = 0.0  # type: ignore[index]
+
+    with pytest.raises(FileExistsError, match="select"):
+        _run(changed)
 
 
 def test_random_without_coverage_is_strict_seeded_random_baseline(tmp_path: Path) -> None:
@@ -147,7 +188,7 @@ def test_random_without_coverage_is_strict_seeded_random_baseline(tmp_path: Path
         {"strategy": "random", "use_coverage_seed": False}
     )
 
-    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    result = _run(config, visual_encoder=CocoreVisualEncoder())
 
     report = json.loads((result / "selection_report.json").read_text())
     rows = [json.loads(line) for line in (result / "selected_manifest.jsonl").read_text().splitlines()]
@@ -165,11 +206,12 @@ def test_graph_variants_change_reliability_and_action_catalog(tmp_path: Path) ->
         {"representation": "action_only", "use_assignment_confidence": False}
     )
 
-    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    result = _run(config, visual_encoder=CocoreVisualEncoder())
 
-    nodes = np.load(result.parent / "nodes.npz")
+    graph_root = result.parent / "graph"
+    nodes = np.load(graph_root / "nodes.npz")
     np.testing.assert_array_equal(nodes["reliability"], np.ones(len(nodes["reliability"])))
-    catalog = json.loads((result.parent / "prototype_catalog.json").read_text())
+    catalog = json.loads((graph_root / "prototype_catalog.json").read_text())
     assert catalog["schema_version"] == 1
     assert catalog["representation"] == "action_only"
     assert catalog["use_assignment_confidence"] is False
@@ -178,7 +220,7 @@ def test_graph_variants_change_reliability_and_action_catalog(tmp_path: Path) ->
 
 def test_validator_rejects_tampered_selection_order(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
-    result = run_pipeline(_config(tmp_path), visual_encoder=CocoreVisualEncoder())
+    result = _run(_config(tmp_path), visual_encoder=CocoreVisualEncoder())
     path = result / "selected_manifest.jsonl"
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     rows[0]["sample_id"], rows[1]["sample_id"] = rows[1]["sample_id"], rows[0]["sample_id"]
@@ -190,7 +232,7 @@ def test_validator_rejects_tampered_selection_order(tmp_path: Path) -> None:
 
 def test_validator_rejects_tampered_run_fingerprint(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
-    result = run_pipeline(_config(tmp_path), visual_encoder=CocoreVisualEncoder())
+    result = _run(_config(tmp_path), visual_encoder=CocoreVisualEncoder())
     path = result / "run_manifest.json"
     manifest = json.loads(path.read_text())
     manifest["fingerprint"] = "0" * 64
@@ -212,7 +254,7 @@ def test_select_stage_writes_a_complete_validatable_artifact(tmp_path: Path) -> 
 
 def test_validator_rejects_tampered_replay_metadata(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
-    result = run_pipeline(_config(tmp_path), visual_encoder=CocoreVisualEncoder())
+    result = _run(_config(tmp_path), visual_encoder=CocoreVisualEncoder())
 
     selected_path = result / "selected_manifest.jsonl"
     original_selected = selected_path.read_text()
@@ -244,8 +286,8 @@ def test_validator_rejects_tampered_replay_metadata(tmp_path: Path) -> None:
 
 def test_validator_rejects_tampered_prototype_artifacts(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
-    result = run_pipeline(_config(tmp_path), visual_encoder=CocoreVisualEncoder())
-    graph_root = result.parent
+    result = _run(_config(tmp_path), visual_encoder=CocoreVisualEncoder())
+    graph_root = result.parent / "graph"
 
     centers_path = graph_root / "prototype_centers.npy"
     original_centers = np.load(centers_path, allow_pickle=False)
@@ -270,9 +312,19 @@ def test_validator_accepts_absolute_path_for_relative_configured_output(
     config = _config(tmp_path)
     config["output"] = {"directory": "ablation-output"}
 
-    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    result = _run(config, visual_encoder=CocoreVisualEncoder())
 
     assert validate_output(result.resolve())["status"] == "valid"
+
+
+def test_validator_accepts_original_base_output_config_for_named_result(
+    tmp_path: Path,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = _run(config, visual_encoder=CocoreVisualEncoder())
+
+    assert validate_output(result, config=config)["status"] == "valid"
 
 
 def test_run_pipeline_persists_the_canonicalized_output_path(
@@ -283,7 +335,7 @@ def test_run_pipeline_persists_the_canonicalized_output_path(
     config = _config(tmp_path)
     config["output"] = {"directory": "./ablation-output"}
 
-    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    result = _run(config, visual_encoder=CocoreVisualEncoder())
 
     assert validate_output(result)["status"] == "valid"
 
@@ -300,11 +352,12 @@ def test_full_ablation_defaults_match_production_cocore_exactly(tmp_path: Path) 
     ablation_config = _config(tmp_path)
     ablation_config["upstream"] = {"directory": str(production_root)}
 
-    ablation = run_pipeline(ablation_config)
+    ablation = _run(ablation_config)
 
     production_graph = production_root / "graph-18-motion-hard-nearest-pca"
     production_nodes = np.load(production_graph / "nodes.npz")
-    ablation_nodes = np.load(ablation.parent / "nodes.npz")
+    ablation_graph = ablation.parent / "graph"
+    ablation_nodes = np.load(ablation_graph / "nodes.npz")
     for name in (
         "task_indices",
         "reliability",
@@ -318,7 +371,7 @@ def test_full_ablation_defaults_match_production_cocore_exactly(tmp_path: Path) 
         (production_graph / "prototype_catalog.json").read_text()
     )
     ablation_catalog = json.loads(
-        (ablation.parent / "prototype_catalog.json").read_text()
+        (ablation_graph / "prototype_catalog.json").read_text()
     )
     for name in (
         "method",
