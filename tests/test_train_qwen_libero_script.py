@@ -11,6 +11,11 @@ LIBERO_SCRIPT = (
     / "scripts"
     / "train_libero_qwen3_vl_4b_groot_all_tasks_4x4090.sh"
 )
+LIBERO_8X_SCRIPT = (
+    PROJECT_ROOT
+    / "scripts"
+    / "train_libero_qwen3_vl_4b_groot_all_tasks_8x4090.sh"
+)
 CYCLIC_LIBERO_SCRIPT = (
     PROJECT_ROOT
     / "scripts"
@@ -28,6 +33,9 @@ CYCLIC_BRIDGE_SCRIPT = (
     / "train_bridge_qwen3_vl_4b_groot_cyclic_lora_4x4090.sh"
 )
 LIBERO_CONFIG = PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
+LIBERO_8X_CONFIG = (
+    PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_8x4090.yaml"
+)
 QWEN35_LIBERO_CONFIG = (
     PROJECT_ROOT / "configs" / "qwen3_5_0_8b_groot_libero_4x4090.yaml"
 )
@@ -51,13 +59,21 @@ def _fake_python_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
     return environment, calls
 
 
-def test_libero_script_uses_only_libero_config_and_full_prior_by_default(tmp_path):
+@pytest.mark.parametrize(
+    ("script", "config"),
+    [(LIBERO_SCRIPT, LIBERO_CONFIG), (LIBERO_8X_SCRIPT, LIBERO_8X_CONFIG)],
+)
+def test_libero_script_uses_only_libero_config_and_full_prior_by_default(
+    tmp_path,
+    script,
+    config,
+):
     environment, calls = _fake_python_environment(tmp_path)
 
     subprocess.run(
         [
             "bash",
-            str(LIBERO_SCRIPT),
+            str(script),
             "--output-dir",
             "outputs/libero",
             "--lora-learning-rate",
@@ -73,7 +89,7 @@ def test_libero_script_uses_only_libero_config_and_full_prior_by_default(tmp_pat
 
     arguments = calls.read_text(encoding="utf-8").splitlines()
     assert arguments[:3] == ["-m", "qwen3_vl_groot.cli", "launch"]
-    assert arguments[arguments.index("--config") + 1] == str(LIBERO_CONFIG)
+    assert arguments[arguments.index("--config") + 1] == str(config)
     assert str(BRIDGE_CONFIG) not in arguments
     assert "--all-tasks" in arguments
     weight_index = arguments.index("--sample-weights")
@@ -83,13 +99,14 @@ def test_libero_script_uses_only_libero_config_and_full_prior_by_default(tmp_pat
     assert arguments[arguments.index("--action-head-learning-rate") + 1] == "2e-4"
 
 
-def test_libero_target_only_does_not_inject_prior_or_sample_weights(tmp_path):
+@pytest.mark.parametrize("script", [LIBERO_SCRIPT, LIBERO_8X_SCRIPT])
+def test_libero_target_only_does_not_inject_prior_or_sample_weights(tmp_path, script):
     environment, calls = _fake_python_environment(tmp_path)
 
     subprocess.run(
         [
             "bash",
-            str(LIBERO_SCRIPT),
+            str(script),
             "--target-only",
             "--output-dir",
             "outputs/libero-target-only",
@@ -317,7 +334,10 @@ def test_qwen35_libero_preserves_explicit_weights_and_prior(tmp_path):
     assert "--prior-prefiltered-scores" not in arguments
 
 
-@pytest.mark.parametrize("script", [LIBERO_SCRIPT, QWEN35_LIBERO_SCRIPT])
+@pytest.mark.parametrize(
+    "script",
+    [LIBERO_SCRIPT, LIBERO_8X_SCRIPT, QWEN35_LIBERO_SCRIPT],
+)
 def test_qwen_libero_scripts_forward_explicit_prefiltered_scores_once(
     tmp_path,
     script,

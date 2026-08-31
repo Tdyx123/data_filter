@@ -16,6 +16,9 @@ from libero_lerobot.selection import resolve_prior_selection
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 QWEN35_CONFIG = PROJECT_ROOT / "configs" / "qwen3_5_0_8b_groot_libero_4x4090.yaml"
+QWEN_LIBERO_8X_CONFIG = (
+    PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_8x4090.yaml"
+)
 BRIDGE_V2_NORMALIZATION_CONTRACT = "bridge_v2_q99_binary_v1"
 
 
@@ -61,6 +64,7 @@ def test_libero_config_does_not_require_bridge_normalization_contract():
     "config_path",
     [
         PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml",
+        QWEN_LIBERO_8X_CONFIG,
         QWEN35_CONFIG,
     ],
 )
@@ -81,6 +85,7 @@ def test_qwen_libero_configs_default_to_full_prior_dataset(config_path):
     "config_path",
     [
         PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml",
+        QWEN_LIBERO_8X_CONFIG,
         QWEN35_CONFIG,
     ],
 )
@@ -105,6 +110,7 @@ def test_qwen_libero_configs_allow_explicit_prefiltered_override(config_path):
         "bridge_4x4090.yaml",
         "bridge_8x4090.yaml",
         "qwen3_vl_4b_groot_libero_4x4090.yaml",
+        "qwen3_vl_4b_groot_libero_8x4090.yaml",
     ],
 )
 def test_qwen3_vl_configs_enable_attention_and_mlp_lora(name):

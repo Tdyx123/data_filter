@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 
@@ -38,6 +39,7 @@ def test_default_config_keeps_all_qwen_layers():
         "bridge_4x4090.yaml",
         "bridge_8x4090.yaml",
         "qwen3_vl_4b_groot_libero_4x4090.yaml",
+        "qwen3_vl_4b_groot_libero_8x4090.yaml",
     ],
 )
 def test_qwen3_vl_4b_configs_disable_checkpointing_and_compile_only_action_head(name):
@@ -66,6 +68,33 @@ def test_four_gpu_config_preserves_effective_batch_64():
         * config["train"]["gradient_accumulation_steps"]
     )
     assert effective_batch == 64
+
+
+def test_libero_eight_gpu_config_only_changes_parallelism_and_preserves_batch_256():
+    four_gpu = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_4x4090.yaml"
+    )
+    eight_gpu = load_config(
+        PROJECT_ROOT / "configs" / "qwen3_vl_4b_groot_libero_8x4090.yaml"
+    )
+    four_gpu.pop("_config_path")
+    eight_gpu.pop("_config_path")
+
+    expected = copy.deepcopy(four_gpu)
+    expected["train"].update(
+        {
+            "gpu_count": 8,
+            "gpu_ids": [0, 1, 2, 3, 4, 5, 6, 7],
+            "gradient_accumulation_steps": 16,
+        }
+    )
+
+    assert eight_gpu == expected
+    assert (
+        eight_gpu["train"]["gpu_count"]
+        * eight_gpu["train"]["micro_batch_size"]
+        * eight_gpu["train"]["gradient_accumulation_steps"]
+    ) == 256
 
 
 def test_gpu_id_override_requires_matching_count():

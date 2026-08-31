@@ -710,13 +710,20 @@ bash scripts/evaluate_simpler_qwenvl_oft.sh \
 
 Qwen LIBERO 使用独立的 Shell/YAML 入口，不读取 Bridge 配置。默认训练
 `libero10_5` 的全部 50 条 target 轨迹，并使用 SQCN Top10% LIBERO-90 prior；
-4 卡每个全局 micro-step 按 1:1 取得 2 条 target 与 2 条 prior，梯度累积 16
-后的有效 batch 64 为 32/32。`--output-dir` 必须显式指定：
+4 卡配置使用每卡 micro batch 2、梯度累积 32，8 卡配置把梯度累积降为 16，
+两者均保持有效 batch 256，并按 1:1 混合 target 与 prior。`--output-dir` 必须显式指定：
 
 ```bash
 bash scripts/train_libero_qwen3_vl_4b_groot_all_tasks_4x4090.sh \
   --lora-learning-rate 5e-6 \
   --action-head-learning-rate 2e-4 \
+  --output-dir outputs/qwen3_vl_groot_libero
+```
+
+8 卡启动入口使用 GPU 0–7，也可通过 `--gpu-ids` 覆盖：
+
+```bash
+bash scripts/train_libero_qwen3_vl_4b_groot_all_tasks_8x4090.sh \
   --output-dir outputs/qwen3_vl_groot_libero
 ```
 
