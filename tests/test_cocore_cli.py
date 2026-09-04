@@ -14,8 +14,8 @@ def _objective(relation: str = "cooccurrence", weight: float = 1.0) -> dict[str,
     return {"objective": {"relation": relation, "relation_weight": weight}}
 
 
-def test_package_version_matches_optional_stop_release() -> None:
-    assert cocore.__version__ == "0.16.0"
+def test_package_version_matches_configurable_reliability_release() -> None:
+    assert cocore.__version__ == "0.17.0"
 
 
 def test_config_requires_explicit_relation_and_weight() -> None:
@@ -54,6 +54,38 @@ def test_config_accepts_supported_relations(relation: str) -> None:
     assert resolved["reliability_metrics"] == ["support", "progress"]
     assert resolved["objective"] == {"relation": relation, "relation_weight": 1.0}
     assert resolved["selection"] == {"ratio": 0.1, "budget": None}
+
+
+def test_config_accepts_support_only_reliability() -> None:
+    resolved = resolve_config(
+        {
+            **_objective(),
+            "reliability_metrics": ["support"],
+        }
+    )
+
+    assert resolved["reliability_metrics"] == ["support"]
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        [],
+        ["progress"],
+        ["support", "support"],
+        ["smoothness"],
+        ["progress", "support"],
+        "support",
+    ],
+)
+def test_config_rejects_unsupported_reliability_metrics(metrics: object) -> None:
+    with pytest.raises(ValueError, match="reliability_metrics"):
+        resolve_config(
+            {
+                **_objective(),
+                "reliability_metrics": metrics,
+            }
+        )
 
 
 def test_config_accepts_bridge_v2_motion_primitive_profile() -> None:

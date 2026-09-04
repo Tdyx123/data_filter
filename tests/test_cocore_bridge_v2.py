@@ -214,7 +214,7 @@ def test_package_exposes_only_version() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["0.10.0", "['__version__']"]
+    assert result.stdout.splitlines() == ["0.11.0", "['__version__']"]
 
 
 def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None:
@@ -268,6 +268,7 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
         "use_stop_bucket",
     }
     assert config["prototypes"]["num_threads"] == 4
+    assert config["reliability_metrics"] == ["support", "progress"]
     assert config["objective"] == {"relation": "sequence", "relation_weight": 1.5}
     assert config["selection"] == {"ratio": 0.2, "budget": None}
     assert config["runtime"]["max_episodes"] == 100
@@ -279,6 +280,19 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
     assert translated["clip"] == {"length": 7, "stride": 7}
     assert translated["selection"]["quota_mode"] == "none"
     assert translated["selection"]["minimum_per_task"] == 0
+
+
+def test_bridge_config_accepts_support_only_reliability(tmp_path: Path) -> None:
+    from cocore_bridge_v2.config import build_config
+
+    config = build_config(
+        relation="sequence",
+        relation_weight=1.0,
+        dataset_path=tmp_path / "bridge",
+        reliability_metrics=("support",),
+    )
+
+    assert config["reliability_metrics"] == ["support"]
 
 
 def test_bridge_config_rejects_removed_selection_method(tmp_path: Path) -> None:
@@ -502,6 +516,38 @@ def test_graph_commands_accept_stop_bucket_disable_flag(command: str) -> None:
     assert parsed.no_use_stop_bucket is True
 
 
+@pytest.mark.parametrize("command", ["build-graph", "select", "run", "validate"])
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("support", ["support"]),
+        ("support,progress", ["support", "progress"]),
+    ],
+)
+def test_graph_commands_accept_reliability_metrics(
+    command: str,
+    value: str,
+    expected: list[str],
+) -> None:
+    from cocore_bridge_v2 import cli
+
+    arguments = [
+        command,
+        "--relation",
+        "sequence",
+        "--relation-weight",
+        "1",
+        "--reliability-metrics",
+        value,
+    ]
+    if command == "validate":
+        arguments += ["--output-dir", "result"]
+
+    parsed = cli.build_parser().parse_args(arguments)
+
+    assert parsed.reliability_metrics == expected
+
+
 @pytest.mark.parametrize("command", ["scan", "encode"])
 def test_non_graph_commands_reject_stop_bucket_disable_flag(command: str) -> None:
     from cocore_bridge_v2 import cli
@@ -515,6 +561,42 @@ def test_non_graph_commands_reject_stop_bucket_disable_flag(command: str) -> Non
                 "--relation-weight",
                 "1",
                 "--no-use-stop-bucket",
+            ]
+        )
+
+
+@pytest.mark.parametrize("command", ["scan", "encode"])
+def test_non_graph_commands_reject_reliability_metrics(command: str) -> None:
+    from cocore_bridge_v2 import cli
+
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            [
+                command,
+                "--relation",
+                "sequence",
+                "--relation-weight",
+                "1",
+                "--reliability-metrics",
+                "support",
+            ]
+        )
+
+
+@pytest.mark.parametrize("value", ["none", "progress", "progress,support", "smoothness"])
+def test_graph_commands_reject_unsupported_reliability_metrics(value: str) -> None:
+    from cocore_bridge_v2 import cli
+
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            [
+                "run",
+                "--relation",
+                "sequence",
+                "--relation-weight",
+                "1",
+                "--reliability-metrics",
+                value,
             ]
         )
 
@@ -723,6 +805,44 @@ def test_run_cli_disables_stop_bucket_in_delegated_config(
     capsys.readouterr()
 
 
+def test_run_cli_passes_support_only_to_delegated_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from cocore_bridge_v2 import cli
+
+    dataset = tmp_path / "bridge"
+    output = tmp_path / "output"
+    _write_bridge_info(dataset, _bridge_info())
+    received: dict[str, object] = {}
+
+    def fake_run_pipeline(config, **kwargs):
+        received["config"] = config
+        return output / "select-sequence-w1-top10pct"
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+
+    cli.main(
+        [
+            "run",
+            "--relation",
+            "sequence",
+            "--relation-weight",
+            "1",
+            "--dataset-path",
+            str(dataset),
+            "--output-dir",
+            str(output),
+            "--reliability-metrics",
+            "support",
+        ]
+    )
+
+    assert received["config"]["reliability_metrics"] == ["support"]
+    capsys.readouterr()
+
+
 def test_validate_cli_passes_custom_dataset_path_without_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -855,10 +975,10 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     graph_manifest = json.loads((graph_root / "manifest.json").read_text())
     catalog = json.loads((graph_root / "prototype_catalog.json").read_text())
     assert select_manifest["producer"] == "cocore"
-    assert select_manifest["cocore_version"] == "0.16.0"
+    assert select_manifest["cocore_version"] == "0.17.0"
     assert select_manifest["prototype_profile"] == "bridge_v2"
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.16.0"
+    assert run_manifest["cocore_version"] == "0.17.0"
     assert run_manifest["stage_directories"]["graph"] == "graph-18-motion-hard-nearest-pca"
     assert run_manifest["prototype_schema_version"] == 10
     assert run_manifest["prototype_profile"] == "bridge_v2"

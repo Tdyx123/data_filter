@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
@@ -128,8 +128,20 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if configured_method not in {None, "motion_primitives"}:
         raise ValueError("cocore prototypes.method must be motion_primitives")
     configured_metrics = config.get("reliability_metrics")
-    if configured_metrics is not None and list(configured_metrics) != ["support", "progress"]:
-        raise ValueError("cocore reliability_metrics are fixed to support,progress")
+    if configured_metrics is None:
+        reliability_metrics = ["support", "progress"]
+    else:
+        if isinstance(configured_metrics, (str, bytes)) or not isinstance(
+            configured_metrics, Sequence
+        ):
+            raise ValueError(
+                "cocore reliability_metrics must be [support] or [support, progress]"
+            )
+        reliability_metrics = list(configured_metrics)
+        if reliability_metrics not in (["support"], ["support", "progress"]):
+            raise ValueError(
+                "cocore reliability_metrics must be [support] or [support, progress]"
+            )
     resolved = _merge(DEFAULT_CONFIG, config)
     resolved["prototypes"]["method"] = "motion_primitives"
     profile = resolved["prototypes"].get("profile")
@@ -157,7 +169,7 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError("cocore prototypes.tol must be a finite positive number")
     resolved["prototypes"]["tol"] = float(tolerance)
-    resolved["reliability_metrics"] = ["support", "progress"]
+    resolved["reliability_metrics"] = reliability_metrics
     relation = str(resolved["objective"]["relation"])
     if relation not in {"sequence", "cooccurrence"}:
         raise ValueError("objective.relation must be sequence or cooccurrence")

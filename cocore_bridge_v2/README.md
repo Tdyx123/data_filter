@@ -26,6 +26,9 @@ Cocore 的编码、运动原语、关系目标或选择算法，而是固定 Bri
   10～30 个中心；
 - 默认 `prototypes.use_stop_bucket: true`，保留 Cocore 的 stop 桶与回退行为；graph
   相关命令可用 `--no-use-stop-bucket` 关闭；
+- 可靠性默认使用 `sqrt(support * progress)`；graph 相关命令可用
+  `--reliability-metrics support` 切换为 `sqrt(support)`；两种结果均应用
+  `quality.min_reliability` 截断；
 - 不超过 65,536 个训练窗口的动作桶使用完整 KMeans，以
   `prototypes.num_threads: 4` 并行且每个模型使用 1 个 OpenMP 线程；超过阈值的桶使用
   MiniBatchKMeans，按动作 ID 串行且每个模型使用 4 个 OpenMP 线程；
@@ -67,6 +70,8 @@ python -m cocore_bridge_v2 select \
 python -m cocore_bridge_v2 run \
   --relation sequence --relation-weight 1.0 \
   --selection-ratio 0.10 \
+  --reliability-metrics support \
+  --output-dir outputs/cocore_bridge_v2/bridge-support-only \
   --no-use-stop-bucket \
   --force
 ```
@@ -80,6 +85,8 @@ python -m cocore_bridge_v2 run \
 - `--force`：按 Cocore 的缓存规则重建不兼容阶段。
 - `--no-use-stop-bucket`：仅用于 `build-graph`、`select`、`run` 和 `validate`，关闭 stop
   桶并排除双半段均无非 stop 标签的候选；未传时保持默认启用。
+- `--reliability-metrics support|support,progress`：仅用于 `build-graph`、`select`、
+  `run` 和 `validate`；默认 `support,progress`，只用 support 时必须显式传 `support`。
 
 本包不接受任意 YAML `--config`，以防绕过固定相机、空任务策略或运动原语契约。
 
@@ -105,19 +112,17 @@ PCA components 前半列进行逐帧纯矩阵投影，不使用 mean/scale。选
 原型标签、动作标签、绝对置信度和 `half_action_labels`，不包含旧的 action/distance
 分解权重。catalog 与 manifest 记录 `bridge_v2` profile、分轴阈值、roll 标签、环绕轴
 和 `0.5%/400` 保留策略，并记录起点最大间隔 2 的窗口策略。select manifest 与报告
-使用 selection schema 1；manifest 的生产者仍为 `cocore`。Cocore 版本为 0.16.0，
-Bridge 包版本为 0.10.0。
+使用 selection schema 1；manifest 的生产者仍为 `cocore`。Cocore 版本为 0.17.0，
+Bridge 包版本为 0.11.0。graph/select/run manifest、报告和解析配置均记录实际可靠性指标。
 
 视觉中心训练只物化一次保留窗口投影；小桶并行执行完整 KMeans，大桶串行执行
 MiniBatchKMeans。Bridge V2 完整生产数据的基础额外内存约为 257 MiB（按参考精确保留
 非 stop 与原始 stop 窗口估算，每窗口 `128 × 4` 字节），不使用 memmap 或磁盘 fallback。
 
-Cocore schema 9 artifact 不迁移且 validator 会拒绝。Cocore 仍为 0.16.0/schema 10；
-Bridge 0.10.0 的最大起点间隔 2 与 0.9.0 的最大间隔 3 不兼容。旧 graph/selection
-artifact 会被 validator 拒绝，必须使用 `--force` 重建；契约兼容的 scan/encode 缓存
-继续复用。缺少 selection schema 1、但上游 graph 指纹与随机多分支算法契约匹配的旧
-select 缓存会自动仅重建选择阶段；旧堆算法产物不会迁移。0.7.x 的 15/8 artifact 与
-7/4 几何不兼容，升级时仍需重建全部阶段。
+Cocore schema 9 artifact 不迁移且 validator 会拒绝。Cocore 0.17.0/schema 10 与 Bridge
+0.11.0 新增可靠性指标契约；版本校验保持严格，旧 artifact 必须使用 `--force` 重建。
+同一输出根切换 `support` 与 `support,progress` 也会使 graph 指纹不兼容；需要保留两组
+实验时应使用不同的 `--output-dir`。
 
 验证时必须重复传入生成该选择结果时使用的目标、比例、数据集路径以及
 `--max-episodes`（若生成时设置）。省略 `--max-episodes` 表示按完整有效数据集重放；
@@ -133,11 +138,13 @@ python -m cocore_bridge_v2 validate \
   --relation sequence --relation-weight 1.0 \
   --selection-ratio 0.10 \
   --max-episodes 100 \
+  --reliability-metrics support \
   --no-use-stop-bucket
 ```
 
-只有生成结果时传入了 `--no-use-stop-bucket`，验证时才重复传入。升级自 schema 9 / 0.7.x
-或切换 stop 设置并复用同一输出根目录时，应使用 `--force` 重建全部不兼容阶段。
+只有生成结果时传入了 `--no-use-stop-bucket` 或 `--reliability-metrics support`，验证时才
+重复对应参数。升级旧版本，或切换 stop/可靠性指标并复用同一输出根目录时，应使用
+`--force` 重建全部不兼容阶段。
 
 ## 运行基线
 

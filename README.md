@@ -9,7 +9,8 @@ flow-matching DiT 动作头开始训练。视觉塔和主干原始参数始终�
 仓库同时包含与训练解耦的通用轨迹数据价值工具
 [TDUS](tdus/README.md)，用于直接从 LeRobot trajectory/chunk 计算 Quality、
 Coverage、Diversity 和 Novelty；以及仿照 SQCN 两遍数据流、面向 LIBERO 关系图与
-集合目标筛选的 [RelCore](relcore/README.md)。另有固定使用 support、progress 和
+集合目标筛选的 [RelCore](relcore/README.md)。另有默认使用 support、progress，并可
+切换为仅使用 support 的
 运动原语、以可配置 sequence/cooccurrence 关系减冗余目标执行有界惰性最大堆选择的
 [Cocore](cocore/README.md)。
 

@@ -72,7 +72,6 @@ from cocore.timing import emit_completed_timing, timed_step
 
 
 GRAPH_DIRECTORY = "graph-18-motion-hard-nearest-pca"
-RELIABILITY_METRICS = ("support", "progress")
 PROTOTYPE_SCHEMA_VERSION = 10
 PROTOTYPE_STRATEGY = (
     "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_half_visual_"
@@ -859,6 +858,7 @@ def graph_stage(
     pca_components = _load_visual_pca_components(root / "encode", visual_dim=visual_dim)
     prototype_config = resolved["prototypes"]
     prototype_profile = str(prototype_config["profile"])
+    reliability_metrics = tuple(resolved["reliability_metrics"])
     geometry = resolve_temporal_geometry(prototype_profile)
     primitive_contract = motion_primitive_contract(prototype_profile)
     prototype_fingerprint_config = {
@@ -877,7 +877,7 @@ def graph_stage(
         "graph": resolved["graph"],
         "seed": resolved["seed"],
         "max_episodes": resolved["runtime"].get("max_episodes"),
-        "reliability_metrics": list(RELIABILITY_METRICS),
+        "reliability_metrics": list(reliability_metrics),
         "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
         "prototype_strategy": PROTOTYPE_STRATEGY,
         "sequence_adjacency": SEQUENCE_ADJACENCY,
@@ -902,7 +902,7 @@ def graph_stage(
                 noop_threshold=float(quality_config["noop_threshold"]),
                 gripper_action_index=int(quality_config["gripper_action_index"]),
                 min_reliability=float(quality_config["min_reliability"]),
-                reliability_metrics=RELIABILITY_METRICS,
+                reliability_metrics=reliability_metrics,
             )
         with timed_step("graph.prototypes", emit_completed_timing):
             hierarchy = build_hierarchical_motion_prototypes(
@@ -972,7 +972,7 @@ def graph_stage(
                 "fingerprint": fingerprint,
                 "upstream_fingerprint": encoded.fingerprint,
                 "stage_directory": GRAPH_DIRECTORY,
-                "reliability_metrics": list(RELIABILITY_METRICS),
+                "reliability_metrics": list(reliability_metrics),
                 "prototype_method": "motion_primitives",
                 "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
                 "prototype_strategy": PROTOTYPE_STRATEGY,
@@ -1627,7 +1627,7 @@ def select_stage(
             "selected_clips": len(result.selected_indices),
             "selection_ratio": len(result.selected_indices) / len(clips),
             "configured_selection_ratio": ratio,
-            "reliability_metrics": list(RELIABILITY_METRICS),
+            "reliability_metrics": list(resolved["reliability_metrics"]),
             "prototype_method": "motion_primitives",
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
             "prototype_strategy": PROTOTYPE_STRATEGY,
@@ -1692,6 +1692,7 @@ def select_stage(
                 "selection_ratio": ratio,
                 "relation_type": relation_type,
                 "relation_weight": relation_weight,
+                "reliability_metrics": list(resolved["reliability_metrics"]),
                 "algorithm": algorithm,
                 **_selection_schema_fields(),
                 "prototype_method": "motion_primitives",
@@ -1756,7 +1757,7 @@ def select_stage(
                 }
             ),
             "cocore_version": __version__,
-            "reliability_metrics": list(RELIABILITY_METRICS),
+            "reliability_metrics": list(resolved["reliability_metrics"]),
             "prototype_method": "motion_primitives",
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
             "prototype_strategy": PROTOTYPE_STRATEGY,
@@ -1838,6 +1839,9 @@ def validate_output(
         raise ValueError("cocore prototype schema version is incompatible")
     if run_manifest.get("selection_schema_version") != SELECTION_SCHEMA_VERSION:
         raise ValueError("cocore selection schema version is incompatible")
+    run_reliability_metrics = run_manifest.get("reliability_metrics")
+    if run_reliability_metrics not in (["support"], ["support", "progress"]):
+        raise ValueError("cocore run manifest reliability metrics are incompatible")
     if run_manifest.get("prototype_strategy") != PROTOTYPE_STRATEGY:
         raise ValueError("cocore prototype strategy is incompatible")
     run_profile = run_manifest.get("prototype_profile")
@@ -1959,6 +1963,7 @@ def validate_output(
         or graph_temporal_is_incompatible
         or graph_manifest.get("stage_directory") != GRAPH_DIRECTORY
         or graph_manifest.get("sequence_adjacency") != SEQUENCE_ADJACENCY
+        or graph_manifest.get("reliability_metrics") != run_reliability_metrics
     ):
         raise ValueError("graph manifest prototype schema is incompatible")
     encode_temporal_fields = {
@@ -2027,6 +2032,9 @@ def validate_output(
     else:
         validation_config = config
     replay_resolved = resolve_config(validation_config)
+    expected_reliability_metrics = list(replay_resolved["reliability_metrics"])
+    if run_reliability_metrics != expected_reliability_metrics:
+        raise ValueError("cocore reliability metrics configuration does not match output")
     if int(replay_resolved["seed"]) != int(algorithm["seed"]):
         raise ValueError("configuration seed does not match output")
     expected_use_stop_bucket = bool(replay_resolved["prototypes"]["use_stop_bucket"])
@@ -2089,6 +2097,8 @@ def validate_output(
         or report.get("prototype_strategy") != PROTOTYPE_STRATEGY
         or select_manifest.get("prototype_profile") != expected_profile
         or report.get("prototype_profile") != expected_profile
+        or select_manifest.get("reliability_metrics") != expected_reliability_metrics
+        or report.get("reliability_metrics") != expected_reliability_metrics
         or select_manifest.get("motion_primitive") != expected_motion_primitive
         or report.get("motion_primitive") != expected_motion_primitive
     ):
@@ -2121,6 +2131,21 @@ def validate_output(
         raise ValueError("all_clips.parquet is not sorted by sample_id")
     leaf_metadata = _leaf_prototype_metadata(root / GRAPH_DIRECTORY)
     nodes = np.load(root / GRAPH_DIRECTORY / "nodes.npz")
+    expected_reliability = nodes["support"] ** 0.5
+    if expected_reliability_metrics == ["support", "progress"]:
+        expected_reliability *= nodes["progress"] ** 0.5
+    expected_reliability = np.clip(
+        expected_reliability,
+        float(replay_resolved["quality"]["min_reliability"]),
+        1.0,
+    )
+    if not np.allclose(
+        nodes["reliability"],
+        expected_reliability,
+        rtol=1.0e-6,
+        atol=1.0e-8,
+    ):
+        raise ValueError("graph node reliability does not match configured reliability metrics")
     half_action_labels = np.load(
         root / GRAPH_DIRECTORY / "half_action_labels.npy", allow_pickle=False
     )

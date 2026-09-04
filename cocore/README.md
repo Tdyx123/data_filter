@@ -87,7 +87,10 @@ w_half = w_r * w_d
 命中同一叶时合并为 `max(w1,w2)+0.5*min(w1,w2)`；同动作不同中心不合并。最终固定
 最多两个槽位，按权重降序、叶 ID 破平局；权重不归一、不截断，范围可到 1.5。
 
-可靠性固定为 `sqrt(support * progress)`。初始集合为每个可达运动原语选择
+可靠性指标由顶层 `reliability_metrics` 配置，只接受 `[support, progress]`（默认）或
+`[support]`。双指标可靠性为 `sqrt(support * progress)`，仅启用 support 时为
+`sqrt(support)`；两种结果都按 `quality.min_reliability` 截断到 `[min_reliability, 1]`。
+初始集合为每个可达运动原语选择
 `reliability * assignment` 最大的片段并取并集，使所有原型 coverage 达到全池最大值。
 其余预算固定使用可复现的随机多分支搜索，并优化以下目标：
 
@@ -179,6 +182,8 @@ python -m cocore run --config cocore/config_libero90.yaml
 配置必须显式声明关系类型与权重：
 
 ```yaml
+reliability_metrics: [support, progress]  # 仅使用 support 时写 [support]
+
 encoding:
   visual_dim: 128
   pca_fit_max_samples: null
@@ -256,8 +261,8 @@ python -m cocore run --config cocore/config_libero90.yaml \
 
 上述选择写入
 `outputs/cocore/libero90/select-sequence-w1p5-top20pct-random-multibranch/`。
-`--cooccurrence-weight` 已移除；Cocore 也不接受
-RelCore 的 `--reliability-metrics`、`--prototype-method` 或
+`--cooccurrence-weight` 已移除；Cocore 的可靠性指标只通过 YAML 顶层字段配置，不接受
+RelCore 的 CLI `--reliability-metrics`、`--prototype-method` 或
 `--prototype-gain-metrics` 参数。
 
 快速 CPU 检查：
@@ -266,18 +271,16 @@ RelCore 的 `--reliability-metrics`、`--prototype-method` 或
 python -m cocore run --config cocore/config_debug.yaml --force
 ```
 
-Cocore 0.16.0 使用 prototype schema 10、profile 固定的 15/8（LIBERO）或 7/4（Bridge）
+Cocore 0.17.0 使用 prototype schema 10、profile 固定的 15/8（LIBERO）或 7/4（Bridge）
 时间几何、10～30 个桶内视觉中心、可选 stop 桶、无标签
 候选诱导子图、65,536 窗口的混合 KMeans 阈值、LIBERO 最大间隔 3、Bridge 最大间隔 2
 的动作训练窗口、裁剪 PCA
 的 128 维聚类空间、近似均匀候选和原始相邻 sequence 图，并按 episode 持久化完整原始
-逐帧 CLIP 特征，选择阶段固定使用 selection schema 1 的随机多分支算法。0.15.x 的 schema 9
-artifact 不迁移，也不会被 validator 接受；既有 scan、encode、graph 和 selection 缓存
-全部视为不兼容。Bridge 适配器 0.10.0 保持 Cocore 0.16.0/schema 10；相对 0.9.0，
-新的动作窗口最大间隔 2 进入 graph/select 指纹、manifest 和 catalog，旧 graph/selection
-artifact 会被拒绝，必须通过 `--force` 重建，兼容的 scan/encode 缓存继续复用。旧
-Bridge 15/8 artifact 与 7/4 几何不兼容，升级时仍需重建全部阶段。LIBERO 的 15/8
-缓存契约不变。
+逐帧 CLIP 特征，选择阶段固定使用 selection schema 1 的随机多分支算法。0.17.0 新增
+`[support]` 可靠性配置；指标进入 graph 指纹以及 graph/select/run manifest 和报告，
+validator 同时核对指标与节点可靠性公式。版本校验保持严格，因此 0.16.x 及更早 artifact
+不会被接受，升级后应使用 `--force` 重建。Bridge 适配器 0.11.0 使用 Cocore
+0.17.0/schema 10；prototype schema 与 selection schema 均未变化。
 
 ## 输出与校验
 
@@ -305,7 +308,7 @@ Bridge 15/8 artifact 与 7/4 几何不兼容，升级时仍需重建全部阶段
 - `selection_report.json`：coverage、目标分解、任务计数、`branch_search`
   轮次/评估/重组统计、逐轮与逐次重组耗时，以及 scanned、eligible、
   excluded-unlabeled 候选数量；
-- `manifest.json`、`run_manifest.json`：Cocore 参数、阶段目录与指纹；
+- `manifest.json`、`run_manifest.json`：Cocore 参数、可靠性指标、阶段目录与指纹；
 - `resolved_config.yaml`、`environment.json`：`run` 的完整配置与环境。
 
 使用以下命令独立重算 coverage、逐步边际增益、目标、预算、唯一性、方法统计和清单一致性：
@@ -318,9 +321,10 @@ python -m cocore validate \
 ```
 
 只有生成结果时关闭了 stop 桶，验证时才应传入该开关。若省略 `--config`，CLI 会从
-选择目录的 `resolved_config.yaml` 读取重放配置；验证时必须使用生成时相同的 seed，
+选择目录的 `resolved_config.yaml` 读取重放配置；验证时必须使用生成时相同的 seed 和
+`reliability_metrics`，
 校验器会重放每个分支的 FAISS 阈值检索并核对增量惩罚。复用
-0.15.x/schema 9、旧 Bridge 15/8 几何、profile、阈值、环绕策略或 stop 设置不同的
+旧版本、旧 Bridge 15/8 几何、profile、阈值、环绕策略、可靠性指标或 stop 设置不同的
 输出目录时，应使用 `--force` 重建全部不兼容阶段。
 
 校验还会从 episode 元数据重放近似均匀候选，逐字段核对 `clips.parquet`，逐个检查

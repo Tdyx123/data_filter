@@ -429,7 +429,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     for directory in ("scan", "encode", "graph-18-motion-hard-nearest-pca"):
         manifest = json.loads((root / directory / "manifest.json").read_text())
         assert manifest["producer"] == "cocore"
-        assert manifest["cocore_version"] == "0.16.0"
+        assert manifest["cocore_version"] == "0.17.0"
     scan_manifest = json.loads((root / "scan" / "manifest.json").read_text())
     assert scan_manifest["window_policy"] == "near_uniform_full_coverage"
     assert scan_manifest["clip_length"] == 15
@@ -595,7 +595,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert "branch_search" in report
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.16.0"
+    assert run_manifest["cocore_version"] == "0.17.0"
     assert run_manifest["relation_type"] == relation
     assert run_manifest["relation_weight"] == 1.0
     assert run_manifest["prototype_schema_version"] == 10
@@ -619,7 +619,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert "trajectory_window_policy" not in run_manifest
     assert run_manifest["sequence_adjacency"] == "ordered_candidates"
     select_manifest = json.loads((result / "manifest.json").read_text())
-    assert select_manifest["cocore_version"] == "0.16.0"
+    assert select_manifest["cocore_version"] == "0.17.0"
     assert select_manifest["relation_type"] == relation
     assert select_manifest["relation_weight"] == 1.0
     assert select_manifest["prototype_schema_version"] == 10
@@ -639,7 +639,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     (result / "manifest.json").write_text(json.dumps(select_manifest))
     with pytest.raises(ValueError, match="selection manifest Cocore version"):
         validate_output(result, config=config)
-    select_manifest["cocore_version"] = "0.16.0"
+    select_manifest["cocore_version"] = "0.17.0"
     (result / "manifest.json").write_text(json.dumps(select_manifest))
 
     report["relation_type"] = "sequence" if relation == "cooccurrence" else "cooccurrence"
@@ -652,6 +652,76 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     (result / "selection_report.json").write_text(json.dumps(report))
     with pytest.raises(ValueError, match="heap metadata"):
         validate_output(result, config=config)
+
+
+def test_support_only_bridge_profile_changes_graph_and_artifact_contract(
+    tmp_path: Path,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    dual_config = _config(tmp_path, "sequence")
+    dual_config["prototypes"]["profile"] = "bridge_v2"  # type: ignore[index]
+    support_config = copy.deepcopy(dual_config)
+    support_config["reliability_metrics"] = ["support"]
+    root = tmp_path / "support-only-output"
+
+    _, _, _, _, dual_fingerprint = graph_stage(
+        dual_config,
+        output_dir=root,
+        visual_encoder=CocoreVisualEncoder(),
+    )
+
+    with pytest.raises(FileExistsError, match="--force"):
+        graph_stage(
+            support_config,
+            output_dir=root,
+            visual_encoder=FailingCocoreVisualEncoder(),
+        )
+
+    _, _, _, _, support_fingerprint = graph_stage(
+        support_config,
+        output_dir=root,
+        force=True,
+        visual_encoder=FailingCocoreVisualEncoder(),
+    )
+
+    assert support_fingerprint != dual_fingerprint
+    graph_root = root / "graph-18-motion-hard-nearest-pca"
+    nodes = np.load(graph_root / "nodes.npz")
+    np.testing.assert_allclose(
+        nodes["reliability"],
+        np.maximum(nodes["support"] ** 0.5, 0.05),
+        rtol=1.0e-6,
+    )
+
+    result = run_pipeline(
+        support_config,
+        output_dir=root,
+        visual_encoder=FailingCocoreVisualEncoder(),
+    )
+    graph_manifest = json.loads((graph_root / "manifest.json").read_text())
+    select_manifest = json.loads((result / "manifest.json").read_text())
+    run_manifest = json.loads((result / "run_manifest.json").read_text())
+    report = json.loads((result / "selection_report.json").read_text())
+    resolved = yaml.safe_load((result / "resolved_config.yaml").read_text())
+    for metadata in (graph_manifest, select_manifest, run_manifest, report, resolved):
+        assert metadata["reliability_metrics"] == ["support"]
+
+    assert validate_output(result, config=support_config) == {
+        "status": "valid",
+        "selected_clips": 10,
+    }
+    with pytest.raises(ValueError, match="reliability metrics"):
+        validate_output(result, config=dual_config)
+
+    nodes.close()
+    nodes_path = graph_root / "nodes.npz"
+    with np.load(nodes_path) as stored_nodes:
+        tampered_nodes = {name: stored_nodes[name] for name in stored_nodes.files}
+    tampered_nodes["reliability"] = np.zeros_like(tampered_nodes["reliability"])
+    np.savez(nodes_path, **tampered_nodes)
+
+    with pytest.raises(ValueError, match="graph node reliability"):
+        validate_output(result, config=support_config)
 
 
 def test_random_multibranch_pipeline_publishes_and_replays_branch_search(

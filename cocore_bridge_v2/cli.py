@@ -20,6 +20,7 @@ from cocore.pipeline import (
 
 from .config import (
     DEFAULT_DATASET_PATH,
+    DEFAULT_RELIABILITY_METRICS,
     DEFAULT_SELECTION_RATIO,
     build_config,
 )
@@ -50,6 +51,19 @@ def _selection_ratio(value: str) -> float:
     return parsed
 
 
+def _reliability_metrics(value: str) -> list[str]:
+    choices = {
+        "support": ["support"],
+        "support,progress": ["support", "progress"],
+    }
+    try:
+        return choices[value]
+    except KeyError as error:
+        raise argparse.ArgumentTypeError(
+            "reliability metrics must be support or support,progress"
+        ) from error
+
+
 def _add_objective_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--relation",
@@ -71,6 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--force", action="store_true")
         if command in {"build-graph", "select", "run"}:
             child.add_argument("--no-use-stop-bucket", action="store_true")
+            child.add_argument(
+                "--reliability-metrics",
+                type=_reliability_metrics,
+                default=list(DEFAULT_RELIABILITY_METRICS),
+            )
         if command in {"select", "run"}:
             child.add_argument(
                 "--selection-ratio",
@@ -89,6 +108,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate.add_argument("--max-episodes", type=_positive_int, default=None)
     validate.add_argument("--no-use-stop-bucket", action="store_true")
+    validate.add_argument(
+        "--reliability-metrics",
+        type=_reliability_metrics,
+        default=list(DEFAULT_RELIABILITY_METRICS),
+    )
     return parser
 
 
@@ -102,6 +126,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         dataset_path=getattr(args, "dataset_path", DEFAULT_DATASET_PATH),
         max_episodes=getattr(args, "max_episodes", None),
         use_stop_bucket=not getattr(args, "no_use_stop_bucket", False),
+        reliability_metrics=getattr(
+            args, "reliability_metrics", DEFAULT_RELIABILITY_METRICS
+        ),
     )
     if args.command == "validate":
         result = validate_output(args.output_dir, config=config)

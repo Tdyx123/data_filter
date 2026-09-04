@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,7 @@ from cocore.config import resolve_config
 
 DEFAULT_DATASET_PATH = Path("/data/dwb/datasets/bridge_orig_1.0.0_lerobot")
 DEFAULT_SELECTION_RATIO = 0.10
+DEFAULT_RELIABILITY_METRICS = ("support", "progress")
 _CONFIG_PATH = Path(__file__).with_name("config_bridge_v2.yaml")
 
 
@@ -31,6 +32,7 @@ def build_config(
     dataset_path: str | Path = DEFAULT_DATASET_PATH,
     max_episodes: int | None = None,
     use_stop_bucket: bool = True,
+    reliability_metrics: Sequence[str] = DEFAULT_RELIABILITY_METRICS,
 ) -> dict[str, Any]:
     """Build and validate the fixed BridgeData V2 Cocore configuration."""
 
@@ -44,4 +46,5 @@ def build_config(
     config["selection"]["budget"] = None
     config["runtime"]["max_episodes"] = max_episodes
     config["prototypes"]["use_stop_bucket"] = use_stop_bucket
+    config["reliability_metrics"] = list(reliability_metrics)
     return resolve_config(config)
