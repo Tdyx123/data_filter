@@ -8,6 +8,7 @@ import math
 from collections.abc import Sequence
 from pathlib import Path
 
+from cocore.action_variation import RELIABILITY_METRICS, normalize_reliability_metrics
 from cocore.pipeline import (
     GRAPH_DIRECTORY,
     encode_stage,
@@ -51,20 +52,10 @@ def _selection_ratio(value: str) -> float:
     return parsed
 
 
-def _reliability_metrics(value: str) -> list[str]:
-    choices = {
-        "support": ["support"],
-        "support,progress": ["support", "progress"],
-    }
-    try:
-        return choices[value]
-    except KeyError as error:
-        raise argparse.ArgumentTypeError(
-            "reliability metrics must be support or support,progress"
-        ) from error
-
-
 def _add_objective_arguments(parser: argparse.ArgumentParser) -> None:
+    for name in ("position-speed-threshold", "gripper-speed-threshold", "angular-speed-threshold"):
+        parser.add_argument(f"--dwell-{name}", type=float, default=None)
+    parser.add_argument("--dwell-gripper-mode", choices=("continuous", "binary"), default=None)
     parser.add_argument(
         "--relation",
         choices=("sequence", "cooccurrence"),
@@ -87,7 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
             child.add_argument("--no-use-stop-bucket", action="store_true")
             child.add_argument(
                 "--reliability-metrics",
-                type=_reliability_metrics,
+                nargs="+",
+                choices=RELIABILITY_METRICS,
                 default=list(DEFAULT_RELIABILITY_METRICS),
             )
         if command in {"select", "run"}:
@@ -110,7 +102,8 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--no-use-stop-bucket", action="store_true")
     validate.add_argument(
         "--reliability-metrics",
-        type=_reliability_metrics,
+        nargs="+",
+        choices=RELIABILITY_METRICS,
         default=list(DEFAULT_RELIABILITY_METRICS),
     )
     return parser
@@ -118,17 +111,34 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    try:
+        args.reliability_metrics = list(
+            normalize_reliability_metrics(
+                getattr(args, "reliability_metrics", DEFAULT_RELIABILITY_METRICS)
+            )
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     selection_ratio = getattr(args, "selection_ratio", DEFAULT_SELECTION_RATIO)
+    dwell = {
+        name: getattr(args, f"dwell_{name}")
+        for name in (
+            "position_speed_threshold",
+            "gripper_speed_threshold",
+            "angular_speed_threshold",
+            "gripper_mode",
+        )
+        if getattr(args, f"dwell_{name}", None) is not None
+    }
     config = build_config(
+        dwell=dwell or None,
         relation=args.relation,
         relation_weight=args.relation_weight,
         selection_ratio=selection_ratio,
         dataset_path=getattr(args, "dataset_path", DEFAULT_DATASET_PATH),
         max_episodes=getattr(args, "max_episodes", None),
         use_stop_bucket=not getattr(args, "no_use_stop_bucket", False),
-        reliability_metrics=getattr(
-            args, "reliability_metrics", DEFAULT_RELIABILITY_METRICS
-        ),
+        reliability_metrics=getattr(args, "reliability_metrics", DEFAULT_RELIABILITY_METRICS),
     )
     if args.command == "validate":
         result = validate_output(args.output_dir, config=config)

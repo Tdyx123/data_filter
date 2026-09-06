@@ -116,7 +116,7 @@ class ReverseOrderCocorePipelineAdapter(CocorePipelineAdapter):
 class ShortEpisodeCocorePipelineAdapter(CocorePipelineAdapter):
     def __init__(self, config: Mapping[str, object]) -> None:
         super().__init__(config)
-        self._records = (*self._records, EpisodeRecord(2, 5, 2, "short task"))
+        self._records = (*self._records, EpisodeRecord(2, 1, 2, "short task"))
 
 
 class MixedStopCocorePipelineAdapter(CocorePipelineAdapter):
@@ -379,7 +379,7 @@ def test_encode_stage_caches_every_indexed_episode_including_short_episodes(
     assert [(entry["episode_id"], entry["frames"]) for entry in index["episodes"]] == [
         (0, 605),
         (1, 605),
-        (2, 5),
+        (2, 1),
     ]
     result = run_pipeline(config, visual_encoder=FailingCocoreVisualEncoder())
     assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 10}
@@ -422,6 +422,10 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert (root / "scan" / "manifest.json").is_file()
     assert (root / "encode" / "manifest.json").is_file()
     assert (root / "encode" / "visual_half_embeddings.npy").is_file()
+    assert (root / "encode" / "action_variation_raw.npy").is_file()
+    assert (root / "encode" / "action_variation.npy").is_file()
+    assert (root / "encode" / "visual_action_consistency_raw.npy").is_file()
+    assert (root / "encode" / "visual_action_consistency.npy").is_file()
     assert (root / "graph-18-motion-hard-nearest-pca" / "prototype_catalog.json").is_file()
     assert (root / "graph-18-motion-hard-nearest-pca" / "prototype_centers.npy").is_file()
     assert (root / "graph-18-motion-hard-nearest-pca" / "half_action_labels.npy").is_file()
@@ -429,7 +433,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     for directory in ("scan", "encode", "graph-18-motion-hard-nearest-pca"):
         manifest = json.loads((root / directory / "manifest.json").read_text())
         assert manifest["producer"] == "cocore"
-        assert manifest["cocore_version"] == "0.17.0"
+        assert manifest["cocore_version"] == "0.19.0"
     scan_manifest = json.loads((root / "scan" / "manifest.json").read_text())
     assert scan_manifest["window_policy"] == "near_uniform_full_coverage"
     assert scan_manifest["clip_length"] == 15
@@ -472,8 +476,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
         "visual_projection_padding": "right_zero_to_128",
         "visual_half_encoding": "l2_normalized_mean_of_eight_projected_frames",
         "cluster_count": (
-            "min(training_count, min(30, max(10, "
-            "floor(4 * log2(training_count) - 30))))"
+            "min(training_count, min(30, max(10, floor(4 * log2(training_count) - 30))))"
         ),
         "retention_weight": "0.5 + 0.5 * retained_atomic_ratio",
         "distance_quantiles": [0.1, 0.9],
@@ -499,6 +502,42 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     graph_manifest = json.loads(
         (root / "graph-18-motion-hard-nearest-pca" / "manifest.json").read_text()
     )
+    action_variation_contract = {
+        "input": "robust_scaled_full_episode_actions",
+        "difference": "l2_norm_current_minus_previous",
+        "difference_weight": 2.0,
+        "first_step_difference": 0.0,
+        "future_window": 5,
+        "future_variance": "mean_dimension_population_variance",
+        "future_variance_weight": 1.0,
+        "future_boundary": "truncate_available_less_than_two_is_zero",
+        "clip_aggregation": "top_k_mean",
+        "top_k": 3,
+        "normalization": "clip_quantile_scale_to_zero_one",
+        "quantile_low": 0.01,
+        "quantile_high": 0.99,
+        "epsilon": 1.0e-8,
+    }
+    visual_action_consistency_contract = {
+        "formula": "l2(v_t-v_t_minus_1)/(l2(a_t-a_t_minus_1)+epsilon)",
+        "visual_input": "configured_encoder_full_episode_frame_features",
+        "action_input": "robust_scaled_full_episode_actions",
+        "visual_difference": "l2_norm_current_minus_previous",
+        "action_difference": "l2_norm_current_minus_previous",
+        "ratio": "visual_difference_over_action_difference_plus_epsilon",
+        "first_step": "copy_first_valid_ratio",
+        "clip_aggregation": "top_k_mean",
+        "top_k": 3,
+        "normalization": "clip_quantile_scale_to_zero_one",
+        "quantile_low": 0.01,
+        "quantile_high": 0.99,
+        "epsilon": 1.0e-8,
+    }
+    encode_manifest = json.loads((root / "encode" / "manifest.json").read_text())
+    assert encode_manifest["action_variation"] == action_variation_contract
+    assert encode_manifest["visual_action_consistency"] == visual_action_consistency_contract
+    assert graph_manifest["action_variation"] == action_variation_contract
+    assert graph_manifest["visual_action_consistency"] == visual_action_consistency_contract
     assert graph_manifest["prototype_profile"] == "libero"
     assert graph_manifest["motion_primitive"] == {
         "profile": "libero",
@@ -530,11 +569,26 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert "trajectory_window_policy" not in graph_manifest
     assert "prototype_action_weights" not in nodes.files
     assert "prototype_distance_weights" not in nodes.files
+    assert {
+        "action_variation_raw",
+        "action_variation",
+        "visual_action_consistency_raw",
+        "visual_action_consistency",
+    } <= set(nodes.files)
     assert np.all(nodes["prototype_weights"].sum(axis=1) > 0.0)
     assert np.any(nodes["prototype_weights"].sum(axis=1) > 1.0)
     np.testing.assert_allclose(
         nodes["reliability"],
-        np.maximum(nodes["support"] ** 0.5 * nodes["progress"] ** 0.5, 0.05),
+        np.maximum(
+            (
+                nodes["support"]
+                * nodes["progress"]
+                * nodes["action_variation"]
+                * nodes["visual_action_consistency"]
+            )
+            ** 0.25,
+            0.05,
+        ),
         rtol=1.0e-6,
     )
     selected = [
@@ -549,8 +603,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
         "branch_final",
     }
     assert all(
-        {"selection_step", "selection_score_delta"} <= row.keys()
-        and "heap_refreshes" not in row
+        {"selection_step", "selection_score_delta"} <= row.keys() and "heap_refreshes" not in row
         for row in selected
     )
     assert all("heap_refreshes" not in row for row in all_rows)
@@ -558,6 +611,10 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
         {
             "support",
             "progress",
+            "action_variation_raw",
+            "action_variation",
+            "visual_action_consistency_raw",
+            "visual_action_consistency",
             "reliability",
             "prototype_labels",
             "prototype_action_labels",
@@ -590,16 +647,20 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert report["objective"]["weighted_relation"] == report["objective"]["relation"]
     assert report["coverage"]["target"] == report["coverage"]["achieved"]
     assert report["algorithm"]["type"] == "random_multibranch"
-    assert report["selection_schema_version"] == 1
+    assert report["selection_schema_version"] == 3
+    assert report["action_variation"] == action_variation_contract
+    assert report["visual_action_consistency"] == visual_action_consistency_contract
     assert "heap" not in report
     assert "branch_search" in report
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.17.0"
+    assert run_manifest["cocore_version"] == "0.19.0"
     assert run_manifest["relation_type"] == relation
     assert run_manifest["relation_weight"] == 1.0
     assert run_manifest["prototype_schema_version"] == 10
-    assert run_manifest["selection_schema_version"] == 1
+    assert run_manifest["selection_schema_version"] == 3
+    assert run_manifest["action_variation"] == action_variation_contract
+    assert run_manifest["visual_action_consistency"] == visual_action_consistency_contract
     assert run_manifest["prototype_profile"] == "libero"
     assert run_manifest["use_stop_bucket"] is True
     assert run_manifest["prototype_strategy"] == (
@@ -619,11 +680,13 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     assert "trajectory_window_policy" not in run_manifest
     assert run_manifest["sequence_adjacency"] == "ordered_candidates"
     select_manifest = json.loads((result / "manifest.json").read_text())
-    assert select_manifest["cocore_version"] == "0.17.0"
+    assert select_manifest["cocore_version"] == "0.19.0"
     assert select_manifest["relation_type"] == relation
     assert select_manifest["relation_weight"] == 1.0
     assert select_manifest["prototype_schema_version"] == 10
-    assert select_manifest["selection_schema_version"] == 1
+    assert select_manifest["selection_schema_version"] == 3
+    assert select_manifest["action_variation"] == action_variation_contract
+    assert select_manifest["visual_action_consistency"] == visual_action_consistency_contract
     assert select_manifest["prototype_profile"] == "libero"
     assert select_manifest["use_stop_bucket"] is True
     assert select_manifest["prototype_strategy"] == (
@@ -639,7 +702,7 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
     (result / "manifest.json").write_text(json.dumps(select_manifest))
     with pytest.raises(ValueError, match="selection manifest Cocore version"):
         validate_output(result, config=config)
-    select_manifest["cocore_version"] = "0.17.0"
+    select_manifest["cocore_version"] = "0.19.0"
     (result / "manifest.json").write_text(json.dumps(select_manifest))
 
     report["relation_type"] = "sequence" if relation == "cooccurrence" else "cooccurrence"
@@ -689,7 +752,7 @@ def test_support_only_bridge_profile_changes_graph_and_artifact_contract(
     nodes = np.load(graph_root / "nodes.npz")
     np.testing.assert_allclose(
         nodes["reliability"],
-        np.maximum(nodes["support"] ** 0.5, 0.05),
+        np.maximum(nodes["support"], 0.05),
         rtol=1.0e-6,
     )
 
@@ -737,8 +800,7 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
 
     assert result == root / "select-sequence-w1-top50pct-random-multibranch"
     selected = [
-        json.loads(line)
-        for line in (result / "selected_manifest.jsonl").read_text().splitlines()
+        json.loads(line) for line in (result / "selected_manifest.jsonl").read_text().splitlines()
     ]
     report = json.loads((result / "selection_report.json").read_text())
     algorithm = {
@@ -811,9 +873,9 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
     run_manifest = json.loads((result / "run_manifest.json").read_text())
     assert select_manifest["algorithm"] == algorithm
     assert run_manifest["algorithm"] == algorithm
-    assert report["selection_schema_version"] == 1
-    assert select_manifest["selection_schema_version"] == 1
-    assert run_manifest["selection_schema_version"] == 1
+    assert report["selection_schema_version"] == 3
+    assert select_manifest["selection_schema_version"] == 3
+    assert run_manifest["selection_schema_version"] == 3
     assert validate_output(result, config=config) == {
         "status": "valid",
         "selected_clips": 10,
@@ -834,7 +896,7 @@ def test_random_multibranch_pipeline_publishes_and_replays_branch_search(
     run_path.write_text(json.dumps(run_manifest))
     with pytest.raises(ValueError, match="selection schema version"):
         validate_output(result, config=config)
-    run_manifest["selection_schema_version"] = 1
+    run_manifest["selection_schema_version"] = 3
     run_path.write_text(json.dumps(run_manifest))
 
     run_manifest["algorithm"] = {"type": "lazy_max_heap", "max_refreshes": 2}
@@ -922,16 +984,12 @@ def test_random_multibranch_reports_recombination_detail_and_average_log(
 
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
     captured = capsys.readouterr()
-    timings = json.loads((result / "selection_report.json").read_text())["branch_search"][
-        "timings"
-    ]
+    timings = json.loads((result / "selection_report.json").read_text())["branch_search"]["timings"]
 
     assert len(timings["recombinations"]) == 1
     assert timings["recombinations"][0]["round"] == 2
     assert timings["recombinations"][0]["seconds"] >= 0.0
-    assert timings["average_recombination_seconds"] == timings["recombinations"][0][
-        "seconds"
-    ]
+    assert timings["average_recombination_seconds"] == timings["recombinations"][0]["seconds"]
     random_timing_steps = [
         line.split(" step=", 1)[1].split(" ", 1)[0]
         for line in captured.err.splitlines()
@@ -962,15 +1020,13 @@ def test_selection_schema_rebuilds_legacy_select_only(
         visual_encoder=CocoreVisualEncoder(),
     )
     legacy_run = json.loads((legacy_result / "run_manifest.json").read_text())
-    legacy_fingerprint = json.loads((legacy_result / "manifest.json").read_text())[
-        "fingerprint"
-    ]
+    legacy_fingerprint = json.loads((legacy_result / "manifest.json").read_text())["fingerprint"]
     assert "selection_schema_version" not in legacy_run
 
     monkeypatch.setattr(
         cocore_pipeline,
         "SELECTION_SCHEMA_VERSION",
-        1,
+        3,
     )
     upgraded_result = run_pipeline(
         config,
@@ -986,17 +1042,13 @@ def test_selection_schema_rebuilds_legacy_select_only(
     assert upgraded_fingerprint != legacy_fingerprint
     assert upgraded_run["stage_fingerprints"]["select"] == upgraded_fingerprint
     assert {
-        stage: upgraded_run["stage_fingerprints"][stage]
-        for stage in ("scan", "encode", "graph")
-    } == {
-        stage: legacy_run["stage_fingerprints"][stage]
-        for stage in ("scan", "encode", "graph")
-    }
+        stage: upgraded_run["stage_fingerprints"][stage] for stage in ("scan", "encode", "graph")
+    } == {stage: legacy_run["stage_fingerprints"][stage] for stage in ("scan", "encode", "graph")}
     upgraded_report = json.loads((upgraded_result / "selection_report.json").read_text())
     upgraded_manifest = json.loads((upgraded_result / "manifest.json").read_text())
-    assert upgraded_report["selection_schema_version"] == 1
-    assert upgraded_manifest["selection_schema_version"] == 1
-    assert upgraded_run["selection_schema_version"] == 1
+    assert upgraded_report["selection_schema_version"] == 3
+    assert upgraded_manifest["selection_schema_version"] == 3
+    assert upgraded_run["selection_schema_version"] == 3
 
 
 def test_disabled_stop_bucket_excludes_unlabeled_candidates_from_graph_and_selection(
@@ -1020,7 +1072,9 @@ def test_disabled_stop_bucket_excludes_unlabeled_candidates_from_graph_and_selec
     assert np.load(graph_root / "half_action_labels.npy", allow_pickle=False).shape == (82, 2)
 
     catalog = json.loads((graph_root / "prototype_catalog.json").read_text())
-    stop = next(category for category in catalog["action_categories"] if category["label"] == "stop")
+    stop = next(
+        category for category in catalog["action_categories"] if category["label"] == "stop"
+    )
     assert catalog["use_stop_bucket"] is False
     assert stop["action_id"] is None
     assert stop["training_count"] == 0
@@ -1075,7 +1129,9 @@ def test_disabled_stop_bucket_rejects_budget_above_eligible_candidate_count(
     config["prototypes"]["use_stop_bucket"] = False
     config["selection"]["budget"] = 83
 
-    with pytest.raises(ValueError, match="selection budget must be within eligible candidate count"):
+    with pytest.raises(
+        ValueError, match="selection budget must be within eligible candidate count"
+    ):
         run_pipeline(config, visual_encoder=CocoreVisualEncoder())
 
 
@@ -1261,6 +1317,142 @@ def test_validate_rejects_missing_visual_half_embeddings_as_encode_artifact(
     (result.parent / "encode" / "visual_half_embeddings.npy").unlink()
 
     with pytest.raises(ValueError, match="invalid stage artifacts: encode"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_tampered_action_variation_cache(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    path = result.parent / "encode" / "action_variation.npy"
+    values = np.load(path)
+    values[0] = 1.0 - values[0]
+    np.save(path, values)
+
+    with pytest.raises(ValueError, match="action variation cache"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_tampered_graph_action_variation(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    path = result.parent / "graph-18-motion-hard-nearest-pca" / "nodes.npz"
+    with np.load(path) as stored:
+        arrays = {name: stored[name] for name in stored.files}
+    arrays["action_variation"] = arrays["action_variation"].copy()
+    arrays["action_variation"][0] = 1.0 - arrays["action_variation"][0]
+    np.savez(path, **arrays)
+
+    with pytest.raises(ValueError, match="graph node action variation"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_missing_graph_action_variation_field(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    path = result.parent / "graph-18-motion-hard-nearest-pca" / "nodes.npz"
+    with np.load(path) as stored:
+        arrays = {name: stored[name] for name in stored.files if name != "action_variation"}
+    np.savez(path, **arrays)
+
+    with pytest.raises(ValueError, match="graph node reliability arrays"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_tampered_all_clips_action_variation(tmp_path: Path) -> None:
+    import pyarrow as pa
+
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    path = result / "all_clips.parquet"
+    rows = pq.read_table(path).to_pylist()
+    rows[0]["action_variation"] = 1.0 - rows[0]["action_variation"]
+    pq.write_table(pa.Table.from_pylist(rows), path)
+
+    with pytest.raises(ValueError, match="hierarchical prototype row"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_tampered_selected_action_variation(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    path = result / "selected_manifest.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0]["action_variation"] = 1.0 - rows[0]["action_variation"]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    with pytest.raises(ValueError, match="selected action variation"):
+        validate_output(result, config=config)
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["visual_action_consistency_raw.npy", "visual_action_consistency.npy"],
+)
+def test_validate_rejects_tampered_visual_action_consistency_cache(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    path = result.parent / "encode" / filename
+    values = np.load(path)
+    values[0] = values[0] * np.float32(2.0) + np.float32(1.0)
+    np.save(path, values)
+
+    with pytest.raises(ValueError, match="visual-action consistency cache"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_tampered_graph_visual_action_consistency(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    path = result.parent / "graph-18-motion-hard-nearest-pca" / "nodes.npz"
+    with np.load(path) as stored:
+        arrays = {name: stored[name] for name in stored.files}
+    arrays["visual_action_consistency"] = arrays["visual_action_consistency"].copy()
+    arrays["visual_action_consistency"][0] = np.float32(
+        0.25 if arrays["visual_action_consistency"][0] > 0.5 else 0.75
+    )
+    np.savez(path, **arrays)
+
+    with pytest.raises(ValueError, match="graph node visual-action consistency"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_tampered_all_clips_visual_action_consistency(
+    tmp_path: Path,
+) -> None:
+    import pyarrow as pa
+
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    path = result / "all_clips.parquet"
+    rows = pq.read_table(path).to_pylist()
+    rows[0]["visual_action_consistency"] += 0.125
+    pq.write_table(pa.Table.from_pylist(rows), path)
+
+    with pytest.raises(ValueError, match="hierarchical prototype row"):
+        validate_output(result, config=config)
+
+
+def test_validate_rejects_tampered_selected_visual_action_consistency(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    path = result / "selected_manifest.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0]["visual_action_consistency"] += 0.125
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    with pytest.raises(ValueError, match="visual-action consistency"):
         validate_output(result, config=config)
 
 
@@ -1781,3 +1973,117 @@ def test_validate_aligns_sorted_output_rows_by_sample_id(tmp_path: Path) -> None
     result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
 
     assert validate_output(result, config=config) == {"status": "valid", "selected_clips": 10}
+
+
+@pytest.mark.parametrize("profile", ["libero", "bridge_v2"])
+def test_dwell_pipeline_cache_fusion_and_replay(tmp_path: Path, profile: str) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["prototypes"]["profile"] = profile
+    config["dwell"] = dict(
+        position_speed_threshold=0.5, gripper_speed_threshold=0.1, angular_speed_threshold=0.1
+    )
+    config["reliability_metrics"] = ["non_dwell"]
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    root = result.parent
+    ratio = np.load(root / "encode" / "dwell_ratio.npy")
+    np.testing.assert_allclose(ratio, 1.0)
+    with np.load(root / cocore_pipeline.GRAPH_DIRECTORY / "nodes.npz") as nodes:
+        np.testing.assert_allclose(nodes["non_dwell"], 0.0)
+        np.testing.assert_allclose(nodes["reliability"], 0.05)
+    validate_output(result, config=config)
+    encode_stage(config, visual_encoder=FailingCocoreVisualEncoder())
+    changed = copy.deepcopy(config)
+    changed["dwell"]["position_speed_threshold"] = 0.3
+    with pytest.raises(FileExistsError):
+        encode_stage(changed, visual_encoder=FailingCocoreVisualEncoder())
+    path = root / "encode" / "dwell_ratio.npy"
+    ratio[0] = 0.0
+    np.save(path, ratio)
+    with pytest.raises(ValueError, match="dwell"):
+        validate_output(result, config=config)
+
+
+@pytest.mark.parametrize(
+    "target", ["raw_state", "timestamps", "graph", "all_rows", "selected_rows", "report"]
+)
+def test_dwell_diagnostics_and_tamper_detection(tmp_path: Path, target: str) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["dwell"] = dict(
+        position_speed_threshold=0.5, gripper_speed_threshold=0.1, angular_speed_threshold=0.1
+    )
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    rows = pq.read_table(result / "all_clips.parquet").to_pylist()
+    assert all(row["dwell_ratio"] == 1 and row["non_dwell"] == 0 for row in rows)
+    report_path = result / "selection_report.json"
+    report = json.loads(report_path.read_text())
+    assert report["dwell_summary"]["dwell_ratio"]["all_mean"] == 1
+    assert report["dwell_summary"]["non_dwell"]["selected_mean"] == 0
+    assert "non_dwell" not in report["reliability_metrics"]
+    validate_output(result, config=config)
+    if target in ("raw_state", "timestamps"):
+        field = "dwell_state_sequences" if target == "raw_state" else "dwell_timestamps"
+        path = result.parent / "encode" / f"{field}.npy"
+        values = np.load(path)
+        values.flat[0] += 0.01
+        np.save(path, values)
+    elif target == "graph":
+        path = result.parent / cocore_pipeline.GRAPH_DIRECTORY / "nodes.npz"
+        with np.load(path) as nodes:
+            values = dict(nodes)
+        values["non_dwell"][0] = 1
+        np.savez(path, **values)
+    elif target == "all_rows":
+        rows[0]["dwell_ratio"] = 0
+        pq.write_table(pa.Table.from_pylist(rows), result / "all_clips.parquet")
+    elif target == "selected_rows":
+        path = result / "selected_manifest.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[0]["non_dwell"] = 1
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    else:
+        report["dwell_summary"]["dwell_ratio"]["all_mean"] = 0
+        report_path.write_text(json.dumps(report))
+    with pytest.raises(ValueError):
+        validate_output(result, config=config)
+
+
+def test_dwell_cache_replay_recomputes_after_checksum_update(tmp_path):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["dwell"] = dict(
+        position_speed_threshold=0.5, angular_speed_threshold=0.1, gripper_mode="binary"
+    )
+    root, _, artifact = encode_stage(config, visual_encoder=CocoreVisualEncoder())
+    path = root / "encode" / "dwell_ratio.npy"
+    ratio = np.load(path)
+    ratio[0] = 0.5
+    np.save(path, ratio)
+    manifest_path = root / "encode" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["dwell_checksums"]["dwell_ratio"] = cocore_pipeline.file_sha256(path)
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="dwell cache does not match"):
+        cocore_pipeline._validate_dwell_cache(
+            root / "encode", artifact.clips, cocore_pipeline.resolve_config(config)
+        )
+
+
+def test_dwell_diagnostics_preserve_default_scores_and_selection(tmp_path):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    baseline = run_pipeline(
+        config, output_dir=tmp_path / "baseline", visual_encoder=CocoreVisualEncoder()
+    )
+    config["dwell"] = dict(
+        position_speed_threshold=0.5, angular_speed_threshold=0.1, gripper_mode="binary"
+    )
+    diagnostic = run_pipeline(
+        config, output_dir=tmp_path / "diagnostic", visual_encoder=CocoreVisualEncoder()
+    )
+    baseline_rows = pq.read_table(baseline / "all_clips.parquet").to_pylist()
+    diagnostic_rows = pq.read_table(diagnostic / "all_clips.parquet").to_pylist()
+    for before, after in zip(baseline_rows, diagnostic_rows, strict=True):
+        assert "dwell_ratio" not in before
+        assert {k: v for k, v in after.items() if k not in ("dwell_ratio", "non_dwell")} == before

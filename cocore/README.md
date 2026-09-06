@@ -87,9 +87,81 @@ w_half = w_r * w_d
 命中同一叶时合并为 `max(w1,w2)+0.5*min(w1,w2)`；同动作不同中心不合并。最终固定
 最多两个槽位，按权重降序、叶 ID 破平局；权重不归一、不截断，范围可到 1.5。
 
-可靠性指标由顶层 `reliability_metrics` 配置，只接受 `[support, progress]`（默认）或
-`[support]`。双指标可靠性为 `sqrt(support * progress)`，仅启用 support 时为
-`sqrt(support)`；两种结果都按 `quality.min_reliability` 截断到 `[min_reliability, 1]`。
+可靠性目录为 `support`、`progress`、`action_variation`、
+`visual_action_consistency` 和 `non_dwell`，顶层 `reliability_metrics` 可选择其中任意
+1～5 个无重复指标，默认仅启用前四项；`non_dwell` 需要显式配置 `dwell` 阈值。输入顺序会按
+上述固定顺序规范化。`action_variation` 在完整 episode 的分位缩放动作上计算：逐步分数
+为当前与前一步动作的 L2 差乘 2，再加未来最多 5 步动作逐维总体方差的维度均值；首步
+差分为 0，未来少于 2 步时方差为 0。片段原始分数取最高 3 个逐步分数的均值，再使用
+全部候选的 `encoding.quantile_low/high` 分位数缩放并截断到 `[0, 1]`。
+
+`visual_action_consistency`（VAC，语义参考
+[FrameSkip](https://arxiv.org/html/2605.13757)）复用同一轮编码保存的完整 episode 逐帧视觉特征和
+分位缩放动作，不增加视觉模型前向。逐步分数为
+
+```text
+VAC_t = ||v_t - v_(t-1)||_2 / (||a_t - a_(t-1)||_2 + encoding.epsilon)
+```
+
+`VAC_0` 复制第一个有效分数；片段原始分数同样取最高 3 个逐步分数的均值，再按全部
+候选的 `encoding.quantile_low/high` 缩放并截断到 `[0, 1]`。候选原始分数为常量时归零。
+高 VAC 表示相对于动作变化出现了更显著的视觉变化，因此保持“越高越重要”的方向。
+
+### 低变化驻留比例
+
+`dwell_ratio` 表示片段内末端位置、姿态和夹爪同时低变化的时间占比，
+`non_dwell = 1 - dwell_ratio` 是可选可靠性分量，不进行分位数归一化。
+对片段内部的 `L−1` 对相邻帧计算：
+
+```text
+low_t = (||p_t - p_(t-1)|| / dt_t < position_speed_threshold)
+        AND (relative_rotation_angle / dt_t < angular_speed_threshold)
+        AND (|g_t - g_(t-1)| / dt_t < gripper_speed_threshold)
+dwell_ratio = sum(dt_t * low_t) / sum(dt_t)
+```
+
+使用未归一化的 `observation.state`：位置为 `[0:3]`、姿态为 `[3:6]`、夹爪为 `[7]`。
+LIBERO 姿态按旋转向量解释，Bridge 按 XYZ 欧拉角解释，均计算最短相对旋转角。
+时间戳单位为秒，必须有限且严格递增；状态必须有限，片段至少两帧。
+等间隔时公式等价于低变化比较次数除以 `L−1`，例如 `70/100 = 0.70`；
+片段首帧不与片段外的前一帧比较。
+
+默认不配置 `dwell`，也不计算该指标。下面展示配置结构，`null` 必须替换为按数据集
+校准的有限正数，否则配置校验会报错；不提供通用默认阈值：
+
+```yaml
+dwell:
+  position_speed_threshold: null  # 原始位置单位/秒，LIBERO、Bridge 通常为 m/s
+  angular_speed_threshold: null   # rad/s
+  gripper_speed_threshold: null   # 原始夹爪单位/秒，不同数据集量纲可能不同
+  gripper_mode: continuous
+reliability_metrics: [support, progress, action_variation, visual_action_consistency, non_dwell]
+```
+
+如仅需诊断，完整配置 `dwell` 后保持原来的四项 `reliability_metrics`。
+二值夹爪显式设置 `gripper_mode: binary`，直接比较相邻状态是否相等，此时可以省略
+`gripper_speed_threshold`。这里的夹爪来自观测状态，不能用二值动作指令替代连续观测。
+
+启用计算后，encode 新增 `dwell_state_sequences.npy`、`dwell_timestamps.npy`、
+`dwell_ratio.npy`、`non_dwell.npy`；原始缓存用 float64 保存，配有 SHA-256 校验。
+graph 节点、`all_clips.parquet` 和 `selected_manifest.jsonl` 均包含两项得分。
+`selection_report.json` 的 `dwell_summary` 提供全池与选中片段的得分算术均值，
+不是将所有片段时长合并计算的比例。配置、profile 和计算版本写入阶段契约及指纹；
+修改配置需重建不兼容缓存，`validate` 会复算并检查缓存、节点、行和报告的一致性。
+
+高驻留比例不等于低价值：持物、等待、接触保持均可能合理。`non_dwell` 仅在显式选择时
+影响几何均值，不新增仅凭驻留比例直接删除片段的规则。
+
+任意所选指标集合都统一取几何均值：
+
+```text
+reliability = clip((product(selected_metrics)) ** (1 / metric_count),
+                   quality.min_reliability, 1)
+```
+
+融合取所选指标乘积的 n 次方根，再应用可靠性下限。该
+reliability 会同时进入
+coverage seed、关系收益、冗余惩罚和分支保留排序。
 初始集合为每个可达运动原语选择
 `reliability * assignment` 最大的片段并取并集，使所有原型 coverage 达到全池最大值。
 其余预算固定使用可复现的随机多分支搜索，并优化以下目标：
@@ -175,14 +247,15 @@ pip install -r cocore/requirements.txt
 python -m cocore scan --config cocore/config_libero90.yaml
 python -m cocore encode --config cocore/config_libero90.yaml
 python -m cocore build-graph --config cocore/config_libero90.yaml
-python -m cocore select --config cocore/config_libero90.yaml
+python -m cocore select --config cocore/config_libero90.yaml \
+  --reliability-metrics support action_variation
 python -m cocore run --config cocore/config_libero90.yaml
 ```
 
 配置必须显式声明关系类型与权重：
 
 ```yaml
-reliability_metrics: [support, progress]  # 仅使用 support 时写 [support]
+reliability_metrics: [support, progress, action_variation, visual_action_consistency]
 
 encoding:
   visual_dim: 128
@@ -261,8 +334,9 @@ python -m cocore run --config cocore/config_libero90.yaml \
 
 上述选择写入
 `outputs/cocore/libero90/select-sequence-w1p5-top20pct-random-multibranch/`。
-`--cooccurrence-weight` 已移除；Cocore 的可靠性指标只通过 YAML 顶层字段配置，不接受
-RelCore 的 CLI `--reliability-metrics`、`--prototype-method` 或
+`build-graph`、`select`、`run` 和 `validate` 可通过
+`--reliability-metrics METRIC [METRIC ...]` 覆盖 YAML；空集合、重复项或未知指标都会报错。
+`--cooccurrence-weight` 已移除，且 Cocore 不接受 RelCore 的 `--prototype-method` 或
 `--prototype-gain-metrics` 参数。
 
 快速 CPU 检查：
@@ -271,16 +345,18 @@ RelCore 的 CLI `--reliability-metrics`、`--prototype-method` 或
 python -m cocore run --config cocore/config_debug.yaml --force
 ```
 
-Cocore 0.17.0 使用 prototype schema 10、profile 固定的 15/8（LIBERO）或 7/4（Bridge）
+Cocore 0.19.0 使用 prototype schema 10、profile 固定的 15/8（LIBERO）或 7/4（Bridge）
 时间几何、10～30 个桶内视觉中心、可选 stop 桶、无标签
 候选诱导子图、65,536 窗口的混合 KMeans 阈值、LIBERO 最大间隔 3、Bridge 最大间隔 2
 的动作训练窗口、裁剪 PCA
 的 128 维聚类空间、近似均匀候选和原始相邻 sequence 图，并按 episode 持久化完整原始
-逐帧 CLIP 特征，选择阶段固定使用 selection schema 1 的随机多分支算法。0.17.0 新增
-`[support]` 可靠性配置；指标进入 graph 指纹以及 graph/select/run manifest 和报告，
-validator 同时核对指标与节点可靠性公式。版本校验保持严格，因此 0.16.x 及更早 artifact
-不会被接受，升级后应使用 `--force` 重建。Bridge 适配器 0.11.0 使用 Cocore
-0.17.0/schema 10；prototype schema 与 selection schema 均未变化。
+逐帧 CLIP 特征，选择阶段固定使用 selection schema 3 的随机多分支算法。0.19.0 新增
+VAC 原始/归一化产物，默认采用四指标的任意非空子集几何均值融合；另支持显式配置的
+第五项 `non_dwell`，其计算版本和阈值独立进入缓存契约。指标、AVI 与
+VAC 契约进入阶段指纹、manifest 和报告，validator 会从动作序列和逐帧视觉缓存重算
+VAC，校验 Top-3、分位缩放、图节点、选择输出及融合结果。版本校验保持严格，因此旧
+artifact 不会被接受，升级后应使用 `--force` 重建。Bridge 适配器 0.12.0 使用 Cocore
+0.19.0/schema 10；prototype schema 不变，selection schema 升至 3。
 
 ## 输出与校验
 
@@ -301,10 +377,14 @@ validator 同时核对指标与节点可靠性公式。版本校验保持严格�
   `frame_embeddings_index.json` 记录顺序、shape 和 SHA-256；
 - encode 目录中的 `visual_half_embeddings.npy`：每个候选两个半段的归一化视觉均值；
   graph 目录中的 `half_action_labels.npy` 记录两个半段各自的原始动作标签；
+- encode 目录中的 `action_variation_raw.npy`、`action_variation.npy`、
+  `visual_action_consistency_raw.npy` 和 `visual_action_consistency.npy`：候选级 AVI/VAC
+  原始值和全候选分位归一化值；
 
 - `selected_manifest.jsonl`：训练入口可直接消费的片段清单；
-- `all_clips.parquet`：eligible 筛选池的 support、progress、reliability、运动原语与选择
-  诊断，不包含无标签候选；
+- `all_clips.parquet`：eligible 筛选池的 support、progress、原始/归一化
+  `action_variation`、原始/归一化 `visual_action_consistency`、reliability、运动原语与
+  选择诊断，不包含无标签候选；
 - `selection_report.json`：coverage、目标分解、任务计数、`branch_search`
   轮次/评估/重组统计、逐轮与逐次重组耗时，以及 scanned、eligible、
   excluded-unlabeled 候选数量；

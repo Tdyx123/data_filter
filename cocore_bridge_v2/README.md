@@ -26,8 +26,10 @@ Cocore 的编码、运动原语、关系目标或选择算法，而是固定 Bri
   10～30 个中心；
 - 默认 `prototypes.use_stop_bucket: true`，保留 Cocore 的 stop 桶与回退行为；graph
   相关命令可用 `--no-use-stop-bucket` 关闭；
-- 可靠性默认使用 `sqrt(support * progress)`；graph 相关命令可用
-  `--reliability-metrics support` 切换为 `sqrt(support)`；两种结果均应用
+- 可靠性默认选择 `support`、`progress`、`action_variation`、
+  `visual_action_consistency`；显式配置驻留阈值后还可选择 `non_dwell`，
+  graph 相关命令支持五项中的任意非空无重复子集；所选
+  指标统一取几何均值，再按
   `quality.min_reliability` 截断；
 - 不超过 65,536 个训练窗口的动作桶使用完整 KMeans，以
   `prototypes.num_threads: 4` 并行且每个模型使用 1 个 OpenMP 线程；超过阈值的桶使用
@@ -85,8 +87,11 @@ python -m cocore_bridge_v2 run \
 - `--force`：按 Cocore 的缓存规则重建不兼容阶段。
 - `--no-use-stop-bucket`：仅用于 `build-graph`、`select`、`run` 和 `validate`，关闭 stop
   桶并排除双半段均无非 stop 标签的候选；未传时保持默认启用。
-- `--reliability-metrics support|support,progress`：仅用于 `build-graph`、`select`、
-  `run` 和 `validate`；默认 `support,progress`，只用 support 时必须显式传 `support`。
+- `--reliability-metrics METRIC [METRIC ...]`：仅用于 `build-graph`、`select`、`run` 和
+  `validate`；指标可从 `support`、`progress`、`action_variation`、
+  `visual_action_consistency`、`non_dwell` 中选择，默认启用前四项；`non_dwell`
+  需要显式指定驻留阈值。输入顺序会被规范化，重复项和
+  未知项会报错。
 
 本包不接受任意 YAML `--config`，以防绕过固定相机、空任务策略或运动原语契约。
 
@@ -112,16 +117,19 @@ PCA components 前半列进行逐帧纯矩阵投影，不使用 mean/scale。选
 原型标签、动作标签、绝对置信度和 `half_action_labels`，不包含旧的 action/distance
 分解权重。catalog 与 manifest 记录 `bridge_v2` profile、分轴阈值、roll 标签、环绕轴
 和 `0.5%/400` 保留策略，并记录起点最大间隔 2 的窗口策略。select manifest 与报告
-使用 selection schema 1；manifest 的生产者仍为 `cocore`。Cocore 版本为 0.17.0，
-Bridge 包版本为 0.11.0。graph/select/run manifest、报告和解析配置均记录实际可靠性指标。
+使用 selection schema 3；manifest 的生产者仍为 `cocore`。Cocore 版本为 0.19.0，
+Bridge 包版本为 0.12.0。graph/select/run manifest、报告和解析配置均记录实际可靠性
+指标以及 AVI/VAC 契约。VAC 复用完整 episode 的逐帧视觉缓存与鲁棒缩放动作，片段取
+逐帧比值的 Top-3 均值并在全部候选上做 1%/99% 分位缩放。
 
 视觉中心训练只物化一次保留窗口投影；小桶并行执行完整 KMeans，大桶串行执行
 MiniBatchKMeans。Bridge V2 完整生产数据的基础额外内存约为 257 MiB（按参考精确保留
 非 stop 与原始 stop 窗口估算，每窗口 `128 × 4` 字节），不使用 memmap 或磁盘 fallback。
 
-Cocore schema 9 artifact 不迁移且 validator 会拒绝。Cocore 0.17.0/schema 10 与 Bridge
-0.11.0 新增可靠性指标契约；版本校验保持严格，旧 artifact 必须使用 `--force` 重建。
-同一输出根切换 `support` 与 `support,progress` 也会使 graph 指纹不兼容；需要保留两组
+Cocore schema 9 artifact 不迁移且 validator 会拒绝。Cocore 0.19.0/schema 10 与 Bridge
+0.12.0 默认使用 AVI、VAC 和四指标几何均值可靠性契约，并支持显式启用第五项
+`non_dwell`；驻留计算版本和阈值独立进入缓存契约。版本校验保持严格，旧 artifact 必须使用
+`--force` 重建。同一输出根切换所选可靠性指标也会使 graph 指纹不兼容；需要保留多组
 实验时应使用不同的 `--output-dir`。
 
 验证时必须重复传入生成该选择结果时使用的目标、比例、数据集路径以及
@@ -142,7 +150,7 @@ python -m cocore_bridge_v2 validate \
   --no-use-stop-bucket
 ```
 
-只有生成结果时传入了 `--no-use-stop-bucket` 或 `--reliability-metrics support`，验证时才
+只有生成结果时传入了 `--no-use-stop-bucket` 或覆盖了 `--reliability-metrics`，验证时才
 重复对应参数。升级旧版本，或切换 stop/可靠性指标并复用同一输出根目录时，应使用
 `--force` 重建全部不兼容阶段。
 
@@ -211,3 +219,20 @@ python -m cocore_bridge_v2 scan \
 episode（包括不足 7 帧的短 episode）的完整逐帧特征会写入 encode 缓存，并经 128 维视觉 PCA 与 state/action
 时序池化特征融合。生产配置固定从 `/data/dwb/models/clip-vit-base-patch32` 本地加载
 模型，要求 CUDA；不会访问网络，也不会读取 `image_1`、`image_2` 或 `image_3`。
+
+## 可选低变化驻留指标
+
+默认可靠性仍为原来的四项。新增 `non_dwell` 必须显式配置位置速度、旋转角速度及
+连续夹爪变化率阈值；计算使用实际时间戳、原始状态和时间加权，姿态为 XYZ 欧拉角。
+Python 入口 `build_config(..., dwell={...})` 接受与 Cocore 相同的 `dwell` 配置。
+
+所有命令支持以下参数，阈值应按数据集校准，无默认值：
+
+- `--dwell-position-speed-threshold`：m/s。
+- `--dwell-angular-speed-threshold`：rad/s。
+- `--dwell-gripper-speed-threshold`：原始夹爪单位/秒。
+- `--dwell-gripper-mode continuous|binary`：默认连续；二值模式使用状态相等条件，可省略夹爪阈值。
+
+完整指定阈值即可输出 `dwell_ratio` 与 `non_dwell` 诊断值；要参与融合，另外通过
+`--reliability-metrics` 选择 `non_dwell`（可与原四项组合）。分阶段执行和 `validate`
+应传入相同阈值。高驻留不代表无价值，持物、等待和接触保持不能仅凭该指标删除。

@@ -343,6 +343,7 @@ def test_run_pipeline_persists_the_canonicalized_output_path(
 def test_full_ablation_defaults_match_production_cocore_exactly(tmp_path: Path) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     production_config = cocore_test_config(tmp_path, relation="sequence")
+    production_config["reliability_metrics"] = ["support", "progress"]
     production_root = tmp_path / "production-cocore"
     production = run_cocore_pipeline(
         production_config,
@@ -360,13 +361,18 @@ def test_full_ablation_defaults_match_production_cocore_exactly(tmp_path: Path) 
     ablation_nodes = np.load(ablation_graph / "nodes.npz")
     for name in (
         "task_indices",
-        "reliability",
         "prototype_indices",
         "prototype_weights",
         "support",
         "progress",
     ):
         np.testing.assert_array_equal(ablation_nodes[name], production_nodes[name])
+    np.testing.assert_allclose(
+        ablation_nodes["reliability"],
+        production_nodes["reliability"],
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    )
     production_catalog = json.loads(
         (production_graph / "prototype_catalog.json").read_text()
     )

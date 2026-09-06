@@ -95,6 +95,95 @@ class _FailingVisualEncoder(_CountingVisualEncoder):
         raise RuntimeError(f"injected visual failure for {len(images)} frames")
 
 
+class _ActionVariationAdapter(DatasetAdapter):
+    def __init__(self) -> None:
+        self._records = (
+            EpisodeRecord(0, 15, 0, "task zero"),
+            EpisodeRecord(1, 15, 1, "task one"),
+        )
+
+    @property
+    def vector_observation_keys(self) -> tuple[str, ...]:
+        return ("observation.state",)
+
+    @property
+    def image_observation_keys(self) -> tuple[str, ...]:
+        return ("observation.images.image",)
+
+    def episodes(self) -> Sequence[EpisodeRecord]:
+        return self._records
+
+    def iter_episodes(
+        self,
+        *,
+        num_workers: int = 0,
+        max_episodes: int | None = None,
+        load_images: bool = True,
+    ) -> Iterator[EpisodeData]:
+        del num_workers
+        records = self._records[:max_episodes] if max_episodes else self._records
+        for record in records:
+            steps = np.arange(record.length, dtype=np.float32)
+            action = np.zeros((record.length, 2), dtype=np.float32)
+            action[5:, 0] = 1.0
+            observations = {"observation.state": np.stack([steps, np.zeros_like(steps)], axis=1)}
+            if load_images:
+                observations["observation.images.image"] = np.broadcast_to(
+                    ((record.episode_id + 1) * steps)[:, None, None, None],
+                    (record.length, 2, 2, 3),
+                ).astype(np.uint8)
+            yield EpisodeData(
+                episode_id=record.episode_id,
+                timestamps=steps.astype(np.float64),
+                frame_indices=np.arange(record.length, dtype=np.int64),
+                observations=observations,
+                actions=action,
+                task_index=record.task_index,
+                task_name=record.task_name,
+            )
+
+    def fingerprint(self) -> str:
+        return "cocore-action-variation-test-v1"
+
+
+class _OverlappingVacAdapter(_ActionVariationAdapter):
+    def __init__(self) -> None:
+        self._records = (EpisodeRecord(0, 16, 0, "overlapping VAC"),)
+
+    def iter_episodes(
+        self,
+        *,
+        num_workers: int = 0,
+        max_episodes: int | None = None,
+        load_images: bool = True,
+    ) -> Iterator[EpisodeData]:
+        del num_workers
+        records = self._records[:max_episodes] if max_episodes else self._records
+        for record in records:
+            steps = np.arange(record.length, dtype=np.float32)
+            observations = {"observation.state": np.zeros((record.length, 2), dtype=np.float32)}
+            if load_images:
+                pixels = np.concatenate(
+                    [np.asarray([0.0], dtype=np.float32), np.arange(100.0, 115.0)]
+                )
+                observations["observation.images.image"] = np.broadcast_to(
+                    pixels[:, None, None, None],
+                    (record.length, 2, 2, 3),
+                ).astype(np.uint8)
+            yield EpisodeData(
+                episode_id=record.episode_id,
+                timestamps=steps.astype(np.float64),
+                frame_indices=np.arange(record.length, dtype=np.int64),
+                observations=observations,
+                actions=np.zeros((record.length, 2), dtype=np.float32),
+                task_index=record.task_index,
+                task_name=record.task_name,
+            )
+
+    def fingerprint(self) -> str:
+        return "cocore-overlapping-vac-test-v1"
+
+
 def test_quality_style_primitives_match_shared_reference() -> None:
     actions = np.asarray(
         [[-5.0, 2.0], [0.0, 4.0], [5.0, 8.0], [10.0, 16.0]],
@@ -135,6 +224,8 @@ def test_quality_style_primitives_match_shared_reference() -> None:
         reference_projector.fit_transform(raw, max_samples=5),
         atol=1.0e-6,
     )
+
+
 def test_quality_style_pca_requires_positive_output_dimension() -> None:
     with pytest.raises(ValueError, match="output_dim must be positive"):
         CocorePCAProjector(output_dim=0)
@@ -175,6 +266,74 @@ def test_cocore_encoder_uses_bridge_profile_clip_geometry(tmp_path: Path) -> Non
     assert encoded.state_sequences.shape == (11, 7, 8)
     assert encoded.action_sequences.shape == (11, 7, 2)
     assert encoded.visual_half_embeddings.shape == (11, 2, 3)
+
+
+def test_cocore_encoder_computes_top_three_action_variation_from_full_episode(
+    tmp_path: Path,
+) -> None:
+    encoded = encode_cocore_dataset(
+        _ActionVariationAdapter(),
+        _CountingVisualEncoder(),
+        quantile_low=0.0,
+        quantile_high=1.0,
+        frame_cache_dir=tmp_path / "frame_embeddings",
+    )
+
+    np.testing.assert_allclose(
+        encoded.action_variation_raw,
+        [0.74666667, 0.74666667],
+        rtol=0.0,
+        atol=1.0e-7,
+    )
+    np.testing.assert_array_equal(
+        encoded.action_variation,
+        np.zeros(2, dtype=np.float32),
+    )
+
+
+def test_cocore_encoder_computes_top_three_vac_from_full_episode(tmp_path: Path) -> None:
+    visual = _CountingVisualEncoder()
+    encoded = encode_cocore_dataset(
+        _ActionVariationAdapter(),
+        visual,
+        quantile_low=0.0,
+        quantile_high=1.0,
+        epsilon=0.5,
+        frame_cache_dir=tmp_path / "frame_embeddings",
+    )
+
+    np.testing.assert_allclose(
+        encoded.visual_action_consistency_raw,
+        [2.0 * np.sqrt(3.0), 4.0 * np.sqrt(3.0)],
+        rtol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        encoded.visual_action_consistency,
+        [0.0, 1.0],
+        rtol=0.0,
+        atol=1.0e-7,
+    )
+    assert visual.episode_lengths == [15, 15]
+
+
+def test_overlapping_candidates_reuse_the_same_full_episode_vac(tmp_path: Path) -> None:
+    visual = _CountingVisualEncoder()
+    encoded = encode_cocore_dataset(
+        _OverlappingVacAdapter(),
+        visual,
+        quantile_low=0.0,
+        quantile_high=1.0,
+        epsilon=0.5,
+        frame_cache_dir=tmp_path / "frame_embeddings",
+    )
+
+    np.testing.assert_allclose(
+        encoded.visual_action_consistency_raw,
+        [134.0 * np.sqrt(3.0), 68.0 * np.sqrt(3.0)],
+        rtol=1.0e-6,
+    )
+    np.testing.assert_allclose(encoded.visual_action_consistency, [1.0, 0.0], atol=1.0e-7)
+    assert visual.episode_lengths == [16]
 
 
 def test_cocore_encoder_uses_quality_fusion_and_caches_episode_frames(

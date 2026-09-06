@@ -28,6 +28,8 @@ encoding:
   quantile_high: 0.99
   epsilon: 1.0e-8
 
+reliability_metrics: [support, progress, action_variation, visual_action_consistency]
+
 quality:
   knn: 10
   gripper_progress_weight: 0.5
@@ -61,3 +63,11 @@ runtime:
 
 output:
   directory: outputs/cocore_bridge_v2/bridge_orig_1.0.0
+
+# 可选驻留诊断：取消注释前将 null 替换为校准后的有限正数。
+# 如需影响可靠性，再把 non_dwell 加入 reliability_metrics。
+# dwell:
+#   position_speed_threshold: null  # 原始位置单位/秒
+#   angular_speed_threshold: null   # rad/s
+#   gripper_speed_threshold: null   # 原始夹爪单位/秒
+#   gripper_mode: continuous        # binary 时可省略夹爪阈值

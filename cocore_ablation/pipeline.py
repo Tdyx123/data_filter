@@ -97,9 +97,7 @@ def _graph_fingerprint(resolved: Mapping[str, Any], encoded_fingerprint: str) ->
                 )
             },
             "representation": prototypes["representation"],
-            "use_assignment_confidence": prototypes[
-                "use_assignment_confidence"
-            ],
+            "use_assignment_confidence": prototypes["use_assignment_confidence"],
             "reliability_metrics": resolved["reliability_metrics"],
             "seed": resolved["seed"],
             "max_episodes": resolved["runtime"].get("max_episodes"),
@@ -107,9 +105,7 @@ def _graph_fingerprint(resolved: Mapping[str, Any], encoded_fingerprint: str) ->
     )
 
 
-def _selection_fingerprint(
-    resolved: Mapping[str, Any], graph_fingerprint: str
-) -> str:
+def _selection_fingerprint(resolved: Mapping[str, Any], graph_fingerprint: str) -> str:
     return stable_hash(
         {
             "producer": "cocore_ablation",
@@ -183,9 +179,7 @@ def _prototype_metadata(graph_root: Path) -> tuple[Mapping[str, Any], ...]:
         or not isinstance(payload.get("leaf_prototypes"), list)
     ):
         raise ValueError("cocore_ablation prototype catalog is incompatible")
-    return tuple(
-        sorted(payload["leaf_prototypes"], key=lambda leaf: int(leaf["prototype_id"]))
-    )
+    return tuple(sorted(payload["leaf_prototypes"], key=lambda leaf: int(leaf["prototype_id"])))
 
 
 def _load_graph(
@@ -236,9 +230,7 @@ def graph_stage(
     seed_everything(int(resolved["seed"]))
     root = _output_root(resolved, output_dir)
     resolved["output"]["directory"] = str(root)
-    upstream_root, adapter, encoded = _prepare_upstream(
-        resolved, visual_encoder=visual_encoder
-    )
+    upstream_root, adapter, encoded = _prepare_upstream(resolved, visual_encoder=visual_encoder)
     fingerprint = _graph_fingerprint(resolved, encoded.fingerprint)
     destination = root / GRAPH_DIRECTORY
 
@@ -286,9 +278,7 @@ def graph_stage(
             use_stop_bucket=bool(prototype_config["use_stop_bucket"]),
             profile="libero",
             representation=str(prototype_config["representation"]),
-            use_assignment_confidence=bool(
-                prototype_config["use_assignment_confidence"]
-            ),
+            use_assignment_confidence=bool(prototype_config["use_assignment_confidence"]),
         )
         source = np.flatnonzero(hierarchy.eligible_mask).astype(np.int64)
         if len(source) == 0:
@@ -345,14 +335,13 @@ def graph_stage(
                 "upstream_fingerprint": encoded.fingerprint,
                 "reliability_metrics": resolved["reliability_metrics"],
                 "prototype_representation": prototype_config["representation"],
-                "use_assignment_confidence": prototype_config[
-                    "use_assignment_confidence"
-                ],
+                "use_assignment_confidence": prototype_config["use_assignment_confidence"],
                 "use_stop_bucket": prototype_config["use_stop_bucket"],
                 "nodes": len(graph.sample_ids),
                 "runtime_seconds": time.perf_counter() - started,
             },
         )
+
     stage_started = time.perf_counter()
     built = publish_stage(
         destination,
@@ -421,9 +410,7 @@ def _selection_report(
         "selection_ratio": len(result.selected_indices) / len(graph.sample_ids),
         "reliability_metrics": list(resolved["reliability_metrics"]),
         "prototype_representation": resolved["prototypes"]["representation"],
-        "use_assignment_confidence": resolved["prototypes"][
-            "use_assignment_confidence"
-        ],
+        "use_assignment_confidence": resolved["prototypes"]["use_assignment_confidence"],
         "use_stop_bucket": resolved["prototypes"]["use_stop_bucket"],
         "relation_type": resolved["objective"]["relation"],
         "relation_weight": relation_weight,
@@ -499,12 +486,8 @@ def select_stage(
             budget=budget,
             use_coverage_seed=bool(resolved["selection"]["use_coverage_seed"]),
         )
-        result = _selector(resolved, context).select(
-            budget, initial_indices=initial
-        )
-        half_action_labels = np.load(
-            graph_root / "half_action_labels.npy", allow_pickle=False
-        )
+        result = _selector(resolved, context).select(budget, initial_indices=initial)
+        half_action_labels = np.load(graph_root / "half_action_labels.npy", allow_pickle=False)
         selected_rows, all_rows = cocore_pipeline._selection_rows(  # noqa: SLF001
             resolved,
             clips,
@@ -514,10 +497,10 @@ def select_stage(
             context,
             _prototype_metadata(graph_root),
             half_action_labels,
+            include_action_variation=False,
+            include_visual_action_consistency=False,
         )
-        scan_manifest = json.loads(
-            (upstream_root / "scan" / "manifest.json").read_text()
-        )
+        scan_manifest = json.loads((upstream_root / "scan" / "manifest.json").read_text())
         report = _selection_report(
             resolved,
             graph,
@@ -620,12 +603,8 @@ def _load_selected_rows(path: Path) -> list[dict[str, Any]]:
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError as error:
-                raise ValueError(
-                    f"selected manifest line {line_number} is invalid"
-                ) from error
-            if not isinstance(payload, dict) or not isinstance(
-                payload.get("sample_id"), str
-            ):
+                raise ValueError(f"selected manifest line {line_number} is invalid") from error
+            if not isinstance(payload, dict) or not isinstance(payload.get("sample_id"), str):
                 raise ValueError("selected manifest row is invalid")
             rows.append(payload)
     return rows
@@ -648,9 +627,7 @@ def _sparse_matrices_match(actual, expected) -> bool:
     if actual.shape != expected.shape:
         return False
     difference = (actual.astype(np.float64) - expected.astype(np.float64)).tocsr()
-    return difference.nnz == 0 or bool(
-        np.allclose(difference.data, 0.0, rtol=1.0e-7, atol=1.0e-8)
-    )
+    return difference.nnz == 0 or bool(np.allclose(difference.data, 0.0, rtol=1.0e-7, atol=1.0e-8))
 
 
 def _validate_graph_replay(
@@ -705,9 +682,7 @@ def _validate_graph_replay(
         use_stop_bucket=bool(prototype_config["use_stop_bucket"]),
         profile="libero",
         representation=str(prototype_config["representation"]),
-        use_assignment_confidence=bool(
-            prototype_config["use_assignment_confidence"]
-        ),
+        use_assignment_confidence=bool(prototype_config["use_assignment_confidence"]),
     )
     source = np.flatnonzero(hierarchy.eligible_mask).astype(np.int64)
     stored_source = cocore_pipeline._load_source_clip_indices(  # noqa: SLF001
@@ -725,9 +700,7 @@ def _validate_graph_replay(
         stored_centers, replay_centers, rtol=1.0e-6, atol=1.0e-7
     ):
         raise ValueError("prototype centers do not match graph replay")
-    stored_half_labels = np.load(
-        graph_root / "half_action_labels.npy", allow_pickle=False
-    )
+    stored_half_labels = np.load(graph_root / "half_action_labels.npy", allow_pickle=False)
     if not np.array_equal(stored_half_labels, hierarchy.half_action_labels[source]):
         raise ValueError("prototype half-action labels do not match graph replay")
 
@@ -762,12 +735,8 @@ def _validate_graph_replay(
         graph.sample_ids != replay_graph.sample_ids
         or not _edge_tables_match(graph.sequence_edges, replay_graph.sequence_edges)
         or not _edge_tables_match(graph.similarity_edges, replay_graph.similarity_edges)
-        or not _sparse_matrices_match(
-            graph.transition_matrix, replay_graph.transition_matrix
-        )
-        or not _sparse_matrices_match(
-            graph.cooccurrence_matrix, replay_graph.cooccurrence_matrix
-        )
+        or not _sparse_matrices_match(graph.transition_matrix, replay_graph.transition_matrix)
+        or not _sparse_matrices_match(graph.cooccurrence_matrix, replay_graph.cooccurrence_matrix)
     ):
         raise ValueError("graph relations do not match graph replay")
 
@@ -840,8 +809,7 @@ def validate_output(
         "upstream_fingerprint": encoded.fingerprint,
     }
     if any(
-        graph_manifest.get(key) != value
-        for key, value in expected_graph_manifest_fields.items()
+        graph_manifest.get(key) != value for key, value in expected_graph_manifest_fields.items()
     ):
         raise ValueError("cocore_ablation artifact fingerprint is invalid")
     _validate_graph_replay(
@@ -896,9 +864,7 @@ def validate_output(
         use_coverage_seed=bool(resolved["selection"]["use_coverage_seed"]),
     )
     replayed = _selector(resolved, context).select(budget, initial_indices=initial)
-    half_action_labels = np.load(
-        graph_root / "half_action_labels.npy", allow_pickle=False
-    )
+    half_action_labels = np.load(graph_root / "half_action_labels.npy", allow_pickle=False)
     expected_selected_rows, expected_all_rows = cocore_pipeline._selection_rows(  # noqa: SLF001
         resolved,
         clips,
@@ -908,6 +874,8 @@ def validate_output(
         context,
         _prototype_metadata(graph_root),
         half_action_labels,
+        include_action_variation=False,
+        include_visual_action_consistency=False,
     )
     selected_rows = _load_selected_rows(required["selected_manifest.jsonl"])
     if selected_rows != _json_normalized(expected_selected_rows):
@@ -943,9 +911,7 @@ def validate_output(
         "total": float(replayed.objective_value),
     }
     if set(objective) != set(expected_objective) or any(
-        not math.isclose(
-            float(objective[key]), value, rel_tol=1.0e-9, abs_tol=1.0e-9
-        )
+        not math.isclose(float(objective[key]), value, rel_tol=1.0e-9, abs_tol=1.0e-9)
         for key, value in expected_objective.items()
     ):
         raise ValueError("selection report objective does not match replay")

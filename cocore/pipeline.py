@@ -38,6 +38,21 @@ from relcore.utils.io import (
 from relcore.utils.random import seed_everything
 
 from cocore import __version__
+from cocore.dwell import (
+    DWELL_FIELDS,
+    DWELL_CACHE_FIELDS,
+    compute_dwell_ratio,
+    dwell_contract,
+    dwell_summary,
+)
+from cocore.action_variation import (
+    action_variation_contract,
+    compute_step_action_variation,
+    fuse_reliability,
+    normalize_action_variation,
+    normalize_reliability_metrics,
+    top_k_mean,
+)
 from cocore.config import resolve_config
 from cocore.encoding import (
     CocoreEncodedArtifact,
@@ -69,6 +84,11 @@ from cocore.random_multibranch import (
 from cocore.selection import build_max_coverage_seed
 from cocore.temporal import TemporalGeometry, resolve_temporal_geometry
 from cocore.timing import emit_completed_timing, timed_step
+from cocore.visual_action_consistency import (
+    compute_step_visual_action_consistency,
+    normalize_visual_action_consistency,
+    visual_action_consistency_contract,
+)
 
 
 GRAPH_DIRECTORY = "graph-18-motion-hard-nearest-pca"
@@ -78,7 +98,7 @@ PROTOTYPE_STRATEGY = (
     "hybrid_kmeans_nearest"
 )
 PROTOTYPE_VISUAL_PROJECTION = "frame @ visual_pca.components[:, :frame_embedding_dim].T"
-SELECTION_SCHEMA_VERSION = 1
+SELECTION_SCHEMA_VERSION = 3
 
 
 def _frame_count_name(frame_count: int) -> str:
@@ -86,10 +106,7 @@ def _frame_count_name(frame_count: int) -> str:
 
 
 def _visual_half_encoding(geometry: TemporalGeometry) -> str:
-    return (
-        f"l2_normalized_{_frame_count_name(geometry.trajectory_window_length)}_"
-        "frame_mean"
-    )
+    return f"l2_normalized_{_frame_count_name(geometry.trajectory_window_length)}_frame_mean"
 
 
 def _prototype_visual_normalization(geometry: TemporalGeometry) -> str:
@@ -114,6 +131,25 @@ def _temporal_manifest_fields(geometry: TemporalGeometry) -> dict[str, object]:
         "trajectory_window_length": geometry.trajectory_window_length,
         "trajectory_horizon": geometry.state_delta_horizon,
     } | _action_sampling_manifest_fields(geometry)
+
+
+def _action_variation_metadata(config: Mapping[str, Any]) -> dict[str, object]:
+    encoding = config["encoding"]
+    return action_variation_contract(
+        quantile_low=encoding["quantile_low"],
+        quantile_high=encoding["quantile_high"],
+        epsilon=encoding["epsilon"],
+    )
+
+
+def _visual_action_consistency_metadata(config: Mapping[str, Any]) -> dict[str, object]:
+    encoding = config["encoding"]
+    return visual_action_consistency_contract(
+        quantile_low=encoding["quantile_low"],
+        quantile_high=encoding["quantile_high"],
+        epsilon=encoding["epsilon"],
+    )
+
 
 def _number_tag(value: float) -> str:
     return format(float(value), ".12g").replace("-", "m").replace(".", "p")
@@ -183,9 +219,7 @@ def _random_multibranch_timing_report(
     result: RandomMultiBranchSelectionResult,
 ) -> dict[str, Any]:
     round_seconds = result.round_runtime_seconds
-    recombination_seconds = tuple(
-        seconds for _, seconds in result.recombination_runtime_seconds
-    )
+    recombination_seconds = tuple(seconds for _, seconds in result.recombination_runtime_seconds)
     return {
         "rounds": [
             {"round": round_number, "seconds": seconds}
@@ -196,9 +230,7 @@ def _random_multibranch_timing_report(
             for round_number, seconds in result.recombination_runtime_seconds
         ],
         "average_round_seconds": _average_runtime_seconds(round_seconds),
-        "average_recombination_seconds": _average_runtime_seconds(
-            recombination_seconds
-        ),
+        "average_recombination_seconds": _average_runtime_seconds(recombination_seconds),
     }
 
 
@@ -305,9 +337,7 @@ def _matches_legacy_selection_cache(
     if SELECTION_SCHEMA_VERSION <= 0:
         return False
     manifest_path = destination / "manifest.json"
-    if not manifest_path.is_file() or any(
-        not (destination / name).is_file() for name in required
-    ):
+    if not manifest_path.is_file() or any(not (destination / name).is_file() for name in required):
         return False
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -347,14 +377,33 @@ def _save_cocore_encoded(
     encoded: CocoreEncodedClips,
     *,
     profile: str,
+    action_variation_metadata: Mapping[str, object],
+    visual_action_consistency_metadata: Mapping[str, object],
+    dwell_metadata: Mapping[str, object] | None,
     fingerprint: str,
     runtime_seconds: float,
 ) -> None:
     geometry = resolve_temporal_geometry(profile)
+    dwell_checksums = {}
+    if dwell_metadata is not None:
+        for field in DWELL_CACHE_FIELDS:
+            path = temporary / f"{field}.npy"
+            np.save(path, getattr(encoded, field))
+            dwell_checksums[field] = file_sha256(path)
     np.save(temporary / "embeddings.npy", encoded.embeddings)
     np.save(temporary / "visual_half_embeddings.npy", encoded.visual_half_embeddings)
     np.save(temporary / "state_sequences.npy", encoded.state_sequences)
     np.save(temporary / "action_sequences.npy", encoded.action_sequences)
+    np.save(temporary / "action_variation_raw.npy", encoded.action_variation_raw)
+    np.save(temporary / "action_variation.npy", encoded.action_variation)
+    np.save(
+        temporary / "visual_action_consistency_raw.npy",
+        encoded.visual_action_consistency_raw,
+    )
+    np.save(
+        temporary / "visual_action_consistency.npy",
+        encoded.visual_action_consistency,
+    )
     np.save(temporary / "visual_progress.npy", encoded.visual_progress)
     normalizers = encoded.numeric_normalizers
     state_lower = np.concatenate(
@@ -422,10 +471,12 @@ def _save_cocore_encoded(
             "clip_length": geometry.clip_length,
             "window_policy": WINDOW_POLICY,
             "clip_anchors": list(geometry.clip_anchors),
-            "visual_half_windows": [
-                list(window) for window in geometry.visual_half_windows
-            ],
+            "visual_half_windows": [list(window) for window in geometry.visual_half_windows],
             "visual_half_encoding": _visual_half_encoding(geometry),
+            "action_variation": dict(action_variation_metadata),
+            "visual_action_consistency": dict(visual_action_consistency_metadata),
+            "dwell": dwell_metadata,
+            "dwell_checksums": dwell_checksums,
             "counts": {
                 "candidate_fragments": candidate_count,
                 "pca_fit_fragments": encoded.pca_fit_fragment_count,
@@ -435,6 +486,68 @@ def _save_cocore_encoded(
             "runtime_seconds": runtime_seconds,
         },
     )
+
+
+def _validate_dwell_cache(
+    encode_root: Path, clips: list[ClipRecord], config: Mapping[str, Any]
+) -> dict[str, np.ndarray]:
+    contract = dwell_contract(config)
+    manifest = json.loads((encode_root / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("dwell") != contract:
+        raise ValueError("dwell cache contract does not match configuration")
+    if contract is None:
+        if any((encode_root / f"{field}.npy").exists() for field in DWELL_CACHE_FIELDS):
+            raise ValueError("unexpected dwell cache without configuration")
+        return {}
+    arrays = {}
+    checksums = manifest.get("dwell_checksums")
+    if not isinstance(checksums, dict):
+        raise ValueError("dwell cache checksums are missing")
+    for field in DWELL_CACHE_FIELDS:
+        path = encode_root / f"{field}.npy"
+        try:
+            if file_sha256(path) != checksums.get(field):
+                raise ValueError("dwell cache checksum mismatch")
+            arrays[field] = np.load(path, allow_pickle=False)
+        except (OSError, ValueError) as error:
+            raise ValueError(f"dwell cache {field} is missing or invalid") from error
+    states, times = arrays["dwell_state_sequences"], arrays["dwell_timestamps"]
+    count = len(clips)
+    if (
+        states.ndim != 3
+        or states.shape[0] != count
+        or states.shape[2] < 8
+        or times.shape != states.shape[:2]
+        or any(arrays[field].shape != (count,) for field in DWELL_FIELDS)
+    ):
+        raise ValueError("dwell cache shape is invalid")
+    expected = []
+    overlap = {}
+    for index, clip in enumerate(clips):
+        if len(states[index]) != clip.length:
+            raise ValueError("dwell cache clip length mismatch")
+        expected.append(
+            compute_dwell_ratio(
+                states[index],
+                times[index],
+                profile=config["prototypes"]["profile"],
+                config=config["dwell"],
+            )
+        )
+        for offset in range(clip.length):
+            key = (clip.episode_id, clip.start_step + offset)
+            previous = overlap.get(key)
+            current = (states[index, offset], times[index, offset])
+            if previous is not None and (
+                not np.array_equal(previous[0], current[0]) or previous[1] != current[1]
+            ):
+                raise ValueError("dwell cache has inconsistent overlap")
+            overlap[key] = current
+    expected = np.asarray(expected, dtype=np.float64)
+    for field, values in [("dwell_ratio", expected), ("non_dwell", 1.0 - expected)]:
+        if not np.allclose(arrays[field], values, rtol=1e-7, atol=1e-8):
+            raise ValueError("dwell cache does not match raw state and timestamps")
+    return arrays
 
 
 def _load_visual_pca_components(encode_root: Path, *, visual_dim: int) -> np.ndarray:
@@ -594,10 +707,7 @@ def _validate_visual_half_embedding_cache(
             ) or not np.all(np.isfinite(window)):
                 raise ValueError("cocore visual half frame window is invalid")
             means = np.stack(
-                [
-                    window[start:end].mean(axis=0)
-                    for start, end in geometry.visual_half_windows
-                ]
+                [window[start:end].mean(axis=0) for start, end in geometry.visual_half_windows]
             )
             norms = np.linalg.norm(means, axis=1, keepdims=True)
             if not np.all(np.isfinite(norms)) or np.any(norms <= 1.0e-8):
@@ -703,6 +813,10 @@ def encode_stage(
         resolved, output_dir=output_dir, force=force
     )
     visual_config = dict(resolved["visual"])
+    encoding_config = resolved["encoding"]
+    action_variation_metadata = _action_variation_metadata(resolved)
+    visual_action_consistency_metadata = _visual_action_consistency_metadata(resolved)
+    dwell_metadata = dwell_contract(resolved)
     model_sha256 = (
         directory_sha256(str(visual_config["model"]))
         if visual_config["encoder"] == "clip"
@@ -726,11 +840,13 @@ def encode_stage(
                 "windows": [list(window) for window in geometry.visual_half_windows],
                 "encoding": _visual_half_encoding(geometry),
             },
+            "action_variation": action_variation_metadata,
+            "visual_action_consistency": visual_action_consistency_metadata,
+            "dwell": dwell_metadata,
             "visual_model_sha256": model_sha256,
         }
     )
     destination = root / "encode"
-    encoding_config = resolved["encoding"]
 
     def build(temporary: Path) -> None:
         started = time.perf_counter()
@@ -746,6 +862,7 @@ def encode_stage(
             epsilon=float(encoding_config["epsilon"]),
             seed=int(resolved["seed"]),
             frame_cache_dir=temporary / "frame_embeddings",
+            dwell=resolved.get("dwell"),
             num_workers=int(resolved["runtime"].get("num_workers", 0)),
             max_episodes=resolved["runtime"].get("max_episodes"),
             progress_interval=100,
@@ -757,6 +874,9 @@ def encode_stage(
             temporary,
             encoded,
             profile=profile,
+            action_variation_metadata=action_variation_metadata,
+            visual_action_consistency_metadata=visual_action_consistency_metadata,
+            dwell_metadata=dwell_metadata,
             fingerprint=fingerprint,
             runtime_seconds=time.perf_counter() - started,
         )
@@ -766,11 +886,17 @@ def encode_stage(
         "visual_half_embeddings.npy",
         "state_sequences.npy",
         "action_sequences.npy",
+        "action_variation_raw.npy",
+        "action_variation.npy",
+        "visual_action_consistency_raw.npy",
+        "visual_action_consistency.npy",
         "visual_progress.npy",
         "numeric_normalizers.npz",
         "visual_pca.npz",
         "frame_embeddings_index.json",
     )
+    if dwell_metadata is not None:
+        required += tuple(f"{field}.npy" for field in DWELL_CACHE_FIELDS)
     max_episodes_value = resolved["runtime"].get("max_episodes")
     max_episodes = int(max_episodes_value) if max_episodes_value is not None else None
     expected_frame_episodes = _expected_frame_episodes(adapter, max_episodes)
@@ -814,6 +940,7 @@ def encode_stage(
         expected_episodes=expected_frame_episodes,
     )
     _validate_visual_half_embedding_cache(destination, clips, profile=profile)
+    dwell_arrays = _validate_dwell_cache(destination, clips, resolved)
     return (
         root,
         adapter,
@@ -823,8 +950,15 @@ def encode_stage(
             visual_half_embeddings=np.load(destination / "visual_half_embeddings.npy"),
             state_sequences=np.load(destination / "state_sequences.npy"),
             action_sequences=np.load(destination / "action_sequences.npy"),
+            action_variation_raw=np.load(destination / "action_variation_raw.npy"),
+            action_variation=np.load(destination / "action_variation.npy"),
+            visual_action_consistency_raw=np.load(
+                destination / "visual_action_consistency_raw.npy"
+            ),
+            visual_action_consistency=np.load(destination / "visual_action_consistency.npy"),
             visual_progress=np.load(destination / "visual_progress.npy"),
             fingerprint=fingerprint,
+            **dwell_arrays,
         ),
     )
 
@@ -861,6 +995,9 @@ def graph_stage(
     reliability_metrics = tuple(resolved["reliability_metrics"])
     geometry = resolve_temporal_geometry(prototype_profile)
     primitive_contract = motion_primitive_contract(prototype_profile)
+    action_variation_metadata = _action_variation_metadata(resolved)
+    visual_action_consistency_metadata = _visual_action_consistency_metadata(resolved)
+    dwell_metadata = dwell_contract(resolved)
     prototype_fingerprint_config = {
         key: prototype_config[key]
         for key in ("method", "profile", "batch_size", "max_iter", "tol", "use_stop_bucket")
@@ -878,6 +1015,9 @@ def graph_stage(
         "seed": resolved["seed"],
         "max_episodes": resolved["runtime"].get("max_episodes"),
         "reliability_metrics": list(reliability_metrics),
+        "action_variation": action_variation_metadata,
+        "visual_action_consistency": visual_action_consistency_metadata,
+        "dwell": dwell_metadata,
         "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
         "prototype_strategy": PROTOTYPE_STRATEGY,
         "sequence_adjacency": SEQUENCE_ADJACENCY,
@@ -902,7 +1042,16 @@ def graph_stage(
                 noop_threshold=float(quality_config["noop_threshold"]),
                 gripper_action_index=int(quality_config["gripper_action_index"]),
                 min_reliability=float(quality_config["min_reliability"]),
-                reliability_metrics=reliability_metrics,
+                reliability_metrics=("support", "progress"),
+            )
+            reliability_values = fuse_reliability(
+                reliability.support,
+                reliability.progress,
+                encoded.action_variation,
+                encoded.visual_action_consistency,
+                reliability_metrics,
+                non_dwell=encoded.non_dwell,
+                min_reliability=float(quality_config["min_reliability"]),
             )
         with timed_step("graph.prototypes", emit_completed_timing):
             hierarchy = build_hierarchical_motion_prototypes(
@@ -931,7 +1080,7 @@ def graph_stage(
             graph = build_graph(
                 encoded.clips,
                 encoded.embeddings,
-                reliability.reliability,
+                reliability_values,
                 hierarchy.prototypes,
                 included_indices=source_clip_indices,
                 knn=int(graph_config["knn"]),
@@ -941,12 +1090,23 @@ def graph_stage(
             )
         np.savez(
             temporary / "nodes.npz",
+            **(
+                {field: getattr(encoded, field)[source_clip_indices] for field in DWELL_FIELDS}
+                if encoded.dwell_ratio is not None
+                else {}
+            ),
             task_indices=graph.task_indices,
             reliability=graph.reliability,
             prototype_indices=graph.prototype_indices,
             prototype_weights=graph.prototype_weights,
             support=reliability.support[source_clip_indices],
             progress=reliability.progress[source_clip_indices],
+            action_variation_raw=encoded.action_variation_raw[source_clip_indices],
+            action_variation=encoded.action_variation[source_clip_indices],
+            visual_action_consistency_raw=encoded.visual_action_consistency_raw[
+                source_clip_indices
+            ],
+            visual_action_consistency=encoded.visual_action_consistency[source_clip_indices],
             smoothness=reliability.smoothness[source_clip_indices],
             noop_ratio=reliability.noop_ratio[source_clip_indices],
         )
@@ -973,6 +1133,9 @@ def graph_stage(
                 "upstream_fingerprint": encoded.fingerprint,
                 "stage_directory": GRAPH_DIRECTORY,
                 "reliability_metrics": list(reliability_metrics),
+                "action_variation": action_variation_metadata,
+                "visual_action_consistency": visual_action_consistency_metadata,
+                "dwell": dwell_metadata,
                 "prototype_method": "motion_primitives",
                 "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
                 "prototype_strategy": PROTOTYPE_STRATEGY,
@@ -981,9 +1144,7 @@ def graph_stage(
                 "use_stop_bucket": bool(prototype_config["use_stop_bucket"]),
                 "prototype_visual_dim": visual_dim,
                 "prototype_visual_projection": PROTOTYPE_VISUAL_PROJECTION,
-                "prototype_visual_normalization": _prototype_visual_normalization(
-                    geometry
-                ),
+                "prototype_visual_normalization": _prototype_visual_normalization(geometry),
                 "trajectory_window_length": geometry.trajectory_window_length,
                 "trajectory_horizon": geometry.state_delta_horizon,
                 **_action_sampling_manifest_fields(geometry),
@@ -1227,10 +1388,11 @@ def _validate_schema_ten_catalog(
         if expected_action_id is not None:
             categories_by_id[expected_action_id] = category
 
-        expected_training = count if (
-            (label == "stop" and use_stop_bucket)
-            or (label != "stop" and expected_retained)
-        ) else 0
+        expected_training = (
+            count
+            if ((label == "stop" and use_stop_bucket) or (label != "stop" and expected_retained))
+            else 0
+        )
         training = category.get("training_count")
         if (
             isinstance(training, bool)
@@ -1459,6 +1621,178 @@ def _validate_hierarchical_graph_artifacts(
         raise ValueError("hierarchical prototype assignments do not match prototype replay")
 
 
+def _validate_action_variation_cache(
+    encode_root: Path,
+    clips: list[ClipRecord],
+    *,
+    quantile_low: float,
+    quantile_high: float,
+    epsilon: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    try:
+        action_sequences = np.load(encode_root / "action_sequences.npy", allow_pickle=False)
+        stored_raw = np.load(encode_root / "action_variation_raw.npy", allow_pickle=False)
+        stored_normalized = np.load(encode_root / "action_variation.npy", allow_pickle=False)
+    except (OSError, ValueError) as error:
+        raise ValueError("cocore action variation cache is missing or invalid") from error
+    if (
+        action_sequences.dtype != np.dtype(np.float32)
+        or action_sequences.ndim != 3
+        or action_sequences.shape[0] != len(clips)
+        or action_sequences.shape[2] == 0
+        or stored_raw.dtype != np.dtype(np.float32)
+        or stored_normalized.dtype != np.dtype(np.float32)
+        or stored_raw.shape != (len(clips),)
+        or stored_normalized.shape != (len(clips),)
+        or not np.all(np.isfinite(action_sequences))
+        or not np.all(np.isfinite(stored_raw))
+        or not np.all(np.isfinite(stored_normalized))
+        or np.any((stored_normalized < 0.0) | (stored_normalized > 1.0))
+    ):
+        raise ValueError("cocore action variation cache shape or values are invalid")
+
+    clips_by_episode: dict[int, list[tuple[int, ClipRecord]]] = {}
+    for index, clip in enumerate(clips):
+        if action_sequences.shape[1] != clip.length:
+            raise ValueError("cocore action variation cache clip length is invalid")
+        clips_by_episode.setdefault(clip.episode_id, []).append((index, clip))
+
+    expected_raw = np.empty(len(clips), dtype=np.float32)
+    for episode_clips in clips_by_episode.values():
+        episode_length = max(clip.end_step for _, clip in episode_clips) + 1
+        episode_actions = np.empty((episode_length, action_sequences.shape[2]), dtype=np.float32)
+        populated = np.zeros(episode_length, dtype=bool)
+        for index, clip in episode_clips:
+            window = slice(clip.start_step, clip.end_step + 1)
+            sequence = action_sequences[index]
+            seen = populated[window]
+            if np.any(seen) and not np.array_equal(episode_actions[window][seen], sequence[seen]):
+                raise ValueError("cocore action variation cache has inconsistent overlap")
+            episode_window = episode_actions[window]
+            episode_window[~seen] = sequence[~seen]
+            populated[window] = True
+        if not np.all(populated):
+            raise ValueError("cocore action variation cache does not cover its episode")
+        step_scores = compute_step_action_variation(episode_actions)
+        for index, clip in episode_clips:
+            expected_raw[index] = top_k_mean(step_scores[clip.start_step : clip.end_step + 1])
+
+    expected_normalized = normalize_action_variation(
+        expected_raw,
+        quantile_low=quantile_low,
+        quantile_high=quantile_high,
+        epsilon=epsilon,
+    )
+    if not np.allclose(stored_raw, expected_raw, rtol=1.0e-6, atol=1.0e-7) or not np.allclose(
+        stored_normalized,
+        expected_normalized,
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    ):
+        raise ValueError("cocore action variation cache does not match action sequences")
+    return expected_raw, expected_normalized
+
+
+def _validate_visual_action_consistency_cache(
+    encode_root: Path,
+    clips: list[ClipRecord],
+    *,
+    quantile_low: float,
+    quantile_high: float,
+    epsilon: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    try:
+        action_sequences = np.load(encode_root / "action_sequences.npy", allow_pickle=False)
+        stored_raw = np.load(
+            encode_root / "visual_action_consistency_raw.npy",
+            allow_pickle=False,
+        )
+        stored_normalized = np.load(
+            encode_root / "visual_action_consistency.npy",
+            allow_pickle=False,
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError("cocore visual-action consistency cache is missing or invalid") from error
+    if (
+        action_sequences.dtype != np.dtype(np.float32)
+        or action_sequences.ndim != 3
+        or action_sequences.shape[0] != len(clips)
+        or action_sequences.shape[2] == 0
+        or stored_raw.dtype != np.dtype(np.float32)
+        or stored_normalized.dtype != np.dtype(np.float32)
+        or stored_raw.shape != (len(clips),)
+        or stored_normalized.shape != (len(clips),)
+        or not np.all(np.isfinite(action_sequences))
+        or not np.all(np.isfinite(stored_raw))
+        or not np.all(np.isfinite(stored_normalized))
+        or np.any(stored_raw < 0.0)
+        or np.any((stored_normalized < 0.0) | (stored_normalized > 1.0))
+    ):
+        raise ValueError("cocore visual-action consistency cache shape or values are invalid")
+
+    clips_by_episode: dict[int, list[tuple[int, ClipRecord]]] = {}
+    for index, clip in enumerate(clips):
+        if action_sequences.shape[1] != clip.length:
+            raise ValueError("cocore visual-action consistency cache clip length is invalid")
+        clips_by_episode.setdefault(clip.episode_id, []).append((index, clip))
+
+    expected_raw = np.empty(len(clips), dtype=np.float32)
+    for episode_id, episode_clips in clips_by_episode.items():
+        episode_length = max(clip.end_step for _, clip in episode_clips) + 1
+        episode_actions = np.empty((episode_length, action_sequences.shape[2]), dtype=np.float32)
+        populated = np.zeros(episode_length, dtype=bool)
+        for index, clip in episode_clips:
+            window = slice(clip.start_step, clip.end_step + 1)
+            sequence = action_sequences[index]
+            seen = populated[window]
+            if np.any(seen) and not np.array_equal(episode_actions[window][seen], sequence[seen]):
+                raise ValueError("cocore visual-action consistency cache has inconsistent overlap")
+            episode_window = episode_actions[window]
+            episode_window[~seen] = sequence[~seen]
+            populated[window] = True
+        if not np.all(populated):
+            raise ValueError("cocore visual-action consistency cache does not cover its episode")
+        try:
+            frame_values = np.load(
+                encode_root / "frame_embeddings" / f"ep{episode_id:06d}.npy",
+                allow_pickle=False,
+            )
+        except (OSError, ValueError) as error:
+            raise ValueError("cocore visual-action consistency frame cache is invalid") from error
+        if (
+            frame_values.dtype != np.dtype(np.float32)
+            or frame_values.ndim != 2
+            or frame_values.shape[0] != episode_length
+            or frame_values.shape[1] == 0
+            or not np.all(np.isfinite(frame_values))
+        ):
+            raise ValueError("cocore visual-action consistency frame cache is invalid")
+        step_scores = compute_step_visual_action_consistency(
+            frame_values,
+            episode_actions,
+            epsilon=epsilon,
+        )
+        for index, clip in episode_clips:
+            expected_raw[index] = top_k_mean(step_scores[clip.start_step : clip.end_step + 1])
+
+    expected_normalized = normalize_visual_action_consistency(
+        expected_raw,
+        quantile_low=quantile_low,
+        quantile_high=quantile_high,
+        epsilon=epsilon,
+    )
+    if not np.allclose(stored_raw, expected_raw, rtol=1.0e-6, atol=1.0e-7) or not np.allclose(
+        stored_normalized,
+        expected_normalized,
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    ):
+        raise ValueError(
+            "cocore visual-action consistency cache does not match frame and action caches"
+        )
+    return expected_raw, expected_normalized
+
+
 def _selection_rows(
     resolved: Mapping[str, Any],
     clips: list[ClipRecord],
@@ -1468,6 +1802,9 @@ def _selection_rows(
     context: CocoreObjectiveContext,
     leaf_metadata: tuple[Mapping[str, Any], ...],
     half_action_labels: np.ndarray,
+    *,
+    include_action_variation: bool = True,
+    include_visual_action_consistency: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     positions = {index: position for position, index in enumerate(result.selected_indices)}
     all_rows: list[dict[str, Any]] = []
@@ -1502,6 +1839,24 @@ def _selection_rows(
                 float(result.score_deltas[position]) if position is not None else None
             ),
         }
+        if include_action_variation:
+            row.update(
+                {
+                    "action_variation_raw": float(nodes["action_variation_raw"][index]),
+                    "action_variation": float(nodes["action_variation"][index]),
+                }
+            )
+        if include_visual_action_consistency:
+            row.update(
+                {
+                    "visual_action_consistency_raw": float(
+                        nodes["visual_action_consistency_raw"][index]
+                    ),
+                    "visual_action_consistency": float(nodes["visual_action_consistency"][index]),
+                }
+            )
+        if "dwell_ratio" in nodes:
+            row.update({field: float(nodes[field][index]) for field in DWELL_FIELDS})
         all_rows.append(row)
     selected_rows: list[dict[str, Any]] = []
     for index in result.selected_indices:
@@ -1537,6 +1892,9 @@ def select_stage(
     directory = selection_directory_name(relation_type, relation_weight, ratio)
     destination = root / directory
     algorithm = _selection_algorithm(seed=int(resolved["seed"]))
+    action_variation_metadata = _action_variation_metadata(resolved)
+    visual_action_consistency_metadata = _visual_action_consistency_metadata(resolved)
+    dwell_metadata = dwell_contract(resolved)
     fingerprint_payload = {
         "producer": "cocore",
         "version": __version__,
@@ -1546,12 +1904,13 @@ def select_stage(
         "selection": resolved["selection"],
         "seed": resolved["seed"],
         "algorithm": algorithm,
+        "action_variation": action_variation_metadata,
+        "visual_action_consistency": visual_action_consistency_metadata,
+        "dwell": dwell_metadata,
         "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
         "prototype_strategy": PROTOTYPE_STRATEGY,
         "prototype_profile": str(resolved["prototypes"]["profile"]),
-        "motion_primitive": motion_primitive_contract(
-            str(resolved["prototypes"]["profile"])
-        ),
+        "motion_primitive": motion_primitive_contract(str(resolved["prototypes"]["profile"])),
         **_selection_schema_fields(),
     }
     fingerprint = stable_hash(fingerprint_payload)
@@ -1582,9 +1941,7 @@ def select_stage(
                 "select.random_multibranch.round_average",
                 float(average_round_seconds),
             )
-        average_recombination_seconds = branch_search_timings[
-            "average_recombination_seconds"
-        ]
+        average_recombination_seconds = branch_search_timings["average_recombination_seconds"]
         if average_recombination_seconds is not None:
             emit_completed_timing(
                 "select.random_multibranch.recombination_average",
@@ -1628,13 +1985,14 @@ def select_stage(
             "selection_ratio": len(result.selected_indices) / len(clips),
             "configured_selection_ratio": ratio,
             "reliability_metrics": list(resolved["reliability_metrics"]),
+            "action_variation": action_variation_metadata,
+            "visual_action_consistency": visual_action_consistency_metadata,
+            "dwell": dwell_metadata,
             "prototype_method": "motion_primitives",
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
             "prototype_strategy": PROTOTYPE_STRATEGY,
             "prototype_profile": str(resolved["prototypes"]["profile"]),
-            "motion_primitive": motion_primitive_contract(
-                str(resolved["prototypes"]["profile"])
-            ),
+            "motion_primitive": motion_primitive_contract(str(resolved["prototypes"]["profile"])),
             "use_stop_bucket": bool(resolved["prototypes"]["use_stop_bucket"]),
             "initial_set_size": len(coverage_seed.selected_indices),
             "coverage": {
@@ -1655,6 +2013,8 @@ def select_stage(
             "skipped_short_episodes": scan_manifest.get("skipped_short_episodes", []),
             "runtime_seconds": {"select": time.perf_counter() - started},
         }
+        if dwell_metadata is not None:
+            report["dwell_summary"] = dwell_summary(all_rows, selected_rows)
         report["branch_search"] = {
             "rounds": result.rounds,
             "evaluated_branches": result.evaluated_branches,
@@ -1693,6 +2053,9 @@ def select_stage(
                 "relation_type": relation_type,
                 "relation_weight": relation_weight,
                 "reliability_metrics": list(resolved["reliability_metrics"]),
+                "action_variation": action_variation_metadata,
+                "visual_action_consistency": visual_action_consistency_metadata,
+                "dwell": dwell_metadata,
                 "algorithm": algorithm,
                 **_selection_schema_fields(),
                 "prototype_method": "motion_primitives",
@@ -1758,13 +2121,14 @@ def select_stage(
             ),
             "cocore_version": __version__,
             "reliability_metrics": list(resolved["reliability_metrics"]),
+            "action_variation": action_variation_metadata,
+            "visual_action_consistency": visual_action_consistency_metadata,
+            "dwell": dwell_metadata,
             "prototype_method": "motion_primitives",
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
             "prototype_strategy": PROTOTYPE_STRATEGY,
             "prototype_profile": str(resolved["prototypes"]["profile"]),
-            "motion_primitive": motion_primitive_contract(
-                str(resolved["prototypes"]["profile"])
-            ),
+            "motion_primitive": motion_primitive_contract(str(resolved["prototypes"]["profile"])),
             "use_stop_bucket": bool(resolved["prototypes"]["use_stop_bucket"]),
             "window_policy": WINDOW_POLICY,
             **_temporal_manifest_fields(geometry),
@@ -1840,7 +2204,11 @@ def validate_output(
     if run_manifest.get("selection_schema_version") != SELECTION_SCHEMA_VERSION:
         raise ValueError("cocore selection schema version is incompatible")
     run_reliability_metrics = run_manifest.get("reliability_metrics")
-    if run_reliability_metrics not in (["support"], ["support", "progress"]):
+    try:
+        canonical_run_metrics = list(normalize_reliability_metrics(run_reliability_metrics))
+    except ValueError as error:
+        raise ValueError("cocore run manifest reliability metrics are incompatible") from error
+    if run_reliability_metrics != canonical_run_metrics:
         raise ValueError("cocore run manifest reliability metrics are incompatible")
     if run_manifest.get("prototype_strategy") != PROTOTYPE_STRATEGY:
         raise ValueError("cocore prototype strategy is incompatible")
@@ -1854,12 +2222,8 @@ def validate_output(
         raise ValueError("cocore motion primitive contract is incompatible")
     expected_run_temporal = _temporal_manifest_fields(run_geometry)
     if (
-        run_profile != "libero"
-        or any(field in run_manifest for field in expected_run_temporal)
-    ) and any(
-        run_manifest.get(field) != value
-        for field, value in expected_run_temporal.items()
-    ):
+        run_profile != "libero" or any(field in run_manifest for field in expected_run_temporal)
+    ) and any(run_manifest.get(field) != value for field, value in expected_run_temporal.items()):
         raise ValueError("cocore run manifest temporal geometry is incompatible")
     if run_manifest.get("window_policy") != WINDOW_POLICY:
         raise ValueError("cocore run manifest window policy is incompatible")
@@ -1900,6 +2264,10 @@ def validate_output(
             "visual_half_embeddings.npy",
             "state_sequences.npy",
             "action_sequences.npy",
+            "action_variation_raw.npy",
+            "action_variation.npy",
+            "visual_action_consistency_raw.npy",
+            "visual_action_consistency.npy",
             "visual_progress.npy",
             "numeric_normalizers.npz",
             "visual_pca.npz",
@@ -1942,28 +2310,25 @@ def validate_output(
         "trajectory_horizon": run_geometry.state_delta_horizon,
     } | _action_sampling_manifest_fields(run_geometry)
     graph_temporal_is_incompatible = (
-        run_profile != "libero"
-        or any(field in graph_manifest for field in graph_temporal_fields)
-    ) and any(
-        graph_manifest.get(field) != value
-        for field, value in graph_temporal_fields.items()
-    )
+        run_profile != "libero" or any(field in graph_manifest for field in graph_temporal_fields)
+    ) and any(graph_manifest.get(field) != value for field, value in graph_temporal_fields.items())
     if (
         graph_manifest.get("prototype_schema_version") != PROTOTYPE_SCHEMA_VERSION
         or graph_manifest.get("prototype_strategy") != PROTOTYPE_STRATEGY
         or graph_manifest.get("prototype_profile") != run_profile
         or graph_manifest.get("motion_primitive") != run_motion_primitive
-        or graph_manifest.get("use_stop_bucket")
-        is not bool(run_manifest.get("use_stop_bucket"))
+        or graph_manifest.get("use_stop_bucket") is not bool(run_manifest.get("use_stop_bucket"))
         or graph_manifest.get("prototype_visual_dim") != 128
-        or graph_manifest.get("prototype_visual_projection")
-        != PROTOTYPE_VISUAL_PROJECTION
+        or graph_manifest.get("prototype_visual_projection") != PROTOTYPE_VISUAL_PROJECTION
         or graph_manifest.get("prototype_visual_normalization")
         != _prototype_visual_normalization(run_geometry)
         or graph_temporal_is_incompatible
         or graph_manifest.get("stage_directory") != GRAPH_DIRECTORY
         or graph_manifest.get("sequence_adjacency") != SEQUENCE_ADJACENCY
         or graph_manifest.get("reliability_metrics") != run_reliability_metrics
+        or graph_manifest.get("action_variation") != run_manifest.get("action_variation")
+        or graph_manifest.get("visual_action_consistency")
+        != run_manifest.get("visual_action_consistency")
     ):
         raise ValueError("graph manifest prototype schema is incompatible")
     encode_temporal_fields = {
@@ -1993,8 +2358,7 @@ def validate_output(
         "excluded_unlabeled_nodes": len(scan_clips) - len(source_clip_indices),
     }
     if any(
-        stage_manifests["graph"].get(name) != value
-        for name, value in graph_count_contract.items()
+        stage_manifests["graph"].get(name) != value for name, value in graph_count_contract.items()
     ):
         raise ValueError("graph manifest candidate counts do not match source clip indices")
     episode_rows = pq.read_table(root / "scan" / "episodes.parquet").to_pylist()
@@ -2035,15 +2399,57 @@ def validate_output(
     expected_reliability_metrics = list(replay_resolved["reliability_metrics"])
     if run_reliability_metrics != expected_reliability_metrics:
         raise ValueError("cocore reliability metrics configuration does not match output")
+    expected_dwell = _validate_dwell_cache(root / "encode", scan_clips, replay_resolved)
+    expected_dwell_metadata = dwell_contract(replay_resolved)
+    for metadata in (run_manifest, stage_manifests["encode"], graph_manifest):
+        if metadata.get("dwell") != expected_dwell_metadata:
+            raise ValueError("dwell contract does not match output")
+    expected_action_variation_metadata = _action_variation_metadata(replay_resolved)
+    if any(
+        metadata.get("action_variation") != expected_action_variation_metadata
+        for metadata in (
+            run_manifest,
+            stage_manifests["encode"],
+            stage_manifests["graph"],
+        )
+    ):
+        raise ValueError("cocore action variation contract does not match output")
+    expected_action_variation_raw, expected_action_variation = _validate_action_variation_cache(
+        root / "encode",
+        scan_clips,
+        quantile_low=float(replay_resolved["encoding"]["quantile_low"]),
+        quantile_high=float(replay_resolved["encoding"]["quantile_high"]),
+        epsilon=float(replay_resolved["encoding"]["epsilon"]),
+    )
+    expected_visual_action_consistency_metadata = _visual_action_consistency_metadata(
+        replay_resolved
+    )
+    if any(
+        metadata.get("visual_action_consistency") != expected_visual_action_consistency_metadata
+        for metadata in (
+            run_manifest,
+            stage_manifests["encode"],
+            stage_manifests["graph"],
+        )
+    ):
+        raise ValueError("cocore visual-action consistency contract does not match output")
+    (
+        expected_visual_action_consistency_raw,
+        expected_visual_action_consistency,
+    ) = _validate_visual_action_consistency_cache(
+        root / "encode",
+        scan_clips,
+        quantile_low=float(replay_resolved["encoding"]["quantile_low"]),
+        quantile_high=float(replay_resolved["encoding"]["quantile_high"]),
+        epsilon=float(replay_resolved["encoding"]["epsilon"]),
+    )
     if int(replay_resolved["seed"]) != int(algorithm["seed"]):
         raise ValueError("configuration seed does not match output")
     expected_use_stop_bucket = bool(replay_resolved["prototypes"]["use_stop_bucket"])
     expected_profile = str(replay_resolved["prototypes"]["profile"])
     expected_motion_primitive = motion_primitive_contract(expected_profile)
     if run_profile != expected_profile or run_motion_primitive != expected_motion_primitive:
-        raise ValueError(
-            "cocore motion primitive configuration does not match the run manifest"
-        )
+        raise ValueError("cocore motion primitive configuration does not match the run manifest")
     if run_manifest.get("use_stop_bucket") is not expected_use_stop_bucket:
         raise ValueError("cocore stop bucket configuration does not match the run manifest")
     replay_resolved["output"]["directory"] = str(root)
@@ -2076,6 +2482,10 @@ def validate_output(
     ]
     all_rows = pq.read_table(required["all"]).to_pylist()
     report = json.loads(required["report"].read_text(encoding="utf-8"))
+    if any(
+        metadata.get("dwell") != expected_dwell_metadata for metadata in (select_manifest, report)
+    ):
+        raise ValueError("dwell contract does not match selection output")
     if any("heap_refreshes" in row for row in (*selected_rows, *all_rows)):
         raise ValueError("selection row heap metadata is invalid")
     if (
@@ -2099,6 +2509,11 @@ def validate_output(
         or report.get("prototype_profile") != expected_profile
         or select_manifest.get("reliability_metrics") != expected_reliability_metrics
         or report.get("reliability_metrics") != expected_reliability_metrics
+        or select_manifest.get("action_variation") != expected_action_variation_metadata
+        or report.get("action_variation") != expected_action_variation_metadata
+        or select_manifest.get("visual_action_consistency")
+        != expected_visual_action_consistency_metadata
+        or report.get("visual_action_consistency") != expected_visual_action_consistency_metadata
         or select_manifest.get("motion_primitive") != expected_motion_primitive
         or report.get("motion_primitive") != expected_motion_primitive
     ):
@@ -2131,13 +2546,80 @@ def validate_output(
         raise ValueError("all_clips.parquet is not sorted by sample_id")
     leaf_metadata = _leaf_prototype_metadata(root / GRAPH_DIRECTORY)
     nodes = np.load(root / GRAPH_DIRECTORY / "nodes.npz")
-    expected_reliability = nodes["support"] ** 0.5
-    if expected_reliability_metrics == ["support", "progress"]:
-        expected_reliability *= nodes["progress"] ** 0.5
-    expected_reliability = np.clip(
-        expected_reliability,
-        float(replay_resolved["quality"]["min_reliability"]),
-        1.0,
+    node_reliability_fields = {
+        "support",
+        "progress",
+        "action_variation_raw",
+        "action_variation",
+        "visual_action_consistency_raw",
+        "visual_action_consistency",
+        "reliability",
+    }
+    if not node_reliability_fields <= set(nodes.files):
+        raise ValueError("graph node reliability arrays are missing")
+    node_count = len(source_clip_indices)
+    if (
+        any(
+            np.asarray(nodes[field]).shape != (node_count,) or not np.all(np.isfinite(nodes[field]))
+            for field in node_reliability_fields
+        )
+        or any(
+            np.any((nodes[field] < 0.0) | (nodes[field] > 1.0))
+            for field in (
+                "support",
+                "progress",
+                "action_variation",
+                "visual_action_consistency",
+                "reliability",
+            )
+        )
+        or np.any(nodes["action_variation_raw"] < 0.0)
+        or np.any(nodes["visual_action_consistency_raw"] < 0.0)
+    ):
+        raise ValueError("graph node reliability arrays have invalid shape or values")
+    if not np.allclose(
+        nodes["action_variation_raw"],
+        expected_action_variation_raw[source_clip_indices],
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    ) or not np.allclose(
+        nodes["action_variation"],
+        expected_action_variation[source_clip_indices],
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    ):
+        raise ValueError("graph node action variation does not match encode cache")
+    if not np.allclose(
+        nodes["visual_action_consistency_raw"],
+        expected_visual_action_consistency_raw[source_clip_indices],
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    ) or not np.allclose(
+        nodes["visual_action_consistency"],
+        expected_visual_action_consistency[source_clip_indices],
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    ):
+        raise ValueError("graph node visual-action consistency does not match encode cache")
+    for field in DWELL_FIELDS:
+        if expected_dwell:
+            expected_values = expected_dwell[field][source_clip_indices]
+            if (
+                field not in nodes
+                or nodes[field].shape != expected_values.shape
+                or not np.allclose(nodes[field], expected_values, rtol=1e-7, atol=1e-8)
+            ):
+                raise ValueError("graph node dwell values do not match encode cache")
+        elif field in nodes:
+            raise ValueError("unexpected dwell graph values without configuration")
+    expected_reliability = fuse_reliability(
+        nodes["support"],
+        nodes["progress"],
+        nodes["action_variation"],
+        nodes["visual_action_consistency"],
+        expected_reliability_metrics,
+        non_dwell=nodes["non_dwell"] if expected_dwell else None,
+        min_reliability=float(replay_resolved["quality"]["min_reliability"]),
     )
     if not np.allclose(
         nodes["reliability"],
@@ -2149,10 +2631,7 @@ def validate_output(
     half_action_labels = np.load(
         root / GRAPH_DIRECTORY / "half_action_labels.npy", allow_pickle=False
     )
-    clip_index_by_id = {
-        clip.sample_id: index
-        for index, clip in enumerate(eligible_clips)
-    }
+    clip_index_by_id = {clip.sample_id: index for index, clip in enumerate(eligible_clips)}
     if set(clip_index_by_id) != {str(row["sample_id"]) for row in all_rows}:
         raise ValueError("all-clips rows do not match the graph clip index")
     for row in all_rows:
@@ -2165,6 +2644,16 @@ def validate_output(
         expected_clusters = [
             int(leaf_metadata[int(value)]["center_id"]) for value in assigned_indices
         ]
+        expected_metric_values = {
+            **({field: nodes[field][index] for field in DWELL_FIELDS} if expected_dwell else {}),
+            "support": nodes["support"][index],
+            "progress": nodes["progress"][index],
+            "action_variation_raw": nodes["action_variation_raw"][index],
+            "action_variation": nodes["action_variation"][index],
+            "visual_action_consistency_raw": nodes["visual_action_consistency_raw"][index],
+            "visual_action_consistency": nodes["visual_action_consistency"][index],
+            "reliability": nodes["reliability"][index],
+        }
         if (
             row.get("prototype_indices") != [int(value) for value in assigned_indices]
             or not _numeric_values_match(row.get("prototype_weights"), assigned_weights)
@@ -2177,6 +2666,15 @@ def validate_output(
             or row.get("primary_prototype_label") != expected_labels[0]
             or row.get("primary_action_label") != expected_actions[0]
             or row.get("half_action_labels") != [str(value) for value in half_action_labels[index]]
+            or any(
+                not np.isclose(
+                    float(row.get(field, np.nan)),
+                    float(value),
+                    rtol=1.0e-7,
+                    atol=1.0e-8,
+                )
+                for field, value in expected_metric_values.items()
+            )
         ):
             raise ValueError("hierarchical prototype row metadata mismatch")
     selected_from_all = sorted(
@@ -2205,6 +2703,44 @@ def validate_output(
             raise ValueError("selected row contains obsolete schema-3 prototype field")
         if any(selected_row.get(field) != all_row.get(field) for field in hierarchical_fields):
             raise ValueError("selected hierarchical prototype row metadata mismatch")
+        if any(
+            not np.isclose(
+                float(selected_row.get(field, np.nan)),
+                float(all_row.get(field, np.nan)),
+                rtol=1.0e-7,
+                atol=1.0e-8,
+            )
+            for field in (
+                "action_variation_raw",
+                "action_variation",
+                "visual_action_consistency_raw",
+                "visual_action_consistency",
+            )
+        ):
+            raise ValueError(
+                "selected action variation or visual-action consistency does not match "
+                "all-clips row"
+            )
+        if any(
+            not np.isclose(
+                float(selected_row.get(field, np.nan)),
+                float(all_row.get(field, np.nan)),
+                rtol=1.0e-7,
+                atol=1.0e-8,
+            )
+            for field in (
+                "support",
+                "progress",
+                "reliability",
+                *(DWELL_FIELDS if expected_dwell else ()),
+            )
+        ):
+            raise ValueError("selected reliability metrics do not match all-clips row")
+    if expected_dwell:
+        if report.get("dwell_summary") != dwell_summary(all_rows, selected_rows):
+            raise ValueError("dwell report summary does not match clip values")
+    elif "dwell_summary" in report:
+        raise ValueError("unexpected dwell summary without configuration")
     clips, graph, _ = _load_graph(root)
     del clips
     id_to_index = {sample_id: index for index, sample_id in enumerate(graph.sample_ids)}

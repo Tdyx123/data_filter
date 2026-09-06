@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
@@ -14,7 +14,9 @@ import yaml
 from relcore.config import DEFAULT_CONFIG as RELCORE_DEFAULT_CONFIG
 from relcore.config import resolve_config as resolve_relcore_config
 
+from cocore.dwell import resolve_dwell_config
 from cocore.temporal import resolve_temporal_geometry
+from cocore.action_variation import DEFAULT_RELIABILITY_METRICS, normalize_reliability_metrics
 
 
 _SHARED_SECTIONS = (
@@ -36,7 +38,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "quantile_high": 0.99,
         "epsilon": 1.0e-8,
     },
-    "reliability_metrics": ["support", "progress"],
+    "reliability_metrics": list(DEFAULT_RELIABILITY_METRICS),
     "objective": {},
     "selection": {
         "ratio": 0.1,
@@ -128,20 +130,16 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if configured_method not in {None, "motion_primitives"}:
         raise ValueError("cocore prototypes.method must be motion_primitives")
     configured_metrics = config.get("reliability_metrics")
-    if configured_metrics is None:
-        reliability_metrics = ["support", "progress"]
-    else:
-        if isinstance(configured_metrics, (str, bytes)) or not isinstance(
-            configured_metrics, Sequence
-        ):
-            raise ValueError(
-                "cocore reliability_metrics must be [support] or [support, progress]"
+    try:
+        reliability_metrics = list(
+            normalize_reliability_metrics(
+                DEFAULT_CONFIG["reliability_metrics"]
+                if configured_metrics is None
+                else configured_metrics
             )
-        reliability_metrics = list(configured_metrics)
-        if reliability_metrics not in (["support"], ["support", "progress"]):
-            raise ValueError(
-                "cocore reliability_metrics must be [support] or [support, progress]"
-            )
+        )
+    except ValueError as error:
+        raise ValueError(f"cocore reliability_metrics is invalid: {error}") from error
     resolved = _merge(DEFAULT_CONFIG, config)
     resolved["prototypes"]["method"] = "motion_primitives"
     profile = resolved["prototypes"].get("profile")
@@ -153,11 +151,7 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("cocore prototypes.use_stop_bucket must be a boolean")
     resolved["prototypes"]["use_stop_bucket"] = use_stop_bucket
     num_threads = resolved["prototypes"].get("num_threads")
-    if (
-        isinstance(num_threads, bool)
-        or not isinstance(num_threads, Integral)
-        or num_threads <= 0
-    ):
+    if isinstance(num_threads, bool) or not isinstance(num_threads, Integral) or num_threads <= 0:
         raise ValueError("cocore prototypes.num_threads must be a positive integer")
     resolved["prototypes"]["num_threads"] = int(num_threads)
     tolerance = resolved["prototypes"].get("tol")
@@ -170,6 +164,13 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("cocore prototypes.tol must be a finite positive number")
     resolved["prototypes"]["tol"] = float(tolerance)
     resolved["reliability_metrics"] = reliability_metrics
+    dwell = resolve_dwell_config(resolved.get("dwell"))
+    if dwell is not None:
+        resolved["dwell"] = dwell
+    else:
+        resolved.pop("dwell", None)
+    if "non_dwell" in reliability_metrics and dwell is None:
+        raise ValueError("non_dwell requires explicit dwell configuration")
     relation = str(resolved["objective"]["relation"])
     if relation not in {"sequence", "cooccurrence"}:
         raise ValueError("objective.relation must be sequence or cooccurrence")
@@ -226,9 +227,7 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def to_relcore_config(resolved: Mapping[str, Any]) -> dict[str, Any]:
     translated = copy.deepcopy(RELCORE_DEFAULT_CONFIG)
-    geometry = resolve_temporal_geometry(
-        str(resolved["prototypes"].get("profile", "libero"))
-    )
+    geometry = resolve_temporal_geometry(str(resolved["prototypes"].get("profile", "libero")))
     translated["seed"] = int(resolved.get("seed", 42))
     for section in _SHARED_SECTIONS:
         if section == "prototypes":

@@ -12,11 +12,21 @@ import numpy as np
 
 from relcore.features.visual_encoder import VisualEncoder
 from relcore.schemas import ClipRecord
+from cocore.dwell import compute_dwell_ratio, resolve_dwell_config
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
 
+from cocore.action_variation import (
+    compute_step_action_variation,
+    normalize_action_variation,
+    top_k_mean,
+)
 from cocore.index import CLIP_LENGTH, build_clip_records
 from cocore.temporal import resolve_temporal_geometry
 from cocore.timing import TimingCallback, timed_step
+from cocore.visual_action_consistency import (
+    compute_step_visual_action_consistency,
+    normalize_visual_action_consistency,
+)
 
 
 DEFAULT_VISUAL_HALF_WINDOWS = resolve_temporal_geometry("libero").visual_half_windows
@@ -333,11 +343,19 @@ class CocoreEncodedClips:
     visual_half_embeddings: np.ndarray
     state_sequences: np.ndarray
     action_sequences: np.ndarray
+    action_variation_raw: np.ndarray
+    action_variation: np.ndarray
+    visual_action_consistency_raw: np.ndarray
+    visual_action_consistency: np.ndarray
     visual_progress: np.ndarray
     numeric_normalizers: CocoreNumericNormalizers
     visual_projector: CocorePCAProjector
     frame_embeddings: list[FrameEmbeddingEntry]
     pca_fit_fragment_count: int
+    dwell_state_sequences: np.ndarray | None = None
+    dwell_timestamps: np.ndarray | None = None
+    dwell_ratio: np.ndarray | None = None
+    non_dwell: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -347,8 +365,16 @@ class CocoreEncodedArtifact:
     visual_half_embeddings: np.ndarray
     state_sequences: np.ndarray
     action_sequences: np.ndarray
+    action_variation_raw: np.ndarray
+    action_variation: np.ndarray
+    visual_action_consistency_raw: np.ndarray
+    visual_action_consistency: np.ndarray
     visual_progress: np.ndarray
     fingerprint: str
+    dwell_state_sequences: np.ndarray | None = None
+    dwell_timestamps: np.ndarray | None = None
+    dwell_ratio: np.ndarray | None = None
+    non_dwell: np.ndarray | None = None
 
 
 def _records_by_id(records: list[EpisodeRecord]) -> dict[int, EpisodeRecord]:
@@ -392,9 +418,11 @@ def encode_cocore_dataset(
     max_episodes: int | None = None,
     progress_interval: int = 0,
     timing_callback: TimingCallback | None = None,
+    dwell: Mapping[str, object] | None = None,
 ) -> CocoreEncodedClips:
     """Encode Quality-style fragments and cache each usable episode's frames."""
 
+    dwell = resolve_dwell_config(dwell)
     geometry = resolve_temporal_geometry(profile)
     records = list(adapter.episodes())
     if max_episodes is not None:
@@ -447,8 +475,13 @@ def encode_cocore_dataset(
         cache_root.mkdir(parents=True, exist_ok=True)
         raw_visual: dict[tuple[int, int, int], np.ndarray] = {}
         half_visual_by_index: dict[int, np.ndarray] = {}
+        dwell_states: dict[int, np.ndarray] = {}
+        dwell_times: dict[int, np.ndarray] = {}
+        dwell_scores: dict[int, float] = {}
         state_by_index: dict[int, np.ndarray] = {}
         action_by_index: dict[int, np.ndarray] = {}
+        action_variation_by_index: dict[int, float] = {}
+        visual_action_consistency_by_index: dict[int, float] = {}
         position_by_index: dict[int, float] = {}
         progress_by_index: dict[int, float] = {}
         frame_entries: dict[int, FrameEmbeddingEntry] = {}
@@ -492,14 +525,34 @@ def encode_cocore_dataset(
 
             normalized_state = normalizers.state(episode.observations)
             normalized_action = normalizers.action(episode.actions)
+            episode_action_variation = compute_step_action_variation(normalized_action)
+            episode_visual_action_consistency = None
+            if candidate_windows[episode.episode_id]:
+                episode_visual_action_consistency = compute_step_visual_action_consistency(
+                    frame_features,
+                    normalized_action,
+                    epsilon=epsilon,
+                )
             for start, end in candidate_windows[episode.episode_id]:
                 raw_visual[(episode.episode_id, start, end)] = visual_fragment_feature(
                     frame_features[start : end + 1],
                     clip_length=geometry.clip_length,
                 )
             for clip_index, clip in clips_by_episode.get(episode.episode_id, ()):
+                if episode_visual_action_consistency is None:
+                    raise RuntimeError("VAC scores are missing for a candidate episode")
                 window = slice(clip.start_step, clip.end_step + 1)
                 visual = frame_features[window]
+                if dwell is not None:
+                    raw_state = np.asarray(
+                        episode.observations["observation.state"][window], dtype=np.float64
+                    )
+                    timestamps = np.asarray(episode.timestamps[window], dtype=np.float64)
+                    dwell_scores[clip_index] = compute_dwell_ratio(
+                        raw_state, timestamps, profile=profile, config=dwell
+                    )
+                    dwell_states[clip_index] = raw_state
+                    dwell_times[clip_index] = timestamps
                 state = normalized_state[window]
                 action = normalized_action[window]
                 half_visual_by_index[clip_index] = visual_half_means(
@@ -508,6 +561,10 @@ def encode_cocore_dataset(
                 )
                 state_by_index[clip_index] = state
                 action_by_index[clip_index] = action
+                action_variation_by_index[clip_index] = top_k_mean(episode_action_variation[window])
+                visual_action_consistency_by_index[clip_index] = top_k_mean(
+                    episode_visual_action_consistency[window]
+                )
                 position_by_index[clip_index] = float(clip.start_step) / float(episode.length)
                 normalized_visual = visual / np.maximum(
                     np.linalg.norm(visual, axis=1, keepdims=True), 1.0e-8
@@ -550,9 +607,29 @@ def encode_cocore_dataset(
         state_sequences = np.stack([state_by_index[index] for index in range(len(clips))]).astype(
             dtype=np.float32,
         )
-        action_sequences = np.stack(
-            [action_by_index[index] for index in range(len(clips))]
-        ).astype(dtype=np.float32)
+        action_sequences = np.stack([action_by_index[index] for index in range(len(clips))]).astype(
+            dtype=np.float32
+        )
+        action_variation_raw = np.asarray(
+            [action_variation_by_index[index] for index in range(len(clips))],
+            dtype=np.float32,
+        )
+        action_variation = normalize_action_variation(
+            action_variation_raw,
+            quantile_low=quantile_low,
+            quantile_high=quantile_high,
+            epsilon=epsilon,
+        )
+        visual_action_consistency_raw = np.asarray(
+            [visual_action_consistency_by_index[index] for index in range(len(clips))],
+            dtype=np.float32,
+        )
+        visual_action_consistency = normalize_visual_action_consistency(
+            visual_action_consistency_raw,
+            quantile_low=quantile_low,
+            quantile_high=quantile_high,
+            epsilon=epsilon,
+        )
         _, embeddings = fuse_fragment_features(
             candidate_visual,
             np.stack([temporal_pool(values) for values in state_sequences]),
@@ -562,6 +639,11 @@ def encode_cocore_dataset(
                 dtype=np.float32,
             ),
         )
+        dwell_values = (
+            np.asarray([dwell_scores[i] for i in range(len(clips))], dtype=np.float64)
+            if dwell is not None
+            else None
+        )
         return CocoreEncodedClips(
             clips=clips,
             embeddings=embeddings,
@@ -570,6 +652,10 @@ def encode_cocore_dataset(
             ).astype(np.float32),
             state_sequences=state_sequences,
             action_sequences=action_sequences,
+            action_variation_raw=action_variation_raw,
+            action_variation=action_variation,
+            visual_action_consistency_raw=visual_action_consistency_raw,
+            visual_action_consistency=visual_action_consistency,
             visual_progress=np.asarray(
                 [progress_by_index[index] for index in range(len(clips))],
                 dtype=np.float32,
@@ -578,4 +664,12 @@ def encode_cocore_dataset(
             visual_projector=projector,
             frame_embeddings=[frame_entries[record.episode_id] for record in records],
             pca_fit_fragment_count=len(candidate_order),
+            dwell_state_sequences=np.stack([dwell_states[i] for i in range(len(clips))])
+            if dwell is not None
+            else None,
+            dwell_timestamps=np.stack([dwell_times[i] for i in range(len(clips))])
+            if dwell is not None
+            else None,
+            dwell_ratio=dwell_values,
+            non_dwell=1.0 - dwell_values if dwell_values is not None else None,
         )

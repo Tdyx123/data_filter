@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 
 import pytest
 
 import cocore
 from cocore import cli
+from cocore.action_variation import RELIABILITY_METRICS
 from cocore.config import load_config, resolve_config
 from cocore.pipeline import selection_directory_name
 
@@ -15,7 +17,7 @@ def _objective(relation: str = "cooccurrence", weight: float = 1.0) -> dict[str,
 
 
 def test_package_version_matches_configurable_reliability_release() -> None:
-    assert cocore.__version__ == "0.17.0"
+    assert cocore.__version__ == "0.19.0"
 
 
 def test_config_requires_explicit_relation_and_weight() -> None:
@@ -51,30 +53,48 @@ def test_config_accepts_supported_relations(relation: str) -> None:
     assert resolved["prototypes"]["tol"] == 1.0e-4
     assert resolved["prototypes"]["num_threads"] == 4
     assert resolved["prototypes"]["use_stop_bucket"] is True
-    assert resolved["reliability_metrics"] == ["support", "progress"]
+    assert resolved["reliability_metrics"] == [
+        "support",
+        "progress",
+        "action_variation",
+        "visual_action_consistency",
+    ]
     assert resolved["objective"] == {"relation": relation, "relation_weight": 1.0}
     assert resolved["selection"] == {"ratio": 0.1, "budget": None}
 
 
-def test_config_accepts_support_only_reliability() -> None:
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        list(metrics)
+        for size in range(1, len(RELIABILITY_METRICS) + 1)
+        for metrics in itertools.combinations(reversed(RELIABILITY_METRICS), size)
+    ],
+)
+def test_config_accepts_every_nonempty_reliability_subset(metrics: list[str]) -> None:
     resolved = resolve_config(
         {
             **_objective(),
-            "reliability_metrics": ["support"],
+            "reliability_metrics": metrics,
+            "dwell": {
+                "position_speed_threshold": 0.1,
+                "angular_speed_threshold": 0.1,
+                "gripper_speed_threshold": 0.1,
+            },
         }
     )
 
-    assert resolved["reliability_metrics"] == ["support"]
+    assert resolved["reliability_metrics"] == [
+        metric for metric in RELIABILITY_METRICS if metric in metrics
+    ]
 
 
 @pytest.mark.parametrize(
     "metrics",
     [
         [],
-        ["progress"],
         ["support", "support"],
         ["smoothness"],
-        ["progress", "support"],
         "support",
     ],
 )
@@ -328,6 +348,55 @@ def test_graph_commands_accept_stop_bucket_disable_flag(command: str) -> None:
     assert parsed.no_use_stop_bucket is True
 
 
+@pytest.mark.parametrize("command", ["build-graph", "select", "run", "validate"])
+def test_graph_commands_accept_one_or_more_reliability_metrics(command: str) -> None:
+    arguments = [
+        command,
+        "--reliability-metrics",
+        "visual_action_consistency",
+        "action_variation",
+        "support",
+    ]
+    if command == "validate":
+        arguments += ["--output-dir", "result"]
+
+    parsed = cli.build_parser().parse_args(arguments)
+
+    assert parsed.reliability_metrics == [
+        "visual_action_consistency",
+        "action_variation",
+        "support",
+    ]
+
+
+@pytest.mark.parametrize("command", ["build-graph", "select", "run", "validate"])
+def test_graph_commands_reject_empty_reliability_metrics(command: str) -> None:
+    arguments = [command]
+    if command == "validate":
+        arguments += ["--output-dir", "result"]
+    arguments += ["--reliability-metrics"]
+
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(arguments)
+
+
+@pytest.mark.parametrize("command", ["build-graph", "select", "run", "validate"])
+def test_graph_commands_reject_unknown_reliability_metric(command: str) -> None:
+    arguments = [command]
+    if command == "validate":
+        arguments += ["--output-dir", "result"]
+    arguments += ["--reliability-metrics", "smoothness"]
+
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(arguments)
+
+
+@pytest.mark.parametrize("command", ["scan", "encode"])
+def test_non_graph_commands_reject_reliability_metrics(command: str) -> None:
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args([command, "--reliability-metrics", "support"])
+
+
 @pytest.mark.parametrize("command", ["scan", "encode"])
 def test_non_graph_commands_reject_stop_bucket_disable_flag(command: str) -> None:
     with pytest.raises(SystemExit):
@@ -410,9 +479,7 @@ def test_validate_stop_bucket_disable_flag_overrides_replay_config(
 
     cli.main(arguments)
 
-    assert loaded_paths == [
-        "custom.yaml" if explicit_config else output / "resolved_config.yaml"
-    ]
+    assert loaded_paths == ["custom.yaml" if explicit_config else output / "resolved_config.yaml"]
     assert received["output_dir"] == str(output)
     assert received["config"]["prototypes"]["use_stop_bucket"] is False
     assert capsys.readouterr().out.strip() == '{"selected_clips": 1, "status": "valid"}'
@@ -441,6 +508,9 @@ def test_main_applies_cli_overrides_to_run_pipeline(monkeypatch, capsys) -> None
             "2",
             "--selection-ratio",
             "0.25",
+            "--reliability-metrics",
+            "action_variation",
+            "support",
         ]
     )
 
@@ -450,7 +520,32 @@ def test_main_applies_cli_overrides_to_run_pipeline(monkeypatch, capsys) -> None
     }
     assert received["config"]["selection"]["ratio"] == 0.25
     assert received["config"]["selection"]["budget"] is None
+    assert received["config"]["reliability_metrics"] == [
+        "support",
+        "action_variation",
+    ]
     assert capsys.readouterr().out.strip().endswith("select-sequence-w2-top25pct")
+
+
+def test_main_rejects_duplicate_cli_reliability_metrics(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "load_config", lambda _: _objective())
+    monkeypatch.setattr(
+        cli,
+        "run_pipeline",
+        lambda config, **kwargs: Path("outputs/cocore/test/result"),
+    )
+
+    with pytest.raises(SystemExit, match="duplicates"):
+        cli.main(
+            [
+                "run",
+                "--config",
+                "unused.yaml",
+                "--reliability-metrics",
+                "support",
+                "support",
+            ]
+        )
 
 
 def test_build_graph_cli_reports_schema_ten_graph_directory(monkeypatch, capsys) -> None:
@@ -499,10 +594,13 @@ def test_shipped_configs_resolve_to_fixed_cocore_contract(path: str) -> None:
         "num_threads",
         "use_stop_bucket",
     }
-    assert config["prototypes"]["num_threads"] == (
-        1 if path.endswith("config_debug.yaml") else 4
-    )
-    assert config["reliability_metrics"] == ["support", "progress"]
+    assert config["prototypes"]["num_threads"] == (1 if path.endswith("config_debug.yaml") else 4)
+    assert config["reliability_metrics"] == [
+        "support",
+        "progress",
+        "action_variation",
+        "visual_action_consistency",
+    ]
     assert config["objective"] == {
         "relation": "cooccurrence",
         "relation_weight": 1.0,

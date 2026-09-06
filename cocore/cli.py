@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 from typing import Sequence
 
+from .action_variation import RELIABILITY_METRICS, normalize_reliability_metrics
 from .config import load_config
 from .pipeline import (
     GRAPH_DIRECTORY,
@@ -45,6 +46,12 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--force", action="store_true")
         if command in {"build-graph", "select", "run"}:
             child.add_argument("--no-use-stop-bucket", action="store_true")
+            child.add_argument(
+                "--reliability-metrics",
+                nargs="+",
+                choices=RELIABILITY_METRICS,
+                default=None,
+            )
         if command in {"select", "run"}:
             child.add_argument("--selection-ratio", type=_selection_ratio, default=None)
             child.add_argument("--relation", choices=("sequence", "cooccurrence"), default=None)
@@ -53,18 +60,33 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--output-dir", required=True)
     validate.add_argument("--config", default=None)
     validate.add_argument("--no-use-stop-bucket", action="store_true")
+    validate.add_argument(
+        "--reliability-metrics",
+        nargs="+",
+        choices=RELIABILITY_METRICS,
+        default=None,
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if getattr(args, "reliability_metrics", None) is not None:
+        try:
+            args.reliability_metrics = list(normalize_reliability_metrics(args.reliability_metrics))
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
     if args.command == "validate":
         config_path = args.config
-        if config_path is None and args.no_use_stop_bucket:
+        if config_path is None and (
+            args.no_use_stop_bucket or args.reliability_metrics is not None
+        ):
             config_path = Path(args.output_dir).expanduser() / "resolved_config.yaml"
         config = load_config(config_path) if config_path is not None else None
         if args.no_use_stop_bucket:
             config.setdefault("prototypes", {})["use_stop_bucket"] = False
+        if args.reliability_metrics is not None:
+            config["reliability_metrics"] = args.reliability_metrics
         result = validate_output(args.output_dir, config=config)
         import json
 
@@ -73,6 +95,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     config = load_config(args.config)
     if getattr(args, "no_use_stop_bucket", False):
         config.setdefault("prototypes", {})["use_stop_bucket"] = False
+    if getattr(args, "reliability_metrics", None) is not None:
+        config["reliability_metrics"] = args.reliability_metrics
     if args.max_episodes is not None:
         if args.max_episodes <= 0:
             raise SystemExit("--max-episodes must be positive")

@@ -214,7 +214,7 @@ def test_package_exposes_only_version() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["0.11.0", "['__version__']"]
+    assert result.stdout.splitlines() == ["0.12.0", "['__version__']"]
 
 
 def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None:
@@ -268,7 +268,12 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
         "use_stop_bucket",
     }
     assert config["prototypes"]["num_threads"] == 4
-    assert config["reliability_metrics"] == ["support", "progress"]
+    assert config["reliability_metrics"] == [
+        "support",
+        "progress",
+        "action_variation",
+        "visual_action_consistency",
+    ]
     assert config["objective"] == {"relation": "sequence", "relation_weight": 1.5}
     assert config["selection"] == {"ratio": 0.2, "budget": None}
     assert config["runtime"]["max_episodes"] == 100
@@ -518,15 +523,18 @@ def test_graph_commands_accept_stop_bucket_disable_flag(command: str) -> None:
 
 @pytest.mark.parametrize("command", ["build-graph", "select", "run", "validate"])
 @pytest.mark.parametrize(
-    ("value", "expected"),
+    ("values", "expected"),
     [
-        ("support", ["support"]),
-        ("support,progress", ["support", "progress"]),
+        (["support"], ["support"]),
+        (
+            ["visual_action_consistency", "action_variation", "support"],
+            ["visual_action_consistency", "action_variation", "support"],
+        ),
     ],
 )
 def test_graph_commands_accept_reliability_metrics(
     command: str,
-    value: str,
+    values: list[str],
     expected: list[str],
 ) -> None:
     from cocore_bridge_v2 import cli
@@ -538,7 +546,7 @@ def test_graph_commands_accept_reliability_metrics(
         "--relation-weight",
         "1",
         "--reliability-metrics",
-        value,
+        *values,
     ]
     if command == "validate":
         arguments += ["--output-dir", "result"]
@@ -583,7 +591,7 @@ def test_non_graph_commands_reject_reliability_metrics(command: str) -> None:
         )
 
 
-@pytest.mark.parametrize("value", ["none", "progress", "progress,support", "smoothness"])
+@pytest.mark.parametrize("value", ["none", "support,progress", "smoothness"])
 def test_graph_commands_reject_unsupported_reliability_metrics(value: str) -> None:
     from cocore_bridge_v2 import cli
 
@@ -843,6 +851,66 @@ def test_run_cli_passes_support_only_to_delegated_config(
     capsys.readouterr()
 
 
+def test_run_cli_canonicalizes_reliability_metric_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from cocore_bridge_v2 import cli
+
+    dataset = tmp_path / "bridge"
+    output = tmp_path / "output"
+    _write_bridge_info(dataset, _bridge_info())
+    received: dict[str, object] = {}
+
+    def fake_run_pipeline(config, **kwargs):
+        received["config"] = config
+        return output / "select-sequence-w1-top10pct"
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+
+    cli.main(
+        [
+            "run",
+            "--relation",
+            "sequence",
+            "--relation-weight",
+            "1",
+            "--dataset-path",
+            str(dataset),
+            "--output-dir",
+            str(output),
+            "--reliability-metrics",
+            "action_variation",
+            "support",
+        ]
+    )
+
+    assert received["config"]["reliability_metrics"] == [
+        "support",
+        "action_variation",
+    ]
+    capsys.readouterr()
+
+
+def test_run_cli_rejects_duplicate_reliability_metrics() -> None:
+    from cocore_bridge_v2 import cli
+
+    with pytest.raises(SystemExit, match="cannot contain duplicates"):
+        cli.main(
+            [
+                "run",
+                "--relation",
+                "sequence",
+                "--relation-weight",
+                "1",
+                "--reliability-metrics",
+                "support",
+                "support",
+            ]
+        )
+
+
 def test_validate_cli_passes_custom_dataset_path_without_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -975,10 +1043,10 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     graph_manifest = json.loads((graph_root / "manifest.json").read_text())
     catalog = json.loads((graph_root / "prototype_catalog.json").read_text())
     assert select_manifest["producer"] == "cocore"
-    assert select_manifest["cocore_version"] == "0.17.0"
+    assert select_manifest["cocore_version"] == "0.19.0"
     assert select_manifest["prototype_profile"] == "bridge_v2"
     assert run_manifest["producer"] == "cocore"
-    assert run_manifest["cocore_version"] == "0.17.0"
+    assert run_manifest["cocore_version"] == "0.19.0"
     assert run_manifest["stage_directories"]["graph"] == "graph-18-motion-hard-nearest-pca"
     assert run_manifest["prototype_schema_version"] == 10
     assert run_manifest["prototype_profile"] == "bridge_v2"
@@ -989,9 +1057,7 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     assert run_manifest["trajectory_window_length"] == 4
     assert run_manifest["trajectory_horizon"] == 3
     assert run_manifest["trajectory_window_max_gap"] == 2
-    assert run_manifest["trajectory_window_policy"] == (
-        "full_coverage_max_gap_2_tail_rebalanced"
-    )
+    assert run_manifest["trajectory_window_policy"] == ("full_coverage_max_gap_2_tail_rebalanced")
     assert graph_manifest["prototype_profile"] == "bridge_v2"
     assert graph_manifest["prototype_visual_normalization"] == (
         "l2_normalized_four_frame_mean_after_projection"
@@ -999,9 +1065,7 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     assert graph_manifest["trajectory_window_length"] == 4
     assert graph_manifest["trajectory_horizon"] == 3
     assert graph_manifest["trajectory_window_max_gap"] == 2
-    assert graph_manifest["trajectory_window_policy"] == (
-        "full_coverage_max_gap_2_tail_rebalanced"
-    )
+    assert graph_manifest["trajectory_window_policy"] == ("full_coverage_max_gap_2_tail_rebalanced")
     assert graph_manifest["motion_primitive"]["roll_labels"] == {
         "positive": "roll positive",
         "negative": "roll negative",
@@ -1032,8 +1096,7 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
         "l2_normalized_mean_of_four_projected_frames"
     )
     assert any(
-        leaf["action_label"] == "move forward, roll positive"
-        for leaf in catalog["leaf_prototypes"]
+        leaf["action_label"] == "move forward, roll positive" for leaf in catalog["leaf_prototypes"]
     )
     assert validate_output(result, config=config) == {
         "status": "valid",
@@ -1058,9 +1121,7 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
 
     legacy_temporal_manifest = copy.deepcopy(run_manifest)
     legacy_temporal_manifest["trajectory_window_max_gap"] = 3
-    legacy_temporal_manifest["trajectory_window_policy"] = (
-        "full_coverage_max_gap_3_tail_rebalanced"
-    )
+    legacy_temporal_manifest["trajectory_window_policy"] = "full_coverage_max_gap_3_tail_rebalanced"
     (result / "run_manifest.json").write_text(json.dumps(legacy_temporal_manifest))
     with pytest.raises(ValueError, match="temporal geometry"):
         validate_output(result, config=config)
@@ -1152,3 +1213,60 @@ def test_bridge_validate_replays_the_same_max_episode_subset(
         "selected_clips": 44,
         "status": "valid",
     }
+
+
+def test_bridge_cli_forwards_explicit_dwell_thresholds(tmp_path, monkeypatch):
+    from cocore_bridge_v2 import cli
+
+    received = {}
+
+    def validate(path, *, config):
+        received.update(config)
+        return {"valid": True}
+
+    monkeypatch.setattr(cli, "validate_output", validate)
+    cli.main(
+        [
+            "validate",
+            "--relation",
+            "sequence",
+            "--relation-weight",
+            "1",
+            "--output-dir",
+            str(tmp_path),
+            "--reliability-metrics",
+            "non_dwell",
+            "--dwell-position-speed-threshold",
+            ".1",
+            "--dwell-angular-speed-threshold",
+            ".2",
+            "--dwell-gripper-mode",
+            "binary",
+        ]
+    )
+    assert received["reliability_metrics"] == ["non_dwell"]
+    assert received["dwell"] == {
+        "position_speed_threshold": 0.1,
+        "angular_speed_threshold": 0.2,
+        "gripper_mode": "binary",
+    }
+
+
+def test_bridge_config_keeps_default_metrics_with_dwell_diagnostics():
+    from cocore_bridge_v2.config import build_config
+
+    config = build_config(
+        relation="sequence",
+        relation_weight=1,
+        dwell={
+            "position_speed_threshold": 0.1,
+            "angular_speed_threshold": 0.2,
+            "gripper_mode": "binary",
+        },
+    )
+    assert config["reliability_metrics"] == [
+        "support",
+        "progress",
+        "action_variation",
+        "visual_action_consistency",
+    ]
