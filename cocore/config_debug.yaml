@@ -49,3 +49,6 @@ output:
 #   angular_speed_threshold: null   # rad/s
 #   gripper_speed_threshold: null   # 原始夹爪单位/秒
 #   gripper_mode: continuous        # binary 时可省略夹爪阈值
+
+# 可选末端 Jerk：在 reliability_metrics 中加入 eef_jerk，默认不计算。
+# 使用原始末端平移位置（米）与时间戳（秒）；不可计算片段排除出图。

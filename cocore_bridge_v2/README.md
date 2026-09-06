@@ -236,3 +236,13 @@ Python 入口 `build_config(..., dwell={...})` 接受与 Cocore 相同的 `dwell
 完整指定阈值即可输出 `dwell_ratio` 与 `non_dwell` 诊断值；要参与融合，另外通过
 `--reliability-metrics` 选择 `non_dwell`（可与原四项组合）。分阶段执行和 `validate`
 应传入相同阈值。高驻留不代表无价值，持物、等待和接触保持不能仅凭该指标删除。
+
+### 可选末端运动 Jerk
+
+`--reliability-metrics support progress action_variation visual_action_consistency eef_jerk`
+可在默认四项之外启用末端 Jerk；也可仅选择 `eef_jerk`。Bridge 使用完整 7 帧候选的
+`observation.state[:, :3]` 原始位置与真实时间戳，得到 4 个三阶差分估计，先取模再求均值。
+单位为 m/s³，按有效扫描候选池分位数反向归一化后融合。
+不等间隔等 Jerk 不可计算片段排除出图，并记录在选择目录 `excluded_clips.json`；
+底层输入校验继续报错。分阶段 build-graph/select/run 和 validate 应使用相同指标列表。
+完整计算、缓存及解释限制见 [Cocore Jerk 说明](../cocore/README.md#可选末端运动-jerk)。

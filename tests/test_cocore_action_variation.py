@@ -88,6 +88,8 @@ def test_reliability_is_geometric_mean_of_every_nonempty_metric_subset() -> None
         "progress": 0.216,
         "action_variation": 0.343,
         "non_dwell": 0.729,
+        "eef_jerk": 0.81,
+        "local_path_efficiency": 0.64,
         "visual_action_consistency": 0.512,
     }
     for size in range(1, len(RELIABILITY_METRICS) + 1):
@@ -100,6 +102,8 @@ def test_reliability_is_geometric_mean_of_every_nonempty_metric_subset() -> None
                 metrics,
                 min_reliability=0.01,
                 non_dwell=np.asarray([components["non_dwell"]], dtype=np.float32),
+                eef_jerk=np.asarray([components["eef_jerk"]], dtype=np.float32),
+                local_path_efficiency=np.asarray([components["local_path_efficiency"]]),
             )
             expected = np.prod([components[metric] for metric in metrics]) ** (1.0 / size)
 

@@ -12,6 +12,8 @@ import numpy as np
 
 from relcore.features.visual_encoder import VisualEncoder
 from relcore.schemas import ClipRecord
+from cocore.local_path_efficiency import compute_local_path_efficiency, resolve_path_config
+from cocore.eef_jerk import jerk_arrays
 from cocore.dwell import compute_dwell_ratio, resolve_dwell_config
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
 
@@ -356,6 +358,14 @@ class CocoreEncodedClips:
     dwell_timestamps: np.ndarray | None = None
     dwell_ratio: np.ndarray | None = None
     non_dwell: np.ndarray | None = None
+    eef_jerk_positions: np.ndarray | None = None
+    eef_jerk_timestamps: np.ndarray | None = None
+    eef_jerk_raw: np.ndarray | None = None
+    eef_jerk: np.ndarray | None = None
+    eef_jerk_valid: np.ndarray | None = None
+    eef_jerk_reason: np.ndarray | None = None
+    path_position_sequences: np.ndarray | None = None
+    local_path_efficiency: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -375,6 +385,14 @@ class CocoreEncodedArtifact:
     dwell_timestamps: np.ndarray | None = None
     dwell_ratio: np.ndarray | None = None
     non_dwell: np.ndarray | None = None
+    eef_jerk_positions: np.ndarray | None = None
+    eef_jerk_timestamps: np.ndarray | None = None
+    eef_jerk_raw: np.ndarray | None = None
+    eef_jerk: np.ndarray | None = None
+    eef_jerk_valid: np.ndarray | None = None
+    eef_jerk_reason: np.ndarray | None = None
+    path_position_sequences: np.ndarray | None = None
+    local_path_efficiency: np.ndarray | None = None
 
 
 def _records_by_id(records: list[EpisodeRecord]) -> dict[int, EpisodeRecord]:
@@ -419,10 +437,13 @@ def encode_cocore_dataset(
     progress_interval: int = 0,
     timing_callback: TimingCallback | None = None,
     dwell: Mapping[str, object] | None = None,
+    eef_jerk: bool = False,
+    local_path_efficiency: Mapping[str, object] | None = None,
 ) -> CocoreEncodedClips:
     """Encode Quality-style fragments and cache each usable episode's frames."""
 
     dwell = resolve_dwell_config(dwell)
+    path_settings = resolve_path_config(local_path_efficiency)
     geometry = resolve_temporal_geometry(profile)
     records = list(adapter.episodes())
     if max_episodes is not None:
@@ -475,6 +496,10 @@ def encode_cocore_dataset(
         cache_root.mkdir(parents=True, exist_ok=True)
         raw_visual: dict[tuple[int, int, int], np.ndarray] = {}
         half_visual_by_index: dict[int, np.ndarray] = {}
+        path_positions: dict[int, np.ndarray] = {}
+        path_scores: dict[int, float] = {}
+        jerk_positions: dict[int, np.ndarray] = {}
+        jerk_times: dict[int, np.ndarray] = {}
         dwell_states: dict[int, np.ndarray] = {}
         dwell_times: dict[int, np.ndarray] = {}
         dwell_scores: dict[int, float] = {}
@@ -543,6 +568,21 @@ def encode_cocore_dataset(
                     raise RuntimeError("VAC scores are missing for a candidate episode")
                 window = slice(clip.start_step, clip.end_step + 1)
                 visual = frame_features[window]
+                if path_settings is not None:
+                    positions = np.asarray(
+                        episode.observations["observation.state"][window, :3], dtype=np.float64
+                    )
+                    path_scores[clip_index] = compute_local_path_efficiency(
+                        positions, **path_settings
+                    )
+                    path_positions[clip_index] = positions
+                if eef_jerk:
+                    jerk_positions[clip_index] = np.asarray(
+                        episode.observations["observation.state"][window, :3], dtype=np.float64
+                    )
+                    jerk_times[clip_index] = np.asarray(
+                        episode.timestamps[window], dtype=np.float64
+                    )
                 if dwell is not None:
                     raw_state = np.asarray(
                         episode.observations["observation.state"][window], dtype=np.float64
@@ -670,6 +710,25 @@ def encode_cocore_dataset(
             dwell_timestamps=np.stack([dwell_times[i] for i in range(len(clips))])
             if dwell is not None
             else None,
+            path_position_sequences=np.stack([path_positions[i] for i in range(len(clips))])
+            if path_settings is not None
+            else None,
+            local_path_efficiency=np.asarray(
+                [path_scores[i] for i in range(len(clips))], dtype=np.float64
+            )
+            if path_settings is not None
+            else None,
             dwell_ratio=dwell_values,
             non_dwell=1.0 - dwell_values if dwell_values is not None else None,
+            **(
+                jerk_arrays(
+                    np.stack([jerk_positions[i] for i in range(len(clips))]),
+                    np.stack([jerk_times[i] for i in range(len(clips))]),
+                    quantile_low=quantile_low,
+                    quantile_high=quantile_high,
+                    epsilon=epsilon,
+                )
+                if eef_jerk
+                else {}
+            ),
         )

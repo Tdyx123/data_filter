@@ -88,8 +88,8 @@ w_half = w_r * w_d
 最多两个槽位，按权重降序、叶 ID 破平局；权重不归一、不截断，范围可到 1.5。
 
 可靠性目录为 `support`、`progress`、`action_variation`、
-`visual_action_consistency` 和 `non_dwell`，顶层 `reliability_metrics` 可选择其中任意
-1～5 个无重复指标，默认仅启用前四项；`non_dwell` 需要显式配置 `dwell` 阈值。输入顺序会按
+`visual_action_consistency`、`non_dwell`、`eef_jerk` 和 `local_path_efficiency`，
+顶层 `reliability_metrics` 可选择非空、无重复的指标子集，默认仅启用前四项；`non_dwell` 需要显式配置 `dwell` 阈值。输入顺序会按
 上述固定顺序规范化。`action_variation` 在完整 episode 的分位缩放动作上计算：逐步分数
 为当前与前一步动作的 L2 差乘 2，再加未来最多 5 步动作逐维总体方差的维度均值；首步
 差分为 0，未来少于 2 步时方差为 0。片段原始分数取最高 3 个逐步分数的均值，再使用
@@ -106,6 +106,47 @@ VAC_t = ||v_t - v_(t-1)||_2 / (||a_t - a_(t-1)||_2 + encoding.epsilon)
 `VAC_0` 复制第一个有效分数；片段原始分数同样取最高 3 个逐步分数的均值，再按全部
 候选的 `encoding.quantile_low/high` 缩放并截断到 `[0, 1]`。候选原始分数为常量时归零。
 高 VAC 表示相对于动作变化出现了更显著的视觉变化，因此保持“越高越重要”的方向。
+
+### 局部路径效率
+
+`local_path_efficiency` 衡量一个片段内末端的实际路径有多接近起终点直线。
+使用同一固定坐标系下、未归一化的 `observation.state[:, 0:3]`，对片段的所有
+L 个位置样本（L ≥ 2）计算：
+
+```text
+D_net  = ||p[L-1] - p[0]||₂
+D_path = sum(||p[t] - p[t-1]||₂, t=1,...,L-1)
+local_path_efficiency = D_net / D_path   if D_path > delta_path
+                        NaN             otherwise
+```
+
+分数在 `[0, 1]`，不进行分位数归一化，计算复杂度为 O(L)。例如净位移 0.20 m、
+累计路程 0.25 m 时得分为 0.80；这只是距离比，不表示任务完成率或动作价值。
+该项默认关闭；启用时必须显式指定有限正阈值 `delta_path`，单位与原始位置相同，
+应结合位置噪声和片段时长设定。以下阈值仅为配置示例：
+
+```yaml
+local_path_efficiency:
+  delta_path: 0.001
+reliability_metrics: [support, progress, action_variation, visual_action_consistency, local_path_efficiency]
+```
+
+也可用 `--reliability-metrics` 选择该项，但 YAML 中仍需配置阈值。只配置阈值、
+不把它加入 `reliability_metrics`，可仅输出诊断结果。
+静止和累计路程不超过阈值的片段不参与此项评分：融合时按每个片段的有效指标数
+计算几何平均；若只选了此项且无有效值，则可靠性采用中性值 1，不把静止记为零分。
+
+encode 保存 float64 的 `path_position_sequences.npy` 和 `local_path_efficiency.npy`，
+阈值、输入定义及计算版本进入缓存契约，并保存 SHA-256 校验。验证会从原始位置重算，
+并检查重叠片段的一致性。图节点及筛选明细包含 `local_path_efficiency`；无效值在
+NumPy 中为 NaN，在 JSON/Parquet 明细中为 `null`。`selection_report.json` 的
+`local_path_efficiency_summary` 分别记录全池和选中片段的有效分数均值、有效数及无效数。
+
+该项适合辅助比较同类、单阶段的点到点移动，不自动识别任务阶段。低分可能来自合理的
+绕障、圆弧开门或往复擦拭；闭环回到起点时可为 0。高分不代表目标正确、运动平滑，
+也不评价速度、停顿、Jerk 或末端旋转；两个不同位置样本的得分恒为 1。
+应统一采样和预处理方式：删除中间点可能缩短累计路程、抬高得分。
+这是此处采用的低成本几何代理指标，不是 S2I 原论文的质量评分公式。
 
 ### 低变化驻留比例
 
@@ -159,7 +200,8 @@ reliability = clip((product(selected_metrics)) ** (1 / metric_count),
                    quality.min_reliability, 1)
 ```
 
-融合取所选指标乘积的 n 次方根，再应用可靠性下限。该
+融合取所选有效指标乘积的 n 次方根，再应用可靠性下限；局部路径效率为 NaN 时，
+n 按片段减一，全部无效时采用中性值 1。该
 reliability 会同时进入
 coverage seed、关系收益、冗余惩罚和分支保留排序。
 初始集合为每个可达运动原语选择
@@ -417,3 +459,53 @@ python -m cocore validate \
 parquet/JSONL 导出最终 `prototype_indices`、`prototype_weights`、叶标签、动作标签与
 `half_action_labels`，不导出可分解的 action/distance 权重。所有图关系与选择目标直接
 消费绝对 `prototype_weights`，不对每行额外归一或截断。
+
+### 可选末端运动 Jerk
+
+在 `reliability_metrics` 中加入 `eef_jerk` 即启用计算和融合，无需模型或额外阈值：
+
+```yaml
+reliability_metrics: [support, progress, action_variation, visual_action_consistency, eef_jerk]
+```
+
+CLI 使用 `--reliability-metrics support progress action_variation visual_action_consistency eef_jerk`。
+默认四项不变，未选择 `eef_jerk` 时不计算，也不要求 Jerk 缓存。
+
+输入为固定坐标系下实际末端位置 `observation.state[:, :3]`（米）和原始时间戳（秒），
+不使用缩放后的 state 或动作指令。使用 float64，在每个片段内部计算：
+
+```text
+j_t = (p_t - 3*p_(t-1) + 3*p_(t-2) - p_(t-3)) / Δt³
+S_jerk = sum(||j_t||₂) / (L-3)
+```
+
+先取向量模长再求平均；原始 `eef_jerk_raw` 单位为 m/s³，非 `[0,1]` 比例。
+`Δt` 为相邻时间差中位数，所有时间差必须为正且满足 `rtol=1e-4, atol=1e-8` 的等间隔检查。
+片段短于四帧、重复时间、不等间隔或数值溢出时，分别记录 `too_short`、
+`non_increasing_time`、`non_uniform_time`、`overflow`。无效值在 NPY 中为 NaN、JSON 中为 null，
+不记为零。位置缺失、NaN/Inf 和适配器拒绝的时间戳仍报错；同时配置 dwell 时保留其校验。
+当前扫描器仅生成完整的 LIBERO 15 帧或 Bridge 7 帧候选，短 episode 继续按原规则跳过。
+
+融合分数使用扫描候选中 Jerk 有效片段的分位数，沿用 `encoding.quantile_low/high` 和 `epsilon`：
+
+```text
+eef_jerk = 1 - clip((eef_jerk_raw - q_low) / max(q_high - q_low, epsilon), 0, 1)
+```
+
+分位数跨度不超过 epsilon 时统一赋 1，表示当前池中不能区分。
+只有有效片段参与 Jerk 融合，最终入图条件为“有原型标签且 Jerk 有效”。过滤保留原始邻接关系，
+不跨被排除片段补 sequence 边。比例预算以入图候选数计算，空候选或预算超限报错。
+
+encode 新增 `eef_jerk_positions.npy`、`eef_jerk_timestamps.npy`、`eef_jerk_raw.npy`、
+`eef_jerk.npy`、`eef_jerk_valid.npy`、`eef_jerk_reason.npy`。缓存包含计算契约和 SHA-256，
+验证时检查原始缓存重叠一致性并重算数值、有效掩码及分数。graph 的
+`prototype_eligible_mask.npy` 保存原型资格，回放核验与 Jerk 掩码的交集。
+节点、all-clips 和 selected manifest 中记录原始值、融合值与状态。
+`excluded_clips.json` 按 sample_id 记录被排除候选及全部原因。
+报告分别记录 `excluded_unlabeled_clips`、`excluded_jerk_clips` 和并集 `excluded_clips`，
+前两项可能重叠，不能相加。`eef_jerk_summary` 汇总有效扫描池/选中片段的原始均值及无效原因计数。
+启用指标会改变 encode 及下游指纹，复用同一目录时需要 `--force` 重建。
+
+首版不平滑、不计算 RMS 或旋转 Jerk。三阶差分对位置噪声敏感；原始 Jerk 还受运动幅度和时长影响，
+同轨迹执行时间延长 k 倍会使 Jerk 缩小到 `1/k³`。归一化分数仅表示本次候选池的相对水平，
+不能据此跨任务统一比较；静止片段也可得到零 Jerk，应结合任务进展和交互事件判断数据价值。

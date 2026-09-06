@@ -2087,3 +2087,264 @@ def test_dwell_diagnostics_preserve_default_scores_and_selection(tmp_path):
     for before, after in zip(baseline_rows, diagnostic_rows, strict=True):
         assert "dwell_ratio" not in before
         assert {k: v for k, v in after.items() if k not in ("dwell_ratio", "non_dwell")} == before
+
+
+class IrregularJerkAdapter(CocorePipelineAdapter):
+    def iter_episodes(self, **kwargs):
+        for episode in super().iter_episodes(**kwargs):
+            episode.timestamps[25] += 0.02
+            yield episode
+
+
+def test_eef_jerk_filter_cache_and_replay(tmp_path):
+    register_dataset_adapter("cocore_jerk_irregular", IrregularJerkAdapter)
+    config = _config(tmp_path)
+    config["dataset"]["type"] = "cocore_jerk_irregular"
+    config["reliability_metrics"] = ["support", "eef_jerk"]
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    root = result.parent
+    valid = np.load(root / "encode/eef_jerk_valid.npy")
+    assert valid.any() and not valid.all()
+    indices = np.load(root / cocore_pipeline.GRAPH_DIRECTORY / "source_clip_indices.npy")
+    np.testing.assert_array_equal(indices, np.flatnonzero(valid))
+    report = json.loads((result / "selection_report.json").read_text())
+    assert report["excluded_unlabeled_clips"] == 0
+    assert report["excluded_jerk_clips"] == int((~valid).sum())
+    assert report["excluded_clips"] == int((~valid).sum())
+    assert report["eef_jerk_summary"]["invalid_clips"] == int((~valid).sum())
+    excluded = json.loads((result / "excluded_clips.json").read_text())
+    assert len(excluded) == int((~valid).sum())
+    assert all(r["eef_jerk_raw"] is None for r in excluded)
+    assert validate_output(result, config=config)["status"] == "valid"
+    assert run_pipeline(config, visual_encoder=FailingCocoreVisualEncoder()) == result
+    path = root / "encode/eef_jerk_raw.npy"
+    raw = np.load(path)
+    raw[valid] += 1
+    np.save(path, raw)
+    with pytest.raises(ValueError, match="eef_jerk"):
+        validate_output(result, config=config)
+
+
+@pytest.mark.parametrize("profile", ["libero", "bridge_v2"])
+@pytest.mark.parametrize("delta_path,expected", [(0.001, 1.0), (100.0, None)])
+def test_local_path_pipeline_cache_fusion_and_replay(tmp_path, profile, delta_path, expected):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["prototypes"]["profile"] = profile
+    config["local_path_efficiency"] = {"delta_path": delta_path}
+    config["reliability_metrics"] = ["local_path_efficiency"]
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    root = result.parent
+    scores = np.load(root / "encode" / "local_path_efficiency.npy")
+    if expected is None:
+        assert np.isnan(scores).all()
+    else:
+        np.testing.assert_allclose(scores, expected)
+    with np.load(root / cocore_pipeline.GRAPH_DIRECTORY / "nodes.npz") as nodes:
+        np.testing.assert_allclose(nodes["reliability"], 1.0)
+    rows = pq.read_table(result / "all_clips.parquet").to_pylist()
+    assert all(row["local_path_efficiency"] == expected for row in rows)
+    assert validate_output(result, config=config)["status"] == "valid"
+    encode_stage(config, visual_encoder=FailingCocoreVisualEncoder())
+    changed = copy.deepcopy(config)
+    changed["local_path_efficiency"]["delta_path"] *= 2
+    with pytest.raises(FileExistsError):
+        encode_stage(changed, visual_encoder=FailingCocoreVisualEncoder())
+    path = root / "encode" / "local_path_efficiency.npy"
+    scores[0] = 0.4
+    np.save(path, scores)
+    manifest_path = root / "encode" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["path_checksums"]["local_path_efficiency"] = cocore_pipeline.file_sha256(path)
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="local_path_efficiency"):
+        validate_output(result, config=config)
+
+
+class AllInvalidJerkAdapter(CocorePipelineAdapter):
+    def iter_episodes(self, **kwargs):
+        for episode in super().iter_episodes(**kwargs):
+            episode.timestamps[1::2] += 0.02
+            yield episode
+
+
+class MixedStopJerkAdapter(MixedStopCocorePipelineAdapter):
+    def iter_episodes(self, **kwargs):
+        for episode in super().iter_episodes(**kwargs):
+            episode.timestamps[25] += 0.02
+            yield episode
+
+
+@pytest.mark.parametrize("profile", ["libero", "bridge_v2"])
+def test_eef_jerk_only_and_dwell_compatibility(tmp_path, profile):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["prototypes"]["profile"] = profile
+    config["reliability_metrics"] = ["eef_jerk"]
+    config["dwell"] = dict(
+        position_speed_threshold=0.1, angular_speed_threshold=0.1, gripper_speed_threshold=0.1
+    )
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    with np.load(result.parent / cocore_pipeline.GRAPH_DIRECTORY / "nodes.npz") as nodes:
+        np.testing.assert_allclose(nodes["reliability"], np.clip(nodes["eef_jerk"], 0.05, 1))
+        assert "dwell_ratio" in nodes
+    assert validate_output(result)["status"] == "valid"
+
+
+def test_eef_jerk_exclusion_union_and_no_gap_edges(tmp_path):
+    register_dataset_adapter("cocore_jerk_mixed", MixedStopJerkAdapter)
+    config = _config(tmp_path, "sequence")
+    config["dataset"]["type"] = "cocore_jerk_mixed"
+    config["prototypes"]["use_stop_bucket"] = False
+    config["reliability_metrics"] = ["eef_jerk"]
+    config["selection"] = {"ratio": 0.5, "budget": None}
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    graph_root = result.parent / cocore_pipeline.GRAPH_DIRECTORY
+    valid = np.load(result.parent / "encode/eef_jerk_valid.npy")
+    prototype = np.load(graph_root / "prototype_eligible_mask.npy")
+    assert ((~valid) & (~prototype)).any()
+    indices = np.load(graph_root / "source_clip_indices.npy")
+    np.testing.assert_array_equal(indices, np.flatnonzero(valid & prototype))
+    with np.load(graph_root / "sequence_edges.npz") as edges:
+        # Original near-uniform candidates are adjacent by source index; no gap bridging.
+        assert np.all(indices[edges["target"]] - indices[edges["source"]] == 1)
+    report = json.loads((result / "selection_report.json").read_text())
+    assert report["excluded_unlabeled_clips"] == int((~prototype).sum())
+    assert report["excluded_jerk_clips"] == int((~valid).sum())
+    assert report["excluded_clips"] == int((~(valid & prototype)).sum())
+    assert report["selected_clips"] == int(np.floor(len(indices) * 0.5 + 0.5))
+    assert validate_output(result, config=config)["status"] == "valid"
+
+
+def test_eef_jerk_all_invalid_and_budget_overflow(tmp_path):
+    register_dataset_adapter("cocore_jerk_all_invalid", AllInvalidJerkAdapter)
+    config = _config(tmp_path)
+    config["dataset"]["type"] = "cocore_jerk_all_invalid"
+    config["reliability_metrics"] = ["eef_jerk"]
+    with pytest.raises(ValueError, match="no eligible candidate"):
+        run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    register_dataset_adapter("cocore_jerk_irregular", IrregularJerkAdapter)
+    config["dataset"]["type"] = "cocore_jerk_irregular"
+    config["selection"]["budget"] = 82
+    with pytest.raises(ValueError, match="budget"):
+        run_pipeline(config, output_dir=tmp_path / "budget", visual_encoder=CocoreVisualEncoder())
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["contract", "missing", "recomputed_raw", "exclusions", "node", "mask", "missing_mask"],
+)
+def test_eef_jerk_rejects_corrupt_artifacts(tmp_path, target):
+    from relcore.utils.io import file_sha256
+
+    register_dataset_adapter("cocore_jerk_irregular", IrregularJerkAdapter)
+    config = _config(tmp_path)
+    config["dataset"]["type"] = "cocore_jerk_irregular"
+    config["reliability_metrics"] = ["eef_jerk"]
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    encode = result.parent / "encode"
+    graph = result.parent / cocore_pipeline.GRAPH_DIRECTORY
+    if target == "contract":
+        path = result / "run_manifest.json"
+        data = json.loads(path.read_text())
+        data["eef_jerk"]["dt"] = "fake"
+        path.write_text(json.dumps(data))
+    elif target == "missing":
+        (encode / "eef_jerk_timestamps.npy").unlink()
+    elif target == "recomputed_raw":
+        path = encode / "eef_jerk_raw.npy"
+        raw = np.load(path)
+        raw[np.isfinite(raw)] += 1
+        np.save(path, raw)
+        manifest = encode / "manifest.json"
+        data = json.loads(manifest.read_text())
+        data["eef_jerk_checksums"]["eef_jerk_raw"] = file_sha256(path)
+        manifest.write_text(json.dumps(data))
+    elif target == "exclusions":
+        (result / "excluded_clips.json").write_text("[]")
+    elif target == "missing_mask":
+        (graph / "prototype_eligible_mask.npy").unlink()
+    elif target == "mask":
+        path = graph / "prototype_eligible_mask.npy"
+        mask = np.load(path)
+        mask[:] = False
+        np.save(path, mask)
+    else:
+        path = graph / "nodes.npz"
+        with np.load(path) as nodes:
+            arrays = {name: nodes[name] for name in nodes.files}
+        arrays["eef_jerk_raw"] += 1
+        np.savez(path, **arrays)
+    with pytest.raises(ValueError):
+        validate_output(result, config=config)
+
+
+@pytest.mark.parametrize(
+    "target", ["raw_positions", "graph", "all_rows", "selected_rows", "report"]
+)
+def test_local_path_diagnostics_and_tamper_detection(tmp_path, target):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["local_path_efficiency"] = {"delta_path": 100.0}
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    rows = pq.read_table(result / "all_clips.parquet").to_pylist()
+    report_path = result / "selection_report.json"
+    report = json.loads(report_path.read_text())
+    assert report["local_path_efficiency_summary"]["all_mean"] is None
+    assert report["local_path_efficiency_summary"]["all_invalid_count"] == len(rows)
+    assert "local_path_efficiency" not in report["reliability_metrics"]
+    validate_output(result, config=config)
+    if target == "raw_positions":
+        path = result.parent / "encode" / "path_position_sequences.npy"
+        values = np.load(path)
+        values.flat[0] += 0.1
+        np.save(path, values)
+    elif target == "graph":
+        path = result.parent / cocore_pipeline.GRAPH_DIRECTORY / "nodes.npz"
+        with np.load(path) as nodes:
+            values = dict(nodes)
+        values["local_path_efficiency"][0] = 0.5
+        np.savez(path, **values)
+    elif target == "all_rows":
+        rows[0]["local_path_efficiency"] = 0.5
+        pq.write_table(pa.Table.from_pylist(rows), result / "all_clips.parquet")
+    elif target == "selected_rows":
+        path = result / "selected_manifest.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[0]["local_path_efficiency"] = 0.5
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    else:
+        report["local_path_efficiency_summary"]["all_mean"] = 0.5
+        report_path.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="local_path_efficiency"):
+        validate_output(result, config=config)
+
+
+@pytest.mark.parametrize("metrics", [None, ["support", "eef_jerk"]])
+def test_local_path_diagnostics_preserve_default_selection(tmp_path, metrics):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    if metrics is not None:
+        config["reliability_metrics"] = metrics
+    baseline = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    before = pq.read_table(baseline / "all_clips.parquet").to_pylist()
+    config["output"]["directory"] = str(tmp_path / "diagnostic")
+    config["local_path_efficiency"] = {"delta_path": 100.0}
+    diagnostic = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    after = pq.read_table(diagnostic / "all_clips.parquet").to_pylist()
+    assert [
+        {k: v for k, v in row.items() if k != "local_path_efficiency"} for row in after
+    ] == before
+
+
+def test_eef_jerk_with_local_path_efficiency(tmp_path):
+    register_dataset_adapter("cocore_jerk_irregular", IrregularJerkAdapter)
+    config = _config(tmp_path)
+    config["dataset"]["type"] = "cocore_jerk_irregular"
+    config["reliability_metrics"] = ["eef_jerk", "local_path_efficiency"]
+    config["local_path_efficiency"] = {"delta_path": 100.0}
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    with np.load(result.parent / cocore_pipeline.GRAPH_DIRECTORY / "nodes.npz") as nodes:
+        assert np.isnan(nodes["local_path_efficiency"]).all()
+        np.testing.assert_allclose(nodes["reliability"], np.clip(nodes["eef_jerk"], 0.05, 1))
+    assert validate_output(result, config=config)["status"] == "valid"

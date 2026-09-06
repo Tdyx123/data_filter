@@ -76,6 +76,7 @@ def test_config_accepts_every_nonempty_reliability_subset(metrics: list[str]) ->
         {
             **_objective(),
             "reliability_metrics": metrics,
+            "local_path_efficiency": {"delta_path": 0.001},
             "dwell": {
                 "position_speed_threshold": 0.1,
                 "angular_speed_threshold": 0.1,
@@ -104,6 +105,7 @@ def test_config_rejects_unsupported_reliability_metrics(metrics: object) -> None
             {
                 **_objective(),
                 "reliability_metrics": metrics,
+            "local_path_efficiency": {"delta_path": 0.001},
             }
         )
 

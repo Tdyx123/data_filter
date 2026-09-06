@@ -14,6 +14,7 @@ import yaml
 from relcore.config import DEFAULT_CONFIG as RELCORE_DEFAULT_CONFIG
 from relcore.config import resolve_config as resolve_relcore_config
 
+from cocore.local_path_efficiency import resolve_path_config
 from cocore.dwell import resolve_dwell_config
 from cocore.temporal import resolve_temporal_geometry
 from cocore.action_variation import DEFAULT_RELIABILITY_METRICS, normalize_reliability_metrics
@@ -171,6 +172,13 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
         resolved.pop("dwell", None)
     if "non_dwell" in reliability_metrics and dwell is None:
         raise ValueError("non_dwell requires explicit dwell configuration")
+    path_settings = resolve_path_config(resolved.get("local_path_efficiency"))
+    if path_settings is not None:
+        resolved["local_path_efficiency"] = path_settings
+    else:
+        resolved.pop("local_path_efficiency", None)
+    if "local_path_efficiency" in reliability_metrics and path_settings is None:
+        raise ValueError("local_path_efficiency requires explicit delta_path configuration")
     relation = str(resolved["objective"]["relation"])
     if relation not in {"sequence", "cooccurrence"}:
         raise ValueError("objective.relation must be sequence or cooccurrence")

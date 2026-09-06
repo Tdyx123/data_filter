@@ -20,7 +20,12 @@ DEFAULT_RELIABILITY_METRICS = (
     "visual_action_consistency",
 )
 
-RELIABILITY_METRICS = (*DEFAULT_RELIABILITY_METRICS, "non_dwell")
+RELIABILITY_METRICS = (
+    *DEFAULT_RELIABILITY_METRICS,
+    "non_dwell",
+    "eef_jerk",
+    "local_path_efficiency",
+)
 
 
 def compute_step_action_variation(actions: np.ndarray) -> np.ndarray:
@@ -116,6 +121,8 @@ def fuse_reliability(
     *,
     min_reliability: float,
     non_dwell: np.ndarray | None = None,
+    local_path_efficiency: np.ndarray | None = None,
+    eef_jerk: np.ndarray | None = None,
 ) -> np.ndarray:
     """Fuse the selected Cocore reliability components by geometric mean."""
 
@@ -132,6 +139,10 @@ def fuse_reliability(
         components["non_dwell"] = np.asarray(non_dwell, dtype=np.float32)
     if "non_dwell" in metrics and non_dwell is None:
         raise ValueError("non_dwell reliability requires dwell configuration and values")
+    if eef_jerk is not None:
+        components["eef_jerk"] = np.asarray(eef_jerk, dtype=np.float32)
+    if "eef_jerk" in metrics and eef_jerk is None:
+        raise ValueError("eef_jerk reliability requires computed values")
     shape = components["support"].shape
     if (
         len(shape) != 1
@@ -144,10 +155,21 @@ def fuse_reliability(
     minimum = float(min_reliability)
     if not math.isfinite(minimum) or not 0.0 <= minimum <= 1.0:
         raise ValueError("minimum reliability must be finite and in [0, 1]")
+    if local_path_efficiency is not None:
+        path = np.asarray(local_path_efficiency, dtype=np.float64)
+        if path.shape != shape or np.any(np.isinf(path)) or np.any((path < 0) | (path > 1)):
+            raise ValueError("local_path_efficiency must be a matching [0, 1] or NaN vector")
+        components["local_path_efficiency"] = path
+    elif "local_path_efficiency" in enabled:
+        raise ValueError("local_path_efficiency requires configuration and values")
+    count = np.zeros(shape, dtype=np.int64)
     product = np.ones(shape, dtype=np.float64)
     for metric in enabled:
-        product *= components[metric]
-    reliability = np.power(product, 1.0 / len(enabled))
+        values = components[metric]
+        valid = ~np.isnan(values)
+        product *= np.where(valid, values, 1.0)
+        count += valid
+    reliability = np.power(product, 1.0 / np.maximum(count, 1))
     return np.clip(reliability, minimum, 1.0).astype(np.float32)
 
 

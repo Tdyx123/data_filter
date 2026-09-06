@@ -38,6 +38,20 @@ from relcore.utils.io import (
 from relcore.utils.random import seed_everything
 
 from cocore import __version__
+from cocore.eef_jerk import (
+    JERK_FIELDS,
+    JERK_CACHE_FIELDS,
+    jerk_contract,
+    save_jerk_cache,
+    validate_jerk_cache,
+    jerk_summary,
+)
+from cocore.local_path_efficiency import (
+    PATH_CACHE_FIELDS,
+    compute_local_path_efficiency,
+    path_contract,
+    path_summary,
+)
 from cocore.dwell import (
     DWELL_FIELDS,
     DWELL_CACHE_FIELDS,
@@ -380,10 +394,19 @@ def _save_cocore_encoded(
     action_variation_metadata: Mapping[str, object],
     visual_action_consistency_metadata: Mapping[str, object],
     dwell_metadata: Mapping[str, object] | None,
+    path_metadata: Mapping[str, object] | None,
+    jerk_metadata: Mapping[str, object] | None = None,
     fingerprint: str,
     runtime_seconds: float,
 ) -> None:
     geometry = resolve_temporal_geometry(profile)
+    jerk_checksums = save_jerk_cache(temporary, encoded) if jerk_metadata is not None else {}
+    path_checksums = {}
+    if path_metadata is not None:
+        for field in PATH_CACHE_FIELDS:
+            path = temporary / f"{field}.npy"
+            np.save(path, getattr(encoded, field))
+            path_checksums[field] = file_sha256(path)
     dwell_checksums = {}
     if dwell_metadata is not None:
         for field in DWELL_CACHE_FIELDS:
@@ -476,7 +499,11 @@ def _save_cocore_encoded(
             "action_variation": dict(action_variation_metadata),
             "visual_action_consistency": dict(visual_action_consistency_metadata),
             "dwell": dwell_metadata,
+            **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+            **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
             "dwell_checksums": dwell_checksums,
+            "path_checksums": path_checksums,
+            **({"eef_jerk_checksums": jerk_checksums} if jerk_metadata is not None else {}),
             "counts": {
                 "candidate_fragments": candidate_count,
                 "pca_fit_fragments": encoded.pca_fit_fragment_count,
@@ -486,6 +513,57 @@ def _save_cocore_encoded(
             "runtime_seconds": runtime_seconds,
         },
     )
+
+
+def _validate_path_cache(
+    root: Path, clips: list[ClipRecord], config: Mapping[str, Any]
+) -> dict[str, np.ndarray]:
+    contract = path_contract(config)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("local_path_efficiency") != contract:
+        raise ValueError("local_path_efficiency cache contract does not match configuration")
+    if contract is None:
+        if any((root / f"{field}.npy").exists() for field in PATH_CACHE_FIELDS):
+            raise ValueError("unexpected local_path_efficiency cache")
+        return {}
+    checksums = manifest.get("path_checksums", {})
+    arrays = {}
+    for field in PATH_CACHE_FIELDS:
+        path = root / f"{field}.npy"
+        try:
+            if checksums.get(field) != file_sha256(path):
+                raise ValueError("local_path_efficiency cache checksum mismatch")
+            arrays[field] = np.load(path, allow_pickle=False)
+        except (OSError, ValueError) as error:
+            raise ValueError(
+                f"local_path_efficiency cache {field} is missing or invalid"
+            ) from error
+    positions = arrays["path_position_sequences"]
+    scores = arrays["local_path_efficiency"]
+    if (
+        positions.ndim != 3
+        or positions.shape[0] != len(clips)
+        or positions.shape[2] != 3
+        or positions.dtype != np.float64
+        or scores.shape != (len(clips),)
+    ):
+        raise ValueError("local_path_efficiency cache shape or dtype is invalid")
+    overlap = {}
+    expected = []
+    for index, clip in enumerate(clips):
+        if len(positions[index]) != clip.length:
+            raise ValueError("local_path_efficiency cache clip length mismatch")
+        expected.append(
+            compute_local_path_efficiency(positions[index], delta_path=contract["delta_path"])
+        )
+        for offset, position in enumerate(positions[index]):
+            key = (clip.episode_id, clip.start_step + offset)
+            if key in overlap and not np.array_equal(overlap[key], position):
+                raise ValueError("local_path_efficiency cache has inconsistent overlap")
+            overlap[key] = position
+    if not np.allclose(scores, expected, rtol=1e-7, atol=1e-8, equal_nan=True):
+        raise ValueError("local_path_efficiency cache does not match raw positions")
+    return arrays
 
 
 def _validate_dwell_cache(
@@ -817,6 +895,8 @@ def encode_stage(
     action_variation_metadata = _action_variation_metadata(resolved)
     visual_action_consistency_metadata = _visual_action_consistency_metadata(resolved)
     dwell_metadata = dwell_contract(resolved)
+    path_metadata = path_contract(resolved)
+    jerk_metadata = jerk_contract(resolved)
     model_sha256 = (
         directory_sha256(str(visual_config["model"]))
         if visual_config["encoder"] == "clip"
@@ -843,6 +923,8 @@ def encode_stage(
             "action_variation": action_variation_metadata,
             "visual_action_consistency": visual_action_consistency_metadata,
             "dwell": dwell_metadata,
+            **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+            **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
             "visual_model_sha256": model_sha256,
         }
     )
@@ -863,6 +945,8 @@ def encode_stage(
             seed=int(resolved["seed"]),
             frame_cache_dir=temporary / "frame_embeddings",
             dwell=resolved.get("dwell"),
+            local_path_efficiency=resolved.get("local_path_efficiency"),
+            eef_jerk=jerk_metadata is not None,
             num_workers=int(resolved["runtime"].get("num_workers", 0)),
             max_episodes=resolved["runtime"].get("max_episodes"),
             progress_interval=100,
@@ -877,6 +961,8 @@ def encode_stage(
             action_variation_metadata=action_variation_metadata,
             visual_action_consistency_metadata=visual_action_consistency_metadata,
             dwell_metadata=dwell_metadata,
+            path_metadata=path_metadata,
+            jerk_metadata=jerk_metadata,
             fingerprint=fingerprint,
             runtime_seconds=time.perf_counter() - started,
         )
@@ -895,6 +981,10 @@ def encode_stage(
         "visual_pca.npz",
         "frame_embeddings_index.json",
     )
+    if jerk_metadata is not None:
+        required += tuple(f"{field}.npy" for field in JERK_CACHE_FIELDS)
+    if path_metadata is not None:
+        required += tuple(f"{field}.npy" for field in PATH_CACHE_FIELDS)
     if dwell_metadata is not None:
         required += tuple(f"{field}.npy" for field in DWELL_CACHE_FIELDS)
     max_episodes_value = resolved["runtime"].get("max_episodes")
@@ -940,7 +1030,9 @@ def encode_stage(
         expected_episodes=expected_frame_episodes,
     )
     _validate_visual_half_embedding_cache(destination, clips, profile=profile)
+    path_arrays = _validate_path_cache(destination, clips, resolved)
     dwell_arrays = _validate_dwell_cache(destination, clips, resolved)
+    jerk_values = validate_jerk_cache(destination, clips, resolved)
     return (
         root,
         adapter,
@@ -959,6 +1051,8 @@ def encode_stage(
             visual_progress=np.load(destination / "visual_progress.npy"),
             fingerprint=fingerprint,
             **dwell_arrays,
+            **path_arrays,
+            **jerk_values,
         ),
     )
 
@@ -998,6 +1092,8 @@ def graph_stage(
     action_variation_metadata = _action_variation_metadata(resolved)
     visual_action_consistency_metadata = _visual_action_consistency_metadata(resolved)
     dwell_metadata = dwell_contract(resolved)
+    path_metadata = path_contract(resolved)
+    jerk_metadata = jerk_contract(resolved)
     prototype_fingerprint_config = {
         key: prototype_config[key]
         for key in ("method", "profile", "batch_size", "max_iter", "tol", "use_stop_bucket")
@@ -1018,6 +1114,8 @@ def graph_stage(
         "action_variation": action_variation_metadata,
         "visual_action_consistency": visual_action_consistency_metadata,
         "dwell": dwell_metadata,
+        **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+        **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
         "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
         "prototype_strategy": PROTOTYPE_STRATEGY,
         "sequence_adjacency": SEQUENCE_ADJACENCY,
@@ -1044,13 +1142,25 @@ def graph_stage(
                 min_reliability=float(quality_config["min_reliability"]),
                 reliability_metrics=("support", "progress"),
             )
-            reliability_values = fuse_reliability(
-                reliability.support,
-                reliability.progress,
-                encoded.action_variation,
-                encoded.visual_action_consistency,
+            jerk_valid = (
+                encoded.eef_jerk_valid
+                if jerk_metadata is not None
+                else np.ones(len(encoded.clips), dtype=bool)
+            )
+            if not jerk_valid.any():
+                raise ValueError("no eligible candidate with computable eef_jerk remains")
+            reliability_values = np.zeros(len(encoded.clips), dtype=np.float32)
+            reliability_values[jerk_valid] = fuse_reliability(
+                reliability.support[jerk_valid],
+                reliability.progress[jerk_valid],
+                encoded.action_variation[jerk_valid],
+                encoded.visual_action_consistency[jerk_valid],
                 reliability_metrics,
-                non_dwell=encoded.non_dwell,
+                local_path_efficiency=encoded.local_path_efficiency[jerk_valid]
+                if encoded.local_path_efficiency is not None
+                else None,
+                non_dwell=encoded.non_dwell[jerk_valid] if encoded.non_dwell is not None else None,
+                eef_jerk=encoded.eef_jerk[jerk_valid] if jerk_metadata is not None else None,
                 min_reliability=float(quality_config["min_reliability"]),
             )
         with timed_step("graph.prototypes", emit_completed_timing):
@@ -1072,7 +1182,7 @@ def graph_stage(
                 profile=prototype_profile,
                 timing_callback=emit_completed_timing,
             )
-        source_clip_indices = np.flatnonzero(hierarchy.eligible_mask).astype(np.int64)
+        source_clip_indices = np.flatnonzero(hierarchy.eligible_mask & jerk_valid).astype(np.int64)
         if len(source_clip_indices) == 0:
             raise ValueError("no eligible candidate with a non-stop action label remains")
         graph_config = resolved["graph"]
@@ -1091,11 +1201,21 @@ def graph_stage(
         np.savez(
             temporary / "nodes.npz",
             **(
+                {"local_path_efficiency": encoded.local_path_efficiency[source_clip_indices]}
+                if encoded.local_path_efficiency is not None
+                else {}
+            ),
+            **(
                 {field: getattr(encoded, field)[source_clip_indices] for field in DWELL_FIELDS}
                 if encoded.dwell_ratio is not None
                 else {}
             ),
             task_indices=graph.task_indices,
+            **(
+                {field: getattr(encoded, field)[source_clip_indices] for field in JERK_FIELDS}
+                if jerk_metadata is not None
+                else {}
+            ),
             reliability=graph.reliability,
             prototype_indices=graph.prototype_indices,
             prototype_weights=graph.prototype_weights,
@@ -1110,6 +1230,8 @@ def graph_stage(
             smoothness=reliability.smoothness[source_clip_indices],
             noop_ratio=reliability.noop_ratio[source_clip_indices],
         )
+        if jerk_metadata is not None:
+            np.save(temporary / "prototype_eligible_mask.npy", hierarchy.eligible_mask)
         np.save(temporary / "source_clip_indices.npy", source_clip_indices)
         assert hierarchy.prototypes.centers is not None
         np.save(temporary / "prototype_centers.npy", hierarchy.prototypes.centers)
@@ -1136,6 +1258,8 @@ def graph_stage(
                 "action_variation": action_variation_metadata,
                 "visual_action_consistency": visual_action_consistency_metadata,
                 "dwell": dwell_metadata,
+                **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+                **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
                 "prototype_method": "motion_primitives",
                 "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
                 "prototype_strategy": PROTOTYPE_STRATEGY,
@@ -1151,7 +1275,15 @@ def graph_stage(
                 "sequence_adjacency": SEQUENCE_ADJACENCY,
                 "nodes": len(graph.sample_ids),
                 "scanned_candidate_nodes": len(encoded.clips),
-                "excluded_unlabeled_nodes": len(encoded.clips) - len(graph.sample_ids),
+                "excluded_unlabeled_nodes": int((~hierarchy.eligible_mask).sum()),
+                **(
+                    {
+                        "excluded_jerk_nodes": int((~jerk_valid).sum()),
+                        "excluded_nodes": len(encoded.clips) - len(graph.sample_ids),
+                    }
+                    if jerk_metadata is not None
+                    else {}
+                ),
                 "sequence_edges": len(graph.sequence_edges.source),
                 "similarity_edges": len(graph.similarity_edges.source),
                 "runtime_seconds": time.perf_counter() - started,
@@ -1172,7 +1304,8 @@ def graph_stage(
             "similarity_edges.npz",
             "transition_matrix.npz",
             "cooccurrence_matrix.npz",
-        ),
+        )
+        + (("prototype_eligible_mask.npy",) if jerk_metadata is not None else ()),
         force=force,
         resume=bool(resolved["runtime"].get("resume", True)),
         build=build,
@@ -1599,7 +1732,14 @@ def _validate_hierarchical_graph_artifacts(
         raise ValueError("hierarchical prototype replay produced no centers")
     if payload != replay.catalog.to_dict():
         raise ValueError("hierarchical prototype catalog does not match prototype replay")
-    expected_source_indices = np.flatnonzero(replay.eligible_mask).astype(np.int64)
+    replay_eligible = replay.eligible_mask.copy()
+    if jerk_contract(resolved) is not None:
+        jerk_values = validate_jerk_cache(root / "encode", clips, resolved)
+        saved_eligible = _load_jerk_prototype_mask(root, len(clips))
+        if not np.array_equal(saved_eligible, replay_eligible):
+            raise ValueError("eef_jerk prototype eligibility mask does not match replay")
+        replay_eligible &= jerk_values["eef_jerk_valid"]
+    expected_source_indices = np.flatnonzero(replay_eligible).astype(np.int64)
     if not np.array_equal(source_clip_indices, expected_source_indices):
         raise ValueError("hierarchical source clip indices do not match prototype replay")
     if not np.array_equal(
@@ -1855,6 +1995,16 @@ def _selection_rows(
                     "visual_action_consistency": float(nodes["visual_action_consistency"][index]),
                 }
             )
+        if "eef_jerk" in nodes:
+            row.update(
+                eef_jerk_raw=float(nodes["eef_jerk_raw"][index]),
+                eef_jerk=float(nodes["eef_jerk"][index]),
+                eef_jerk_valid=bool(nodes["eef_jerk_valid"][index]),
+                eef_jerk_reason=str(nodes["eef_jerk_reason"][index]),
+            )
+        if "local_path_efficiency" in nodes:
+            value = float(nodes["local_path_efficiency"][index])
+            row["local_path_efficiency"] = value if np.isfinite(value) else None
         if "dwell_ratio" in nodes:
             row.update({field: float(nodes[field][index]) for field in DWELL_FIELDS})
         all_rows.append(row)
@@ -1866,6 +2016,40 @@ def _selection_rows(
         row["marginal_gain"] = row["selection_score_delta"]
         selected_rows.append(row)
     return selected_rows, all_rows
+
+
+def _load_jerk_prototype_mask(root: Path, candidate_count: int) -> np.ndarray:
+    try:
+        mask = np.load(root / GRAPH_DIRECTORY / "prototype_eligible_mask.npy", allow_pickle=False)
+    except (OSError, ValueError) as error:
+        raise ValueError("eef_jerk prototype eligibility mask missing or invalid") from error
+    if mask.shape != (candidate_count,) or mask.dtype != np.bool_:
+        raise ValueError("eef_jerk prototype eligibility mask shape or dtype mismatch")
+    return mask
+
+
+def _jerk_excluded_rows(root: Path, values: Mapping[str, np.ndarray]) -> list[dict[str, Any]]:
+    clips = _load_clips(root / "scan" / "clips.parquet")
+    prototype_valid = _load_jerk_prototype_mask(root, len(clips))
+    rows = []
+    for i, clip in enumerate(clips):
+        valid = bool(values["eef_jerk_valid"][i])
+        if valid and prototype_valid[i]:
+            continue
+        reasons = [] if prototype_valid[i] else ["unlabeled"]
+        if not valid:
+            reasons.append("eef_jerk:" + str(values["eef_jerk_reason"][i]))
+        rows.append(
+            {
+                "sample_id": clip.sample_id,
+                "reasons": reasons,
+                "eef_jerk_valid": valid,
+                "eef_jerk_reason": str(values["eef_jerk_reason"][i]),
+                "eef_jerk_raw": float(values["eef_jerk_raw"][i]) if valid else None,
+                "eef_jerk": float(values["eef_jerk"][i]) if valid else None,
+            }
+        )
+    return sorted(rows, key=lambda row: row["sample_id"])
 
 
 def select_stage(
@@ -1895,6 +2079,8 @@ def select_stage(
     action_variation_metadata = _action_variation_metadata(resolved)
     visual_action_consistency_metadata = _visual_action_consistency_metadata(resolved)
     dwell_metadata = dwell_contract(resolved)
+    path_metadata = path_contract(resolved)
+    jerk_metadata = jerk_contract(resolved)
     fingerprint_payload = {
         "producer": "cocore",
         "version": __version__,
@@ -1907,6 +2093,8 @@ def select_stage(
         "action_variation": action_variation_metadata,
         "visual_action_consistency": visual_action_consistency_metadata,
         "dwell": dwell_metadata,
+        **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+        **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
         "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
         "prototype_strategy": PROTOTYPE_STRATEGY,
         "prototype_profile": str(resolved["prototypes"]["profile"]),
@@ -1980,7 +2168,9 @@ def select_stage(
             "number_of_clips": len(clips),
             "number_of_scanned_clips": scanned_clip_count,
             "eligible_clips": len(clips),
-            "excluded_unlabeled_clips": scanned_clip_count - len(clips),
+            "excluded_unlabeled_clips": json.loads(
+                (root / GRAPH_DIRECTORY / "manifest.json").read_text()
+            )["excluded_unlabeled_nodes"],
             "selected_clips": len(result.selected_indices),
             "selection_ratio": len(result.selected_indices) / len(clips),
             "configured_selection_ratio": ratio,
@@ -1988,6 +2178,8 @@ def select_stage(
             "action_variation": action_variation_metadata,
             "visual_action_consistency": visual_action_consistency_metadata,
             "dwell": dwell_metadata,
+            **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+            **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
             "prototype_method": "motion_primitives",
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
             "prototype_strategy": PROTOTYPE_STRATEGY,
@@ -2013,6 +2205,18 @@ def select_stage(
             "skipped_short_episodes": scan_manifest.get("skipped_short_episodes", []),
             "runtime_seconds": {"select": time.perf_counter() - started},
         }
+        if jerk_metadata is not None:
+            jerk_values = validate_jerk_cache(
+                root / "encode", _load_clips(root / "scan" / "clips.parquet"), resolved
+            )
+            report["eef_jerk_summary"] = jerk_summary(
+                jerk_values["eef_jerk_raw"], jerk_values["eef_jerk_reason"], selected_rows
+            )
+            report["excluded_jerk_clips"] = int((~jerk_values["eef_jerk_valid"]).sum())
+            report["excluded_clips"] = scanned_clip_count - len(clips)
+            write_json(temporary / "excluded_clips.json", _jerk_excluded_rows(root, jerk_values))
+        if path_metadata is not None:
+            report["local_path_efficiency_summary"] = path_summary(all_rows, selected_rows)
         if dwell_metadata is not None:
             report["dwell_summary"] = dwell_summary(all_rows, selected_rows)
         report["branch_search"] = {
@@ -2056,6 +2260,8 @@ def select_stage(
                 "action_variation": action_variation_metadata,
                 "visual_action_consistency": visual_action_consistency_metadata,
                 "dwell": dwell_metadata,
+                **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+                **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
                 "algorithm": algorithm,
                 **_selection_schema_fields(),
                 "prototype_method": "motion_primitives",
@@ -2075,6 +2281,8 @@ def select_stage(
         "all_clips.parquet",
         "selection_report.json",
     )
+    if jerk_metadata is not None:
+        selection_required += ("excluded_clips.json",)
     upgrade_legacy_selection_cache = _matches_legacy_selection_cache(
         destination,
         required=selection_required,
@@ -2124,6 +2332,8 @@ def select_stage(
             "action_variation": action_variation_metadata,
             "visual_action_consistency": visual_action_consistency_metadata,
             "dwell": dwell_metadata,
+            **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+            **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
             "prototype_method": "motion_primitives",
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
             "prototype_strategy": PROTOTYPE_STRATEGY,
@@ -2352,15 +2562,6 @@ def validate_output(
         raise ValueError("cocore stage window policy is incompatible")
     scan_clips = _load_clips(root / "scan" / "clips.parquet")
     source_clip_indices = _load_source_clip_indices(root / GRAPH_DIRECTORY, len(scan_clips))
-    graph_count_contract = {
-        "nodes": len(source_clip_indices),
-        "scanned_candidate_nodes": len(scan_clips),
-        "excluded_unlabeled_nodes": len(scan_clips) - len(source_clip_indices),
-    }
-    if any(
-        stage_manifests["graph"].get(name) != value for name, value in graph_count_contract.items()
-    ):
-        raise ValueError("graph manifest candidate counts do not match source clip indices")
     episode_rows = pq.read_table(root / "scan" / "episodes.parquet").to_pylist()
     expected_clips = build_clip_records(
         [
@@ -2396,11 +2597,42 @@ def validate_output(
     else:
         validation_config = config
     replay_resolved = resolve_config(validation_config)
+    expected_jerk = validate_jerk_cache(root / "encode", scan_clips, replay_resolved)
+    jerk_prototype_mask = (
+        _load_jerk_prototype_mask(root, len(scan_clips)) if expected_jerk else None
+    )
+    graph_count_contract = {
+        "nodes": len(source_clip_indices),
+        "scanned_candidate_nodes": len(scan_clips),
+        "excluded_unlabeled_nodes": int((~jerk_prototype_mask).sum())
+        if expected_jerk
+        else len(scan_clips) - len(source_clip_indices),
+        **(
+            {
+                "excluded_jerk_nodes": int((~expected_jerk["eef_jerk_valid"]).sum()),
+                "excluded_nodes": len(scan_clips) - len(source_clip_indices),
+            }
+            if expected_jerk
+            else {}
+        ),
+    }
+    if any(
+        stage_manifests["graph"].get(name) != value for name, value in graph_count_contract.items()
+    ):
+        raise ValueError("graph manifest candidate counts do not match source clip indices")
     expected_reliability_metrics = list(replay_resolved["reliability_metrics"])
     if run_reliability_metrics != expected_reliability_metrics:
         raise ValueError("cocore reliability metrics configuration does not match output")
+    expected_path = _validate_path_cache(root / "encode", scan_clips, replay_resolved)
+    expected_path_metadata = path_contract(replay_resolved)
+    for metadata in (run_manifest, stage_manifests["encode"], graph_manifest):
+        if metadata.get("local_path_efficiency") != expected_path_metadata:
+            raise ValueError("local_path_efficiency contract does not match output")
     expected_dwell = _validate_dwell_cache(root / "encode", scan_clips, replay_resolved)
     expected_dwell_metadata = dwell_contract(replay_resolved)
+    for metadata in (run_manifest, stage_manifests["encode"], graph_manifest):
+        if metadata.get("eef_jerk") != jerk_contract(replay_resolved):
+            raise ValueError("eef_jerk contract does not match output")
     for metadata in (run_manifest, stage_manifests["encode"], graph_manifest):
         if metadata.get("dwell") != expected_dwell_metadata:
             raise ValueError("dwell contract does not match output")
@@ -2482,6 +2714,12 @@ def validate_output(
     ]
     all_rows = pq.read_table(required["all"]).to_pylist()
     report = json.loads(required["report"].read_text(encoding="utf-8"))
+    for metadata in (select_manifest, report):
+        if metadata.get("local_path_efficiency") != expected_path_metadata:
+            raise ValueError("local_path_efficiency contract does not match selection output")
+    for metadata in (select_manifest, report):
+        if metadata.get("eef_jerk") != jerk_contract(replay_resolved):
+            raise ValueError("eef_jerk contract does not match selection output")
     if any(
         metadata.get("dwell") != expected_dwell_metadata for metadata in (select_manifest, report)
     ):
@@ -2538,7 +2776,17 @@ def validate_output(
         "number_of_clips": len(eligible_clips),
         "number_of_scanned_clips": len(scan_clips),
         "eligible_clips": len(eligible_clips),
-        "excluded_unlabeled_clips": len(scan_clips) - len(eligible_clips),
+        "excluded_unlabeled_clips": int((~jerk_prototype_mask).sum())
+        if expected_jerk
+        else len(scan_clips) - len(eligible_clips),
+        **(
+            {
+                "excluded_jerk_clips": int((~expected_jerk["eef_jerk_valid"]).sum()),
+                "excluded_clips": len(scan_clips) - len(eligible_clips),
+            }
+            if expected_jerk
+            else {}
+        ),
     }
     if any(report.get(name) != value for name, value in expected_clip_counts.items()):
         raise ValueError("selection report candidate counts do not match graph eligibility")
@@ -2612,6 +2860,29 @@ def validate_output(
                 raise ValueError("graph node dwell values do not match encode cache")
         elif field in nodes:
             raise ValueError("unexpected dwell graph values without configuration")
+    for field in JERK_FIELDS:
+        if expected_jerk:
+            expected_values = expected_jerk[field][source_clip_indices]
+            if field not in nodes or not np.array_equal(nodes[field], expected_values):
+                raise ValueError("graph node eef_jerk values do not match encode cache")
+        elif field in nodes:
+            raise ValueError("unexpected eef_jerk graph values without configuration")
+    if expected_path:
+        expected_values = expected_path["local_path_efficiency"][source_clip_indices]
+        if (
+            "local_path_efficiency" not in nodes
+            or nodes["local_path_efficiency"].shape != expected_values.shape
+            or not np.allclose(
+                nodes["local_path_efficiency"],
+                expected_values,
+                equal_nan=True,
+                rtol=1e-7,
+                atol=1e-8,
+            )
+        ):
+            raise ValueError("graph local_path_efficiency does not match encode cache")
+    elif "local_path_efficiency" in nodes:
+        raise ValueError("unexpected local_path_efficiency graph values")
     expected_reliability = fuse_reliability(
         nodes["support"],
         nodes["progress"],
@@ -2619,6 +2890,8 @@ def validate_output(
         nodes["visual_action_consistency"],
         expected_reliability_metrics,
         non_dwell=nodes["non_dwell"] if expected_dwell else None,
+        local_path_efficiency=nodes["local_path_efficiency"] if expected_path else None,
+        eef_jerk=nodes["eef_jerk"] if expected_jerk else None,
         min_reliability=float(replay_resolved["quality"]["min_reliability"]),
     )
     if not np.allclose(
@@ -2644,8 +2917,20 @@ def validate_output(
         expected_clusters = [
             int(leaf_metadata[int(value)]["center_id"]) for value in assigned_indices
         ]
+        if expected_path:
+            value = float(nodes["local_path_efficiency"][index])
+            expected_value = value if np.isfinite(value) else None
+            if "local_path_efficiency" not in row or row["local_path_efficiency"] != expected_value:
+                raise ValueError("local_path_efficiency row does not match graph")
+        elif "local_path_efficiency" in row:
+            raise ValueError("unexpected local_path_efficiency row")
         expected_metric_values = {
             **({field: nodes[field][index] for field in DWELL_FIELDS} if expected_dwell else {}),
+            **(
+                {field: nodes[field][index] for field in ("eef_jerk_raw", "eef_jerk")}
+                if expected_jerk
+                else {}
+            ),
             "support": nodes["support"][index],
             "progress": nodes["progress"][index],
             "action_variation_raw": nodes["action_variation_raw"][index],
@@ -2733,9 +3018,39 @@ def validate_output(
                 "progress",
                 "reliability",
                 *(DWELL_FIELDS if expected_dwell else ()),
+                *(("eef_jerk_raw", "eef_jerk") if expected_jerk else ()),
             )
         ):
             raise ValueError("selected reliability metrics do not match all-clips row")
+    if expected_jerk:
+        for row in [*all_rows, *selected_rows]:
+            if row.get("eef_jerk_valid") is not True or row.get("eef_jerk_reason") != "":
+                raise ValueError("eef_jerk selected/all row has invalid status")
+        if report.get("eef_jerk_summary") != jerk_summary(
+            expected_jerk["eef_jerk_raw"], expected_jerk["eef_jerk_reason"], selected_rows
+        ):
+            raise ValueError("eef_jerk report summary does not match replay")
+        try:
+            excluded = json.loads((result / "excluded_clips.json").read_text())
+        except (OSError, ValueError) as error:
+            raise ValueError("eef_jerk exclusion records missing or invalid") from error
+        if excluded != _jerk_excluded_rows(root, expected_jerk):
+            raise ValueError("eef_jerk exclusion records do not match replay")
+    elif "eef_jerk_summary" in report or (result / "excluded_clips.json").exists():
+        raise ValueError("unexpected eef_jerk selection output without configuration")
+    if expected_path:
+        all_by_id = {row["sample_id"]: row for row in all_rows}
+        for row in selected_rows:
+            if (
+                "local_path_efficiency" not in row
+                or row["local_path_efficiency"]
+                != all_by_id[row["sample_id"]]["local_path_efficiency"]
+            ):
+                raise ValueError("selected local_path_efficiency does not match all-clips row")
+        if report.get("local_path_efficiency_summary") != path_summary(all_rows, selected_rows):
+            raise ValueError("local_path_efficiency summary does not match clip values")
+    elif "local_path_efficiency_summary" in report:
+        raise ValueError("unexpected local_path_efficiency summary")
     if expected_dwell:
         if report.get("dwell_summary") != dwell_summary(all_rows, selected_rows):
             raise ValueError("dwell report summary does not match clip values")
