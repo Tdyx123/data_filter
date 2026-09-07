@@ -28,7 +28,7 @@ encoding:
   quantile_high: 0.99
   epsilon: 1.0e-8
 
-reliability_metrics: [support, progress, action_variation, visual_action_consistency]
+reliability_metrics: [support, progress, action_variation, visual_action_consistency, action_jump]
 
 quality:
   knn: 10
@@ -78,3 +78,27 @@ output:
 
 # 可选末端 Jerk：在 reliability_metrics 中加入 eef_jerk，默认不计算。
 # 使用原始末端平移位置（米）与时间戳（秒）；不可计算片段排除出图。
+
+# 可选高频抖动诊断：先将三个 null 替换为校准后的有限正数，再取消注释。
+# 仅配置时输出诊断；如需参与融合，将 low_high_frequency_jitter 加入 reliability_metrics。
+# high_frequency_jitter:
+#   cutoff_hz: null                    # Hz，严格低于 fs/2
+#   noise_floor_rms: null              # 总速度波动噪声底，原始位置单位/秒
+#   max_frequency_resolution_hz: null  # 允许的最大 fs/N，Hz
+#   epsilon: 1.0e-12
+
+# 可选局部折返率：将 null 替换为校准后的有限正数再取消注释。
+# 仅配置时输出诊断；参与融合需将 low_local_backtracking 加入 reliability_metrics。
+# local_backtracking:
+#   epsilon_p: null  # 原始位置单位，当前数据为米；按噪声、采样间隔和运动尺度校准
+#   eta: 0.5        # 0 <= eta < 1；默认对应相邻位移夹角严格大于 120 度
+
+# 可选动作—执行偏差：确认原始指令来源、米制位置、坐标/时间对齐及上游限幅后启用。
+# 将 action_scale 的三个 null 替换为实际每轴米制位移转换系数；已为米时为 [1, 1, 1]。
+# 仅配置输出诊断；参与融合需将 low_action_execution_deviation 加入 reliability_metrics。
+# action_execution_deviation:
+#   action_source: original_command
+#   action_semantics: delta_from_observed_position
+#   action_scale: [null, null, null]
+#   alignment_confirmed: true
+# 状态差重标注动作不可使用；自由空间与接触操作应分开比较。

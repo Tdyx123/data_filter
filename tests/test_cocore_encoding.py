@@ -19,7 +19,6 @@ from cocore.index import uniform_clip_windows
 from segment_filter_core.encoding import (
     NumericNormalizers,
     PCAProjector,
-    fuse_fragment_features as reference_fuse_fragment_features,
 )
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
 
@@ -253,6 +252,14 @@ def test_visual_half_means_accept_overlapping_four_frame_windows() -> None:
     np.testing.assert_allclose(actual, expected, atol=1.0e-7)
 
 
+def test_fragment_fusion_without_position_normalizes_remaining_features() -> None:
+    raw, encoded = fuse_fragment_features(
+        np.asarray([[3.0]]), np.asarray([[0.0]]), np.asarray([[4.0]])
+    )
+    np.testing.assert_array_equal(raw, [[3.0, 0.0, 4.0]])
+    np.testing.assert_allclose(encoded, [[0.6, 0.0, 0.8]])
+
+
 def test_cocore_encoder_uses_bridge_profile_clip_geometry(tmp_path: Path) -> None:
     encoded = encode_cocore_dataset(
         _EncodingAdapter(),
@@ -266,6 +273,9 @@ def test_cocore_encoder_uses_bridge_profile_clip_geometry(tmp_path: Path) -> Non
     assert encoded.state_sequences.shape == (11, 7, 8)
     assert encoded.action_sequences.shape == (11, 7, 2)
     assert encoded.visual_half_embeddings.shape == (11, 2, 3)
+    # Bridge keeps visual (128), state (8 * 3), and action (2 * 3) only.
+    assert encoded.embeddings.shape == (11, 158)
+    np.testing.assert_allclose(np.linalg.norm(encoded.embeddings, axis=1), 1.0, atol=1e-6)
 
 
 def test_cocore_encoder_computes_top_three_action_variation_from_full_episode(
@@ -359,7 +369,7 @@ def test_cocore_encoder_uses_quality_fusion_and_caches_episode_frames(
     assert visual.episode_lengths == [46, 15, 7]
     assert [clip.start_step for clip in cocore.clips] == [0, 10, 20, 31, 0]
     assert cocore.pca_fit_fragment_count == len(cocore.clips) == 5
-    assert cocore.embeddings.shape == (5, 159)
+    assert cocore.embeddings.shape == (5, 158)
     np.testing.assert_allclose(np.linalg.norm(cocore.embeddings, axis=1), 1.0, atol=1.0e-6)
     assert [
         (entry.episode_id, entry.frames, entry.embedding_dim) for entry in cocore.frame_embeddings
@@ -397,23 +407,13 @@ def test_cocore_encoder_uses_quality_fusion_and_caches_episode_frames(
     ]
     state_pooled = np.stack([temporal_pool(values) for values in cocore.state_sequences])
     action_pooled = np.stack([temporal_pool(values) for values in cocore.action_sequences])
-    lengths = {record.episode_id: record.length for record in adapter.episodes()}
-    positions = np.asarray(
-        [clip.start_step / lengths[clip.episode_id] for clip in cocore.clips],
-        dtype=np.float32,
-    )
-    _, expected = reference_fuse_fragment_features(
-        candidate_visual,
-        state_pooled,
-        action_pooled,
-        positions,
-    )
+    expected_raw = np.concatenate([candidate_visual, state_pooled, action_pooled], axis=1)
+    expected = expected_raw / np.maximum(np.linalg.norm(expected_raw, axis=1, keepdims=True), 1e-8)
     np.testing.assert_allclose(cocore.embeddings, expected, atol=1.0e-6)
     _, local_expected = fuse_fragment_features(
         candidate_visual,
         state_pooled,
         action_pooled,
-        positions,
     )
     np.testing.assert_array_equal(cocore.embeddings, local_expected)
 

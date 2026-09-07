@@ -38,6 +38,17 @@ from relcore.utils.io import (
 from relcore.utils.random import seed_everything
 
 from cocore import __version__
+from cocore.action_execution_deviation import (
+    EXECUTION_FIELDS,
+    EXECUTION_CACHE_FIELDS,
+    EXECUTION_METRIC,
+    execution_contract,
+    save_execution_cache,
+    validate_execution_cache,
+    validate_execution_fields,
+    execution_row,
+    execution_summary,
+)
 from cocore.eef_jerk import (
     JERK_FIELDS,
     JERK_CACHE_FIELDS,
@@ -45,6 +56,34 @@ from cocore.eef_jerk import (
     save_jerk_cache,
     validate_jerk_cache,
     jerk_summary,
+)
+from cocore.action_jump import (
+    JUMP_FIELDS,
+    JUMP_CACHE_FIELDS,
+    jump_contract,
+    save_jump_cache,
+    validate_jump_cache,
+    validate_jump_fields,
+)
+from cocore.high_frequency_jitter import (
+    HF_FIELDS,
+    HF_CACHE_FIELDS,
+    hf_contract,
+    save_hf_cache,
+    validate_hf_cache,
+    validate_hf_fields,
+    hf_row,
+    hf_summary,
+)
+from cocore.local_backtracking import (
+    BACKTRACKING_FIELDS,
+    BACKTRACKING_CACHE_FIELDS,
+    backtracking_contract,
+    save_backtracking_cache,
+    validate_backtracking_cache,
+    validate_backtracking_fields,
+    backtracking_row,
+    backtracking_summary,
 )
 from cocore.local_path_efficiency import (
     PATH_CACHE_FIELDS,
@@ -395,12 +434,24 @@ def _save_cocore_encoded(
     visual_action_consistency_metadata: Mapping[str, object],
     dwell_metadata: Mapping[str, object] | None,
     path_metadata: Mapping[str, object] | None,
+    hf_metadata: Mapping[str, object] | None = None,
+    backtracking_metadata: Mapping[str, object] | None = None,
+    jump_metadata: Mapping[str, object] | None = None,
+    execution_metadata: Mapping[str, object] | None = None,
     jerk_metadata: Mapping[str, object] | None = None,
     fingerprint: str,
     runtime_seconds: float,
 ) -> None:
     geometry = resolve_temporal_geometry(profile)
     jerk_checksums = save_jerk_cache(temporary, encoded) if jerk_metadata is not None else {}
+    backtracking_checksums = (
+        save_backtracking_cache(temporary, encoded) if backtracking_metadata is not None else {}
+    )
+    hf_checksums = save_hf_cache(temporary, encoded) if hf_metadata is not None else {}
+    jump_checksums = save_jump_cache(temporary, encoded) if jump_metadata is not None else {}
+    execution_checksums = (
+        save_execution_cache(temporary, encoded) if execution_metadata is not None else {}
+    )
     path_checksums = {}
     if path_metadata is not None:
         for field in PATH_CACHE_FIELDS:
@@ -500,9 +551,33 @@ def _save_cocore_encoded(
             "visual_action_consistency": dict(visual_action_consistency_metadata),
             "dwell": dwell_metadata,
             **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+            **({"high_frequency_jitter": hf_metadata} if hf_metadata is not None else {}),
+            **(
+                {"local_backtracking": backtracking_metadata}
+                if backtracking_metadata is not None
+                else {}
+            ),
+            **({"action_jump": jump_metadata} if jump_metadata is not None else {}),
+            **(
+                {"action_execution_deviation": execution_metadata}
+                if execution_metadata is not None
+                else {}
+            ),
             **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
             "dwell_checksums": dwell_checksums,
             "path_checksums": path_checksums,
+            "high_frequency_checksums": hf_checksums,
+            **(
+                {"local_backtracking_checksums": backtracking_checksums}
+                if backtracking_metadata is not None
+                else {}
+            ),
+            **({"action_jump_checksums": jump_checksums} if jump_metadata is not None else {}),
+            **(
+                {"action_execution_deviation_checksums": execution_checksums}
+                if execution_metadata is not None
+                else {}
+            ),
             **({"eef_jerk_checksums": jerk_checksums} if jerk_metadata is not None else {}),
             "counts": {
                 "candidate_fragments": candidate_count,
@@ -896,6 +971,10 @@ def encode_stage(
     visual_action_consistency_metadata = _visual_action_consistency_metadata(resolved)
     dwell_metadata = dwell_contract(resolved)
     path_metadata = path_contract(resolved)
+    hf_metadata = hf_contract(resolved)
+    backtracking_metadata = backtracking_contract(resolved)
+    jump_metadata = jump_contract(resolved)
+    execution_metadata = execution_contract(resolved)
     jerk_metadata = jerk_contract(resolved)
     model_sha256 = (
         directory_sha256(str(visual_config["model"]))
@@ -924,8 +1003,21 @@ def encode_stage(
             "visual_action_consistency": visual_action_consistency_metadata,
             "dwell": dwell_metadata,
             **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+            **({"high_frequency_jitter": hf_metadata} if hf_metadata is not None else {}),
+            **(
+                {"local_backtracking": backtracking_metadata}
+                if backtracking_metadata is not None
+                else {}
+            ),
+            **({"action_jump": jump_metadata} if jump_metadata is not None else {}),
+            **(
+                {"action_execution_deviation": execution_metadata}
+                if execution_metadata is not None
+                else {}
+            ),
             **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
             "visual_model_sha256": model_sha256,
+            "fragment_encoding": "visual_state_action_no_position_v1",
         }
     )
     destination = root / "encode"
@@ -946,6 +1038,11 @@ def encode_stage(
             frame_cache_dir=temporary / "frame_embeddings",
             dwell=resolved.get("dwell"),
             local_path_efficiency=resolved.get("local_path_efficiency"),
+            high_frequency_jitter=resolved.get("high_frequency_jitter"),
+            local_backtracking=resolved.get("local_backtracking"),
+            action_jump=resolved.get("action_jump"),
+            action_execution_deviation=resolved.get("action_execution_deviation"),
+            gripper_action_index=resolved["quality"]["gripper_action_index"],
             eef_jerk=jerk_metadata is not None,
             num_workers=int(resolved["runtime"].get("num_workers", 0)),
             max_episodes=resolved["runtime"].get("max_episodes"),
@@ -962,6 +1059,10 @@ def encode_stage(
             visual_action_consistency_metadata=visual_action_consistency_metadata,
             dwell_metadata=dwell_metadata,
             path_metadata=path_metadata,
+            hf_metadata=hf_metadata,
+            backtracking_metadata=backtracking_metadata,
+            jump_metadata=jump_metadata,
+            execution_metadata=execution_metadata,
             jerk_metadata=jerk_metadata,
             fingerprint=fingerprint,
             runtime_seconds=time.perf_counter() - started,
@@ -983,6 +1084,14 @@ def encode_stage(
     )
     if jerk_metadata is not None:
         required += tuple(f"{field}.npy" for field in JERK_CACHE_FIELDS)
+    if jump_metadata is not None:
+        required += tuple(f"{field}.npy" for field in JUMP_CACHE_FIELDS)
+    if execution_metadata is not None:
+        required += tuple(f"{field}.npy" for field in EXECUTION_CACHE_FIELDS)
+    if backtracking_metadata is not None:
+        required += tuple(f"{field}.npy" for field in BACKTRACKING_CACHE_FIELDS)
+    if hf_metadata is not None:
+        required += tuple(f"{field}.npy" for field in HF_CACHE_FIELDS)
     if path_metadata is not None:
         required += tuple(f"{field}.npy" for field in PATH_CACHE_FIELDS)
     if dwell_metadata is not None:
@@ -1030,6 +1139,10 @@ def encode_stage(
         expected_episodes=expected_frame_episodes,
     )
     _validate_visual_half_embedding_cache(destination, clips, profile=profile)
+    backtracking_values = validate_backtracking_cache(destination, clips, resolved)
+    hf_values = validate_hf_cache(destination, clips, resolved)
+    jump_values = validate_jump_cache(destination, clips, resolved)
+    execution_values = validate_execution_cache(destination, clips, resolved)
     path_arrays = _validate_path_cache(destination, clips, resolved)
     dwell_arrays = _validate_dwell_cache(destination, clips, resolved)
     jerk_values = validate_jerk_cache(destination, clips, resolved)
@@ -1052,6 +1165,10 @@ def encode_stage(
             fingerprint=fingerprint,
             **dwell_arrays,
             **path_arrays,
+            **hf_values,
+            **backtracking_values,
+            **jump_values,
+            **execution_values,
             **jerk_values,
         ),
     )
@@ -1093,6 +1210,10 @@ def graph_stage(
     visual_action_consistency_metadata = _visual_action_consistency_metadata(resolved)
     dwell_metadata = dwell_contract(resolved)
     path_metadata = path_contract(resolved)
+    hf_metadata = hf_contract(resolved)
+    backtracking_metadata = backtracking_contract(resolved)
+    jump_metadata = jump_contract(resolved)
+    execution_metadata = execution_contract(resolved)
     jerk_metadata = jerk_contract(resolved)
     prototype_fingerprint_config = {
         key: prototype_config[key]
@@ -1115,6 +1236,18 @@ def graph_stage(
         "visual_action_consistency": visual_action_consistency_metadata,
         "dwell": dwell_metadata,
         **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+        **({"high_frequency_jitter": hf_metadata} if hf_metadata is not None else {}),
+        **(
+            {"local_backtracking": backtracking_metadata}
+            if backtracking_metadata is not None
+            else {}
+        ),
+        **({"action_jump": jump_metadata} if jump_metadata is not None else {}),
+        **(
+            {"action_execution_deviation": execution_metadata}
+            if execution_metadata is not None
+            else {}
+        ),
         **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
         "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
         "prototype_strategy": PROTOTYPE_STRATEGY,
@@ -1147,20 +1280,44 @@ def graph_stage(
                 if jerk_metadata is not None
                 else np.ones(len(encoded.clips), dtype=bool)
             )
-            if not jerk_valid.any():
-                raise ValueError("no eligible candidate with computable eef_jerk remains")
+            execution_valid = (
+                encoded.action_execution_deviation_valid
+                if EXECUTION_METRIC in reliability_metrics
+                else np.ones(len(encoded.clips), dtype=bool)
+            )
+            metric_valid = jerk_valid & execution_valid
+            if not metric_valid.any():
+                raise ValueError(
+                    "no eligible candidate with computable eef_jerk/action_execution_deviation remains"
+                )
             reliability_values = np.zeros(len(encoded.clips), dtype=np.float32)
-            reliability_values[jerk_valid] = fuse_reliability(
-                reliability.support[jerk_valid],
-                reliability.progress[jerk_valid],
-                encoded.action_variation[jerk_valid],
-                encoded.visual_action_consistency[jerk_valid],
+            reliability_values[metric_valid] = fuse_reliability(
+                reliability.support[metric_valid],
+                reliability.progress[metric_valid],
+                encoded.action_variation[metric_valid],
+                encoded.visual_action_consistency[metric_valid],
                 reliability_metrics,
-                local_path_efficiency=encoded.local_path_efficiency[jerk_valid]
+                low_action_execution_deviation=(
+                    encoded.low_action_execution_deviation[metric_valid]
+                    if execution_metadata is not None
+                    else None
+                ),
+                action_jump=encoded.action_jump[metric_valid]
+                if encoded.action_jump is not None
+                else None,
+                low_local_backtracking=encoded.low_local_backtracking[metric_valid]
+                if encoded.low_local_backtracking is not None
+                else None,
+                low_high_frequency_jitter=encoded.low_high_frequency_jitter[metric_valid]
+                if encoded.low_high_frequency_jitter is not None
+                else None,
+                local_path_efficiency=encoded.local_path_efficiency[metric_valid]
                 if encoded.local_path_efficiency is not None
                 else None,
-                non_dwell=encoded.non_dwell[jerk_valid] if encoded.non_dwell is not None else None,
-                eef_jerk=encoded.eef_jerk[jerk_valid] if jerk_metadata is not None else None,
+                non_dwell=encoded.non_dwell[metric_valid]
+                if encoded.non_dwell is not None
+                else None,
+                eef_jerk=encoded.eef_jerk[metric_valid] if jerk_metadata is not None else None,
                 min_reliability=float(quality_config["min_reliability"]),
             )
         with timed_step("graph.prototypes", emit_completed_timing):
@@ -1182,7 +1339,9 @@ def graph_stage(
                 profile=prototype_profile,
                 timing_callback=emit_completed_timing,
             )
-        source_clip_indices = np.flatnonzero(hierarchy.eligible_mask & jerk_valid).astype(np.int64)
+        source_clip_indices = np.flatnonzero(hierarchy.eligible_mask & metric_valid).astype(
+            np.int64
+        )
         if len(source_clip_indices) == 0:
             raise ValueError("no eligible candidate with a non-stop action label remains")
         graph_config = resolved["graph"]
@@ -1200,6 +1359,24 @@ def graph_stage(
             )
         np.savez(
             temporary / "nodes.npz",
+            **(
+                {field: getattr(encoded, field)[source_clip_indices] for field in EXECUTION_FIELDS}
+                if execution_metadata is not None else {}
+            ),
+            **(
+                {field: getattr(encoded, field)[source_clip_indices] for field in JUMP_FIELDS}
+                if jump_metadata is not None else {}
+            ),
+            **(
+                {field: getattr(encoded, field)[source_clip_indices] for field in BACKTRACKING_FIELDS}
+                if backtracking_metadata is not None
+                else {}
+            ),
+            **(
+                {field: getattr(encoded, field)[source_clip_indices] for field in HF_FIELDS}
+                if hf_metadata is not None
+                else {}
+            ),
             **(
                 {"local_path_efficiency": encoded.local_path_efficiency[source_clip_indices]}
                 if encoded.local_path_efficiency is not None
@@ -1230,7 +1407,7 @@ def graph_stage(
             smoothness=reliability.smoothness[source_clip_indices],
             noop_ratio=reliability.noop_ratio[source_clip_indices],
         )
-        if jerk_metadata is not None:
+        if jerk_metadata is not None or EXECUTION_METRIC in reliability_metrics:
             np.save(temporary / "prototype_eligible_mask.npy", hierarchy.eligible_mask)
         np.save(temporary / "source_clip_indices.npy", source_clip_indices)
         assert hierarchy.prototypes.centers is not None
@@ -1259,6 +1436,18 @@ def graph_stage(
                 "visual_action_consistency": visual_action_consistency_metadata,
                 "dwell": dwell_metadata,
                 **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+                **({"high_frequency_jitter": hf_metadata} if hf_metadata is not None else {}),
+                **(
+                    {"local_backtracking": backtracking_metadata}
+                    if backtracking_metadata is not None
+                    else {}
+                ),
+                **({"action_jump": jump_metadata} if jump_metadata is not None else {}),
+                **(
+                    {"action_execution_deviation": execution_metadata}
+                    if execution_metadata is not None
+                    else {}
+                ),
                 **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
                 "prototype_method": "motion_primitives",
                 "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
@@ -1284,6 +1473,14 @@ def graph_stage(
                     if jerk_metadata is not None
                     else {}
                 ),
+                **(
+                    {
+                        "excluded_action_execution_deviation_nodes": int((~execution_valid).sum()),
+                        "excluded_nodes": len(encoded.clips) - len(graph.sample_ids),
+                    }
+                    if EXECUTION_METRIC in reliability_metrics
+                    else {}
+                ),
                 "sequence_edges": len(graph.sequence_edges.source),
                 "similarity_edges": len(graph.similarity_edges.source),
                 "runtime_seconds": time.perf_counter() - started,
@@ -1305,7 +1502,7 @@ def graph_stage(
             "transition_matrix.npz",
             "cooccurrence_matrix.npz",
         )
-        + (("prototype_eligible_mask.npy",) if jerk_metadata is not None else ()),
+        + (("prototype_eligible_mask.npy",) if jerk_metadata is not None or EXECUTION_METRIC in reliability_metrics else ()),
         force=force,
         resume=bool(resolved["runtime"].get("resume", True)),
         build=build,
@@ -1735,10 +1932,18 @@ def _validate_hierarchical_graph_artifacts(
     replay_eligible = replay.eligible_mask.copy()
     if jerk_contract(resolved) is not None:
         jerk_values = validate_jerk_cache(root / "encode", clips, resolved)
-        saved_eligible = _load_jerk_prototype_mask(root, len(clips))
+        saved_eligible = _load_prototype_eligible_mask(root, len(clips))
         if not np.array_equal(saved_eligible, replay_eligible):
             raise ValueError("eef_jerk prototype eligibility mask does not match replay")
         replay_eligible &= jerk_values["eef_jerk_valid"]
+    if EXECUTION_METRIC in resolved["reliability_metrics"]:
+        execution_values = validate_execution_cache(root / "encode", clips, resolved)
+        saved_eligible = _load_prototype_eligible_mask(root, len(clips))
+        if not np.array_equal(saved_eligible, replay.eligible_mask):
+            raise ValueError(
+                "action_execution_deviation prototype eligibility mask does not match replay"
+            )
+        replay_eligible &= execution_values["action_execution_deviation_valid"]
     expected_source_indices = np.flatnonzero(replay_eligible).astype(np.int64)
     if not np.array_equal(source_clip_indices, expected_source_indices):
         raise ValueError("hierarchical source clip indices do not match prototype replay")
@@ -2002,6 +2207,14 @@ def _selection_rows(
                 eef_jerk_valid=bool(nodes["eef_jerk_valid"][index]),
                 eef_jerk_reason=str(nodes["eef_jerk_reason"][index]),
             )
+        if "action_execution_deviation_valid" in nodes:
+            row.update(execution_row(nodes, index))
+        if "action_jump_rate" in nodes:
+            row.update({field: float(nodes[field][index]) for field in JUMP_FIELDS})
+        if "local_backtracking_valid" in nodes:
+            row.update(backtracking_row(nodes, index))
+        if "high_frequency_valid" in nodes:
+            row.update(hf_row(nodes, index))
         if "local_path_efficiency" in nodes:
             value = float(nodes["local_path_efficiency"][index])
             row["local_path_efficiency"] = value if np.isfinite(value) else None
@@ -2018,37 +2231,55 @@ def _selection_rows(
     return selected_rows, all_rows
 
 
-def _load_jerk_prototype_mask(root: Path, candidate_count: int) -> np.ndarray:
+def _load_prototype_eligible_mask(root: Path, candidate_count: int) -> np.ndarray:
     try:
         mask = np.load(root / GRAPH_DIRECTORY / "prototype_eligible_mask.npy", allow_pickle=False)
     except (OSError, ValueError) as error:
-        raise ValueError("eef_jerk prototype eligibility mask missing or invalid") from error
+        raise ValueError(
+            "eef_jerk/action_execution_deviation prototype eligibility mask missing or invalid"
+        ) from error
     if mask.shape != (candidate_count,) or mask.dtype != np.bool_:
-        raise ValueError("eef_jerk prototype eligibility mask shape or dtype mismatch")
+        raise ValueError(
+            "eef_jerk/action_execution_deviation prototype eligibility mask shape or dtype mismatch"
+        )
     return mask
 
 
-def _jerk_excluded_rows(root: Path, values: Mapping[str, np.ndarray]) -> list[dict[str, Any]]:
+def _metric_excluded_rows(
+    root: Path, values: Mapping[str, np.ndarray],
+    execution_values: Mapping[str, np.ndarray] | None = None,
+    *, execution_fused: bool = False,
+) -> list[dict[str, Any]]:
     clips = _load_clips(root / "scan" / "clips.parquet")
-    prototype_valid = _load_jerk_prototype_mask(root, len(clips))
+    prototype_valid = _load_prototype_eligible_mask(root, len(clips))
     rows = []
     for i, clip in enumerate(clips):
-        valid = bool(values["eef_jerk_valid"][i])
-        if valid and prototype_valid[i]:
+        valid = bool(values["eef_jerk_valid"][i]) if values else True
+        execution_valid = (
+            bool(execution_values["action_execution_deviation_valid"][i])
+            if execution_fused else True
+        )
+        if valid and execution_valid and prototype_valid[i]:
             continue
         reasons = [] if prototype_valid[i] else ["unlabeled"]
         if not valid:
             reasons.append("eef_jerk:" + str(values["eef_jerk_reason"][i]))
-        rows.append(
-            {
-                "sample_id": clip.sample_id,
-                "reasons": reasons,
-                "eef_jerk_valid": valid,
-                "eef_jerk_reason": str(values["eef_jerk_reason"][i]),
-                "eef_jerk_raw": float(values["eef_jerk_raw"][i]) if valid else None,
-                "eef_jerk": float(values["eef_jerk"][i]) if valid else None,
-            }
-        )
+        if not execution_valid:
+            reasons.append(
+                "action_execution_deviation:"
+                + str(execution_values["action_execution_deviation_reason"][i])
+            )
+        row = {"sample_id": clip.sample_id, "reasons": reasons}
+        if values:
+            row.update(
+                eef_jerk_valid=valid,
+                eef_jerk_reason=str(values["eef_jerk_reason"][i]),
+                eef_jerk_raw=float(values["eef_jerk_raw"][i]) if valid else None,
+                eef_jerk=float(values["eef_jerk"][i]) if valid else None,
+            )
+        if execution_values:
+            row.update(execution_row(execution_values, i))
+        rows.append(row)
     return sorted(rows, key=lambda row: row["sample_id"])
 
 
@@ -2080,6 +2311,10 @@ def select_stage(
     visual_action_consistency_metadata = _visual_action_consistency_metadata(resolved)
     dwell_metadata = dwell_contract(resolved)
     path_metadata = path_contract(resolved)
+    hf_metadata = hf_contract(resolved)
+    backtracking_metadata = backtracking_contract(resolved)
+    jump_metadata = jump_contract(resolved)
+    execution_metadata = execution_contract(resolved)
     jerk_metadata = jerk_contract(resolved)
     fingerprint_payload = {
         "producer": "cocore",
@@ -2094,6 +2329,18 @@ def select_stage(
         "visual_action_consistency": visual_action_consistency_metadata,
         "dwell": dwell_metadata,
         **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+        **({"high_frequency_jitter": hf_metadata} if hf_metadata is not None else {}),
+        **(
+            {"local_backtracking": backtracking_metadata}
+            if backtracking_metadata is not None
+            else {}
+        ),
+        **({"action_jump": jump_metadata} if jump_metadata is not None else {}),
+        **(
+            {"action_execution_deviation": execution_metadata}
+            if execution_metadata is not None
+            else {}
+        ),
         **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
         "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
         "prototype_strategy": PROTOTYPE_STRATEGY,
@@ -2179,6 +2426,18 @@ def select_stage(
             "visual_action_consistency": visual_action_consistency_metadata,
             "dwell": dwell_metadata,
             **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+            **({"high_frequency_jitter": hf_metadata} if hf_metadata is not None else {}),
+            **(
+                {"local_backtracking": backtracking_metadata}
+                if backtracking_metadata is not None
+                else {}
+            ),
+            **({"action_jump": jump_metadata} if jump_metadata is not None else {}),
+            **(
+                {"action_execution_deviation": execution_metadata}
+                if execution_metadata is not None
+                else {}
+            ),
             **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
             "prototype_method": "motion_primitives",
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
@@ -2214,7 +2473,41 @@ def select_stage(
             )
             report["excluded_jerk_clips"] = int((~jerk_values["eef_jerk_valid"]).sum())
             report["excluded_clips"] = scanned_clip_count - len(clips)
-            write_json(temporary / "excluded_clips.json", _jerk_excluded_rows(root, jerk_values))
+        execution_scanned = (
+            validate_execution_cache(
+                root / "encode", _load_clips(root / "scan" / "clips.parquet"), resolved
+            )
+            if execution_metadata is not None
+            else {}
+        )
+        if execution_metadata is not None:
+            report["action_execution_deviation_summary"] = execution_summary(
+                execution_scanned, all_rows, selected_rows
+            )
+        if EXECUTION_METRIC in resolved["reliability_metrics"]:
+            report["excluded_action_execution_deviation_clips"] = int(
+                (~execution_scanned["action_execution_deviation_valid"]).sum()
+            )
+            report["excluded_clips"] = scanned_clip_count - len(clips)
+        if jerk_metadata is not None or EXECUTION_METRIC in resolved["reliability_metrics"]:
+            write_json(temporary / "excluded_clips.json", _metric_excluded_rows(
+                root, jerk_values if jerk_metadata is not None else {}, execution_scanned,
+                execution_fused=EXECUTION_METRIC in resolved["reliability_metrics"],
+            ))
+        if backtracking_metadata is not None:
+            backtracking_scanned = validate_backtracking_cache(
+                root / "encode", _load_clips(root / "scan" / "clips.parquet"), resolved
+            )
+            report["local_backtracking_summary"] = backtracking_summary(
+                backtracking_scanned, all_rows, selected_rows
+            )
+        if hf_metadata is not None:
+            hf_scanned = validate_hf_cache(
+                root / "encode", _load_clips(root / "scan" / "clips.parquet"), resolved
+            )
+            report["high_frequency_jitter_summary"] = hf_summary(
+                hf_scanned, all_rows, selected_rows
+            )
         if path_metadata is not None:
             report["local_path_efficiency_summary"] = path_summary(all_rows, selected_rows)
         if dwell_metadata is not None:
@@ -2261,6 +2554,18 @@ def select_stage(
                 "visual_action_consistency": visual_action_consistency_metadata,
                 "dwell": dwell_metadata,
                 **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+                **({"high_frequency_jitter": hf_metadata} if hf_metadata is not None else {}),
+                **(
+                    {"local_backtracking": backtracking_metadata}
+                    if backtracking_metadata is not None
+                    else {}
+                ),
+                **({"action_jump": jump_metadata} if jump_metadata is not None else {}),
+                **(
+                    {"action_execution_deviation": execution_metadata}
+                    if execution_metadata is not None
+                    else {}
+                ),
                 **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
                 "algorithm": algorithm,
                 **_selection_schema_fields(),
@@ -2281,7 +2586,7 @@ def select_stage(
         "all_clips.parquet",
         "selection_report.json",
     )
-    if jerk_metadata is not None:
+    if jerk_metadata is not None or EXECUTION_METRIC in resolved["reliability_metrics"]:
         selection_required += ("excluded_clips.json",)
     upgrade_legacy_selection_cache = _matches_legacy_selection_cache(
         destination,
@@ -2333,6 +2638,18 @@ def select_stage(
             "visual_action_consistency": visual_action_consistency_metadata,
             "dwell": dwell_metadata,
             **({"local_path_efficiency": path_metadata} if path_metadata is not None else {}),
+            **({"high_frequency_jitter": hf_metadata} if hf_metadata is not None else {}),
+            **(
+                {"local_backtracking": backtracking_metadata}
+                if backtracking_metadata is not None
+                else {}
+            ),
+            **({"action_jump": jump_metadata} if jump_metadata is not None else {}),
+            **(
+                {"action_execution_deviation": execution_metadata}
+                if execution_metadata is not None
+                else {}
+            ),
             **({"eef_jerk": jerk_metadata} if jerk_metadata is not None else {}),
             "prototype_method": "motion_primitives",
             "prototype_schema_version": PROTOTYPE_SCHEMA_VERSION,
@@ -2598,14 +2915,21 @@ def validate_output(
         validation_config = config
     replay_resolved = resolve_config(validation_config)
     expected_jerk = validate_jerk_cache(root / "encode", scan_clips, replay_resolved)
-    jerk_prototype_mask = (
-        _load_jerk_prototype_mask(root, len(scan_clips)) if expected_jerk else None
+    expected_execution = validate_execution_cache(root / "encode", scan_clips, replay_resolved)
+    expected_execution_metadata = execution_contract(replay_resolved)
+    execution_fused = EXECUTION_METRIC in replay_resolved["reliability_metrics"]
+    filters_validity = bool(expected_jerk) or execution_fused
+    prototype_eligible_mask = (
+        _load_prototype_eligible_mask(root, len(scan_clips)) if filters_validity else None
     )
+    for metadata in (run_manifest, stage_manifests["encode"], graph_manifest):
+        if metadata.get("action_execution_deviation") != expected_execution_metadata:
+            raise ValueError("action_execution_deviation contract does not match output")
     graph_count_contract = {
         "nodes": len(source_clip_indices),
         "scanned_candidate_nodes": len(scan_clips),
-        "excluded_unlabeled_nodes": int((~jerk_prototype_mask).sum())
-        if expected_jerk
+        "excluded_unlabeled_nodes": int((~prototype_eligible_mask).sum())
+        if filters_validity
         else len(scan_clips) - len(source_clip_indices),
         **(
             {
@@ -2616,6 +2940,13 @@ def validate_output(
             else {}
         ),
     }
+    if execution_fused:
+        graph_count_contract.update(
+            excluded_action_execution_deviation_nodes=int(
+                (~expected_execution["action_execution_deviation_valid"]).sum()
+            ),
+            excluded_nodes=len(scan_clips) - len(source_clip_indices),
+        )
     if any(
         stage_manifests["graph"].get(name) != value for name, value in graph_count_contract.items()
     ):
@@ -2623,6 +2954,21 @@ def validate_output(
     expected_reliability_metrics = list(replay_resolved["reliability_metrics"])
     if run_reliability_metrics != expected_reliability_metrics:
         raise ValueError("cocore reliability metrics configuration does not match output")
+    expected_jump = validate_jump_cache(root / "encode", scan_clips, replay_resolved)
+    expected_jump_metadata = jump_contract(replay_resolved)
+    for metadata in (run_manifest, stage_manifests["encode"], graph_manifest):
+        if metadata.get("action_jump") != expected_jump_metadata:
+            raise ValueError("action_jump contract does not match output")
+    expected_backtracking = validate_backtracking_cache(root / "encode", scan_clips, replay_resolved)
+    expected_backtracking_metadata = backtracking_contract(replay_resolved)
+    for metadata in (run_manifest, stage_manifests["encode"], graph_manifest):
+        if metadata.get("local_backtracking") != expected_backtracking_metadata:
+            raise ValueError("local_backtracking contract does not match output")
+    expected_hf = validate_hf_cache(root / "encode", scan_clips, replay_resolved)
+    expected_hf_metadata = hf_contract(replay_resolved)
+    for metadata in (run_manifest, stage_manifests["encode"], graph_manifest):
+        if metadata.get("high_frequency_jitter") != expected_hf_metadata:
+            raise ValueError("high_frequency_jitter contract does not match output")
     expected_path = _validate_path_cache(root / "encode", scan_clips, replay_resolved)
     expected_path_metadata = path_contract(replay_resolved)
     for metadata in (run_manifest, stage_manifests["encode"], graph_manifest):
@@ -2715,6 +3061,14 @@ def validate_output(
     all_rows = pq.read_table(required["all"]).to_pylist()
     report = json.loads(required["report"].read_text(encoding="utf-8"))
     for metadata in (select_manifest, report):
+        if metadata.get("action_jump") != expected_jump_metadata:
+            raise ValueError("action_jump contract does not match selection output")
+        if metadata.get("action_execution_deviation") != expected_execution_metadata:
+            raise ValueError("action_execution_deviation contract does not match selection output")
+        if metadata.get("high_frequency_jitter") != expected_hf_metadata:
+            raise ValueError("high_frequency_jitter contract does not match selection output")
+        if metadata.get("local_backtracking") != expected_backtracking_metadata:
+            raise ValueError("local_backtracking contract does not match selection output")
         if metadata.get("local_path_efficiency") != expected_path_metadata:
             raise ValueError("local_path_efficiency contract does not match selection output")
     for metadata in (select_manifest, report):
@@ -2776,8 +3130,8 @@ def validate_output(
         "number_of_clips": len(eligible_clips),
         "number_of_scanned_clips": len(scan_clips),
         "eligible_clips": len(eligible_clips),
-        "excluded_unlabeled_clips": int((~jerk_prototype_mask).sum())
-        if expected_jerk
+        "excluded_unlabeled_clips": int((~prototype_eligible_mask).sum())
+        if filters_validity
         else len(scan_clips) - len(eligible_clips),
         **(
             {
@@ -2788,6 +3142,13 @@ def validate_output(
             else {}
         ),
     }
+    if execution_fused:
+        expected_clip_counts.update(
+            excluded_action_execution_deviation_clips=int(
+                (~expected_execution["action_execution_deviation_valid"]).sum()
+            ),
+            excluded_clips=len(scan_clips) - len(eligible_clips),
+        )
     if any(report.get(name) != value for name, value in expected_clip_counts.items()):
         raise ValueError("selection report candidate counts do not match graph eligibility")
     if [row["sample_id"] for row in all_rows] != sorted(row["sample_id"] for row in all_rows):
@@ -2883,14 +3244,47 @@ def validate_output(
             raise ValueError("graph local_path_efficiency does not match encode cache")
     elif "local_path_efficiency" in nodes:
         raise ValueError("unexpected local_path_efficiency graph values")
+    if expected_backtracking:
+        validate_backtracking_fields(
+            nodes,
+            {
+                field: expected_backtracking[field][source_clip_indices]
+                for field in BACKTRACKING_FIELDS
+            },
+        )
+    elif any(field in nodes for field in BACKTRACKING_FIELDS):
+        raise ValueError("unexpected local_backtracking graph values")
+    if expected_hf:
+        validate_hf_fields(
+            nodes, {field: expected_hf[field][source_clip_indices] for field in HF_FIELDS}
+        )
+    elif any(field in nodes for field in HF_FIELDS):
+        raise ValueError("unexpected high_frequency_jitter graph values")
+    if expected_jump:
+        validate_jump_fields(
+            nodes, {field: expected_jump[field][source_clip_indices] for field in JUMP_FIELDS}
+        )
+    elif any(field in nodes for field in JUMP_FIELDS):
+        raise ValueError("unexpected action_jump graph values")
+    if expected_execution:
+        validate_execution_fields(
+            nodes,
+            {field: expected_execution[field][source_clip_indices] for field in EXECUTION_FIELDS},
+        )
+    elif any(field in nodes for field in EXECUTION_FIELDS):
+        raise ValueError("unexpected action_execution_deviation graph values")
     expected_reliability = fuse_reliability(
         nodes["support"],
         nodes["progress"],
         nodes["action_variation"],
         nodes["visual_action_consistency"],
         expected_reliability_metrics,
+        action_jump=nodes["action_jump"] if expected_jump else None,
+        low_action_execution_deviation=nodes[EXECUTION_METRIC] if expected_execution else None,
         non_dwell=nodes["non_dwell"] if expected_dwell else None,
         local_path_efficiency=nodes["local_path_efficiency"] if expected_path else None,
+        low_high_frequency_jitter=nodes["low_high_frequency_jitter"] if expected_hf else None,
+        low_local_backtracking=nodes["low_local_backtracking"] if expected_backtracking else None,
         eef_jerk=nodes["eef_jerk"] if expected_jerk else None,
         min_reliability=float(replay_resolved["quality"]["min_reliability"]),
     )
@@ -2917,6 +3311,28 @@ def validate_output(
         expected_clusters = [
             int(leaf_metadata[int(value)]["center_id"]) for value in assigned_indices
         ]
+        if expected_jump:
+            validate_jump_fields(
+                row, {field: float(nodes[field][index]) for field in JUMP_FIELDS}
+            )
+        elif any(field in row for field in JUMP_FIELDS):
+            raise ValueError("unexpected action_jump row")
+        if expected_execution:
+            validate_execution_fields(row, execution_row(nodes, index))
+        elif any(field in row for field in EXECUTION_FIELDS):
+            raise ValueError("unexpected action_execution_deviation row")
+        if expected_backtracking:
+            validate_backtracking_fields(row, backtracking_row(nodes, index))
+        elif any(field in row for field in BACKTRACKING_FIELDS):
+            raise ValueError("unexpected local_backtracking row")
+        if expected_hf:
+            expected_hf_row = hf_row(nodes, index)
+            if any(
+                field not in row or row[field] != value for field, value in expected_hf_row.items()
+            ):
+                raise ValueError("high_frequency_jitter row does not match graph")
+        elif any(field in row for field in HF_FIELDS):
+            raise ValueError("unexpected high_frequency_jitter row")
         if expected_path:
             value = float(nodes["local_path_efficiency"][index])
             expected_value = value if np.isfinite(value) else None
@@ -3030,14 +3446,69 @@ def validate_output(
             expected_jerk["eef_jerk_raw"], expected_jerk["eef_jerk_reason"], selected_rows
         ):
             raise ValueError("eef_jerk report summary does not match replay")
+    elif "eef_jerk_summary" in report:
+        raise ValueError("unexpected eef_jerk selection output without configuration")
+    if filters_validity:
         try:
             excluded = json.loads((result / "excluded_clips.json").read_text())
         except (OSError, ValueError) as error:
-            raise ValueError("eef_jerk exclusion records missing or invalid") from error
-        if excluded != _jerk_excluded_rows(root, expected_jerk):
-            raise ValueError("eef_jerk exclusion records do not match replay")
-    elif "eef_jerk_summary" in report or (result / "excluded_clips.json").exists():
-        raise ValueError("unexpected eef_jerk selection output without configuration")
+            raise ValueError(
+                "eef_jerk/action_execution_deviation exclusion records missing or invalid"
+            ) from error
+        if excluded != _metric_excluded_rows(
+            root, expected_jerk, expected_execution, execution_fused=execution_fused
+        ):
+            raise ValueError(
+                "eef_jerk/action_execution_deviation exclusion records do not match replay"
+            )
+    elif (result / "excluded_clips.json").exists():
+        raise ValueError("unexpected exclusion output without configured validity filtering")
+    if expected_execution:
+        execution_all_by_id = {row["sample_id"]: row for row in all_rows}
+        for row in selected_rows:
+            validate_execution_fields(row, execution_all_by_id[row["sample_id"]])
+        if report.get("action_execution_deviation_summary") != execution_summary(
+            expected_execution, all_rows, selected_rows
+        ):
+            raise ValueError("action_execution_deviation summary does not match clip values")
+    elif "action_execution_deviation_summary" in report or any(
+        field in row for row in selected_rows for field in EXECUTION_FIELDS
+    ):
+        raise ValueError("unexpected action_execution_deviation selection output")
+    if expected_jump:
+        jump_all_by_id = {row["sample_id"]: row for row in all_rows}
+        for row in selected_rows:
+            validate_jump_fields(row, jump_all_by_id[row["sample_id"]])
+    elif any(field in row for row in selected_rows for field in JUMP_FIELDS):
+        raise ValueError("unexpected action_jump selection output")
+    if expected_backtracking:
+        backtracking_all_by_id = {row["sample_id"]: row for row in all_rows}
+        for row in selected_rows:
+            validate_backtracking_fields(row, backtracking_all_by_id[row["sample_id"]])
+        if report.get("local_backtracking_summary") != backtracking_summary(
+            expected_backtracking, all_rows, selected_rows
+        ):
+            raise ValueError("local_backtracking summary does not match clip values")
+    elif "local_backtracking_summary" in report or any(
+        field in row for row in selected_rows for field in BACKTRACKING_FIELDS
+    ):
+        raise ValueError("unexpected local_backtracking selection output")
+    if expected_hf:
+        hf_all_by_id = {row["sample_id"]: row for row in all_rows}
+        for row in selected_rows:
+            if any(
+                field not in row or row[field] != hf_all_by_id[row["sample_id"]][field]
+                for field in HF_FIELDS
+            ):
+                raise ValueError("selected high_frequency_jitter does not match all-clips row")
+        if report.get("high_frequency_jitter_summary") != hf_summary(
+            expected_hf, all_rows, selected_rows
+        ):
+            raise ValueError("high_frequency_jitter summary does not match clip values")
+    elif "high_frequency_jitter_summary" in report or any(
+        field in row for row in selected_rows for field in HF_FIELDS
+    ):
+        raise ValueError("unexpected high_frequency_jitter selection output")
     if expected_path:
         all_by_id = {row["sample_id"]: row for row in all_rows}
         for row in selected_rows:

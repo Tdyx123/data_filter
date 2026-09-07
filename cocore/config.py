@@ -14,7 +14,11 @@ import yaml
 from relcore.config import DEFAULT_CONFIG as RELCORE_DEFAULT_CONFIG
 from relcore.config import resolve_config as resolve_relcore_config
 
+from cocore.action_jump import resolve_jump_config
+from cocore.action_execution_deviation import resolve_execution_config
+from cocore.high_frequency_jitter import resolve_hf_config
 from cocore.local_path_efficiency import resolve_path_config
+from cocore.local_backtracking import resolve_backtracking_config
 from cocore.dwell import resolve_dwell_config
 from cocore.temporal import resolve_temporal_geometry
 from cocore.action_variation import DEFAULT_RELIABILITY_METRICS, normalize_reliability_metrics
@@ -165,6 +169,25 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("cocore prototypes.tol must be a finite positive number")
     resolved["prototypes"]["tol"] = float(tolerance)
     resolved["reliability_metrics"] = reliability_metrics
+    execution = resolve_execution_config(resolved.get("action_execution_deviation"))
+    if execution is not None:
+        resolved["action_execution_deviation"] = execution
+    else:
+        resolved.pop("action_execution_deviation", None)
+    if "low_action_execution_deviation" in reliability_metrics and execution is None:
+        raise ValueError(
+            "low_action_execution_deviation requires explicit action_execution_deviation configuration"
+        )
+    jump = resolve_jump_config(resolved.get("action_jump"))
+    if jump is None and "action_jump" in reliability_metrics:
+        jump = resolve_jump_config({})
+    if jump is not None:
+        gripper_index = resolved["quality"].get("gripper_action_index")
+        if isinstance(gripper_index, bool) or not isinstance(gripper_index, Integral):
+            raise ValueError("action_jump quality.gripper_action_index must be an integer")
+        resolved["action_jump"] = jump
+    else:
+        resolved.pop("action_jump", None)
     dwell = resolve_dwell_config(resolved.get("dwell"))
     if dwell is not None:
         resolved["dwell"] = dwell
@@ -172,6 +195,22 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
         resolved.pop("dwell", None)
     if "non_dwell" in reliability_metrics and dwell is None:
         raise ValueError("non_dwell requires explicit dwell configuration")
+    backtracking_settings = resolve_backtracking_config(resolved.get("local_backtracking"))
+    if backtracking_settings is not None:
+        resolved["local_backtracking"] = backtracking_settings
+    else:
+        resolved.pop("local_backtracking", None)
+    if "low_local_backtracking" in reliability_metrics and backtracking_settings is None:
+        raise ValueError("low_local_backtracking requires explicit local_backtracking configuration")
+    hf_settings = resolve_hf_config(resolved.get("high_frequency_jitter"))
+    if hf_settings is not None:
+        resolved["high_frequency_jitter"] = hf_settings
+    else:
+        resolved.pop("high_frequency_jitter", None)
+    if "low_high_frequency_jitter" in reliability_metrics and hf_settings is None:
+        raise ValueError(
+            "low_high_frequency_jitter requires explicit high_frequency_jitter configuration"
+        )
     path_settings = resolve_path_config(resolved.get("local_path_efficiency"))
     if path_settings is not None:
         resolved["local_path_efficiency"] = path_settings

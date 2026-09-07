@@ -4,6 +4,10 @@
 运行 LIBERO 组件消融。它读取或补建现有 Cocore 的共享 `scan/`、`encode/` 缓存，并按
 实验子文件夹隔离自己的 graph 和 select 产物。
 
+共享片段编码仅拼接视觉、状态和动作特征，再整体 L2 归一化，不包含轨迹位置。
+旧版含位置的 upstream 编码需先通过 Cocore 的 `--force` 重建，或改用新的
+`upstream.directory`；消融命令的 `--force` 不会重建 upstream。
+
 ## 运行
 
 ```bash

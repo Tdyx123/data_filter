@@ -16,7 +16,9 @@ LIBERO 中长度为 `L >= 15` 的 episode 固定生成 `N = ceil(L / 15)` 个完
 episode 只执行一次视觉模型前向；候选片段的视觉特征
 `[sum(v0..v(C-1)), v(C-1)-v0]` 直接用于拟合 128 维 PCA，其中 `C` 为 profile 的候选
 长度；再与 state/action 的
-`mean/std/max` 及 `start/episode_length` 拼接并做行 L2 归一化。该 embedding 用于
+`mean/std/max` 拼接并做行 L2 归一化，所有 profile 均不包含轨迹位置
+`start/episode_length`。旧版含位置的编码缓存指纹不兼容，需使用 `--force`
+重新编码并重建下游产物。该 embedding 用于
 可靠性 support 和相似图。Encode 还保留原始逐帧 CLIP 缓存。LIBERO 将候选拆成共享
 第 7 帧的 `[0..7]`、`[7..14]` 两个 8 帧半段；Bridge 将 7 帧候选拆成共享第 3 帧的
 `[0..3]`、`[3..6]` 两个 4 帧半段，分别缓存原始 CLIP 空间中的归一化均值。
@@ -88,8 +90,8 @@ w_half = w_r * w_d
 最多两个槽位，按权重降序、叶 ID 破平局；权重不归一、不截断，范围可到 1.5。
 
 可靠性目录为 `support`、`progress`、`action_variation`、
-`visual_action_consistency`、`non_dwell`、`eef_jerk` 和 `local_path_efficiency`，
-顶层 `reliability_metrics` 可选择非空、无重复的指标子集，默认仅启用前四项；`non_dwell` 需要显式配置 `dwell` 阈值。输入顺序会按
+`visual_action_consistency`、`non_dwell`、`eef_jerk`、`local_path_efficiency`、`low_high_frequency_jitter`、`low_local_backtracking` 和 `action_jump`，
+顶层 `reliability_metrics` 可选择非空、无重复的指标子集，默认启用前四项和 `action_jump`；`non_dwell` 需要显式配置 `dwell` 阈值。输入顺序会按
 上述固定顺序规范化。`action_variation` 在完整 episode 的分位缩放动作上计算：逐步分数
 为当前与前一步动作的 L2 差乘 2，再加未来最多 5 步动作逐维总体方差的维度均值；首步
 差分为 0，未来少于 2 步时方差为 0。片段原始分数取最高 3 个逐步分数的均值，再使用
@@ -193,10 +195,10 @@ graph 节点、`all_clips.parquet` 和 `selected_manifest.jsonl` 均包含两项
 高驻留比例不等于低价值：持物、等待、接触保持均可能合理。`non_dwell` 仅在显式选择时
 影响几何均值，不新增仅凭驻留比例直接删除片段的规则。
 
-任意所选指标集合都统一取几何均值：
+所选指标逐片段跳过允许无效的 NaN 分量，对剩余有效项取几何均值；无有效项时取 1：
 
 ```text
-reliability = clip((product(selected_metrics)) ** (1 / metric_count),
+reliability = clip((product(valid_selected_metrics)) ** (1 / max(valid_metric_count, 1)),
                    quality.min_reliability, 1)
 ```
 
@@ -297,7 +299,7 @@ python -m cocore run --config cocore/config_libero90.yaml
 配置必须显式声明关系类型与权重：
 
 ```yaml
-reliability_metrics: [support, progress, action_variation, visual_action_consistency]
+reliability_metrics: [support, progress, action_variation, visual_action_consistency, action_jump]
 
 encoding:
   visual_dim: 128
@@ -393,8 +395,8 @@ Cocore 0.19.0 使用 prototype schema 10、profile 固定的 15/8（LIBERO）或
 的动作训练窗口、裁剪 PCA
 的 128 维聚类空间、近似均匀候选和原始相邻 sequence 图，并按 episode 持久化完整原始
 逐帧 CLIP 特征，选择阶段固定使用 selection schema 3 的随机多分支算法。0.19.0 新增
-VAC 原始/归一化产物，默认采用四指标的任意非空子集几何均值融合；另支持显式配置的
-第五项 `non_dwell`，其计算版本和阈值独立进入缓存契约。指标、AVI 与
+VAC 原始/归一化产物。当前默认融合 support、progress、AVI、VAC 和 `action_jump`，
+并支持其余可选指标；各指标计算版本和参数独立进入缓存契约。指标、AVI 与
 VAC 契约进入阶段指纹、manifest 和报告，validator 会从动作序列和逐帧视觉缓存重算
 VAC，校验 Top-3、分位缩放、图节点、选择输出及融合结果。版本校验保持严格，因此旧
 artifact 不会被接受，升级后应使用 `--force` 重建。Bridge 适配器 0.12.0 使用 Cocore
@@ -460,6 +462,80 @@ parquet/JSONL 导出最终 `prototype_indices`、`prototype_weights`、叶标签
 `half_action_labels`，不导出可分解的 action/distance 权重。所有图关系与选择目标直接
 消费绝对 `prototype_weights`，不对每行额外归一或截断。
 
+### 可选动作—执行偏差
+
+`action_execution_deviation` 衡量原始控制指令要求的末端平移与实际执行位移的差距。
+它是控制指令与反馈的一致性检查，不是动作平滑度或片段价值的直接度量。
+默认不计算；仅配置时输出诊断，将 `low_action_execution_deviation` 加入
+`reliability_metrics` 后才参与可靠性几何平均融合。
+
+```yaml
+action_execution_deviation:
+  action_source: original_command
+  action_semantics: delta_from_observed_position
+  action_scale: [1, 1, 1]  # 仅适用于动作前三维已经是米制位移；否则填写实际每轴转换系数
+  alignment_confirmed: true
+
+reliability_metrics: [support, progress, action_variation, visual_action_consistency, action_jump, low_action_execution_deviation]
+```
+
+四个配置字段均必须显式填写。`alignment_confirmed: true` 表示使用者已确认：
+`observation.state[:, :3]` 是以米为单位的实测位置，动作与位置处于同一固定坐标系，
+动作 t 对应位置 t→t+1 的执行区间，且控制器限幅已经在上游正确处理。
+`action_scale` 必须是三个有限正数，将原始动作前三维转换为米制期望位移；
+它不是从当前数据分布拟合出的归一化参数，也不能替代坐标转换。
+程序不会推断动作语义、猜测缩放或为每个片段搜索最优延迟。只有 YAML 完整配置后，
+现有 `--reliability-metrics` 参数才能用于选择本指标。
+
+使用 float64，在每个片段内按以下顺序计算：
+
+```text
+a_pos[t] = raw_action[t, :3] * action_scale
+e[t] = ||(p[t+1] - p[t]) - a_pos[t]||₂
+action_execution_deviation_raw = mean(e[0:L-1])
+```
+
+L 个位置只有 L−1 个执行区间；末帧动作不参与计算，不跨片段或 episode 比较。
+必须先逐步取范数再求平均，以免不同方向的偏差抵消。例如指令为 `(10,0,0)` mm，
+实际位移为 `(6,3,0)` mm，偏差为 5 mm，即原始输出 `0.005` m。
+原始值越大偏差越大，不是 `[0,1]` 比例；算法复杂度为 O(L)，不需要训练模型。
+
+时间戳必须严格递增，允许不等间隔。位置、动作或时间缺失、形状错误、NaN/Inf
+均报错；少于两帧、时间不递增和计算溢出分别记录 `too_short`、
+`non_increasing_time`、`overflow`。不可计算时缓存数值为 NaN，JSON/Parquet 导出为 null。
+
+归一化使用所有有效扫描候选的原始偏差，沿用 `encoding.quantile_low/high/epsilon`：
+
+```text
+low_action_execution_deviation = 1 - clip((raw - q_low) / (q_high - q_low), 0, 1)
+```
+
+分位跨度不超过 epsilon 时赋 1，表示当前池无法区分，不能解释为执行无偏差。
+只配置诊断不会改变筛选池或融合分数；选择该指标融合时，不可计算片段排除出图，
+入图条件与原型资格、已启用 Jerk 的有效性取交集。过滤不补跨空洞的 sequence 边，
+比例预算基于最终入图数量；无候选时报错。
+
+encode 缓存保存 `action_execution_deviation_{positions,actions,timestamps,raw,valid,reason}.npy`
+及 `low_action_execution_deviation.npy`，包括原始输入、计算契约与 SHA-256。
+graph 节点、`all_clips.parquet`、选中清单保留原始值、融合值与状态。
+`action_execution_deviation_summary` 分别汇总 scanned、graph、selected 的米制原始均值、
+有效/无效数量和无效原因。启用融合时，`excluded_clips.json` 保留所有排除原因，
+`excluded_action_execution_deviation_clips` 记录本项无效数量；总排除数按并集计算，
+不能与 Jerk/无标签数量直接相加。validator 会检查重叠输入一致性，并重算原始值、
+分位缩放、入图掩码、融合分数、导出及报告。更改配置会使 encode 及下游缓存失效，
+复用同一目录时需 `--force` 重建。未配置时不要求新增缓存。
+
+首版仅支持相对**当前实测位置**的平移指令；相对上一目标位置、绝对位置、速度、
+关节、力矩、旋转和夹爪不适用。位置目标可能需要逐渐跟踪，接触操作中的偏差也可能是
+正常控制行为，因此非零偏差不直接等于示范无效。自由空间与接触操作应分开比较；
+当前不自动识别接触阶段，也不设置统一异常阈值。
+
+若动作由前后状态差重标注，代入公式得到的零只是标签构造结果，不能作为执行质量证据。
+此时必须提供原始下发指令，否则不要启用；`action_source` 声明错误或不明确时会报错。
+程序不能凭数值为零判断来源，真实完全跟踪的零偏差仍有效。
+参考：[robosuite 控制器](https://robosuite.ai/docs/source/robosuite.controllers.parts.arm.html)、
+[Bridge 官方动作重标注代码](https://github.com/rail-berkeley/bridge_data_v2/blob/main/jaxrl_m/data/bridge_dataset.py)。
+
 ### 可选末端运动 Jerk
 
 在 `reliability_metrics` 中加入 `eef_jerk` 即启用计算和融合，无需模型或额外阈值：
@@ -469,7 +545,7 @@ reliability_metrics: [support, progress, action_variation, visual_action_consist
 ```
 
 CLI 使用 `--reliability-metrics support progress action_variation visual_action_consistency eef_jerk`。
-默认四项不变，未选择 `eef_jerk` 时不计算，也不要求 Jerk 缓存。
+`eef_jerk` 为可选项，未选择时不计算，也不要求 Jerk 缓存。
 
 输入为固定坐标系下实际末端位置 `observation.state[:, :3]`（米）和原始时间戳（秒），
 不使用缩放后的 state 或动作指令。使用 float64，在每个片段内部计算：
@@ -509,3 +585,161 @@ encode 新增 `eef_jerk_positions.npy`、`eef_jerk_timestamps.npy`、`eef_jerk_r
 首版不平滑、不计算 RMS 或旋转 Jerk。三阶差分对位置噪声敏感；原始 Jerk 还受运动幅度和时长影响，
 同轨迹执行时间延长 k 倍会使 Jerk 缩小到 `1/k³`。归一化分数仅表示本次候选池的相对水平，
 不能据此跨任务统一比较；静止片段也可得到零 Jerk，应结合任务进展和交互事件判断数据价值。
+
+### 局部折返率（可选）
+
+`local_backtracking_rate` 衡量片段内相邻两段末端位移出现明显反向的比例。
+输入是同一固定坐标系中的实际末端位置 `observation.state[:, :3]`（当前 LIBERO 与
+Bridge V2 以米为单位）及秒单位时间戳。使用片段内全部采样点、float64 原始值，
+不使用动作指令或归一化 state，不平滑、不重采样，也不跨片段或静止步补算。
+
+```text
+d[t] = p[t+1] - p[t]
+V = {t: ||d[t]|| > epsilon_p 且 ||d[t+1]|| > epsilon_p}
+c[t] = clip(dot(d[t], d[t+1]) / (||d[t]|| * ||d[t+1]||), -1, 1)
+local_backtracking_rate = count(c[t] < -eta, t ∈ V) / |V|
+low_local_backtracking = 1 - local_backtracking_rate
+```
+
+分母是有效方向比较次数 `|V|`，只有所有位移均通过检查时才等于 `L−2`。
+例如 80 次有效比较中有 12 次折返，折返率为 `0.15`；它不代表时间或路程浪费了 15%。
+默认 `eta=0.5` 对应夹角严格大于 120°，直角及恰好达到阈值的转向不计入。
+`epsilon_p` 必须显式填写有限正数，单位与原始位置相同；`eta` 可配置，须满足
+`0 ≤ eta < 1`。二者均不接受布尔值，配置块不接受其他键。
+
+```yaml
+# 先按位置噪声、采样间隔及运动尺度校准 epsilon_p，再取消注释。
+# local_backtracking:
+#   epsilon_p: null  # 必填；替换为有限正数，当前数据单位为米
+#   eta: 0.5        # 可省略
+```
+
+存在配置块即可输出诊断；需要影响可靠性时，再将 `low_local_backtracking` 加入
+`reliability_metrics`，或使用 CLI 的 `--reliability-metrics` 选择它。保持原默认分量的示例：
+
+```yaml
+reliability_metrics: [support, progress, action_variation, visual_action_consistency, action_jump, low_local_backtracking]
+```
+
+该例还需填写上述配置块；只选择融合分量而未配置阈值会报错。默认不计算、不参与融合。
+融合使用 `1−折返率` 的逐片段几何平均；无效分量跳过，若选中的所有分量均无效则沿用
+中性可靠性 `1`，保留现有最低可靠性裁剪。不会仅因该指标不可评价而排除候选。
+
+导出字段为 `local_backtracking_rate`、`low_local_backtracking`、
+`local_backtracking_valid_count`（有效比较次数）、`local_backtracking_count`（折返次数）、
+`local_backtracking_valid` 和 `local_backtracking_reason`。两项次数为整数。
+无有效比较时，分数为 NaN、次数为零，原因为 `no_valid_comparisons`。
+少于三帧、非递增时间、不均匀采样或计算溢出也不可评价，原因依次为 `too_short`、
+`non_increasing_time`、`non_uniform_time`、`overflow`。等间隔检查使用时间差中位数，
+容差 `rtol=1e-4, atol=1e-8`；位置或时间戳缺失、形状错误及非有限值直接报错。
+
+encode 保存 `local_backtracking_positions.npy`、`local_backtracking_timestamps.npy`
+及上述六项字段的 NPY 数组；位置、时间戳及分数为 float64，次数为 int64。
+缓存契约记录阈值、公式、采样约定、profile 和 SHA-256；`validate` 重算指标并核对
+重叠片段输入、节点映射、融合值与导出记录。配置变化需要按现有机制使用 `--force` 重建。
+图节点、`all_clips.parquet` 和 `selected_manifest.jsonl` 均保留六项字段，JSON 无效分数为
+`null`。`selection_report.json` 的 `local_backtracking_summary` 分别统计 `scanned`
+（全部扫描候选）、`graph`（入图候选）、`selected`（已选片段）：有效／无效片段数、
+无效原因计数、有效片段的 `rate_mean`、有效比较总次数 `valid_comparison_count` 和
+折返总次数 `backtracking_count`。`rate_mean` 是有效片段等权均值，不是汇总次数之比。
+
+高折返率不等于低价值：擦拭等往复任务或纠偏动作可能需要反向移动，应在同类、同阶段
+片段间比较，并结合有效比较次数解释。改变采样频率或预处理会改变结果；此指标不含旋转
+或夹爪动作，缓慢绕圈及“前进—停顿—后退”也可能漏检，因此低折返率不能证明没有绕行。
+局部路径效率看整体多走多少路，局部折返率看相邻方向反转多频繁。这里采用的是工程代理
+指标，不是 S2I 原论文的评分公式。
+
+### 高频抖动能量占比（可选）
+
+`high_frequency_jitter` 分析片段内部固定坐标系下的末端三轴平移速度。
+输入为原始 `observation.state[:, :3]` 与秒单位时间戳，相邻位置差分产生 `N=L−1`
+个速度样本。逐轴去均值，使用周期 Hann 窗和单边功率谱密度，再合并三轴功率；
+不先取速度模长，不包含旋转或夹爪，不做平滑、重采样或零填充。
+
+- `high_frequency_ratio`：`E_HF / (E_total + epsilon)`，分母排除直流，分子严格取 `f > cutoff_hz`。
+- `high_frequency_rms`：`sqrt(E_HF)`；`total_fluctuation_rms`：`sqrt(E_total)`，单位均为原始位置单位/秒。
+- `high_frequency_resolution_hz`：`fs/N`，采样间隔取片段时间差的中位数。
+- `low_high_frequency_jitter`：有效时等于 `1−high_frequency_ratio`，可选参与可靠性融合。
+- `high_frequency_valid`、`high_frequency_reason`：有效性与原因。
+
+配置块存在即可输出诊断；加入 `reliability_metrics` 或通过 `--reliability-metrics`
+选择 `low_high_frequency_jitter` 才改变融合。三个校准参数必须显式填写有限正数：
+
+```yaml
+# 将 null 替换为同机器人、同采样率、同类任务下校准的数值后启用。
+# high_frequency_jitter:
+#   cutoff_hz: null                    # Hz，必须严格低于 fs/2
+#   noise_floor_rms: null              # 总速度波动的噪声底，原始位置单位/秒
+#   max_frequency_resolution_hz: null  # 可接受的最大 fs/N，Hz
+#   epsilon: 1.0e-12                   # 可省略，单位与积分功率一致
+# reliability_metrics: [support, progress, action_variation, visual_action_consistency, low_high_frequency_jitter]
+```
+
+速度样本不足 3 个、频点间隔超限、截止频率两侧缺少频点或总波动 RMS 不超过噪声底时，
+分别记录 `too_short`、`coarse_resolution`、`missing_band`、`low_fluctuation`，按此顺序
+选择首个原因。能计算的原始诊断仍保留，无效融合分量为 NaN；导出 JSON/Parquet 时为 `null`。
+几何平均逐片段跳过无效分量；所有启用项均无效时取 `1`。高频指标无效不会排除图节点；
+已有 Jerk 无效排除规则仍独立生效。
+
+时间戳必须严格递增且等间隔（`rtol=1e-3, atol=1e-8`，与 Jerk 的容差独立）。
+缺失或非有限输入、非法时间戳、超出奈奎斯特范围的截止频率及数值溢出会报出片段标识。
+LIBERO 的 15 帧只有 14 个速度样本，Bridge 的 7 帧只有 6 个速度样本，应结合实际
+`fs/N` 校准可接受分辨率；不会自动延长片段或把 3 Hz 设为通用阈值。
+
+encode 独立缓存 float64 位置、时间戳、诊断和融合值，以及布尔有效性和原因字符串。
+参数与算法契约进入缓存指纹，`validate` 检查校验和、重叠输入一致性并重新计算指标和融合。
+`high_frequency_jitter_summary` 分别列出 `scanned`（扫描候选）、`graph`（图内片段）
+及 `selected`（选中片段）的有效数、无效数、原因计数和有效片段均值。
+
+这是抖动代理指标，不是片段价值或机械能。高占比不代表大幅抖动，必须结合绝对强度；
+往复任务也可能有高频运动。Jerk 衡量加速度变化强度，本指标衡量速度波动的频率组成，
+两者不等价。本指标不使用分位数归一化，也不自动按占比删除片段。
+
+
+### 异常动作跳变率（默认启用）
+
+`action_jump_rate` 衡量片段内部相邻动作变化超过统一阈值的比例；融合分量
+`action_jump = 1 - action_jump_rate`，保持越高越好的方向，不再进行分位数归一化。
+
+输入为原始动作，排除 `quality.gripper_action_index` 指定的夹爪维度（默认最后一维）。
+不复用截断到 `[0,1]` 的动作编码，避免掩盖极端跳变。用本次加载的全部 episode
+（受 `runtime.max_episodes` 限制）的连续动作，按帧统一计算各维总体标准差 `s_i`：
+
+```text
+J_t = sqrt(mean_i(((a[t,i] - a[t-1,i]) / max(s_i, epsilon))^2))
+tau = quantile(all_episode_internal_J, threshold_quantile, method="linear")
+action_jump_rate = count(J_t > tau within clip) / (L - 1)
+action_jump = 1 - action_jump_rate
+```
+
+尺度不按片段计算；阈值标定不跨 episode，也不会因候选重叠重复计数。片段起始帧不与
+片段外前一帧比较。101 帧中有 8 次严格超过阈值时，跳变率为 `0.08`，融合值为 `0.92`；
+等于阈值不计异常。静止连续动作的跳变率为零，即使二值夹爪正常切换也不会触发此项。
+
+```yaml
+reliability_metrics: [support, progress, action_variation, visual_action_consistency, action_jump]
+# 选择 action_jump 时自动补齐以下默认值；可省略整个配置块。
+action_jump:
+  threshold_quantile: 0.99
+  threshold: null       # 非空时优先使用固定阈值，须有限且非负
+  epsilon: 1.0e-8       # 须有限且为正；分位参数须满足 0 < q < 1
+```
+
+显式选择原四项且不提供配置块时，不计算此项；仅提供配置块而不选择 `action_jump`
+时，输出诊断但不改变融合。CLI 可用 `--reliability-metrics` 选择此项，标定参数通过 YAML
+配置。其他指标的 NaN 跳过、Jerk 无效候选排除规则保持独立；跳变率不新增硬删除条件。
+
+编码缓存以 float64 保存完整参考池的连续动作拼接数组、尺度、阈值、片段跳变率和
+融合值，以 int64 保存 episode ID、边界偏移、连续维度索引和比较样本数，文件均以
+`action_jump` 开头。计算契约及 SHA-256 存于 encode manifest；校验时检查扫描参考池
+边界并重算标定和分数，核对节点、all-clips、selected 及各阶段契约。启用或修改配置会
+改变 encode 及下游指纹，复用不兼容目录须 `--force`；显式旧配置保留原缓存契约。
+
+假设同次运行采用相同动作表示和控制周期，旋转按动作数值直接作差。非有限动作、
+维度不一致、非法夹爪索引、无连续维度或计算溢出时报错。单帧 episode 只贡献尺度样本，
+不贡献阈值比较；指标函数要求片段至少两帧。
+
+当前数据集 P99 是工程标定起点，并非可信参考集或通用最优阈值，需要结合机器人、
+动作表示、控制频率和任务调整。此项衡量动作指令变化；技能切换和快速纠正也可能
+产生高跳变率，不能单独据此删除数据，也不能等同于实际运动不平滑。它与使用末端
+位置及时间戳的 Jerk、高频抖动指标具有不同含义。

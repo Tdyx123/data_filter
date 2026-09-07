@@ -12,8 +12,14 @@ import numpy as np
 
 from relcore.features.visual_encoder import VisualEncoder
 from relcore.schemas import ClipRecord
+from cocore.local_backtracking import backtracking_arrays, resolve_backtracking_config
 from cocore.local_path_efficiency import compute_local_path_efficiency, resolve_path_config
 from cocore.eef_jerk import jerk_arrays
+from cocore.action_jump import build_jump_arrays, resolve_jump_config
+from cocore.action_execution_deviation import (
+    execution_arrays, execution_inputs, resolve_execution_config,
+)
+from cocore.high_frequency_jitter import hf_arrays, resolve_hf_config
 from cocore.dwell import compute_dwell_ratio, resolve_dwell_config
 from trajectory_data import DatasetAdapter, EpisodeData, EpisodeRecord
 
@@ -278,28 +284,22 @@ def fuse_fragment_features(
     visual_embeddings: np.ndarray,
     state_pooled: np.ndarray,
     action_pooled: np.ndarray,
-    progress: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Concatenate Quality fragment features and L2-normalize each row."""
+    """Concatenate visual, state, and action features, then L2-normalize."""
 
     visual = np.asarray(visual_embeddings, dtype=np.float32)
     states = np.asarray(state_pooled, dtype=np.float32)
     actions = np.asarray(action_pooled, dtype=np.float32)
-    progress_values = np.asarray(progress, dtype=np.float32)
     row_count = len(visual)
     if (
         visual.ndim != 2
         or states.ndim != 2
         or actions.ndim != 2
-        or progress_values.ndim != 1
         or len(states) != row_count
         or len(actions) != row_count
-        or len(progress_values) != row_count
     ):
         raise ValueError("fused fragment features must have aligned sample rows")
-    fused_raw = np.concatenate([visual, states, actions, progress_values[:, None]], axis=1).astype(
-        np.float32
-    )
+    fused_raw = np.concatenate([visual, states, actions], axis=1).astype(np.float32)
     return fused_raw, _l2_normalize_rows(fused_raw)
 
 
@@ -364,8 +364,41 @@ class CocoreEncodedClips:
     eef_jerk: np.ndarray | None = None
     eef_jerk_valid: np.ndarray | None = None
     eef_jerk_reason: np.ndarray | None = None
+    high_frequency_positions: np.ndarray | None = None
+    high_frequency_timestamps: np.ndarray | None = None
+    high_frequency_ratio: np.ndarray | None = None
+    high_frequency_rms: np.ndarray | None = None
+    total_fluctuation_rms: np.ndarray | None = None
+    low_high_frequency_jitter: np.ndarray | None = None
+    high_frequency_resolution_hz: np.ndarray | None = None
+    high_frequency_valid: np.ndarray | None = None
+    high_frequency_reason: np.ndarray | None = None
+    local_backtracking_positions: np.ndarray | None = None
+    local_backtracking_timestamps: np.ndarray | None = None
+    local_backtracking_rate: np.ndarray | None = None
+    low_local_backtracking: np.ndarray | None = None
+    local_backtracking_valid_count: np.ndarray | None = None
+    local_backtracking_count: np.ndarray | None = None
+    local_backtracking_valid: np.ndarray | None = None
+    local_backtracking_reason: np.ndarray | None = None
     path_position_sequences: np.ndarray | None = None
     local_path_efficiency: np.ndarray | None = None
+    action_jump_actions: np.ndarray | None = None
+    action_jump_episode_ids: np.ndarray | None = None
+    action_jump_offsets: np.ndarray | None = None
+    action_jump_dimensions: np.ndarray | None = None
+    action_jump_scale: np.ndarray | None = None
+    action_jump_threshold: np.ndarray | None = None
+    action_jump_pair_count: np.ndarray | None = None
+    action_jump_rate: np.ndarray | None = None
+    action_jump: np.ndarray | None = None
+    action_execution_deviation_positions: np.ndarray | None = None
+    action_execution_deviation_actions: np.ndarray | None = None
+    action_execution_deviation_timestamps: np.ndarray | None = None
+    action_execution_deviation_raw: np.ndarray | None = None
+    low_action_execution_deviation: np.ndarray | None = None
+    action_execution_deviation_valid: np.ndarray | None = None
+    action_execution_deviation_reason: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -391,8 +424,41 @@ class CocoreEncodedArtifact:
     eef_jerk: np.ndarray | None = None
     eef_jerk_valid: np.ndarray | None = None
     eef_jerk_reason: np.ndarray | None = None
+    high_frequency_positions: np.ndarray | None = None
+    high_frequency_timestamps: np.ndarray | None = None
+    high_frequency_ratio: np.ndarray | None = None
+    high_frequency_rms: np.ndarray | None = None
+    total_fluctuation_rms: np.ndarray | None = None
+    low_high_frequency_jitter: np.ndarray | None = None
+    high_frequency_resolution_hz: np.ndarray | None = None
+    high_frequency_valid: np.ndarray | None = None
+    high_frequency_reason: np.ndarray | None = None
+    local_backtracking_positions: np.ndarray | None = None
+    local_backtracking_timestamps: np.ndarray | None = None
+    local_backtracking_rate: np.ndarray | None = None
+    low_local_backtracking: np.ndarray | None = None
+    local_backtracking_valid_count: np.ndarray | None = None
+    local_backtracking_count: np.ndarray | None = None
+    local_backtracking_valid: np.ndarray | None = None
+    local_backtracking_reason: np.ndarray | None = None
     path_position_sequences: np.ndarray | None = None
     local_path_efficiency: np.ndarray | None = None
+    action_jump_actions: np.ndarray | None = None
+    action_jump_episode_ids: np.ndarray | None = None
+    action_jump_offsets: np.ndarray | None = None
+    action_jump_dimensions: np.ndarray | None = None
+    action_jump_scale: np.ndarray | None = None
+    action_jump_threshold: np.ndarray | None = None
+    action_jump_pair_count: np.ndarray | None = None
+    action_jump_rate: np.ndarray | None = None
+    action_jump: np.ndarray | None = None
+    action_execution_deviation_positions: np.ndarray | None = None
+    action_execution_deviation_actions: np.ndarray | None = None
+    action_execution_deviation_timestamps: np.ndarray | None = None
+    action_execution_deviation_raw: np.ndarray | None = None
+    low_action_execution_deviation: np.ndarray | None = None
+    action_execution_deviation_valid: np.ndarray | None = None
+    action_execution_deviation_reason: np.ndarray | None = None
 
 
 def _records_by_id(records: list[EpisodeRecord]) -> dict[int, EpisodeRecord]:
@@ -420,6 +486,30 @@ def _validate_episode_metadata(
         raise ValueError(f"episode {episode.episode_id} frame indices must be contiguous from zero")
 
 
+def _position_clip_inputs(
+    episode: EpisodeData, clip: ClipRecord, *, metric: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Validate raw inputs before normalized features can obscure clip context."""
+    window = slice(clip.start_step, clip.end_step + 1)
+    try:
+        positions = np.asarray(
+            episode.observations["observation.state"][window, :3], dtype=np.float64
+        )
+        timestamps = np.asarray(episode.timestamps[window], dtype=np.float64)
+        if (
+            positions.shape != (clip.length, 3)
+            or timestamps.shape != (clip.length,)
+            or not np.all(np.isfinite(positions))
+            or not np.all(np.isfinite(timestamps))
+        ):
+            raise ValueError("expected finite positions and matching timestamps")
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"{metric} clip {clip.sample_id}: missing or invalid positions/timestamps"
+        ) from error
+    return positions, timestamps
+
+
 def encode_cocore_dataset(
     adapter: DatasetAdapter,
     visual_encoder: VisualEncoder,
@@ -439,11 +529,20 @@ def encode_cocore_dataset(
     dwell: Mapping[str, object] | None = None,
     eef_jerk: bool = False,
     local_path_efficiency: Mapping[str, object] | None = None,
+    high_frequency_jitter: Mapping[str, object] | None = None,
+    local_backtracking: Mapping[str, object] | None = None,
+    action_jump: Mapping[str, object] | None = None,
+    action_execution_deviation: Mapping[str, object] | None = None,
+    gripper_action_index: int = -1,
 ) -> CocoreEncodedClips:
     """Encode Quality-style fragments and cache each usable episode's frames."""
 
     dwell = resolve_dwell_config(dwell)
     path_settings = resolve_path_config(local_path_efficiency)
+    hf_settings = resolve_hf_config(high_frequency_jitter)
+    backtracking_settings = resolve_backtracking_config(local_backtracking)
+    jump_settings = resolve_jump_config(action_jump)
+    execution_settings = resolve_execution_config(action_execution_deviation)
     geometry = resolve_temporal_geometry(profile)
     records = list(adapter.episodes())
     if max_episodes is not None:
@@ -453,16 +552,42 @@ def encode_cocore_dataset(
     if not clips:
         raise ValueError("dataset contains no complete clips")
 
+    clips_by_episode: dict[int, list[tuple[int, ClipRecord]]] = {}
+    for index, clip in enumerate(clips):
+        clips_by_episode.setdefault(clip.episode_id, []).append((index, clip))
+
     with timed_step("encode.numeric_normalization", timing_callback):
         numeric_episodes: list[tuple[np.ndarray, Mapping[str, np.ndarray]]] = []
         numeric_seen: set[int] = set()
+        jump_episodes = {}
+        execution_by_index = {}
         for episode in adapter.iter_episodes(
             num_workers=num_workers,
             max_episodes=max_episodes,
             load_images=False,
         ):
             _validate_episode_metadata(episode, records_by_id, numeric_seen, "numeric")
+            if execution_settings is not None:
+                for clip_index, clip in clips_by_episode.get(episode.episode_id, ()):
+                    try:
+                        p, t = _position_clip_inputs(
+                            episode, clip, metric="action_execution_deviation"
+                        )
+                        a = episode.actions[clip.start_step : clip.end_step + 1, :3]
+                        execution_by_index[clip_index] = execution_inputs(p, a, t)
+                    except (AttributeError, IndexError, TypeError, ValueError) as error:
+                        raise ValueError(
+                            f"action_execution_deviation clip {clip.sample_id}: {error}"
+                        ) from error
+            if hf_settings is not None:
+                for _, clip in clips_by_episode.get(episode.episode_id, ()):
+                    _position_clip_inputs(episode, clip, metric="high_frequency_jitter")
+            if backtracking_settings is not None:
+                for _, clip in clips_by_episode.get(episode.episode_id, ()):
+                    _position_clip_inputs(episode, clip, metric="local_backtracking")
             numeric_episodes.append((episode.actions, episode.observations))
+            if jump_settings is not None:
+                jump_episodes[episode.episode_id] = episode.actions
         if numeric_seen != set(records_by_id):
             raise ValueError("numeric pass did not yield every indexed episode exactly once")
         normalizers = CocoreNumericNormalizers.fit(
@@ -473,10 +598,33 @@ def encode_cocore_dataset(
             epsilon=epsilon,
         )
 
+    execution_values = (
+        execution_arrays(
+            *[
+                np.stack([execution_by_index[i][axis] for i in range(len(clips))])
+                for axis in range(3)
+            ],
+            config=execution_settings,
+            quantile_low=quantile_low,
+            quantile_high=quantile_high,
+            epsilon=epsilon,
+        )
+        if execution_settings is not None
+        else {}
+    )
+    jump_values = (
+        build_jump_arrays(
+            [jump_episodes[record.episode_id] for record in records],
+            [record.episode_id for record in records],
+            clips,
+            config=jump_settings,
+            gripper_action_index=gripper_action_index,
+        )
+        if jump_settings is not None
+        else {}
+    )
+
     with timed_step("encode.visual_cache", timing_callback):
-        clips_by_episode: dict[int, list[tuple[int, ClipRecord]]] = {}
-        for index, clip in enumerate(clips):
-            clips_by_episode.setdefault(clip.episode_id, []).append((index, clip))
         candidate_windows = {
             record.episode_id: [
                 (clip.start_step, clip.end_step)
@@ -496,6 +644,10 @@ def encode_cocore_dataset(
         cache_root.mkdir(parents=True, exist_ok=True)
         raw_visual: dict[tuple[int, int, int], np.ndarray] = {}
         half_visual_by_index: dict[int, np.ndarray] = {}
+        backtracking_positions: dict[int, np.ndarray] = {}
+        backtracking_times: dict[int, np.ndarray] = {}
+        hf_positions: dict[int, np.ndarray] = {}
+        hf_times: dict[int, np.ndarray] = {}
         path_positions: dict[int, np.ndarray] = {}
         path_scores: dict[int, float] = {}
         jerk_positions: dict[int, np.ndarray] = {}
@@ -507,7 +659,6 @@ def encode_cocore_dataset(
         action_by_index: dict[int, np.ndarray] = {}
         action_variation_by_index: dict[int, float] = {}
         visual_action_consistency_by_index: dict[int, float] = {}
-        position_by_index: dict[int, float] = {}
         progress_by_index: dict[int, float] = {}
         frame_entries: dict[int, FrameEmbeddingEntry] = {}
         image_key = adapter.image_observation_keys[0]
@@ -568,6 +719,14 @@ def encode_cocore_dataset(
                     raise RuntimeError("VAC scores are missing for a candidate episode")
                 window = slice(clip.start_step, clip.end_step + 1)
                 visual = frame_features[window]
+                if hf_settings is not None:
+                    hf_positions[clip_index], hf_times[clip_index] = _position_clip_inputs(
+                        episode, clip, metric="high_frequency_jitter"
+                    )
+                if backtracking_settings is not None:
+                    backtracking_positions[clip_index], backtracking_times[clip_index] = (
+                        _position_clip_inputs(episode, clip, metric="local_backtracking")
+                    )
                 if path_settings is not None:
                     positions = np.asarray(
                         episode.observations["observation.state"][window, :3], dtype=np.float64
@@ -605,7 +764,6 @@ def encode_cocore_dataset(
                 visual_action_consistency_by_index[clip_index] = top_k_mean(
                     episode_visual_action_consistency[window]
                 )
-                position_by_index[clip_index] = float(clip.start_step) / float(episode.length)
                 normalized_visual = visual / np.maximum(
                     np.linalg.norm(visual, axis=1, keepdims=True), 1.0e-8
                 )
@@ -674,10 +832,6 @@ def encode_cocore_dataset(
             candidate_visual,
             np.stack([temporal_pool(values) for values in state_sequences]),
             np.stack([temporal_pool(values) for values in action_sequences]),
-            np.asarray(
-                [position_by_index[index] for index in range(len(clips))],
-                dtype=np.float32,
-            ),
         )
         dwell_values = (
             np.asarray([dwell_scores[i] for i in range(len(clips))], dtype=np.float64)
@@ -685,6 +839,8 @@ def encode_cocore_dataset(
             else None
         )
         return CocoreEncodedClips(
+            **jump_values,
+            **execution_values,
             clips=clips,
             embeddings=embeddings,
             visual_half_embeddings=np.stack(
@@ -710,6 +866,26 @@ def encode_cocore_dataset(
             dwell_timestamps=np.stack([dwell_times[i] for i in range(len(clips))])
             if dwell is not None
             else None,
+            **(
+                hf_arrays(
+                    np.stack([hf_positions[i] for i in range(len(clips))]),
+                    np.stack([hf_times[i] for i in range(len(clips))]),
+                    config=hf_settings,
+                    clips=clips,
+                )
+                if hf_settings is not None
+                else {}
+            ),
+            **(
+                backtracking_arrays(
+                    np.stack([backtracking_positions[i] for i in range(len(clips))]),
+                    np.stack([backtracking_times[i] for i in range(len(clips))]),
+                    config=backtracking_settings,
+                    clips=clips,
+                )
+                if backtracking_settings is not None
+                else {}
+            ),
             path_position_sequences=np.stack([path_positions[i] for i in range(len(clips))])
             if path_settings is not None
             else None,

@@ -273,6 +273,7 @@ def test_bridge_config_fixes_dataset_and_cocore_contract(tmp_path: Path) -> None
         "progress",
         "action_variation",
         "visual_action_consistency",
+        "action_jump",
     ]
     assert config["objective"] == {"relation": "sequence", "relation_weight": 1.5}
     assert config["selection"] == {"ratio": 0.2, "budget": None}
@@ -1022,6 +1023,7 @@ def test_synthetic_bridge_dataset_runs_cocore_with_only_image_zero(
     assert {row["length"] for row in scanned_clips} == {7}
     encode_manifest = json.loads((output / "encode" / "manifest.json").read_text())
     assert encode_manifest["clips"] == 174
+    assert encode_manifest["embedding_dim"] == 173
     assert encode_manifest["clip_length"] == 7
     assert encode_manifest["clip_anchors"] == [0, 3, 6]
     assert encode_manifest["visual_half_windows"] == [[0, 4], [3, 7]]
@@ -1269,4 +1271,5 @@ def test_bridge_config_keeps_default_metrics_with_dwell_diagnostics():
         "progress",
         "action_variation",
         "visual_action_consistency",
+        "action_jump",
     ]

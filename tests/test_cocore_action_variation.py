@@ -84,12 +84,16 @@ def test_constant_action_variation_normalizes_to_zero(constant: float) -> None:
 
 def test_reliability_is_geometric_mean_of_every_nonempty_metric_subset() -> None:
     components = {
+        "action_jump": 0.9,
         "support": 0.125,
         "progress": 0.216,
         "action_variation": 0.343,
         "non_dwell": 0.729,
         "eef_jerk": 0.81,
         "local_path_efficiency": 0.64,
+        "low_high_frequency_jitter": 0.49,
+        "low_local_backtracking": 0.81,
+        "low_action_execution_deviation": 0.36,
         "visual_action_consistency": 0.512,
     }
     for size in range(1, len(RELIABILITY_METRICS) + 1):
@@ -101,9 +105,15 @@ def test_reliability_is_geometric_mean_of_every_nonempty_metric_subset() -> None
                 np.asarray([components["visual_action_consistency"]], dtype=np.float32),
                 metrics,
                 min_reliability=0.01,
+                action_jump=np.asarray([components["action_jump"]]),
                 non_dwell=np.asarray([components["non_dwell"]], dtype=np.float32),
                 eef_jerk=np.asarray([components["eef_jerk"]], dtype=np.float32),
                 local_path_efficiency=np.asarray([components["local_path_efficiency"]]),
+                low_high_frequency_jitter=np.asarray([components["low_high_frequency_jitter"]]),
+                low_local_backtracking=np.asarray([components["low_local_backtracking"]]),
+                low_action_execution_deviation=np.asarray(
+                    [components["low_action_execution_deviation"]]
+                ),
             )
             expected = np.prod([components[metric] for metric in metrics]) ** (1.0 / size)
 

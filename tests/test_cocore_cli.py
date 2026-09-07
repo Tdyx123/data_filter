@@ -58,6 +58,7 @@ def test_config_accepts_supported_relations(relation: str) -> None:
         "progress",
         "action_variation",
         "visual_action_consistency",
+        "action_jump",
     ]
     assert resolved["objective"] == {"relation": relation, "relation_weight": 1.0}
     assert resolved["selection"] == {"ratio": 0.1, "budget": None}
@@ -76,7 +77,19 @@ def test_config_accepts_every_nonempty_reliability_subset(metrics: list[str]) ->
         {
             **_objective(),
             "reliability_metrics": metrics,
+            "action_execution_deviation": {
+                "action_source": "original_command",
+                "action_semantics": "delta_from_observed_position",
+                "action_scale": [1, 1, 1],
+                "alignment_confirmed": True,
+            },
             "local_path_efficiency": {"delta_path": 0.001},
+            "local_backtracking": {"epsilon_p": 0.001},
+            "high_frequency_jitter": {
+                "cutoff_hz": 2.0,
+                "noise_floor_rms": 0.001,
+                "max_frequency_resolution_hz": 1.0,
+            },
             "dwell": {
                 "position_speed_threshold": 0.1,
                 "angular_speed_threshold": 0.1,
@@ -105,7 +118,12 @@ def test_config_rejects_unsupported_reliability_metrics(metrics: object) -> None
             {
                 **_objective(),
                 "reliability_metrics": metrics,
-            "local_path_efficiency": {"delta_path": 0.001},
+                "local_path_efficiency": {"delta_path": 0.001},
+                "high_frequency_jitter": {
+                    "cutoff_hz": 2.0,
+                    "noise_floor_rms": 0.001,
+                    "max_frequency_resolution_hz": 1.0,
+                },
             }
         )
 
@@ -602,6 +620,7 @@ def test_shipped_configs_resolve_to_fixed_cocore_contract(path: str) -> None:
         "progress",
         "action_variation",
         "visual_action_consistency",
+        "action_jump",
     ]
     assert config["objective"] == {
         "relation": "cooccurrence",
@@ -620,3 +639,23 @@ def test_shipped_configs_resolve_to_fixed_cocore_contract(path: str) -> None:
     assert config["output"]["directory"].startswith("outputs/cocore/")
     if path.endswith("config_debug.yaml"):
         assert config["runtime"]["max_episodes"] == 20
+
+
+def test_high_frequency_requires_explicit_config():
+    with pytest.raises(ValueError, match="high_frequency_jitter"):
+        resolve_config({**_objective(), "reliability_metrics": ["low_high_frequency_jitter"]})
+    settings = dict(cutoff_hz=2.0, noise_floor_rms=0.001, max_frequency_resolution_hz=1.0)
+    config = resolve_config({**_objective(), "high_frequency_jitter": settings})
+    assert "low_high_frequency_jitter" not in config["reliability_metrics"]
+    assert config["high_frequency_jitter"]["epsilon"] == 1e-12
+    args = cli.build_parser().parse_args(
+        ["run", "--reliability-metrics", "low_high_frequency_jitter"]
+    )
+    assert args.reliability_metrics == ["low_high_frequency_jitter"]
+
+
+def test_local_backtracking_cli_metric():
+    args = cli.build_parser().parse_args(
+        ["run", "--reliability-metrics", "low_local_backtracking"]
+    )
+    assert args.reliability_metrics == ["low_local_backtracking"]

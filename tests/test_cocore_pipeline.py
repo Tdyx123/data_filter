@@ -225,7 +225,7 @@ def test_encode_stage_publishes_normalized_visual_half_artifact(tmp_path: Path) 
     assert result_root == root
     assert CocorePipelineAdapter.load_images_calls == [False, True]
     embeddings = np.load(root / "encode" / "embeddings.npy")
-    assert embeddings.shape == (82, 159)
+    assert embeddings.shape == (82, 158)
     np.testing.assert_allclose(np.linalg.norm(embeddings, axis=1), 1.0, atol=1.0e-6)
     stored = np.load(root / "encode" / "visual_half_embeddings.npy")
     np.testing.assert_array_equal(stored, encoded.visual_half_embeddings)
@@ -242,7 +242,7 @@ def test_encode_stage_publishes_normalized_visual_half_artifact(tmp_path: Path) 
     assert manifest["producer"] == "cocore"
     assert manifest["encoding"] == "quality_fusion"
     assert manifest["visual_embedding_dim"] == 128
-    assert manifest["embedding_dim"] == 159
+    assert manifest["embedding_dim"] == 158
     assert manifest["counts"] == {
         "candidate_fragments": 82,
         "pca_fit_fragments": 82,
@@ -585,8 +585,9 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
                 * nodes["progress"]
                 * nodes["action_variation"]
                 * nodes["visual_action_consistency"]
+                * nodes["action_jump"]
             )
-            ** 0.25,
+            ** 0.2,
             0.05,
         ),
         rtol=1.0e-6,
@@ -722,6 +723,9 @@ def test_support_only_bridge_profile_changes_graph_and_artifact_contract(
 ) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     dual_config = _config(tmp_path, "sequence")
+    dual_config["reliability_metrics"] = [
+        "support", "progress", "action_variation", "visual_action_consistency"
+    ]
     dual_config["prototypes"]["profile"] = "bridge_v2"  # type: ignore[index]
     support_config = copy.deepcopy(dual_config)
     support_config["reliability_metrics"] = ["support"]
@@ -1829,7 +1833,7 @@ def test_validate_rejects_motion_primitive_profile_config_mismatch(tmp_path: Pat
     mismatched = copy.deepcopy(config)
     mismatched["prototypes"]["profile"] = "bridge_v2"  # type: ignore[index]
 
-    with pytest.raises(ValueError, match="motion primitive configuration"):
+    with pytest.raises(ValueError, match="motion primitive configuration|action_jump cache contract mismatch"):
         validate_output(result, config=mismatched)
 
 
@@ -2348,3 +2352,385 @@ def test_eef_jerk_with_local_path_efficiency(tmp_path):
         assert np.isnan(nodes["local_path_efficiency"]).all()
         np.testing.assert_allclose(nodes["reliability"], np.clip(nodes["eef_jerk"], 0.05, 1))
     assert validate_output(result, config=config)["status"] == "valid"
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        None,
+        ["low_high_frequency_jitter"],
+        ["eef_jerk", "local_path_efficiency", "low_high_frequency_jitter"],
+    ],
+)
+def test_high_frequency_pipeline_roundtrip(tmp_path, metrics):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["high_frequency_jitter"] = dict(
+        cutoff_hz=2.0, noise_floor_rms=0.01, max_frequency_resolution_hz=2.0
+    )
+    if metrics is not None:
+        config["reliability_metrics"] = metrics
+    if metrics and "local_path_efficiency" in metrics:
+        config["local_path_efficiency"] = {"delta_path": 100.0}
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    rows = pq.read_table(result / "all_clips.parquet").to_pylist()
+    assert rows and all(r["low_high_frequency_jitter"] is None for r in rows)
+    assert all(r["high_frequency_reason"] == "low_fluctuation" for r in rows)
+    if metrics == ["low_high_frequency_jitter"]:
+        assert all(r["reliability"] == 1.0 for r in rows)
+    report = json.loads((result / "selection_report.json").read_text())
+    assert report["high_frequency_jitter_summary"]["graph"]["invalid_count"] == len(rows)
+    assert validate_output(result, config=config)["status"] == "valid"
+
+
+class HighFrequencyAdapter(CocorePipelineAdapter):
+    def iter_episodes(self, **kwargs):
+        for episode in super().iter_episodes(**kwargs):
+            episode.observations["observation.state"][:, 1] = 0.01 * np.cos(
+                2 * np.pi * 3 * episode.timestamps
+            )
+            yield episode
+
+
+class HfCompatibleIrregularJerkAdapter(HighFrequencyAdapter):
+    def iter_episodes(self, **kwargs):
+        for episode in super().iter_episodes(**kwargs):
+            # Accepted by HF's 1e-3 tolerance, rejected by jerk's 1e-4 tolerance.
+            episode.timestamps[25] += 0.00005
+            yield episode
+
+
+def _hf_config(tmp_path):
+    config = _config(tmp_path)
+    config["high_frequency_jitter"] = dict(
+        cutoff_hz=2.0, noise_floor_rms=1e-5, max_frequency_resolution_hz=2.0
+    )
+    return config
+
+
+@pytest.mark.parametrize("profile", ["libero", "bridge_v2"])
+def test_hf_valid_profile_and_jerk_mapping(tmp_path, profile):
+    from cocore.high_frequency_jitter import HF_FIELDS
+
+    register_dataset_adapter("hf_irregular_jerk", HfCompatibleIrregularJerkAdapter)
+    config = _hf_config(tmp_path)
+    config["dataset"]["type"] = "hf_irregular_jerk"
+    config["prototypes"]["profile"] = profile
+    config["reliability_metrics"] = ["eef_jerk", "low_high_frequency_jitter"]
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    root = result.parent
+    indices = np.load(root / cocore_pipeline.GRAPH_DIRECTORY / "source_clip_indices.npy")
+    with np.load(root / cocore_pipeline.GRAPH_DIRECTORY / "nodes.npz") as nodes:
+        assert nodes["high_frequency_valid"].all()
+        for field in HF_FIELDS:
+            np.testing.assert_array_equal(
+                nodes[field], np.load(root / "encode" / f"{field}.npy")[indices]
+            )
+        np.testing.assert_allclose(
+            nodes["reliability"],
+            np.clip(np.sqrt(nodes["eef_jerk"] * nodes["low_high_frequency_jitter"]), 0.05, 1),
+            rtol=1e-6,
+        )
+    report = json.loads((result / "selection_report.json").read_text())
+    assert report["excluded_jerk_clips"] > 0
+    counts = report["high_frequency_jitter_summary"]
+    assert counts["scanned"]["valid_count"] > counts["graph"]["valid_count"]
+    assert validate_output(result, config=config)["status"] == "valid"
+
+
+@pytest.mark.parametrize("profile", ["libero", "bridge_v2"])
+def test_hf_diagnostics_preserve_selection(tmp_path, profile):
+    from cocore.high_frequency_jitter import HF_FIELDS
+
+    register_dataset_adapter("cocore_pipeline_synthetic", HighFrequencyAdapter)
+    config = _config(tmp_path)
+    config["prototypes"]["profile"] = profile
+    baseline = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    before = pq.read_table(baseline / "all_clips.parquet").to_pylist()
+    config["output"]["directory"] = str(tmp_path / "hf_diagnostics")
+    config["high_frequency_jitter"] = _hf_config(tmp_path)["high_frequency_jitter"]
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    after = pq.read_table(result / "all_clips.parquet").to_pylist()
+    assert [{k: v for k, v in row.items() if k not in HF_FIELDS} for row in after] == before
+    assert validate_output(result, config=config)["status"] == "valid"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "input",
+        "overlap",
+        "result",
+        "validity",
+        "reason",
+        "node",
+        "row",
+        "selected",
+        "summary",
+        "contract",
+    ],
+)
+def test_hf_tamper_detection(tmp_path, target):
+    register_dataset_adapter("cocore_pipeline_synthetic", HighFrequencyAdapter)
+    config = _hf_config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    encode = result.parent / "encode"
+    if target in {"input", "overlap", "result", "validity", "reason"}:
+        field = {
+            "input": "high_frequency_positions",
+            "overlap": "high_frequency_positions",
+            "result": "high_frequency_ratio",
+            "validity": "high_frequency_valid",
+            "reason": "high_frequency_reason",
+        }[target]
+        path = encode / f"{field}.npy"
+        values = np.load(path)
+        if target in {"input", "overlap"}:
+            values[0, -1, 0] += 0.01
+        elif target == "validity":
+            values[0] = not values[0]
+        elif target == "reason":
+            values[0] = "fake"
+        else:
+            values[0] *= 0.5
+        np.save(path, values)
+        if target != "input":
+            manifest_path = encode / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["high_frequency_checksums"][field] = cocore_pipeline.file_sha256(path)
+            manifest_path.write_text(json.dumps(manifest))
+    elif target == "node":
+        path = result.parent / cocore_pipeline.GRAPH_DIRECTORY / "nodes.npz"
+        with np.load(path) as nodes:
+            arrays = dict(nodes)
+        arrays["high_frequency_ratio"][0] *= 0.5
+        np.savez(path, **arrays)
+    elif target == "row":
+        path = result / "all_clips.parquet"
+        rows = pq.read_table(path).to_pylist()
+        rows[0]["high_frequency_ratio"] *= 0.5
+        pq.write_table(pa.Table.from_pylist(rows), path)
+    elif target == "selected":
+        path = result / "selected_manifest.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[0]["high_frequency_reason"] = "fake"
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    else:
+        path = result / ("selection_report.json" if target == "summary" else "run_manifest.json")
+        data = json.loads(path.read_text())
+        if target == "summary":
+            data["high_frequency_jitter_summary"]["scanned"]["valid_count"] += 1
+        else:
+            data["high_frequency_jitter"]["window"] = "boxcar"
+        path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="high_frequency_jitter"):
+        validate_output(result, config=config)
+
+
+@pytest.mark.parametrize(
+    "parameter", ["cutoff_hz", "noise_floor_rms", "max_frequency_resolution_hz", "epsilon"]
+)
+def test_hf_cache_parameters_invalidate(tmp_path, parameter):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _hf_config(tmp_path)
+    root, _, encoded = encode_stage(config, visual_encoder=CocoreVisualEncoder())
+    resumed = encode_stage(config, visual_encoder=FailingCocoreVisualEncoder())[2]
+    assert resumed.fingerprint == encoded.fingerprint
+    changed = copy.deepcopy(config)
+    changed["high_frequency_jitter"][parameter] = (
+        config["high_frequency_jitter"].get(parameter, 1e-12) * 0.9
+    )
+    with pytest.raises(FileExistsError):
+        encode_stage(changed, visual_encoder=FailingCocoreVisualEncoder())
+
+
+def test_hf_missing_cache_requires_force(tmp_path):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _hf_config(tmp_path)
+    root, _, _ = encode_stage(config, visual_encoder=CocoreVisualEncoder())
+    (root / "encode" / "high_frequency_ratio.npy").unlink()
+    with pytest.raises(FileExistsError):
+        encode_stage(config, visual_encoder=FailingCocoreVisualEncoder())
+
+
+@pytest.mark.parametrize("problem", ["missing", "nonfinite", "shape"])
+def test_hf_raw_input_error_identifies_clip(tmp_path, problem):
+    class BadPositionAdapter(CocorePipelineAdapter):
+        def iter_episodes(self, **kwargs):
+            for episode in super().iter_episodes(**kwargs):
+                if problem == "missing":
+                    del episode.observations["observation.state"]
+                elif problem == "nonfinite":
+                    episode.observations["observation.state"][0, 0] = np.nan
+                else:
+                    episode.observations["observation.state"] = episode.observations[
+                        "observation.state"
+                    ][:, :2]
+                yield episode
+
+    register_dataset_adapter("cocore_pipeline_synthetic", BadPositionAdapter)
+    with pytest.raises(ValueError, match="high_frequency_jitter clip ep000000_fragment_"):
+        encode_stage(_hf_config(tmp_path), visual_encoder=CocoreVisualEncoder())
+
+
+@pytest.mark.parametrize("profile", ["libero", "bridge_v2"])
+def test_action_jump_pipeline_and_jerk_mapping(tmp_path, profile):
+    register_dataset_adapter("jump_jerk", HfCompatibleIrregularJerkAdapter)
+    config = _hf_config(tmp_path)
+    config["dataset"]["type"] = "jump_jerk"
+    config["prototypes"]["profile"] = profile
+    config["reliability_metrics"] = ["action_jump", "eef_jerk", "low_high_frequency_jitter"]
+    config["action_jump"] = {"threshold": 0.005}
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    root = result.parent
+    indices = np.load(root / cocore_pipeline.GRAPH_DIRECTORY / "source_clip_indices.npy")
+    with np.load(root / cocore_pipeline.GRAPH_DIRECTORY / "nodes.npz") as nodes:
+        for field in ("action_jump_rate", "action_jump"):
+            np.testing.assert_array_equal(
+                nodes[field], np.load(root / "encode" / f"{field}.npy")[indices]
+            )
+        expected = (
+            nodes["action_jump"] * nodes["eef_jerk"] * nodes["low_high_frequency_jitter"]
+        ) ** (1 / 3)
+        np.testing.assert_allclose(nodes["reliability"], np.clip(expected, 0.05, 1), rtol=1e-6)
+    assert validate_output(result, config=config)["status"] == "valid"
+
+
+def test_action_jump_default_cache_and_replay(tmp_path):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    rows = pq.read_table(result / "all_clips.parquet").to_pylist()
+    assert rows and all(0 <= row["action_jump_rate"] <= 1 for row in rows)
+    assert validate_output(result, config=config)["status"] == "valid"
+    run_pipeline(config, visual_encoder=FailingCocoreVisualEncoder())
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "scale",
+        "threshold",
+        "pair_count",
+        "offsets",
+        "dimensions",
+        "rate",
+        "missing",
+        "raw",
+        "node",
+        "row",
+        "selected",
+        "contract",
+    ],
+)
+def test_action_jump_tamper_detection(tmp_path, target):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    encode = result.parent / "encode"
+    if target in {
+        "scale",
+        "threshold",
+        "pair_count",
+        "offsets",
+        "dimensions",
+        "rate",
+        "raw",
+        "missing",
+    }:
+        field = (
+            "action_jump_actions"
+            if target == "raw"
+            else "action_jump_rate"
+            if target == "missing"
+            else f"action_jump_{target}"
+        )
+        path = encode / f"{field}.npy"
+        if target == "missing":
+            path.unlink()
+        else:
+            values = np.load(path)
+            values.flat[0] += 1
+            np.save(path, values)
+            if target != "raw":
+                manifest_path = encode / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["action_jump_checksums"][field] = cocore_pipeline.file_sha256(path)
+                manifest_path.write_text(json.dumps(manifest))
+    elif target == "node":
+        path = result.parent / cocore_pipeline.GRAPH_DIRECTORY / "nodes.npz"
+        with np.load(path) as nodes:
+            arrays = dict(nodes)
+        arrays["action_jump_rate"][0] += 0.1
+        np.savez(path, **arrays)
+    elif target == "row":
+        path = result / "all_clips.parquet"
+        rows = pq.read_table(path).to_pylist()
+        rows[0]["action_jump_rate"] += 0.1
+        pq.write_table(pa.Table.from_pylist(rows), path)
+    elif target == "selected":
+        path = result / "selected_manifest.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[0]["action_jump_rate"] += 0.1
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    else:
+        path = result / "selection_report.json"
+        report = json.loads(path.read_text())
+        report["action_jump"]["threshold_quantile"] = 0.5
+        path.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="action_jump|cache file"):
+        validate_output(result, config=config)
+
+
+def test_action_jump_diagnostics_and_disabled_compatibility(tmp_path):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["reliability_metrics"] = [
+        "support",
+        "progress",
+        "action_variation",
+        "visual_action_consistency",
+    ]
+    plain = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    original = (plain / "selected_manifest.jsonl").read_text()
+    fingerprint = json.loads((plain.parent / "encode" / "manifest.json").read_text())["fingerprint"]
+    assert not list((plain.parent / "encode").glob("action_jump*"))
+    assert "action_jump" not in json.loads((plain.parent / "encode" / "manifest.json").read_text())
+    config["action_jump"] = {}
+    config["output"]["directory"] = str(tmp_path / "diagnostic")
+    diagnostic = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    expected = [json.loads(line) for line in original.splitlines()]
+    actual = [
+        json.loads(line)
+        for line in (diagnostic / "selected_manifest.jsonl").read_text().splitlines()
+    ]
+    assert [(r["sample_id"], r["reliability"]) for r in actual] == [
+        (r["sample_id"], r["reliability"]) for r in expected
+    ]
+    assert (
+        json.loads((diagnostic.parent / "encode" / "manifest.json").read_text())["fingerprint"]
+        != fingerprint
+    )
+    assert validate_output(diagnostic, config=config)["status"] == "valid"
+
+
+@pytest.mark.parametrize(
+    "parameter,value", [("threshold", 1.0), ("threshold_quantile", 0.9), ("epsilon", 1e-6)]
+)
+def test_action_jump_parameters_invalidate_cache(tmp_path, parameter, value):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    encode_stage(config, visual_encoder=CocoreVisualEncoder())
+    config["action_jump"] = {parameter: value}
+    with pytest.raises(FileExistsError):
+        encode_stage(config, visual_encoder=FailingCocoreVisualEncoder())
+
+
+def test_action_jump_reference_respects_episode_limit(tmp_path):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["runtime"]["max_episodes"] = 1
+    _, _, encoded = encode_stage(config, visual_encoder=CocoreVisualEncoder())
+    np.testing.assert_array_equal(encoded.action_jump_episode_ids, [0])
+    np.testing.assert_array_equal(encoded.action_jump_offsets, [0, 605])
+    assert encoded.action_jump_pair_count == 604

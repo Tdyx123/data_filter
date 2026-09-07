@@ -18,13 +18,18 @@ DEFAULT_RELIABILITY_METRICS = (
     "progress",
     "action_variation",
     "visual_action_consistency",
+    "action_jump",
 )
 
 RELIABILITY_METRICS = (
-    *DEFAULT_RELIABILITY_METRICS,
+    *DEFAULT_RELIABILITY_METRICS[:-1],
     "non_dwell",
     "eef_jerk",
     "local_path_efficiency",
+    "low_high_frequency_jitter",
+    "low_local_backtracking",
+    "action_jump",
+    "low_action_execution_deviation",
 )
 
 
@@ -120,9 +125,13 @@ def fuse_reliability(
     metrics: Sequence[str],
     *,
     min_reliability: float,
+    action_jump: np.ndarray | None = None,
     non_dwell: np.ndarray | None = None,
     local_path_efficiency: np.ndarray | None = None,
     eef_jerk: np.ndarray | None = None,
+    low_high_frequency_jitter: np.ndarray | None = None,
+    low_local_backtracking: np.ndarray | None = None,
+    low_action_execution_deviation: np.ndarray | None = None,
 ) -> np.ndarray:
     """Fuse the selected Cocore reliability components by geometric mean."""
 
@@ -135,6 +144,10 @@ def fuse_reliability(
             dtype=np.float32,
         ),
     }
+    if action_jump is not None:
+        components["action_jump"] = np.asarray(action_jump, dtype=np.float64)
+    elif "action_jump" in metrics:
+        raise ValueError("action_jump reliability requires computed values")
     if non_dwell is not None:
         components["non_dwell"] = np.asarray(non_dwell, dtype=np.float32)
     if "non_dwell" in metrics and non_dwell is None:
@@ -152,6 +165,18 @@ def fuse_reliability(
     ):
         raise ValueError("reliability components must be matching finite [0, 1] vectors")
     enabled = normalize_reliability_metrics(metrics)
+    if "low_action_execution_deviation" in enabled:
+        if low_action_execution_deviation is None:
+            raise ValueError("low_action_execution_deviation requires computed values")
+        execution = np.asarray(low_action_execution_deviation, dtype=np.float32)
+        if (
+            execution.shape != shape or not np.all(np.isfinite(execution))
+            or np.any((execution < 0) | (execution > 1))
+        ):
+            raise ValueError(
+                "low_action_execution_deviation requires matching finite [0, 1] values"
+            )
+        components["low_action_execution_deviation"] = execution
     minimum = float(min_reliability)
     if not math.isfinite(minimum) or not 0.0 <= minimum <= 1.0:
         raise ValueError("minimum reliability must be finite and in [0, 1]")
@@ -162,6 +187,24 @@ def fuse_reliability(
         components["local_path_efficiency"] = path
     elif "local_path_efficiency" in enabled:
         raise ValueError("local_path_efficiency requires configuration and values")
+    if low_high_frequency_jitter is not None:
+        hf = np.asarray(low_high_frequency_jitter, dtype=np.float64)
+        if hf.shape != shape or np.any(np.isinf(hf)) or np.any((hf < 0) | (hf > 1)):
+            raise ValueError("low_high_frequency_jitter must be a matching [0, 1] or NaN vector")
+        components["low_high_frequency_jitter"] = hf
+    elif "low_high_frequency_jitter" in enabled:
+        raise ValueError("low_high_frequency_jitter requires configuration and values")
+    if low_local_backtracking is not None:
+        backtracking = np.asarray(low_local_backtracking, dtype=np.float64)
+        if (
+            backtracking.shape != shape
+            or np.any(np.isinf(backtracking))
+            or np.any((backtracking < 0) | (backtracking > 1))
+        ):
+            raise ValueError("low_local_backtracking must be a matching [0, 1] or NaN vector")
+        components["low_local_backtracking"] = backtracking
+    elif "low_local_backtracking" in enabled:
+        raise ValueError("low_local_backtracking requires configuration and values")
     count = np.zeros(shape, dtype=np.int64)
     product = np.ones(shape, dtype=np.float64)
     for metric in enabled:

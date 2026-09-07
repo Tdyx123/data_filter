@@ -2,7 +2,7 @@
 
 `cocore_bridge_v2` 是仓库内的 BridgeData V2 专用 Cocore 命令包。它不复制
 Cocore 的编码、运动原语、关系目标或选择算法，而是固定 Bridge 数据契约后
-调用现有 `cocore.pipeline`。输出仍是 Cocore artifact，可直接交给现有训练入口和
+  调用现有 `cocore.pipeline`。输出仍是 Cocore artifact，可直接交给现有训练入口和
 `cocore` 校验器消费。
 
 ## 固定数据契约
@@ -10,6 +10,9 @@ Cocore 的编码、运动原语、关系目标或选择算法，而是固定 Bri
 - 默认数据路径：`/data/dwb/datasets/bridge_orig_1.0.0_lerobot`；
 - LeRobot `v2.0`、WidowX、5 Hz；
 - 只读取 `observation.images.image_0`、8 维 `observation.state` 和 7 维 `action`；
+- support 与相似图使用 173 维片段编码：128 维 PCA 视觉特征、24 维状态统计、
+  21 维动作统计拼接后整体 L2 归一化，不包含轨迹位置。旧版含位置的编码缓存
+  指纹不兼容，已有输出需使用 `--force` 重新编码并重建下游产物；
 - 排除任务名为空的 episode，再应用 `--max-episodes`；
 - 固定使用 7 帧近似均匀候选和 Cocore schema 10 两级动作原型；原型学习在完整轨迹
   上使用首尾覆盖、起点间隔最大为 2 的四帧窗口，只用精确保留动作训练硬视觉桶；
@@ -27,8 +30,9 @@ Cocore 的编码、运动原语、关系目标或选择算法，而是固定 Bri
 - 默认 `prototypes.use_stop_bucket: true`，保留 Cocore 的 stop 桶与回退行为；graph
   相关命令可用 `--no-use-stop-bucket` 关闭；
 - 可靠性默认选择 `support`、`progress`、`action_variation`、
-  `visual_action_consistency`；显式配置驻留阈值后还可选择 `non_dwell`，
-  graph 相关命令支持五项中的任意非空无重复子集；所选
+  `visual_action_consistency` 和 `action_jump`；还可按各指标配置要求选择
+  `non_dwell`、`eef_jerk`、`local_path_efficiency`、`low_high_frequency_jitter`、`low_local_backtracking`。
+  graph 相关命令支持完整目录中的任意非空无重复子集；所选
   指标统一取几何均值，再按
   `quality.min_reliability` 截断；
 - 不超过 65,536 个训练窗口的动作桶使用完整 KMeans，以
@@ -89,7 +93,8 @@ python -m cocore_bridge_v2 run \
   桶并排除双半段均无非 stop 标签的候选；未传时保持默认启用。
 - `--reliability-metrics METRIC [METRIC ...]`：仅用于 `build-graph`、`select`、`run` 和
   `validate`；指标可从 `support`、`progress`、`action_variation`、
-  `visual_action_consistency`、`non_dwell` 中选择，默认启用前四项；`non_dwell`
+  `visual_action_consistency`、`non_dwell`、`eef_jerk`、`local_path_efficiency`、
+  `low_high_frequency_jitter`、`low_local_backtracking`、`action_jump` 中选择，默认启用原四项及 `action_jump`；`non_dwell`
   需要显式指定驻留阈值。输入顺序会被规范化，重复项和
   未知项会报错。
 
@@ -127,8 +132,8 @@ MiniBatchKMeans。Bridge V2 完整生产数据的基础额外内存约为 257 Mi
 非 stop 与原始 stop 窗口估算，每窗口 `128 × 4` 字节），不使用 memmap 或磁盘 fallback。
 
 Cocore schema 9 artifact 不迁移且 validator 会拒绝。Cocore 0.19.0/schema 10 与 Bridge
-0.12.0 默认使用 AVI、VAC 和四指标几何均值可靠性契约，并支持显式启用第五项
-`non_dwell`；驻留计算版本和阈值独立进入缓存契约。版本校验保持严格，旧 artifact 必须使用
+0.12.0 当前默认使用 support、progress、AVI、VAC、`action_jump` 的几何均值，
+并支持显式启用其余可选指标；各指标计算版本和参数独立进入缓存契约。版本校验保持严格，旧 artifact 必须使用
 `--force` 重建。同一输出根切换所选可靠性指标也会使 graph 指纹不兼容；需要保留多组
 实验时应使用不同的 `--output-dir`。
 
@@ -222,7 +227,7 @@ episode（包括不足 7 帧的短 episode）的完整逐帧特征会写入 enco
 
 ## 可选低变化驻留指标
 
-默认可靠性仍为原来的四项。新增 `non_dwell` 必须显式配置位置速度、旋转角速度及
+默认可靠性为原四项加 `action_jump`。新增 `non_dwell` 必须显式配置位置速度、旋转角速度及
 连续夹爪变化率阈值；计算使用实际时间戳、原始状态和时间加权，姿态为 XYZ 欧拉角。
 Python 入口 `build_config(..., dwell={...})` 接受与 Cocore 相同的 `dwell` 配置。
 
@@ -240,9 +245,44 @@ Python 入口 `build_config(..., dwell={...})` 接受与 Cocore 相同的 `dwell
 ### 可选末端运动 Jerk
 
 `--reliability-metrics support progress action_variation visual_action_consistency eef_jerk`
-可在默认四项之外启用末端 Jerk；也可仅选择 `eef_jerk`。Bridge 使用完整 7 帧候选的
+可在默认五项之外启用末端 Jerk；也可仅选择 `eef_jerk`。Bridge 使用完整 7 帧候选的
 `observation.state[:, :3]` 原始位置与真实时间戳，得到 4 个三阶差分估计，先取模再求均值。
 单位为 m/s³，按有效扫描候选池分位数反向归一化后融合。
 不等间隔等 Jerk 不可计算片段排除出图，并记录在选择目录 `excluded_clips.json`；
 底层输入校验继续报错。分阶段 build-graph/select/run 和 validate 应使用相同指标列表。
 完整计算、缓存及解释限制见 [Cocore Jerk 说明](../cocore/README.md#可选末端运动-jerk)。
+
+### 高频抖动诊断
+
+共用 cocore 流水线支持 `high_frequency_jitter` 配置块及可选可靠性分量
+`low_high_frequency_jitter`，完整参数和输出见 [cocore 说明](../cocore/README.md#高频抖动能量占比可选)。
+仅配置参数时输出诊断，加入 `reliability_metrics` 后以 `1−高频占比` 融合；无效项逐片段跳过，
+不新增图节点排除条件。Bridge 的 7 帧片段只有 6 个速度样本，需要按实际采样率校准
+截止频率、总波动噪声底及最大频点间隔。Bridge 专用命令不新增参数；可编辑共用 YAML
+配置后通过 `python -m cocore run --config <配置路径>` 运行。
+
+
+### 异常动作跳变率
+
+默认可靠性增加 `action_jump`，与 support、progress、AVI、VAC 融合；支持通过
+`--reliability-metrics` 显式选择或排除此项。Bridge 使用完整 7 帧候选内部的 6 次
+相邻动作比较，排除配置指定的夹爪维度，输出 `action_jump_rate` 及其互补分数
+`action_jump`。标准差与 P99 在本次加载的全部原始连续动作上统一标定，保留极端值，
+不跨 episode、不重复统计重叠片段。完整参数、缓存及限制见
+[异常动作跳变率](../cocore/README.md#异常动作跳变率默认启用)。启停指标或修改标定参数后，
+不兼容缓存须用 `--force` 重建；跳变率不增加候选排除规则。
+
+### 局部折返率（可选）
+
+共用 cocore 的 `local_backtracking` 配置，必填 `epsilon_p`（原始位置单位，当前为米），
+`eta` 默认 `0.5`。配置后输出原始折返率、`1−折返率`、有效比较与折返次数及有效性；
+显式选择 `low_local_backtracking` 才参与可靠性融合。使用 Bridge 7 帧片段内的全部
+原始末端位置，最多有 5 次有效方向比较；静止步不会被跨越。默认配置保持关闭。
+完整定义、不可评价约定和输出说明见 [cocore 局部折返率](../cocore/README.md#局部折返率可选)。
+
+### 动作—执行偏差的使用边界
+
+Cocore 提供可选 `low_action_execution_deviation`，要求原始下发指令、明确的米制转换系数，
+以及相对当前实测位置、坐标系和执行区间对齐的确认。Bridge 状态差重标注动作不可用于此指标；
+真实数据来源未确认时保持关闭。首版通过 `python -m cocore ... --config <完整配置>` 使用，
+Bridge 专用命令不新增配置参数。完整配置与公式见 Cocore README 的“可选动作—执行偏差”。

@@ -1,0 +1,67 @@
+seed: 42
+dataset:
+  type: lerobot
+  name: libero90
+  path: /data/dwb/datasets/LIBERO_lerobot/libero90
+  use_images: true
+  empty_task_policy: error
+  feature_keys:
+    action: action
+    timestamp: timestamp
+    frame_index: frame_index
+    episode_index: episode_index
+    vector_observations:
+    - observation.state
+    image_observations:
+    - observation.images.image
+visual:
+  encoder: clip
+  model: /data/dwb/models/clip-vit-base-patch32
+  local_files_only: true
+  batch_size: 64
+  device: auto
+encoding:
+  visual_dim: 128
+  pca_fit_max_samples: null
+  quantile_low: 0.01
+  quantile_high: 0.99
+  epsilon: 1.0e-08
+reliability_metrics:
+- support
+- low_high_frequency_jitter
+quality:
+  knn: 10
+  gripper_progress_weight: 0.5
+  visual_progress_weight: 0.25
+  noop_threshold: 0.0001
+  gripper_action_index: -1
+  min_reliability: 0.05
+prototypes:
+  method: motion_primitives
+  profile: libero
+  batch_size: 4096
+  max_iter: 100
+  tol: 0.0001
+  num_threads: 4
+  use_stop_bucket: true
+graph:
+  knn: 32
+  similarity_threshold: 0.8
+  cooccurrence_max_gap: 4
+objective:
+  relation: cooccurrence
+  relation_weight: 1.0
+selection:
+  ratio: 0.1
+  budget: null
+runtime:
+  num_workers: 4
+  max_episodes: null
+  resume: true
+output:
+  directory: outputs/cocore/libero90
+high_frequency_jitter:
+  cutoff_hz: 2.0
+  noise_floor_rms: 0.005
+  max_frequency_resolution_hz: 1.0
+  epsilon: 1.0e-12
