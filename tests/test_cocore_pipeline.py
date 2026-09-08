@@ -718,15 +718,17 @@ def test_run_pipeline_publishes_relation_outputs_and_validate_recomputes_them(
         validate_output(result, config=config)
 
 
+@pytest.mark.parametrize("profile", ["libero", "bridge_v2"])
 def test_support_only_bridge_profile_changes_graph_and_artifact_contract(
     tmp_path: Path,
+    profile: str,
 ) -> None:
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     dual_config = _config(tmp_path, "sequence")
     dual_config["reliability_metrics"] = [
         "support", "progress", "action_variation", "visual_action_consistency"
     ]
-    dual_config["prototypes"]["profile"] = "bridge_v2"  # type: ignore[index]
+    dual_config["prototypes"]["profile"] = profile  # type: ignore[index]
     support_config = copy.deepcopy(dual_config)
     support_config["reliability_metrics"] = ["support"]
     root = tmp_path / "support-only-output"
@@ -754,6 +756,11 @@ def test_support_only_bridge_profile_changes_graph_and_artifact_contract(
     assert support_fingerprint != dual_fingerprint
     graph_root = root / "graph-18-motion-hard-nearest-pca"
     nodes = np.load(graph_root / "nodes.npz")
+    embeddings = np.load(root / "encode" / "embeddings.npy")
+    effective_k = min(int(support_config["quality"]["knn"]), len(embeddings) - 1)
+    scaled_support = nodes["support"] * (effective_k + 1)
+    np.testing.assert_allclose(scaled_support, np.round(scaled_support), atol=1e-6)
+    assert np.all(scaled_support >= 1)
     np.testing.assert_allclose(
         nodes["reliability"],
         np.maximum(nodes["support"], 0.05),
@@ -780,6 +787,13 @@ def test_support_only_bridge_profile_changes_graph_and_artifact_contract(
     with pytest.raises(ValueError, match="reliability metrics"):
         validate_output(result, config=dual_config)
 
+    original_graph_manifest = (graph_root / "manifest.json").read_text()
+    graph_manifest.pop("support_mode")
+    (graph_root / "manifest.json").write_text(json.dumps(graph_manifest))
+    with pytest.raises(ValueError, match="support"):
+        validate_output(result, config=support_config)
+    (graph_root / "manifest.json").write_text(original_graph_manifest)
+
     nodes.close()
     nodes_path = graph_root / "nodes.npz"
     with np.load(nodes_path) as stored_nodes:
@@ -789,6 +803,57 @@ def test_support_only_bridge_profile_changes_graph_and_artifact_contract(
 
     with pytest.raises(ValueError, match="graph node reliability"):
         validate_output(result, config=support_config)
+
+
+def test_support_formula_invalidates_graph_and_downstream_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    original_hash = cocore_pipeline.stable_hash
+
+    def legacy_hash(payload):
+        if isinstance(payload, dict) and payload.get("stage") == "graph":
+            payload = {key: value for key, value in payload.items() if key != "support_mode"}
+        return original_hash(payload)
+
+    # Reproduce the pre-migration graph fingerprint, which had no formula identifier.
+    with monkeypatch.context() as context:
+        context.setattr(cocore_pipeline, "stable_hash", legacy_hash)
+        result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    old_run = json.loads((result / "run_manifest.json").read_text())
+    with pytest.raises(FileExistsError, match="--force"):
+        run_pipeline(config, visual_encoder=FailingCocoreVisualEncoder())
+    result = run_pipeline(config, force=True, visual_encoder=FailingCocoreVisualEncoder())
+    new_run = json.loads((result / "run_manifest.json").read_text())
+    for stage in ("scan", "encode"):
+        assert new_run["stage_fingerprints"][stage] == old_run["stage_fingerprints"][stage]
+    for stage in ("graph", "select"):
+        assert new_run["stage_fingerprints"][stage] != old_run["stage_fingerprints"][stage]
+    assert validate_output(result, config=config)["status"] == "valid"
+
+
+def test_support_k_is_saved_validated_and_invalidates_graph_cache(tmp_path: Path) -> None:
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    old_run = json.loads((result / "run_manifest.json").read_text())
+    changed = copy.deepcopy(config)
+    changed["quality"]["knn"] = 4
+    with pytest.raises(ValueError, match="support.*k"):
+        validate_output(result, config=changed)
+    with pytest.raises(FileExistsError, match="--force"):
+        run_pipeline(changed, visual_encoder=FailingCocoreVisualEncoder())
+    result = run_pipeline(changed, force=True, visual_encoder=FailingCocoreVisualEncoder())
+    new_run = json.loads((result / "run_manifest.json").read_text())
+    for stage in ("scan", "encode"):
+        assert old_run["stage_fingerprints"][stage] == new_run["stage_fingerprints"][stage]
+    for stage in ("graph", "select"):
+        assert old_run["stage_fingerprints"][stage] != new_run["stage_fingerprints"][stage]
+    stored = yaml.safe_load((result / "resolved_config.yaml").read_text())
+    assert stored["quality"]["knn"] == 4
+    assert validate_output(result, config=changed)["status"] == "valid"
+    assert validate_output(result)["status"] == "valid"
 
 
 def test_random_multibranch_pipeline_publishes_and_replays_branch_search(

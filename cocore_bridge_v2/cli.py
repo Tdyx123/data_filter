@@ -75,6 +75,10 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--max-episodes", type=_positive_int, default=None)
         child.add_argument("--force", action="store_true")
         if command in {"build-graph", "select", "run"}:
+            child.add_argument(
+                "--support-k", type=_positive_int, default=None,
+                help="override quality.knn for support (positive integer; default: configuration)",
+            )
             child.add_argument("--no-use-stop-bucket", action="store_true")
             child.add_argument(
                 "--reliability-metrics",
@@ -92,6 +96,10 @@ def build_parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate")
     _add_objective_arguments(validate)
     validate.add_argument("--output-dir", required=True)
+    validate.add_argument(
+        "--support-k", type=_positive_int, default=None,
+        help="validate the support k against the saved output configuration",
+    )
     validate.add_argument("--dataset-path", default=str(DEFAULT_DATASET_PATH))
     validate.add_argument(
         "--selection-ratio",
@@ -131,6 +139,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         if getattr(args, f"dwell_{name}", None) is not None
     }
     config = build_config(
+        support_k=getattr(args, "support_k", None),
         dwell=dwell or None,
         relation=args.relation,
         relation_weight=args.relation_weight,

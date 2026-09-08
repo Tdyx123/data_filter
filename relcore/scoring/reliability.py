@@ -74,7 +74,11 @@ def compute_reliability(
     min_reliability: float = 0.05,
     reliability_metrics: Sequence[str] = RELIABILITY_METRICS,
     epsilon: float = 1.0e-8,
+    support_mode: str = "exponential",
 ) -> ReliabilityResult:
+    """Compute components; radius-count support includes self after capping neighbors."""
+    if support_mode not in ("exponential", "median_radius_count_with_self"):
+        raise ValueError(f"unknown support_mode: {support_mode}")
     enabled_metrics = normalize_reliability_metrics(reliability_metrics)
     values = np.asarray(embeddings, dtype=np.float32)
     states = np.asarray(state_sequences, dtype=np.float32)
@@ -100,9 +104,18 @@ def compute_reliability(
 
         effective_k = min(int(knn), count - 1)
         neighbors = NearestNeighbors(n_neighbors=effective_k + 1, metric="euclidean")
-        distances, _ = neighbors.fit(values).kneighbors(values)
-        kth = distances[:, -1]
-        support = np.exp(-kth / (np.median(kth) + epsilon)).astype(np.float32)
+        neighbors.fit(values)
+        if support_mode == "median_radius_count_with_self":
+            # X=None excludes each query's own index, including with duplicate points.
+            distances, _ = neighbors.kneighbors(n_neighbors=effective_k)
+            radius = np.median(distances[:, -1])
+            # Keeping only k neighbors implements the count cap without a radius query.
+            capped_count = np.count_nonzero(distances <= radius, axis=1)
+            support = ((capped_count + 1) / (effective_k + 1)).astype(np.float32)
+        else:
+            distances, _ = neighbors.kneighbors(values)
+            kth = distances[:, -1]
+            support = np.exp(-kth / (np.median(kth) + epsilon)).astype(np.float32)
 
     state_motion = states[..., :-1] if states.shape[-1] > 1 else states
     state_gripper = states[..., -1]

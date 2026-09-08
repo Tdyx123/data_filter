@@ -34,10 +34,15 @@ def build_config(
     use_stop_bucket: bool = True,
     reliability_metrics: Sequence[str] = DEFAULT_RELIABILITY_METRICS,
     dwell: Mapping[str, Any] | None = None,
+    support_k: int | None = None,
 ) -> dict[str, Any]:
     """Build and validate the fixed BridgeData V2 Cocore configuration."""
 
     config = _load_base_config()
+    if support_k is not None:
+        if isinstance(support_k, bool) or not isinstance(support_k, int) or support_k <= 0:
+            raise ValueError("support_k must be a positive integer")
+        config["quality"]["knn"] = support_k
     config["dataset"]["path"] = str(Path(dataset_path).expanduser())
     config["objective"] = {
         "relation": relation,

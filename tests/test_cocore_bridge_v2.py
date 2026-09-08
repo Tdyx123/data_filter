@@ -1193,23 +1193,24 @@ def test_bridge_validate_replays_the_same_max_episode_subset(
 
     result = run_pipeline(config, output_dir=output, visual_encoder=DummyVisualEncoder())
 
-    cli.main(
-        [
-            "validate",
-            "--output-dir",
-            str(result),
-            "--dataset-path",
-            str(dataset),
-            "--relation",
-            "sequence",
-            "--relation-weight",
-            "1",
-            "--selection-ratio",
-            "0.5",
-            "--max-episodes",
-            "1",
-        ]
-    )
+    arguments = [
+        "validate",
+        "--output-dir",
+        str(result),
+        "--dataset-path",
+        str(dataset),
+        "--relation",
+        "sequence",
+        "--relation-weight",
+        "1",
+        "--selection-ratio",
+        "0.5",
+        "--max-episodes",
+        "1",
+    ]
+    with pytest.raises(ValueError, match="support k"):
+        cli.main(arguments)
+    cli.main(arguments + ["--support-k", "2"])
 
     assert json.loads(capsys.readouterr().out) == {
         "selected_clips": 44,

@@ -145,6 +145,7 @@ from cocore.visual_action_consistency import (
 
 
 GRAPH_DIRECTORY = "graph-18-motion-hard-nearest-pca"
+SUPPORT_MODE = "median_radius_count_with_self"
 PROTOTYPE_SCHEMA_VERSION = 10
 PROTOTYPE_STRATEGY = (
     "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_half_visual_"
@@ -1223,6 +1224,7 @@ def graph_stage(
         "producer": "cocore",
         "version": __version__,
         "stage": "graph",
+        "support_mode": SUPPORT_MODE,
         "adapter": adapter.fingerprint(),
         "upstream": encoded.fingerprint,
         "quality": resolved["quality"],
@@ -1274,6 +1276,7 @@ def graph_stage(
                 gripper_action_index=int(quality_config["gripper_action_index"]),
                 min_reliability=float(quality_config["min_reliability"]),
                 reliability_metrics=("support", "progress"),
+                support_mode=SUPPORT_MODE,
             )
             jerk_valid = (
                 encoded.eef_jerk_valid
@@ -1428,6 +1431,7 @@ def graph_stage(
                 "producer": "cocore",
                 "cocore_version": __version__,
                 "cocore_stage": "graph",
+                "support_mode": SUPPORT_MODE,
                 "fingerprint": fingerprint,
                 "upstream_fingerprint": encoded.fingerprint,
                 "stage_directory": GRAPH_DIRECTORY,
@@ -2832,6 +2836,8 @@ def validate_output(
         if run_manifest["stage_fingerprints"].get(stage) != manifest["fingerprint"]:
             raise ValueError(f"run/stage fingerprint mismatch: {stage}")
     graph_manifest = stage_manifests["graph"]
+    if graph_manifest.get("support_mode") != SUPPORT_MODE:
+        raise ValueError("graph manifest support mode is incompatible; rebuild graph with --force")
     graph_temporal_fields = {
         "trajectory_window_length": run_geometry.trajectory_window_length,
         "trajectory_horizon": run_geometry.state_delta_horizon,
@@ -2903,17 +2909,17 @@ def validate_output(
         scan_clips,
         profile=str(run_profile),
     )
-    if config is None:
-        resolved_path = result / "resolved_config.yaml"
-        if not resolved_path.is_file():
-            raise ValueError("cocore validation requires configuration for prototype replay")
-        stored_config = yaml.safe_load(resolved_path.read_text(encoding="utf-8")) or {}
-        if not isinstance(stored_config, Mapping):
-            raise ValueError("stored cocore configuration is invalid")
-        validation_config = stored_config
-    else:
-        validation_config = config
+    resolved_path = result / "resolved_config.yaml"
+    if not resolved_path.is_file():
+        raise ValueError("cocore validation requires stored configuration for support k validation")
+    stored_config = yaml.safe_load(resolved_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(stored_config, Mapping):
+        raise ValueError("stored cocore configuration is invalid")
+    validation_config = stored_config if config is None else config
     replay_resolved = resolve_config(validation_config)
+    stored_resolved = resolve_config(stored_config) if config is not None else replay_resolved
+    if int(replay_resolved["quality"]["knn"]) != int(stored_resolved["quality"]["knn"]):
+        raise ValueError("cocore support k configuration does not match output")
     expected_jerk = validate_jerk_cache(root / "encode", scan_clips, replay_resolved)
     expected_execution = validate_execution_cache(root / "encode", scan_clips, replay_resolved)
     expected_execution_metadata = execution_contract(replay_resolved)

@@ -5,6 +5,27 @@ Cocore 的编码、运动原语、关系目标或选择算法，而是固定 Bri
   调用现有 `cocore.pipeline`。输出仍是 Cocore artifact，可直接交给现有训练入口和
 `cocore` 校验器消费。
 
+support 与 Cocore 共用含自身的半径计数公式。在全体候选 embedding 的欧氏距离空间中，
+取 `k_eff = min(quality.knn, N-1)`，以各点到第 `k_eff` 个其他点距离的中位数为
+统一半径 `R = median(d_k)`。设 `count_i` 是距离 `<= R` 的其他点数量，则
+`support_i = min(count_i + 1, k_eff + 1) / (k_eff + 1)`，输出为 `[0,1]` 的 float32。
+自身只计一次，边界点和重复坐标的其他点正常计入；零半径同样适用，单样本取 1。
+graph manifest 使用 `support_mode: median_radius_count_with_self` 标识公式。
+已有旧公式 graph 及下游选择缓存需用 `--force` 重建；兼容的 scan/encode 缓存可复用。
+
+`build-graph`、`select`、`run` 和 `validate` 支持 `--support-k K`，K 必须为正整数。
+显式传入时覆盖 `quality.knn`；未传时使用内置配置值，目前为 10。
+该参数不改变 `graph.knn`，计算仍使用 `k_eff = min(K, N-1)`。例如：
+
+```bash
+python -m cocore_bridge_v2 run \
+  --relation sequence --relation-weight 1.0 \
+  --support-k 20
+```
+
+复用旧输出目录且 k 改变时加 `--force`。验证非默认 k 的产物时，`validate` 也需传入
+相同的 `--support-k`，否则会报告 k 不一致。`scan` 和 `encode` 不接受此参数。
+
 ## 固定数据契约
 
 - 默认数据路径：`/data/dwb/datasets/bridge_orig_1.0.0_lerobot`；

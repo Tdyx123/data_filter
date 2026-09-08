@@ -23,6 +23,21 @@ episode 只执行一次视觉模型前向；候选片段的视觉特征
 第 7 帧的 `[0..7]`、`[7..14]` 两个 8 帧半段；Bridge 将 7 帧候选拆成共享第 3 帧的
 `[0..3]`、`[3..6]` 两个 4 帧半段，分别缓存原始 CLIP 空间中的归一化均值。
 
+support 使用全体候选 embedding 的欧氏距离：令 `k_eff = min(quality.knn, N-1)`，
+`d_k(i)` 为第 `k_eff` 个其他候选的距离，统一半径为 `R = median(d_k)`。
+令 `count_i` 为距离 `<= R` 的其他候选数，则计入自身后的
+`support_i = min(count_i + 1, k_eff + 1) / (k_eff + 1)`，输出为 `[0,1]` 的 float32。
+边界点和重复坐标的其他候选均计入；`R=0` 时仍按此规则计算，单候选直接取 1。
+graph manifest 记录 `support_mode: median_radius_count_with_self`；旧公式的 graph
+及下游选择缓存需用 `--force` 重建，兼容的 scan/encode 缓存可继续复用。
+
+`build-graph`、`select`、`run` 和 `validate` 支持 `--support-k K`，K 必须为正整数。
+显式传入时覆盖 `quality.knn`；未传时保留 YAML 配置值，默认配置为 10。
+该参数不改变 `graph.knn`，计算仍使用 `k_eff = min(K, N-1)`。
+例如 `python -m cocore run --support-k 20`；复用旧输出目录且 k 改变时加 `--force`。
+`validate --support-k 20` 会检查 k 与产物保存值一致；未指定 `--config` 时读取
+输出目录中的 `resolved_config.yaml`。`scan` 和 `encode` 不接受此参数。
+
 动作—视觉原型保留两级解耦：一级表达动作桶，二级表达桶内视觉中心。学习原型时，
 对每条完整轨迹生成首尾覆盖的 profile 固定窗口：LIBERO 使用起点最大间隔 3 的
 8 帧 `[t,t+7]` 和 `state[t]→state[t+7]`；Bridge 使用起点最大间隔 2 的 4 帧

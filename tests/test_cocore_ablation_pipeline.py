@@ -340,7 +340,13 @@ def test_run_pipeline_persists_the_canonicalized_output_path(
     assert validate_output(result)["status"] == "valid"
 
 
-def test_full_ablation_defaults_match_production_cocore_exactly(tmp_path: Path) -> None:
+@pytest.mark.parametrize("support_mode", ["exponential", "median_radius_count_with_self"])
+def test_full_ablation_preserves_legacy_support_and_shared_cocore_behavior(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, support_mode: str,
+) -> None:
+    from sklearn.neighbors import NearestNeighbors
+
+    monkeypatch.setattr("cocore.pipeline.SUPPORT_MODE", support_mode)
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     production_config = cocore_test_config(tmp_path, relation="sequence")
     production_config["reliability_metrics"] = ["support", "progress"]
@@ -363,16 +369,28 @@ def test_full_ablation_defaults_match_production_cocore_exactly(tmp_path: Path) 
         "task_indices",
         "prototype_indices",
         "prototype_weights",
-        "support",
         "progress",
     ):
         np.testing.assert_array_equal(ablation_nodes[name], production_nodes[name])
-    np.testing.assert_allclose(
-        ablation_nodes["reliability"],
-        production_nodes["reliability"],
-        rtol=1.0e-6,
-        atol=1.0e-7,
-    )
+    embeddings = np.load(production_root / "encode" / "embeddings.npy")
+    # This fixture uses k=2. Check the retained legacy formula independently.
+    distances, _ = NearestNeighbors(n_neighbors=3).fit(embeddings).kneighbors(embeddings)
+    kth = distances[:, -1]
+    legacy_support = np.exp(-kth / (np.median(kth) + 1e-8))
+    np.testing.assert_allclose(ablation_nodes["support"], legacy_support, rtol=1e-6)
+    if support_mode == "exponential":
+        np.testing.assert_array_equal(ablation_nodes["support"], production_nodes["support"])
+        np.testing.assert_allclose(
+            ablation_nodes["reliability"], production_nodes["reliability"],
+            rtol=1e-6, atol=1e-7,
+        )
+    else:
+        assert not np.array_equal(ablation_nodes["support"], production_nodes["support"])
+        np.testing.assert_allclose(
+            production_nodes["reliability"],
+            np.maximum(np.sqrt(production_nodes["support"] * production_nodes["progress"]), 0.05),
+            rtol=1e-6,
+        )
     production_catalog = json.loads(
         (production_graph / "prototype_catalog.json").read_text()
     )
@@ -398,4 +416,9 @@ def test_full_ablation_defaults_match_production_cocore_exactly(tmp_path: Path) 
         json.loads(line)["sample_id"]
         for line in (ablation / "selected_manifest.jsonl").read_text().splitlines()
     ]
-    assert ablation_ids == production_ids
+    if support_mode == "exponential":
+        assert ablation_ids == production_ids
+    else:
+        assert len(ablation_ids) == len(production_ids) == 10
+    production_nodes.close()
+    ablation_nodes.close()
