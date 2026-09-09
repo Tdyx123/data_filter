@@ -13,6 +13,23 @@ support 与 Cocore 共用含自身的半径计数公式。在全体候选 embedd
 graph manifest 使用 `support_mode: median_radius_count_with_self` 标识公式。
 已有旧公式 graph 及下游选择缓存需用 `--force` 重建；兼容的 scan/encode 缓存可复用。
 
+新增可选可靠性指标 `support_old`，复用原先基于距离的 support：
+`support_old_i = exp(-d_k(i) / (median(d_k) + 1e-8))`。`d_k` 是全体候选
+embedding 欧氏距离空间中的第 `k_eff = min(quality.knn, N-1)` 个非自身近邻距离；
+单候选分数为 `1`，输出为 `[0,1]` 的 float32。
+
+`support` 与 `support_old` **不能同时加入** `reliability_metrics`，也可以均不选择；
+默认仍启用当前 `support`。两者共用 `quality.knn` / `--support-k K`，与相似图的
+`graph.knn` 独立。无论选择哪项，graph 的 `nodes.npz`、`all_clips.parquet` 和
+`selected_manifest.jsonl` 均保存两项分数，仅所选项参与几何均值融合及可靠性下限截断。
+例如将 `--reliability-metrics support_old progress --support-k 20` 加入运行命令；
+验证时使用相同指标及 K。Cocore YAML 等价配置为
+`reliability_metrics: [support_old, progress]` 与 `quality: {knn: 20}`。
+
+graph manifest 和缓存指纹新增 `support_old` 公式契约，现有 `support_mode` 仍标识
+当前计数公式。缺少新契约或字段的旧产物需使用 `--force` 重建 graph 及下游结果；
+兼容的 scan/encode 缓存会复用。校验会从全部候选 embedding 重算两项分数。
+
 `build-graph`、`select`、`run` 和 `validate` 支持 `--support-k K`，K 必须为正整数。
 显式传入时覆盖 `quality.knn`；未传时使用内置配置值，目前为 10。
 该参数不改变 `graph.knn`，计算仍使用 `k_eff = min(K, N-1)`。例如：
@@ -113,7 +130,7 @@ python -m cocore_bridge_v2 run \
 - `--no-use-stop-bucket`：仅用于 `build-graph`、`select`、`run` 和 `validate`，关闭 stop
   桶并排除双半段均无非 stop 标签的候选；未传时保持默认启用。
 - `--reliability-metrics METRIC [METRIC ...]`：仅用于 `build-graph`、`select`、`run` 和
-  `validate`；指标可从 `support`、`progress`、`action_variation`、
+  `validate`；指标可从 `support`、`support_old`、`progress`、`action_variation`、
   `visual_action_consistency`、`non_dwell`、`eef_jerk`、`local_path_efficiency`、
   `low_high_frequency_jitter`、`low_local_backtracking`、`action_jump` 中选择，默认启用原四项及 `action_jump`；`non_dwell`
   需要显式指定驻留阈值。输入顺序会被规范化，重复项和
@@ -305,5 +322,43 @@ Python 入口 `build_config(..., dwell={...})` 接受与 Cocore 相同的 `dwell
 
 Cocore 提供可选 `low_action_execution_deviation`，要求原始下发指令、明确的米制转换系数，
 以及相对当前实测位置、坐标系和执行区间对齐的确认。Bridge 状态差重标注动作不可用于此指标；
-真实数据来源未确认时保持关闭。首版通过 `python -m cocore ... --config <完整配置>` 使用，
-Bridge 专用命令不新增配置参数。完整配置与公式见 Cocore README 的“可选动作—执行偏差”。
+真实数据来源未确认时保持关闭。Bridge 的 `scan`、`encode`、`build-graph`、`select`、
+`run` 和 `validate` 均支持以下参数：
+
+| 参数 | 含义 |
+| --- | --- |
+| `--execution-action-source original_command` | 声明 `action` 是原始下发指令，而非状态差重标注标签 |
+| `--execution-action-semantics delta_from_observed_position` | 声明平移指令相对当前实测位置 |
+| `--execution-action-scale SX SY SZ` | 三个有限正数，将原始指令前三维转换为米制位移；无默认值 |
+| `--execution-alignment-confirmed` | 声明米制实测位置、同一固定坐标系、动作 t 对应位置 t→t+1，且上游已处理限幅 |
+
+四项 CLI 参数必须一起提供，并整体覆盖基础 YAML 的 `action_execution_deviation` 块。
+没有提供任何一项时保留 YAML 配置；部分 CLI 参数不会从 YAML 补齐，缺项即报错。
+对齐参数只是使用者的声明，不代表程序自动验证了数据来源、坐标系或时间对齐。
+配置完整但未选择 `low_action_execution_deviation` 时仅输出诊断；选择该指标后才参与融合。
+默认指标不变，原有 `python -m cocore ... --config <完整配置>` 入口仍然可用。
+
+以下目录仅为示例，必须替换为保留原始指令且满足上述条件的数据集。
+**只有原始指令前三维已经是米制相对位移时，才可使用 `1 1 1`**；其他控制器应填写实际
+每轴转换系数，不能沿用 LIBERO 的 `0.05`，也不能从状态差拟合系数来替代原始指令。
+
+```bash
+python -m cocore_bridge_v2 run \
+  --dataset-path /path/to/bridge_original_commands_lerobot \
+  --output-dir outputs/cocore_bridge_v2/bridge-execution-deviation \
+  --reliability-metrics support low_action_execution_deviation \
+  --support-k 8 \
+  --execution-action-source original_command \
+  --execution-action-semantics delta_from_observed_position \
+  --execution-action-scale 1 1 1 \
+  --execution-alignment-confirmed \
+  --selection-ratio 0.20 \
+  --relation sequence \
+  --relation-weight 1.0 \
+  --force
+```
+
+分阶段执行及 `validate` 应使用相同执行偏差配置；支持可靠性选择的子命令还应保持
+相同指标列表和 `support-k`，选择与校验阶段保持相同比例。修改缩放等配置会使 encode
+及下游缓存失效，复用目录时需要 `--force` 重建。此功能不新增原始指令字段读取、
+数据转换或指令恢复能力。完整配置与公式见 Cocore README 的“可选动作—执行偏差”。

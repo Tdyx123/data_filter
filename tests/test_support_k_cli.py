@@ -19,11 +19,12 @@ def _args(module, command, output):
 @pytest.mark.parametrize("module", [cocore_cli, bridge_cli])
 @pytest.mark.parametrize("command", ["build-graph", "select", "run", "validate"])
 @pytest.mark.parametrize("value", [None, "1", "20"])
-def test_support_k_reaches_pipeline_config(module, command, value, tmp_path, monkeypatch):
+@pytest.mark.parametrize("metric", ["support", "support_old"])
+def test_support_k_reaches_pipeline_config(module, command, value, metric, tmp_path, monkeypatch):
     received = {}
     output = tmp_path / "output"
     output.mkdir()
-    args = _args(module, command, output)
+    args = _args(module, command, output) + ["--reliability-metrics", metric]
     if module is cocore_cli:
         config = yaml.safe_load(Path(cocore_cli.__file__).with_name("config_libero90.yaml").read_text())
         config["quality"]["knn"] = 7
@@ -53,6 +54,7 @@ def test_support_k_reaches_pipeline_config(module, command, value, tmp_path, mon
     monkeypatch.setattr(module, "validate_output", validate)
     module.main(args)
     expected = int(value) if value is not None else (7 if module is cocore_cli else 10)
+    assert received["reliability_metrics"] == [metric]
     assert received["quality"]["knn"] == expected
     assert received["graph"]["knn"] == 32
 
@@ -83,3 +85,23 @@ def test_bridge_build_config_support_k_override():
 def test_bridge_build_config_rejects_invalid_support_k(value):
     with pytest.raises(ValueError, match="support_k"):
         build_config(relation="sequence", relation_weight=1, support_k=value)
+
+
+@pytest.mark.parametrize("module", [cocore_cli, bridge_cli])
+@pytest.mark.parametrize("command", ["build-graph", "select", "run", "validate"])
+def test_support_modes_are_rejected_together_before_pipeline(module, command, tmp_path):
+    args = _args(module, command, tmp_path) + [
+        "--reliability-metrics", "support", "support_old",
+    ]
+    with pytest.raises(SystemExit, match="mutually exclusive"):
+        module.main(args)
+
+
+def test_bridge_config_support_old_and_mutual_exclusion():
+    config = build_config(relation="sequence", relation_weight=1,
+                          reliability_metrics=["progress", "support_old"], support_k=7)
+    assert config["reliability_metrics"] == ["support_old", "progress"]
+    assert config["quality"]["knn"] == 7
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        build_config(relation="sequence", relation_weight=1,
+                     reliability_metrics=["support_old", "support"])

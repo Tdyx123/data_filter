@@ -26,6 +26,7 @@ from relcore.features.visual_encoder import (
 )
 from relcore.graph.prototypes import valid_prototype_assignments
 from relcore.scoring import compute_reliability
+from relcore.scoring.reliability import compute_support_components
 from relcore.schemas import ClipRecord, EdgeTable, GraphData
 from relcore.utils.io import (
     cache_is_valid,
@@ -146,6 +147,16 @@ from cocore.visual_action_consistency import (
 
 GRAPH_DIRECTORY = "graph-18-motion-hard-nearest-pca"
 SUPPORT_MODE = "median_radius_count_with_self"
+SUPPORT_OLD_CONTRACT = {
+    "mode": "exponential",
+    "input": "all_candidate_embeddings",
+    "distance": "euclidean_kth_non_self",
+    "knn": "quality.knn",
+    "effective_k": "min(knn, candidate_count - 1)",
+    "formula": "exp(-kth_distance / (median(kth_distance) + epsilon))",
+    "epsilon": 1.0e-8,
+    "single_candidate": 1.0,
+}
 PROTOTYPE_SCHEMA_VERSION = 10
 PROTOTYPE_STRATEGY = (
     "trajectory_sampled_optional_stop_retained_action_then_cropped_pca_half_visual_"
@@ -1225,6 +1236,7 @@ def graph_stage(
         "version": __version__,
         "stage": "graph",
         "support_mode": SUPPORT_MODE,
+        "support_old": SUPPORT_OLD_CONTRACT,
         "adapter": adapter.fingerprint(),
         "upstream": encoded.fingerprint,
         "quality": resolved["quality"],
@@ -1277,6 +1289,7 @@ def graph_stage(
                 min_reliability=float(quality_config["min_reliability"]),
                 reliability_metrics=("support", "progress"),
                 support_mode=SUPPORT_MODE,
+                compute_support_old=True,
             )
             jerk_valid = (
                 encoded.eef_jerk_valid
@@ -1300,6 +1313,7 @@ def graph_stage(
                 encoded.action_variation[metric_valid],
                 encoded.visual_action_consistency[metric_valid],
                 reliability_metrics,
+                support_old=reliability.support_old[metric_valid],
                 low_action_execution_deviation=(
                     encoded.low_action_execution_deviation[metric_valid]
                     if execution_metadata is not None
@@ -1400,6 +1414,7 @@ def graph_stage(
             prototype_indices=graph.prototype_indices,
             prototype_weights=graph.prototype_weights,
             support=reliability.support[source_clip_indices],
+            support_old=reliability.support_old[source_clip_indices],
             progress=reliability.progress[source_clip_indices],
             action_variation_raw=encoded.action_variation_raw[source_clip_indices],
             action_variation=encoded.action_variation[source_clip_indices],
@@ -1432,6 +1447,7 @@ def graph_stage(
                 "cocore_version": __version__,
                 "cocore_stage": "graph",
                 "support_mode": SUPPORT_MODE,
+                "support_old": SUPPORT_OLD_CONTRACT,
                 "fingerprint": fingerprint,
                 "upstream_fingerprint": encoded.fingerprint,
                 "stage_directory": GRAPH_DIRECTORY,
@@ -2170,6 +2186,7 @@ def _selection_rows(
             **asdict(clip),
             "selected": position is not None,
             "support": float(nodes["support"][index]),
+            **({"support_old": float(nodes["support_old"][index])} if "support_old" in nodes else {}),
             "progress": float(nodes["progress"][index]),
             "reliability": float(graph.reliability[index]),
             "primary_prototype": int(prototype_indices[0]),
@@ -2838,6 +2855,8 @@ def validate_output(
     graph_manifest = stage_manifests["graph"]
     if graph_manifest.get("support_mode") != SUPPORT_MODE:
         raise ValueError("graph manifest support mode is incompatible; rebuild graph with --force")
+    if graph_manifest.get("support_old") != SUPPORT_OLD_CONTRACT:
+        raise ValueError("graph support_old contract is incompatible; rebuild graph with --force")
     graph_temporal_fields = {
         "trajectory_window_length": run_geometry.trajectory_window_length,
         "trajectory_horizon": run_geometry.state_delta_horizon,
@@ -3163,6 +3182,7 @@ def validate_output(
     nodes = np.load(root / GRAPH_DIRECTORY / "nodes.npz")
     node_reliability_fields = {
         "support",
+        "support_old",
         "progress",
         "action_variation_raw",
         "action_variation",
@@ -3171,7 +3191,7 @@ def validate_output(
         "reliability",
     }
     if not node_reliability_fields <= set(nodes.files):
-        raise ValueError("graph node reliability arrays are missing")
+        raise ValueError("graph node reliability arrays are missing; rebuild graph with --force")
     node_count = len(source_clip_indices)
     if (
         any(
@@ -3182,6 +3202,7 @@ def validate_output(
             np.any((nodes[field] < 0.0) | (nodes[field] > 1.0))
             for field in (
                 "support",
+                "support_old",
                 "progress",
                 "action_variation",
                 "visual_action_consistency",
@@ -3192,6 +3213,15 @@ def validate_output(
         or np.any(nodes["visual_action_consistency_raw"] < 0.0)
     ):
         raise ValueError("graph node reliability arrays have invalid shape or values")
+    expected_support, expected_support_old = compute_support_components(
+        np.load(root / "encode" / "embeddings.npy", allow_pickle=False),
+        knn=int(replay_resolved["quality"]["knn"]),
+        support_mode=SUPPORT_MODE,
+        include_old=True,
+    )
+    for field, expected in (("support", expected_support), ("support_old", expected_support_old)):
+        if not np.allclose(nodes[field], expected[source_clip_indices], rtol=1.0e-6, atol=1.0e-7):
+            raise ValueError(f"graph {field} does not match encode cache")
     if not np.allclose(
         nodes["action_variation_raw"],
         expected_action_variation_raw[source_clip_indices],
@@ -3285,6 +3315,7 @@ def validate_output(
         nodes["action_variation"],
         nodes["visual_action_consistency"],
         expected_reliability_metrics,
+        support_old=nodes["support_old"],
         action_jump=nodes["action_jump"] if expected_jump else None,
         low_action_execution_deviation=nodes[EXECUTION_METRIC] if expected_execution else None,
         non_dwell=nodes["non_dwell"] if expected_dwell else None,
@@ -3354,6 +3385,7 @@ def validate_output(
                 else {}
             ),
             "support": nodes["support"][index],
+            "support_old": nodes["support_old"][index],
             "progress": nodes["progress"][index],
             "action_variation_raw": nodes["action_variation_raw"][index],
             "action_variation": nodes["action_variation"][index],
@@ -3437,6 +3469,7 @@ def validate_output(
             )
             for field in (
                 "support",
+                "support_old",
                 "progress",
                 "reliability",
                 *(DWELL_FIELDS if expected_dwell else ()),

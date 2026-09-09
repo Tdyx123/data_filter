@@ -2799,3 +2799,98 @@ def test_action_jump_reference_respects_episode_limit(tmp_path):
     np.testing.assert_array_equal(encoded.action_jump_episode_ids, [0])
     np.testing.assert_array_equal(encoded.action_jump_offsets, [0, 605])
     assert encoded.action_jump_pair_count == 604
+
+
+@pytest.mark.parametrize("profile", ["libero", "bridge_v2"])
+@pytest.mark.parametrize("metrics", [["support_old", "progress"], ["support"], ["progress"]])
+def test_support_old_roundtrip(tmp_path, profile, metrics):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["prototypes"]["profile"] = profile
+    config["reliability_metrics"] = metrics
+    config["quality"] = {"knn": 2}
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    root = result.parent
+    embeddings = np.load(root / "encode" / "embeddings.npy")
+    # Independent brute-force distances, rather than the production nearest-neighbor helper.
+    distances = np.linalg.norm(embeddings[:, None] - embeddings[None, :], axis=2)
+    np.fill_diagonal(distances, np.inf)
+    kth = np.sort(distances, axis=1)[:, 1]
+    expected_old = np.exp(-kth / (np.median(kth) + 1e-8))
+    source = np.load(root / cocore_pipeline.GRAPH_DIRECTORY / "source_clip_indices.npy")
+    with np.load(root / cocore_pipeline.GRAPH_DIRECTORY / "nodes.npz") as nodes:
+        np.testing.assert_allclose(nodes["support_old"], expected_old[source], rtol=1e-5, atol=1e-6)
+        expected = np.prod([nodes[name] for name in metrics], axis=0) ** (1 / len(metrics))
+        np.testing.assert_allclose(nodes["reliability"], np.clip(expected, .05, 1), rtol=1e-6)
+    for filename in ("all_clips.parquet", "selected_clips.parquet"):
+        if (result / filename).exists():
+            rows = pq.read_table(result / filename).to_pylist()
+            assert rows and all("support" in row and "support_old" in row for row in rows)
+    selected = [json.loads(line) for line in (result / "selected_manifest.jsonl").read_text().splitlines()]
+    assert selected and all("support" in row and "support_old" in row for row in selected)
+    assert validate_output(result, config=config)["status"] == "valid"
+    run_pipeline(config, visual_encoder=FailingCocoreVisualEncoder())
+    for key, value in (("reliability_metrics", ["support_old"]), ("quality", {"knn": 3})):
+        changed = copy.deepcopy(config)
+        changed[key] = value
+        with pytest.raises(FileExistsError):
+            graph_stage(changed, visual_encoder=FailingCocoreVisualEncoder())
+
+
+@pytest.mark.parametrize("target", ["node", "missing", "row", "selected", "contract"])
+def test_support_old_tamper_detection(tmp_path, target):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    config["reliability_metrics"] = ["progress"]  # Even unselected diagnostics must be checked.
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    graph_root = result.parent / cocore_pipeline.GRAPH_DIRECTORY
+    if target in {"node", "missing"}:
+        path = graph_root / "nodes.npz"
+        with np.load(path) as nodes:
+            arrays = dict(nodes)
+        if target == "missing":
+            arrays.pop("support_old")
+        else:
+            arrays["support_old"][0] *= .5
+        np.savez(path, **arrays)
+    elif target == "row":
+        path = result / "all_clips.parquet"
+        rows = pq.read_table(path).to_pylist()
+        rows[0]["support_old"] *= .5
+        pq.write_table(pa.Table.from_pylist(rows), path)
+    elif target == "selected":
+        path = result / "selected_manifest.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[0]["support_old"] *= .5
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    else:
+        path = graph_root / "manifest.json"
+        manifest = json.loads(path.read_text())
+        manifest.pop("support_old")
+        path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="support_old|reliability|metadata mismatch"):
+        validate_output(result, config=config)
+
+
+
+def test_support_old_legacy_graph_requires_rebuild_and_reuses_encoding(tmp_path):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    result = run_pipeline(config, visual_encoder=CocoreVisualEncoder())
+    root = result.parent
+    encode_manifest = (root / "encode" / "manifest.json").read_bytes()
+    graph_root = root / cocore_pipeline.GRAPH_DIRECTORY
+    manifest_path = graph_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.pop("support_old")
+    manifest["fingerprint"] = "legacy-graph-without-support-old"
+    manifest_path.write_text(json.dumps(manifest))
+    with np.load(graph_root / "nodes.npz") as nodes:
+        arrays = dict(nodes)
+    arrays.pop("support_old")
+    np.savez(graph_root / "nodes.npz", **arrays)
+    with pytest.raises(FileExistsError, match="--force"):
+        run_pipeline(config, visual_encoder=FailingCocoreVisualEncoder())
+    run_pipeline(config, force=True, visual_encoder=FailingCocoreVisualEncoder())
+    assert (root / "encode" / "manifest.json").read_bytes() == encode_manifest
+    assert validate_output(result, config=config)["status"] == "valid"

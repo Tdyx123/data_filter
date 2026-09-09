@@ -22,7 +22,9 @@ DEFAULT_RELIABILITY_METRICS = (
 )
 
 RELIABILITY_METRICS = (
-    *DEFAULT_RELIABILITY_METRICS[:-1],
+    "support",
+    "support_old",
+    *DEFAULT_RELIABILITY_METRICS[1:-1],
     "non_dwell",
     "eef_jerk",
     "local_path_efficiency",
@@ -114,6 +116,8 @@ def normalize_reliability_metrics(metrics: Sequence[str]) -> tuple[str, ...]:
     if unknown:
         raise ValueError(f"reliability metrics contain unknown names: {unknown}")
     enabled = set(values)
+    if {"support", "support_old"} <= enabled:
+        raise ValueError("support and support_old are mutually exclusive reliability metrics")
     return tuple(metric for metric in RELIABILITY_METRICS if metric in enabled)
 
 
@@ -125,6 +129,7 @@ def fuse_reliability(
     metrics: Sequence[str],
     *,
     min_reliability: float,
+    support_old: np.ndarray | None = None,
     action_jump: np.ndarray | None = None,
     non_dwell: np.ndarray | None = None,
     local_path_efficiency: np.ndarray | None = None,
@@ -144,6 +149,10 @@ def fuse_reliability(
             dtype=np.float32,
         ),
     }
+    if support_old is not None:
+        components["support_old"] = np.asarray(support_old, dtype=np.float32)
+    elif "support_old" in metrics:
+        raise ValueError("support_old reliability requires computed values")
     if action_jump is not None:
         components["action_jump"] = np.asarray(action_jump, dtype=np.float64)
     elif "action_jump" in metrics:

@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
         if command in {"build-graph", "select", "run"}:
             child.add_argument(
                 "--support-k", type=_positive_int, default=None,
-                help="override quality.knn for support (positive integer; default: configuration)",
+                help="override quality.knn shared by support/support_old (positive integer; default: configuration)",
             )
             child.add_argument("--no-use-stop-bucket", action="store_true")
             child.add_argument(
@@ -72,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--config", default=None)
     validate.add_argument(
         "--support-k", type=_positive_int, default=None,
-        help="validate the support k against the saved output configuration",
+        help="validate the shared support/support_old k against the saved output configuration",
     )
     validate.add_argument("--no-use-stop-bucket", action="store_true")
     validate.add_argument(

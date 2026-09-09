@@ -70,9 +70,10 @@ def test_config_accepts_supported_relations(relation: str) -> None:
         list(metrics)
         for size in range(1, len(RELIABILITY_METRICS) + 1)
         for metrics in itertools.combinations(reversed(RELIABILITY_METRICS), size)
+        if not {"support", "support_old"} <= set(metrics)
     ],
 )
-def test_config_accepts_every_nonempty_reliability_subset(metrics: list[str]) -> None:
+def test_config_accepts_every_nonempty_compatible_reliability_subset(metrics: list[str]) -> None:
     resolved = resolve_config(
         {
             **_objective(),

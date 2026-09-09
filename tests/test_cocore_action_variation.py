@@ -82,10 +82,11 @@ def test_constant_action_variation_normalizes_to_zero(constant: float) -> None:
     np.testing.assert_array_equal(actual, np.zeros(3, dtype=np.float32))
 
 
-def test_reliability_is_geometric_mean_of_every_nonempty_metric_subset() -> None:
+def test_reliability_is_geometric_mean_of_every_nonempty_compatible_metric_subset() -> None:
     components = {
         "action_jump": 0.9,
         "support": 0.125,
+        "support_old": 0.064,
         "progress": 0.216,
         "action_variation": 0.343,
         "non_dwell": 0.729,
@@ -98,6 +99,8 @@ def test_reliability_is_geometric_mean_of_every_nonempty_metric_subset() -> None
     }
     for size in range(1, len(RELIABILITY_METRICS) + 1):
         for metrics in itertools.combinations(RELIABILITY_METRICS, size):
+            if {"support", "support_old"} <= set(metrics):
+                continue
             actual = fuse_reliability(
                 np.asarray([components["support"]], dtype=np.float32),
                 np.asarray([components["progress"]], dtype=np.float32),
@@ -105,6 +108,7 @@ def test_reliability_is_geometric_mean_of_every_nonempty_metric_subset() -> None
                 np.asarray([components["visual_action_consistency"]], dtype=np.float32),
                 metrics,
                 min_reliability=0.01,
+                support_old=np.asarray([components["support_old"]], dtype=np.float32),
                 action_jump=np.asarray([components["action_jump"]]),
                 non_dwell=np.asarray([components["non_dwell"]], dtype=np.float32),
                 eef_jerk=np.asarray([components["eef_jerk"]], dtype=np.float32),
@@ -120,9 +124,13 @@ def test_reliability_is_geometric_mean_of_every_nonempty_metric_subset() -> None
             assert float(actual[0]) == pytest.approx(expected, rel=1.0e-6)
 
 
-def test_metric_normalization_accepts_every_nonempty_subset_in_canonical_order() -> None:
+def test_metric_normalization_checks_every_nonempty_subset_in_canonical_order() -> None:
     for size in range(1, len(RELIABILITY_METRICS) + 1):
         for metrics in itertools.combinations(reversed(RELIABILITY_METRICS), size):
+            if {"support", "support_old"} <= set(metrics):
+                with pytest.raises(ValueError, match="mutually exclusive"):
+                    normalize_reliability_metrics(metrics)
+                continue
             expected = tuple(metric for metric in RELIABILITY_METRICS if metric in metrics)
             assert normalize_reliability_metrics(metrics) == expected
 

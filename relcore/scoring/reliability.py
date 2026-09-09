@@ -51,6 +51,7 @@ class ReliabilityResult:
     progress: np.ndarray
     smoothness: np.ndarray
     noop_ratio: np.ndarray
+    support_old: np.ndarray | None = None
 
 
 def _motion_without_gripper(values: np.ndarray, gripper_index: int) -> np.ndarray:
@@ -58,6 +59,54 @@ def _motion_without_gripper(values: np.ndarray, gripper_index: int) -> np.ndarra
     if index < 0 or index >= values.shape[-1]:
         raise ValueError("gripper_action_index is outside the action dimension")
     return np.delete(values, index, axis=-1)
+
+
+def compute_support_components(
+    embeddings: np.ndarray,
+    *,
+    knn: int = 10,
+    epsilon: float = 1.0e-8,
+    support_mode: str = "exponential",
+    include_old: bool = False,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Compute support and optional legacy diagnostics from one neighbor query.
+
+    The non-self kth distance equals the kth distance after including self
+    in a k+1 query, also when duplicate embeddings have zero distance.
+    """
+    if support_mode not in ("exponential", "median_radius_count_with_self"):
+        raise ValueError(f"unknown support_mode: {support_mode}")
+    values = np.asarray(embeddings, dtype=np.float32)
+    if values.ndim != 2 or len(values) == 0 or not np.all(np.isfinite(values)):
+        raise ValueError("support requires non-empty finite [sample, dimension] embeddings")
+    count = len(values)
+    support_old = None
+    if count == 1:
+        support = np.ones(1, dtype=np.float32)
+        if include_old:
+            support_old = support.copy()
+    else:
+        from sklearn.neighbors import NearestNeighbors
+
+        effective_k = min(int(knn), count - 1)
+        neighbors = NearestNeighbors(n_neighbors=effective_k + 1, metric="euclidean")
+        neighbors.fit(values)
+        if support_mode == "median_radius_count_with_self":
+            # X=None excludes each query's own index, including with duplicate points.
+            distances, _ = neighbors.kneighbors(n_neighbors=effective_k)
+            kth = distances[:, -1]
+            radius = np.median(kth)
+            # Keeping only k neighbors implements the count cap without a radius query.
+            capped_count = np.count_nonzero(distances <= radius, axis=1)
+            support = ((capped_count + 1) / (effective_k + 1)).astype(np.float32)
+        else:
+            distances, _ = neighbors.kneighbors(values)
+            kth = distances[:, -1]
+            support = np.exp(-kth / (np.median(kth) + epsilon)).astype(np.float32)
+
+        if include_old:
+            support_old = np.exp(-kth / (np.median(kth) + epsilon)).astype(np.float32)
+    return support, support_old
 
 
 def compute_reliability(
@@ -75,6 +124,7 @@ def compute_reliability(
     reliability_metrics: Sequence[str] = RELIABILITY_METRICS,
     epsilon: float = 1.0e-8,
     support_mode: str = "exponential",
+    compute_support_old: bool = False,
 ) -> ReliabilityResult:
     """Compute components; radius-count support includes self after capping neighbors."""
     if support_mode not in ("exponential", "median_radius_count_with_self"):
@@ -97,25 +147,10 @@ def compute_reliability(
     if not all(np.all(np.isfinite(array)) for array in (values, states, actions, visual)):
         raise ValueError("reliability inputs contain NaN or infinity")
 
-    if count == 1:
-        support = np.ones(1, dtype=np.float32)
-    else:
-        from sklearn.neighbors import NearestNeighbors
-
-        effective_k = min(int(knn), count - 1)
-        neighbors = NearestNeighbors(n_neighbors=effective_k + 1, metric="euclidean")
-        neighbors.fit(values)
-        if support_mode == "median_radius_count_with_self":
-            # X=None excludes each query's own index, including with duplicate points.
-            distances, _ = neighbors.kneighbors(n_neighbors=effective_k)
-            radius = np.median(distances[:, -1])
-            # Keeping only k neighbors implements the count cap without a radius query.
-            capped_count = np.count_nonzero(distances <= radius, axis=1)
-            support = ((capped_count + 1) / (effective_k + 1)).astype(np.float32)
-        else:
-            distances, _ = neighbors.kneighbors(values)
-            kth = distances[:, -1]
-            support = np.exp(-kth / (np.median(kth) + epsilon)).astype(np.float32)
+    support, support_old = compute_support_components(
+        values, knn=knn, epsilon=epsilon, support_mode=support_mode,
+        include_old=compute_support_old,
+    )
 
     state_motion = states[..., :-1] if states.shape[-1] > 1 else states
     state_gripper = states[..., -1]
@@ -155,4 +190,4 @@ def compute_reliability(
     for metric in enabled_metrics:
         reliability *= metric_values[metric] ** _RELIABILITY_METRIC_EXPONENTS[metric]
     reliability = np.clip(reliability, min_reliability, 1.0).astype(np.float32)
-    return ReliabilityResult(reliability, support, progress, smoothness, noop_ratio)
+    return ReliabilityResult(reliability, support, progress, smoothness, noop_ratio, support_old)

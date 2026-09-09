@@ -53,6 +53,23 @@ def _selection_ratio(value: str) -> float:
 
 
 def _add_objective_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--execution-action-source", choices=("original_command",), default=None,
+        help="declare original issued commands; state-difference labels are not supported",
+    )
+    parser.add_argument(
+        "--execution-action-semantics", choices=("delta_from_observed_position",),
+        default=None, help="declare translation relative to the current observed position",
+    )
+    parser.add_argument(
+        "--execution-action-scale", nargs=3, type=float, metavar=("SX", "SY", "SZ"),
+        default=None, help="three finite positive command-to-metre factors (no defaults)",
+    )
+    parser.add_argument(
+        "--execution-alignment-confirmed", action="store_true", default=None,
+        help="declare coordinate/time alignment and upstream clipping; not automatic verification. "
+        "All four --execution-* options must be supplied together",
+    )
     for name in ("position-speed-threshold", "gripper-speed-threshold", "angular-speed-threshold"):
         parser.add_argument(f"--dwell-{name}", type=float, default=None)
     parser.add_argument("--dwell-gripper-mode", choices=("continuous", "binary"), default=None)
@@ -77,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
         if command in {"build-graph", "select", "run"}:
             child.add_argument(
                 "--support-k", type=_positive_int, default=None,
-                help="override quality.knn for support (positive integer; default: configuration)",
+                help="override quality.knn shared by support/support_old (positive integer; default: configuration)",
             )
             child.add_argument("--no-use-stop-bucket", action="store_true")
             child.add_argument(
@@ -98,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--output-dir", required=True)
     validate.add_argument(
         "--support-k", type=_positive_int, default=None,
-        help="validate the support k against the saved output configuration",
+        help="validate the shared support/support_old k against the saved output configuration",
     )
     validate.add_argument("--dataset-path", default=str(DEFAULT_DATASET_PATH))
     validate.add_argument(
@@ -139,6 +156,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         if getattr(args, f"dwell_{name}", None) is not None
     }
     config = build_config(
+        action_execution_deviation={
+            name: getattr(args, f"execution_{name}")
+            for name in (
+                "action_source", "action_semantics", "action_scale", "alignment_confirmed"
+            )
+            if getattr(args, f"execution_{name}") is not None
+        } or None,
         support_k=getattr(args, "support_k", None),
         dwell=dwell or None,
         relation=args.relation,

@@ -31,6 +31,23 @@ support 使用全体候选 embedding 的欧氏距离：令 `k_eff = min(quality.
 graph manifest 记录 `support_mode: median_radius_count_with_self`；旧公式的 graph
 及下游选择缓存需用 `--force` 重建，兼容的 scan/encode 缓存可继续复用。
 
+新增可选可靠性指标 `support_old`，复用原先基于距离的 support：
+`support_old_i = exp(-d_k(i) / (median(d_k) + 1e-8))`。`d_k` 是全体候选
+embedding 欧氏距离空间中的第 `k_eff = min(quality.knn, N-1)` 个非自身近邻距离；
+单候选分数为 `1`，输出为 `[0,1]` 的 float32。
+
+`support` 与 `support_old` **不能同时加入** `reliability_metrics`，也可以均不选择；
+默认仍启用当前 `support`。两者共用 `quality.knn` / `--support-k K`，与相似图的
+`graph.knn` 独立。无论选择哪项，graph 的 `nodes.npz`、`all_clips.parquet` 和
+`selected_manifest.jsonl` 均保存两项分数，仅所选项参与几何均值融合及可靠性下限截断。
+例如将 `--reliability-metrics support_old progress --support-k 20` 加入运行命令；
+验证时使用相同指标及 K。Cocore YAML 等价配置为
+`reliability_metrics: [support_old, progress]` 与 `quality: {knn: 20}`。
+
+graph manifest 和缓存指纹新增 `support_old` 公式契约，现有 `support_mode` 仍标识
+当前计数公式。缺少新契约或字段的旧产物需使用 `--force` 重建 graph 及下游结果；
+兼容的 scan/encode 缓存会复用。校验会从全部候选 embedding 重算两项分数。
+
 `build-graph`、`select`、`run` 和 `validate` 支持 `--support-k K`，K 必须为正整数。
 显式传入时覆盖 `quality.knn`；未传时保留 YAML 配置值，默认配置为 10。
 该参数不改变 `graph.knn`，计算仍使用 `k_eff = min(K, N-1)`。
@@ -104,9 +121,11 @@ w_half = w_r * w_d
 命中同一叶时合并为 `max(w1,w2)+0.5*min(w1,w2)`；同动作不同中心不合并。最终固定
 最多两个槽位，按权重降序、叶 ID 破平局；权重不归一、不截断，范围可到 1.5。
 
-可靠性目录为 `support`、`progress`、`action_variation`、
+可靠性目录为 `support`、`support_old`、`progress`、`action_variation`、
 `visual_action_consistency`、`non_dwell`、`eef_jerk`、`local_path_efficiency`、`low_high_frequency_jitter`、`low_local_backtracking` 和 `action_jump`，
-顶层 `reliability_metrics` 可选择非空、无重复的指标子集，默认启用前四项和 `action_jump`；`non_dwell` 需要显式配置 `dwell` 阈值。输入顺序会按
+顶层 `reliability_metrics` 可选择非空、无重复且满足互斥规则的指标子集。默认启用
+`support`、`progress`、`action_variation`、`visual_action_consistency` 和 `action_jump`；
+`non_dwell` 需要显式配置 `dwell` 阈值。输入顺序会按
 上述固定顺序规范化。`action_variation` 在完整 episode 的分位缩放动作上计算：逐步分数
 为当前与前一步动作的 L2 差乘 2，再加未来最多 5 步动作逐维总体方差的维度均值；首步
 差分为 0，未来少于 2 步时方差为 0。片段原始分数取最高 3 个逐步分数的均值，再使用
