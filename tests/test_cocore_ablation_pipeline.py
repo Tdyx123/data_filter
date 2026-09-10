@@ -23,7 +23,7 @@ from trajectory_data import register_dataset_adapter
 def _config(tmp_path: Path) -> dict[str, object]:
     config = copy.deepcopy(cocore_test_config(tmp_path, relation="sequence"))
     config["upstream"] = {"directory": str(tmp_path / "upstream-cocore")}
-    config["reliability_metrics"] = ["support", "progress"]
+    config["reliability_metrics"] = ["support_old", "action_jump"]
     config["prototypes"].update(  # type: ignore[union-attr]
         {
             "profile": "libero",
@@ -90,8 +90,8 @@ def test_run_pipeline_reuses_upstream_encode_and_publishes_named_sibling_artifac
 
     report = json.loads((result / "selection_report.json").read_text())
     assert report["producer"] == "cocore_ablation"
-    assert report["schema_version"] == 1
-    assert report["reliability_metrics"] == ["support", "progress"]
+    assert report["schema_version"] == 2
+    assert report["reliability_metrics"] == ["support_old", "action_jump"]
     assert report["prototype_representation"] == "action_visual"
     assert report["use_assignment_confidence"] is True
     assert report["initial_set_size"] > 0
@@ -212,7 +212,7 @@ def test_graph_variants_change_reliability_and_action_catalog(tmp_path: Path) ->
     nodes = np.load(graph_root / "nodes.npz")
     np.testing.assert_array_equal(nodes["reliability"], np.ones(len(nodes["reliability"])))
     catalog = json.loads((graph_root / "prototype_catalog.json").read_text())
-    assert catalog["schema_version"] == 1
+    assert catalog["schema_version"] == 2
     assert catalog["representation"] == "action_only"
     assert catalog["use_assignment_confidence"] is False
     assert all(category["actual_centers"] in {0, 1} for category in catalog["action_categories"])
@@ -341,7 +341,7 @@ def test_run_pipeline_persists_the_canonicalized_output_path(
 
 
 @pytest.mark.parametrize("support_mode", ["exponential", "median_radius_count_with_self"])
-def test_full_ablation_preserves_legacy_support_and_shared_cocore_behavior(
+def test_full_ablation_matches_reference_cocore_baseline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, support_mode: str,
 ) -> None:
     from sklearn.neighbors import NearestNeighbors
@@ -349,7 +349,9 @@ def test_full_ablation_preserves_legacy_support_and_shared_cocore_behavior(
     monkeypatch.setattr("cocore.pipeline.SUPPORT_MODE", support_mode)
     register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
     production_config = cocore_test_config(tmp_path, relation="sequence")
-    production_config["reliability_metrics"] = ["support", "progress"]
+    production_config["reliability_metrics"] = ["support_old", "action_jump"]
+    production_config["quality"]["knn"] = 10
+    production_config["selection"].update({"ratio": 0.20, "budget": None})
     production_root = tmp_path / "production-cocore"
     production = run_cocore_pipeline(
         production_config,
@@ -358,6 +360,8 @@ def test_full_ablation_preserves_legacy_support_and_shared_cocore_behavior(
     )
     ablation_config = _config(tmp_path)
     ablation_config["upstream"] = {"directory": str(production_root)}
+    ablation_config["quality"]["knn"] = 10
+    ablation_config["selection"].update({"ratio": 0.20, "budget": None})
 
     ablation = _run(ablation_config)
 
@@ -369,28 +373,20 @@ def test_full_ablation_preserves_legacy_support_and_shared_cocore_behavior(
         "task_indices",
         "prototype_indices",
         "prototype_weights",
-        "progress",
+        "action_jump",
     ):
         np.testing.assert_array_equal(ablation_nodes[name], production_nodes[name])
     embeddings = np.load(production_root / "encode" / "embeddings.npy")
-    # This fixture uses k=2. Check the retained legacy formula independently.
-    distances, _ = NearestNeighbors(n_neighbors=3).fit(embeddings).kneighbors(embeddings)
+    # Check the reference k=10 legacy formula independently.
+    distances, _ = NearestNeighbors(n_neighbors=11).fit(embeddings).kneighbors(embeddings)
     kth = distances[:, -1]
     legacy_support = np.exp(-kth / (np.median(kth) + 1e-8))
-    np.testing.assert_allclose(ablation_nodes["support"], legacy_support, rtol=1e-6)
-    if support_mode == "exponential":
-        np.testing.assert_array_equal(ablation_nodes["support"], production_nodes["support"])
-        np.testing.assert_allclose(
-            ablation_nodes["reliability"], production_nodes["reliability"],
-            rtol=1e-6, atol=1e-7,
-        )
-    else:
-        assert not np.array_equal(ablation_nodes["support"], production_nodes["support"])
-        np.testing.assert_allclose(
-            production_nodes["reliability"],
-            np.maximum(np.sqrt(production_nodes["support"] * production_nodes["progress"]), 0.05),
-            rtol=1e-6,
-        )
+    np.testing.assert_allclose(ablation_nodes["support_old"], legacy_support, rtol=1e-6)
+    np.testing.assert_array_equal(ablation_nodes["support_old"], production_nodes["support_old"])
+    np.testing.assert_allclose(
+        ablation_nodes["reliability"], production_nodes["reliability"],
+        rtol=1e-6, atol=1e-7,
+    )
     production_catalog = json.loads(
         (production_graph / "prototype_catalog.json").read_text()
     )
@@ -416,9 +412,23 @@ def test_full_ablation_preserves_legacy_support_and_shared_cocore_behavior(
         json.loads(line)["sample_id"]
         for line in (ablation / "selected_manifest.jsonl").read_text().splitlines()
     ]
-    if support_mode == "exponential":
-        assert ablation_ids == production_ids
-    else:
-        assert len(ablation_ids) == len(production_ids) == 10
+    assert ablation_ids == production_ids
+    assert validate_output(ablation)["status"] == "valid"
     production_nodes.close()
     ablation_nodes.close()
+
+
+@pytest.mark.parametrize("metrics", [[], ["support_old"], ["action_jump"]])
+def test_reliability_subsets_reuse_baseline_encode_and_validate(tmp_path, metrics):
+    register_dataset_adapter("cocore_pipeline_synthetic", CocorePipelineAdapter)
+    config = _config(tmp_path)
+    _run(config, subfolder_name="full", visual_encoder=CocoreVisualEncoder())
+    encode_manifest = tmp_path / "upstream-cocore" / "encode" / "manifest.json"
+    original_mtime = encode_manifest.stat().st_mtime_ns
+    config["reliability_metrics"] = metrics
+    result = _run(config, subfolder_name="subset")
+    assert encode_manifest.stat().st_mtime_ns == original_mtime
+    with np.load(result.parent / "graph" / "nodes.npz") as nodes:
+        expected = np.maximum(nodes[metrics[0]], 0.05) if metrics else np.ones_like(nodes["reliability"])
+        np.testing.assert_allclose(nodes["reliability"], expected)
+    assert validate_output(result)["status"] == "valid"

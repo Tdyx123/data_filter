@@ -74,7 +74,7 @@ def test_cli_keeps_validate_as_a_public_command() -> None:
     assert args.command == "validate"
 
 
-@pytest.mark.parametrize("value", ["smoothness", "support,support", "progress,support"])
+@pytest.mark.parametrize("value", ["smoothness", "support_old,support_old", "action_jump,support_old"])
 def test_cli_rejects_noncanonical_reliability_metric_lists(value: str) -> None:
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(
@@ -94,7 +94,7 @@ def test_cli_applies_overrides_before_running(monkeypatch, capsys) -> None:
         cli,
         "load_config",
         lambda _: {
-            "reliability_metrics": ["support", "progress"],
+            "reliability_metrics": ["support_old", "action_jump"],
             "prototypes": {
                 "representation": "action_visual",
                 "use_assignment_confidence": True,
@@ -145,3 +145,24 @@ def test_cli_applies_overrides_before_running(monkeypatch, capsys) -> None:
     assert capsys.readouterr().out.strip() == (
         "cocore_ablation_output=outputs/cocore_ablation/result"
     )
+
+
+@pytest.mark.parametrize("command", ["run", "validate"])
+def test_cli_accepts_reference_baseline_flags(command):
+    location = ["--subfolder-name", "full-model"] if command == "run" else ["--output-dir", "result"]
+    args = cli.build_parser().parse_args([
+        command, *location, "--reliability-metrics", "support_old", "action_jump",
+        "--support-k", "10", "--selection-ratio", "0.20",
+        "--relation", "sequence", "--relation-weight", "1.0",
+    ])
+    config = {}
+    cli._apply_overrides(config, args)
+    assert config["reliability_metrics"] == ["support_old", "action_jump"]
+    assert config["quality"]["knn"] == 10
+    assert config["selection"]["ratio"] == 0.20
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5"])
+def test_cli_rejects_invalid_support_k(value):
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["run", "--subfolder-name", "full", "--support-k", value])

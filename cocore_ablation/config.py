@@ -15,7 +15,8 @@ from cocore.config import resolve_config as resolve_cocore_config
 
 
 DEFAULT_CONFIG: dict[str, Any] = copy.deepcopy(COCORE_DEFAULT_CONFIG)
-DEFAULT_CONFIG["reliability_metrics"] = ["support", "progress"]
+DEFAULT_CONFIG["quality"]["knn"] = 10
+DEFAULT_CONFIG["reliability_metrics"] = ["support_old", "action_jump"]
 DEFAULT_CONFIG["prototypes"].update(
     {
         "representation": "action_visual",
@@ -29,15 +30,16 @@ DEFAULT_CONFIG["objective"] = {
 }
 DEFAULT_CONFIG["selection"].update(
     {
+        "ratio": 0.20,
         "strategy": "random_multibranch",
         "use_coverage_seed": True,
     }
 )
-DEFAULT_CONFIG["upstream"] = {"directory": "outputs/cocore/libero90"}
-DEFAULT_CONFIG["output"] = {"directory": "outputs/cocore_ablation/libero90"}
+DEFAULT_CONFIG["upstream"] = {"directory": "/data/dwb/libero_filter/cocore_ablation/shared"}
+DEFAULT_CONFIG["output"] = {"directory": "/data/dwb/libero_filter/cocore_ablation"}
 
-_METRIC_ORDER = ("support", "progress")
-_TOP_LEVEL_KEYS = frozenset(DEFAULT_CONFIG)
+_METRIC_ORDER = ("support_old", "action_jump")
+_TOP_LEVEL_KEYS = frozenset(DEFAULT_CONFIG) | {"action_jump"}
 
 
 def _merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -131,7 +133,7 @@ def resolve_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
     cocore_payload = copy.deepcopy(resolved)
     cocore_payload.pop("upstream", None)
-    cocore_payload["reliability_metrics"] = ["support", "progress"]
+    cocore_payload["reliability_metrics"] = ["support_old", "action_jump"]
     for name in ("representation", "use_assignment_confidence"):
         cocore_payload["prototypes"].pop(name, None)
     cocore_payload["objective"].pop("redundancy_weight", None)
@@ -170,7 +172,7 @@ def to_cocore_config(resolved: Mapping[str, Any]) -> dict[str, Any]:
 
     payload = copy.deepcopy(dict(resolved))
     upstream = payload.pop("upstream")
-    payload["reliability_metrics"] = ["support", "progress"]
+    payload["reliability_metrics"] = ["support_old", "action_jump"]
     payload["prototypes"].pop("representation", None)
     payload["prototypes"].pop("use_assignment_confidence", None)
     payload["objective"].pop("redundancy_weight", None)

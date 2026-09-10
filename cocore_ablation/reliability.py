@@ -1,4 +1,4 @@
-"""Reliability fusion variants used by Cocore ablation graphs."""
+"""Reliability fusion for subsets of the support_old/action_jump baseline."""
 
 from __future__ import annotations
 
@@ -6,29 +6,25 @@ from collections.abc import Sequence
 
 import numpy as np
 
+from cocore.action_variation import fuse_reliability as fuse_cocore_reliability
+from .config import _validate_metrics
+
 
 def fuse_reliability(
-    support: np.ndarray,
-    progress: np.ndarray,
+    support_old: np.ndarray,
+    action_jump: np.ndarray,
     metrics: Sequence[str],
     *,
     min_reliability: float,
 ) -> np.ndarray:
-    support_values = np.asarray(support, dtype=np.float32)
-    progress_values = np.asarray(progress, dtype=np.float32)
-    if (
-        support_values.ndim != 1
-        or support_values.shape != progress_values.shape
-        or not np.all(np.isfinite(support_values))
-        or not np.all(np.isfinite(progress_values))
-    ):
-        raise ValueError("reliability components must be matching finite vectors")
-    enabled = tuple(metrics)
-    if len(enabled) != len(set(enabled)) or set(enabled) - {"support", "progress"}:
-        raise ValueError("reliability metrics must be a unique support/progress subset")
-    reliability = np.ones_like(support_values, dtype=np.float32)
-    if "support" in enabled:
-        reliability *= np.sqrt(np.maximum(support_values, 0.0))
-    if "progress" in enabled:
-        reliability *= np.sqrt(np.maximum(progress_values, 0.0))
-    return np.clip(reliability, float(min_reliability), 1.0).astype(np.float32)
+    enabled = _validate_metrics(metrics)
+    neutral = np.ones_like(support_old, dtype=np.float32)
+    # Validate components even when reliability is disabled.
+    fused = fuse_cocore_reliability(
+        neutral, neutral, neutral, neutral,
+        enabled or ["support_old", "action_jump"],
+        support_old=support_old,
+        action_jump=action_jump,
+        min_reliability=min_reliability,
+    )
+    return fused if enabled else np.ones_like(fused)

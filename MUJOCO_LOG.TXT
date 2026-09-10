@@ -42,3 +42,9 @@ WARNING Wed Aug 19 01:51:27 2026: Linesearch objective is not convex
 
 WARNING Wed Aug 19 01:51:27 2026: Linesearch objective is not convex
 
+WARNING Wed Sep  9 20:10:04 2026: Linesearch objective is not convex
+
+WARNING Wed Sep  9 20:10:04 2026: Linesearch objective is not convex
+
+WARNING Wed Sep  9 20:10:04 2026: Linesearch objective is not convex
+

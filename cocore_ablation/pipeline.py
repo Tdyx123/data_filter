@@ -35,7 +35,7 @@ from .reliability import fuse_reliability
 from .selection import SeededRandomSelector, initial_selection
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 GRAPH_DIRECTORY = "graph"
 SELECT_DIRECTORY = "select"
 _GRAPH_REQUIRED = (
@@ -249,10 +249,11 @@ def graph_stage(
             gripper_action_index=int(quality["gripper_action_index"]),
             min_reliability=float(quality["min_reliability"]),
             reliability_metrics=("support", "progress"),
+            compute_support_old=True,
         )
         reliability = fuse_reliability(
-            components.support,
-            components.progress,
+            components.support_old,
+            encoded.action_jump,
             resolved["reliability_metrics"],
             min_reliability=float(quality["min_reliability"]),
         )
@@ -301,6 +302,8 @@ def graph_stage(
             reliability=graph.reliability,
             prototype_indices=graph.prototype_indices,
             prototype_weights=graph.prototype_weights,
+            support_old=components.support_old[source],
+            action_jump=encoded.action_jump[source],
             support=components.support[source],
             progress=components.progress[source],
             smoothness=components.smoothness[source],
@@ -653,10 +656,11 @@ def _validate_graph_replay(
         gripper_action_index=int(quality["gripper_action_index"]),
         min_reliability=float(quality["min_reliability"]),
         reliability_metrics=("support", "progress"),
+        compute_support_old=True,
     )
     reliability = fuse_reliability(
-        components.support,
-        components.progress,
+        components.support_old,
+        encoded.action_jump,
         resolved["reliability_metrics"],
         min_reliability=float(quality["min_reliability"]),
     )
@@ -721,6 +725,8 @@ def _validate_graph_replay(
         "reliability": replay_graph.reliability,
         "prototype_indices": replay_graph.prototype_indices,
         "prototype_weights": replay_graph.prototype_weights,
+        "support_old": components.support_old[source],
+        "action_jump": encoded.action_jump[source],
         "support": components.support[source],
         "progress": components.progress[source],
         "smoothness": components.smoothness[source],

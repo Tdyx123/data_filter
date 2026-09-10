@@ -1,7 +1,7 @@
 # Cocore Ablation：LIBERO 独立消融模块
 
 `cocore_ablation` 在不改变生产 `cocore` 配置、CLI、版本和 artifact schema 的前提下，
-运行 LIBERO 组件消融。它读取或补建现有 Cocore 的共享 `scan/`、`encode/` 缓存，并按
+运行 LIBERO 组件消融。它使用独立配置创建或复用消融专用的共享 `scan/`、`encode/` 缓存，并按
 实验子文件夹隔离自己的 graph 和 select 产物。
 
 共享片段编码仅拼接视觉、状态和动作特征，再整体 L2 归一化，不包含轨迹位置。
@@ -15,10 +15,17 @@ pip install -r cocore_ablation/requirements.txt
 
 python -m cocore_ablation run \
   --config cocore_ablation/config_libero90.yaml \
-  --subfolder-name full-model
+  --output-dir /data/dwb/libero_filter/cocore_ablation \
+  --subfolder-name full-model \
+  --reliability-metrics support_old action_jump \
+  --support-k 10 \
+  --selection-ratio 0.20 \
+  --relation sequence \
+  --relation-weight 1.0 \
+  --force
 
 python -m cocore_ablation validate \
-  --output-dir outputs/cocore_ablation/libero90/full-model/select
+  --output-dir /data/dwb/libero_filter/cocore_ablation/full-model/select
 ```
 
 `run` 会连续完成 graph 和 select，并打印最终的 `select/` 路径。CLI 不单独暴露
@@ -34,7 +41,10 @@ python -m cocore_ablation validate \
 完整模型默认配置为：
 
 ```yaml
-reliability_metrics: [support, progress]
+reliability_metrics: [support_old, action_jump]
+
+quality:
+  knn: 10
 
 prototypes:
   representation: action_visual
@@ -47,17 +57,26 @@ objective:
   redundancy_weight: 1.0
 
 selection:
+  ratio: 0.20
+  budget: null
   strategy: random_multibranch
   use_coverage_seed: true
 ```
+
+独立配置为 `cocore_ablation/config_libero90.yaml`，基准参数与前述 Cocore 命令一致。
+共享上游为 `/data/dwb/libero_filter/cocore_ablation/shared`，首次运行自动创建，
+后续实验复用；无需提前运行 `cocore`。所有可靠性消融共享包含 `action_jump` 的上游编码，
+仅在图阶段切换融合指标。`support_old` 使用旧版指数支持度，`action_jump` 使用 Cocore
+的原始动作跳变评分；双指标取几何平均，单指标直接使用该指标值，最后应用可靠性下限。
+去可靠性时各片段可靠性为 1。CLI 同时接受空格分隔和逗号分隔的指标列表。
 
 建议一次只改变一个组件：
 
 | 实验 | 配置或 CLI |
 |---|---|
 | 去可靠性 | `reliability_metrics: []` / `--reliability-metrics none` |
-| 只用 support | `[support]` / `--reliability-metrics support` |
-| 只用 progress | `[progress]` / `--reliability-metrics progress` |
+| 只用 support_old | `[support_old]` / `--reliability-metrics support_old` |
+| 只用 action_jump | `[action_jump]` / `--reliability-metrics action_jump` |
 | 动作原型，无视觉细分 | `prototypes.representation: action_only` |
 | 去分配置信度 | `prototypes.use_assignment_confidence: false` |
 | 去关系项 | `objective.relation_weight: 0` |
@@ -80,7 +99,7 @@ python -m cocore_ablation run \
   --redundancy-weight 0 \
   --no-coverage-seed \
   --selection-strategy random \
-  --selection-ratio 0.10
+  --selection-ratio 0.20
 ```
 
 `action_only` 为每个有训练样本的动作桶生成一个叶原型。复合动作回退存在多个同阶父动作
@@ -93,7 +112,10 @@ python -m cocore_ablation run \
 输出结构如下：
 
 ```text
-outputs/cocore_ablation/libero90/
+/data/dwb/libero_filter/cocore_ablation/
+  shared/
+    scan/
+    encode/
   <subfolder-name>/
     graph/
       nodes.npz
@@ -116,5 +138,5 @@ graph manifest 指纹；关系类型、两个目标权重、coverage seed、选�
 raw/weighted relation、raw/weighted redundancy、总分、coverage、初始集合大小及 upstream
 fingerprint。
 
-本模块 schema 固定为 1，仅支持 `prototypes.profile: libero`，不会接入
+本模块 schema 为 2（旧消融产物需用 `--force` 重建），仅支持 `prototypes.profile: libero`，不会接入
 `cocore_bridge_v2`。

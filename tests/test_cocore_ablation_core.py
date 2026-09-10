@@ -13,9 +13,9 @@ from tests.test_cocore_core import _graph
 @pytest.mark.parametrize(
     ("metrics", "expected"),
     [
-        (("support", "progress"), [0.3, 0.8]),
-        (("support",), [0.5, 0.8**0.5]),
-        (("progress",), [0.6, 0.8**0.5]),
+        (("support_old", "action_jump"), [0.3, 0.8]),
+        (("support_old",), [0.25, 0.8]),
+        (("action_jump",), [0.36, 0.8]),
         ((), [1.0, 1.0]),
     ],
 )

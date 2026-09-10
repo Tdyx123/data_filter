@@ -27,19 +27,21 @@ def _ratio(value: str) -> float:
     return parsed
 
 
-def _metrics(value: str) -> list[str]:
-    choices = {
-        "none": [],
-        "support": ["support"],
-        "progress": ["progress"],
-        "support,progress": ["support", "progress"],
-    }
-    try:
-        return choices[value]
-    except KeyError as error:
-        raise argparse.ArgumentTypeError(
-            "reliability metrics must be none, support, progress, or support,progress"
-        ) from error
+class _MetricsAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        names = [name for value in values for name in value.split(",")]
+        choices = [[], ["support_old"], ["action_jump"], ["support_old", "action_jump"]]
+        metrics = [] if names == ["none"] else names
+        if metrics not in choices:
+            parser.error("reliability metrics must be none, support_old, action_jump, or support_old action_jump")
+        setattr(namespace, self.dest, metrics)
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("support k must be a positive integer")
+    return parsed
 
 
 def _subfolder_name(value: str) -> str:
@@ -50,12 +52,13 @@ def _subfolder_name(value: str) -> str:
 
 
 def _add_common_overrides(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--reliability-metrics", type=_metrics, default=None)
+    parser.add_argument("--reliability-metrics", nargs="+", action=_MetricsAction, default=None)
     parser.add_argument(
         "--prototype-representation",
         choices=("action_visual", "action_only"),
         default=None,
     )
+    parser.add_argument("--support-k", type=_positive_int, default=None)
     parser.add_argument("--no-assignment-confidence", action="store_true")
     parser.add_argument("--no-use-stop-bucket", action="store_true")
     parser.add_argument("--relation", choices=("sequence", "cooccurrence"), default=None)
@@ -92,6 +95,8 @@ def build_parser() -> argparse.ArgumentParser:
 def _apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
     if args.reliability_metrics is not None:
         config["reliability_metrics"] = args.reliability_metrics
+    if args.support_k is not None:
+        config.setdefault("quality", {})["knn"] = args.support_k
     prototypes = config.setdefault("prototypes", {})
     if args.prototype_representation is not None:
         prototypes["representation"] = args.prototype_representation
@@ -123,6 +128,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         if config_path is None and any(
             (
                 args.reliability_metrics is not None,
+                args.support_k is not None,
                 args.prototype_representation is not None,
                 args.no_assignment_confidence,
                 args.no_use_stop_bucket,

@@ -5,29 +5,29 @@ import math
 
 import pytest
 
-from cocore_ablation.config import DEFAULT_CONFIG, load_config, resolve_config
+from cocore_ablation.config import DEFAULT_CONFIG, load_config, resolve_config, to_cocore_config
 
 
 def test_ablation_defaults_preserve_full_cocore_behavior() -> None:
     config = resolve_config(copy.deepcopy(DEFAULT_CONFIG))
 
-    assert config["reliability_metrics"] == ["support", "progress"]
+    assert config["reliability_metrics"] == ["support_old", "action_jump"]
     assert config["prototypes"]["representation"] == "action_visual"
     assert config["prototypes"]["use_assignment_confidence"] is True
     assert config["objective"]["redundancy_weight"] == 1.0
     assert config["selection"]["use_coverage_seed"] is True
     assert config["selection"]["strategy"] == "random_multibranch"
-    assert config["upstream"]["directory"] == "outputs/cocore/libero90"
-    assert config["output"]["directory"] == "outputs/cocore_ablation/libero90"
+    assert config["upstream"]["directory"] == "/data/dwb/libero_filter/cocore_ablation/shared"
+    assert config["output"]["directory"] == "/data/dwb/libero_filter/cocore_ablation"
 
 
 @pytest.mark.parametrize(
     "metrics",
     [
         [],
-        ["support"],
-        ["progress"],
-        ["support", "progress"],
+        ["support_old"],
+        ["action_jump"],
+        ["support_old", "action_jump"],
     ],
 )
 def test_ablation_accepts_every_reliability_subset(metrics: list[str]) -> None:
@@ -39,7 +39,7 @@ def test_ablation_accepts_every_reliability_subset(metrics: list[str]) -> None:
 
 @pytest.mark.parametrize(
     "metrics",
-    [["support", "support"], ["smoothness"], "support"],
+    [["support_old", "support_old"], ["smoothness"], "support_old"],
 )
 def test_ablation_rejects_invalid_reliability_metrics(metrics: object) -> None:
     config = copy.deepcopy(DEFAULT_CONFIG)
@@ -94,3 +94,12 @@ def test_ablation_rejects_unknown_public_fields(section: str, field: str) -> Non
 
     with pytest.raises(ValueError, match=field):
         resolve_config(config)
+
+
+@pytest.mark.parametrize("metrics", [[], ["support_old"], ["action_jump"]])
+def test_upstream_retains_baseline_metrics_for_all_subsets(metrics):
+    resolved = resolve_config({"reliability_metrics": metrics})
+    assert resolve_config(resolved) == resolved
+    upstream = to_cocore_config(resolved)
+    assert upstream["reliability_metrics"] == ["support_old", "action_jump"]
+    assert upstream["action_jump"] == resolved["action_jump"]
